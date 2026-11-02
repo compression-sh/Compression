@@ -9,14 +9,27 @@ const SETTINGS_SIDEBAR_BREAKPOINT: f32 = 600.0;
 const SETTINGS_SIZE: egui::Vec2 = egui::vec2(1000.0, 720.0);
 const SETTINGS_MIN_SIZE: egui::Vec2 = egui::vec2(420.0, 400.0);
 
+/// The trace log is rotated once it reaches this size, so it stays at about twice this at most.
+const TRACE_LIMIT: u64 = 1 << 20;
+
 /// Appends a line to `~/.cache/compression/settings.log`, so a run started from anywhere leaves its trace.
 pub(crate) fn settings_trace(line: &str) {
-    use std::io::Write;
     let Some(dir) = std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))) else { return };
     let dir = dir.join("compression");
     let _ = std::fs::create_dir_all(&dir);
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("settings.log")) {
-        let _ = writeln!(file, "[settings] {line}");
+    append_capped(&dir.join("settings.log"), &format!("[settings] {line}"), TRACE_LIMIT);
+}
+
+/// Appends `line` to the log at `file`. A log that has reached `limit` bytes becomes `<file>.1`
+/// (the older one of those goes) and a new log is begun, so the log never grows without end. Only
+/// the trace's own two files are touched, both in the folder of `file`.
+fn append_capped(file: &std::path::Path, line: &str, limit: u64) {
+    use std::io::Write;
+    if file.metadata().is_ok_and(|m| m.len() >= limit) {
+        let _ = std::fs::rename(file, file.with_extension("log.1"));
+    }
+    if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
+        let _ = writeln!(log, "{line}");
     }
 }
 
@@ -183,5 +196,36 @@ impl CompressionApp {
             // main window is out of sight
             self.render_icon_gallery(&ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_trace_log_stays_small_and_keeps_working() {
+        let dir = std::env::temp_dir().join(format!("compression_trace_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.log");
+        let (limit, line) = (1000u64, "x".repeat(49));
+        // Writes ten times the limit
+        for i in 0..200 {
+            append_capped(&file, &format!("{i:03} {line}"), limit);
+            let size = |f: &std::path::Path| f.metadata().map_or(0, |m| m.len());
+            assert!(size(&file) < limit + 60, "the log grew past the limit: {} bytes after line {i}", size(&file));
+            assert!(size(&dir.join("settings.log.1")) < limit + 60);
+        }
+        // Only the log and the one rotated copy exist, nothing else was made
+        let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["settings.log", "settings.log.1"]);
+        // The newest line is in the log, and writing still works after many rotations
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.lines().last().unwrap().starts_with("199 "));
+        append_capped(&file, "after", limit);
+        assert!(std::fs::read_to_string(&file).unwrap().ends_with("after\n"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
