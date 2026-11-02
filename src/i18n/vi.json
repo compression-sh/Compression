@@ -776,6 +776,8 @@
   "Nothing to disconnect it with was found": "Không tìm thấy công cụ nào để ngắt kết nối",
   "{} on {}": "{} trên {}",
   "Could not reach {}": "Không thể kết nối được với {}",
+  "The server did not answer within 30 seconds": "Máy chủ không phản hồi trong 30 giây",
+  "The connection program printed too much": "Chương trình kết nối in ra quá nhiều",
   "Edit custom theme": "Sửa chủ đề tùy chỉnh",
   "Start from": "Bắt đầu từ",
   "Light theme": "Chủ đề sáng",

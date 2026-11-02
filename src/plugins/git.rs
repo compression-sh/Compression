@@ -357,6 +357,8 @@ fn run_within(command: Command, timeout: Duration) -> Result<Vec<u8>, String> {
         Err(process::Failure::TimedOut) => Err(tr("git took longer than 10 seconds").to_owned()),
         Err(process::Failure::TooMuchOutput) => Err(tr("git printed more than 64 MiB").to_owned()),
         Err(process::Failure::Io(e)) => Err(e.to_string()),
+        // git is never called off while it runs
+        Err(process::Failure::Cancelled) => Err("cancelled".to_owned()),
     }
 }
 

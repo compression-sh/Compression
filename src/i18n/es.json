@@ -776,6 +776,8 @@
   "Nothing to disconnect it with was found": "No se encontró nada con qué desconectarlo",
   "{} on {}": "{} en {}",
   "Could not reach {}": "No se pudo contactar con {}",
+  "The server did not answer within 30 seconds": "El servidor no respondió en 30 segundos",
+  "The connection program printed too much": "El programa de conexión imprimió demasiado",
   "Edit custom theme": "Editar tema personalizado",
   "Start from": "Partir de",
   "Light theme": "Tema claro",

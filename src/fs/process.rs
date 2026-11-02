@@ -20,6 +20,8 @@ pub enum Failure {
     TooMuchOutput,
     /// It did not end within the time, and was stopped.
     TimedOut,
+    /// The caller asked to stop waiting for it, and it was stopped.
+    Cancelled,
     /// It could not be started or waited for.
     Io(std::io::Error),
 }
@@ -58,11 +60,26 @@ fn read_into(stream: Box<dyn Read + Send>, buffer: &Mutex<Vec<u8>>, limit: usize
 /// poll: the program's exit and its output arrive as messages. What the program left running may
 /// hold its pipes open after it ended; its output is waited for one more second, and what was
 /// read by then is the output.
-pub fn run_capped(mut command: Command, limit: usize, timeout: Duration) -> Result<Output, Failure> {
+pub fn run_capped(command: Command, limit: usize, timeout: Duration) -> Result<Output, Failure> {
+    run_capped_with(command, None, limit, timeout, &|| false)
+}
+
+/// `run_capped`, with `input` written to the program's standard input (which is closed after it;
+/// without input it is closed at once), and a `cancelled` question that is asked every 50
+/// milliseconds while waiting: when it says yes, the program is killed and the answer is
+/// `Failure::Cancelled`.
+pub fn run_capped_with(mut command: Command, input: Option<Vec<u8>>, limit: usize, timeout: Duration, cancelled: &dyn Fn() -> bool) -> Result<Output, Failure> {
+    use std::io::Write;
     use std::os::unix::process::CommandExt;
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    command.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = command.spawn().map_err(Failure::Io)?;
     let id = child.id();
+    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+        // On a thread of its own: a program that does not read must not hold up the wait
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+    }
     let (tx, rx) = mpsc::channel();
     let too_much = Arc::new(AtomicBool::new(false));
     let buffers = [Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new()))];
@@ -97,7 +114,12 @@ pub fn run_capped(mut command: Command, limit: usize, timeout: Duration) -> Resu
             Some(at) => at + Duration::from_secs(1),
             None => deadline,
         };
-        match rx.recv_timeout(wait_until.saturating_duration_since(std::time::Instant::now())) {
+        if ended_at.is_none() && cancelled() {
+            kill();
+            return Err(Failure::Cancelled);
+        }
+        let slice = wait_until.saturating_duration_since(std::time::Instant::now()).min(Duration::from_millis(50));
+        match rx.recv_timeout(slice) {
             Ok(Message::Stream) => {
                 streams_ended += 1;
                 if too_much.load(Ordering::SeqCst) {
@@ -109,11 +131,13 @@ pub fn run_capped(mut command: Command, limit: usize, timeout: Duration) -> Resu
                 status = Some(result.map_err(Failure::Io)?);
                 ended_at = Some(std::time::Instant::now());
             }
-            Err(_) if ended_at.is_some() => break,
-            Err(_) => {
+            Err(_) if ended_at.is_some() && std::time::Instant::now() >= wait_until => break,
+            Err(_) if std::time::Instant::now() >= wait_until => {
                 kill();
                 return Err(Failure::TimedOut);
             }
+            // A slice of the wait went by: ask again whether to go on
+            Err(_) => {}
         }
         if status.is_some() && streams_ended == 2 {
             break;
@@ -167,6 +191,20 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1500));
         assert!(!marker.exists(), "what the program started was left running");
         let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn waiting_can_be_called_off_and_input_reaches_the_program() {
+        let started = std::time::Instant::now();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = || asked.fetch_add(1, Ordering::SeqCst) >= 3;
+        let result = run_capped_with(sh("sleep 30"), None, 1024, Duration::from_secs(60), &cancel);
+        assert!(matches!(result, Err(Failure::Cancelled)), "the wait was not called off");
+        assert!(started.elapsed() < Duration::from_secs(5), "the program was not stopped");
+        // Input is written and closed, so a program that reads to the end finishes
+        let done = run_capped_with(sh("cat >&2"), Some(b"secret\n".to_vec()), 1024, SECS, &|| false).unwrap();
+        assert!(done.success);
+        assert_eq!(done.stderr, b"secret\n");
     }
 
     #[test]

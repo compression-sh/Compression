@@ -776,6 +776,8 @@
   "Nothing to disconnect it with was found": "Не найдено средство для отключения",
   "{} on {}": "{} на {}",
   "Could not reach {}": "Не удалось связаться с {}",
+  "The server did not answer within 30 seconds": "Сервер не ответил за 30 секунд",
+  "The connection program printed too much": "Программа подключения вывела слишком много",
   "Edit custom theme": "Изменить свою тему",
   "Start from": "Взять за основу",
   "Light theme": "Светлая тема",

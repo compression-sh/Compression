@@ -97,6 +97,8 @@ fn message_for(label: &str, result: Result<Output, process::Failure>) -> String 
         Err(process::Failure::TooMuchOutput) => trf("{} failed: {}", &[&label, &tr("it printed more than 1 MiB")]),
         Err(process::Failure::TimedOut) => trf("{} failed: {}", &[&label, &tr("it took longer than 30 seconds")]),
         Err(process::Failure::Io(e)) => trf("{} failed: {}", &[&label, &e]),
+        // Actions are never called off while they run
+        Err(process::Failure::Cancelled) => trf("{} failed: {}", &[&label, &"cancelled"]),
     }
 }
 

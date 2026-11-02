@@ -719,6 +719,12 @@ impl Session {
         self.run_helper(address)
     }
 
+    /// Whether the window gave up on this connection: it dropped the sender of the replies. Nothing
+    /// is waited for in the replies while a program runs, so none is lost here.
+    fn cancelled(&self) -> bool {
+        matches!(self.replies.try_recv(), Err(mpsc::TryRecvError::Disconnected))
+    }
+
     fn ask(&self, prompt: Prompt) -> Reply {
         (self.report)(Progress::Ask(prompt));
         self.replies.recv().unwrap_or(Reply::Cancel)
@@ -796,16 +802,24 @@ impl Session {
         if anonymous {
             command.arg("--anonymous");
         }
-        // Prompts are matched in English
-        let mut child = command
+        // Prompts are matched in English. A process group of its own, so that all of it can be stopped
+        use std::os::unix::process::CommandExt;
+        let child = command
             .arg(address.uri())
             .env("LC_ALL", "C.UTF-8")
             .env_remove("LANGUAGE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .spawn()
             .map_err(|e| Failure::Message(e.to_string()))?;
+        self.drive_gio(child, address, CONNECT_TIMEOUT)
+    }
+
+    /// Answers the questions of a running `gio mount`. It is stopped when it says nothing for
+    /// `timeout` (the time the person takes to answer does not count), and when the window gives up.
+    fn drive_gio(&mut self, mut child: std::process::Child, address: &Address, timeout: std::time::Duration) -> Result<Attempt, Failure> {
         let mut stdin = child.stdin.take();
         let mut stdout = child.stdout.take().ok_or_else(|| Failure::Message("gio".into()))?;
         let errors = child.stderr.take().map(|mut err| {
@@ -815,18 +829,46 @@ impl Session {
                 text
             })
         });
+        // The output is read on a thread, so that waiting for it can be timed out and called off
+        let (chunks_tx, chunks_rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            while let Ok(n @ 1..) = stdout.read(&mut chunk) {
+                if chunks_tx.send(chunk[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let id = child.id();
+        let kill = || {
+            // SAFETY: a signal to the process group this was started in; a group that is gone only fails
+            unsafe { libc::kill(-(id as i32), libc::SIGKILL) };
+        };
 
         let mut buffer = String::new();
-        let mut chunk = [0u8; 4096];
         // The account being entered: user, domain and password are asked one after the other
         let mut entering: Option<Login> = None;
         let mut outcome: Option<Result<Attempt, Failure>> = None;
+        let mut quiet_since = std::time::Instant::now();
         loop {
-            let n = match stdout.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
+            let chunk = match chunks_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(chunk) => chunk,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self.cancelled() {
+                        kill();
+                        outcome = Some(Err(Failure::Cancelled));
+                        break;
+                    }
+                    if quiet_since.elapsed() >= timeout {
+                        kill();
+                        outcome = Some(Err(Failure::Message(tr("The server did not answer within 30 seconds").to_owned())));
+                        break;
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            buffer.push_str(&String::from_utf8_lossy(&chunk[..n]));
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
             let Some((prompt, message)) = parse_gio_prompt(&buffer) else { continue };
             buffer.clear();
             let answer = match prompt {
@@ -882,6 +924,7 @@ impl Session {
             if !written {
                 break;
             }
+            quiet_since = std::time::Instant::now();
         }
         // Closing its input makes gio give up on a question it still waits for
         drop(stdin);
@@ -950,7 +993,7 @@ impl Session {
             } else {
                 command.args(["-o", "BatchMode=yes"]);
             }
-            let output = run_with_input(command, login.as_ref().map(|l| format!("{}\n", l.password)))?;
+            let output = run_with_input(command, login.as_ref().map(|l| format!("{}\n", l.password)), &|| self.cancelled())?;
             if output.0 {
                 self.used = login.clone();
                 return Ok(user);
@@ -987,16 +1030,16 @@ impl Session {
             };
             let remote = rclone_remote(root, user.as_deref(), domain.as_deref());
             // Always given, if only empty: rclone's FTP refuses a remote without one
-            let env = [(format!("RCLONE_{}_PASS", backend.to_uppercase()), rclone_obscure(password.as_deref().unwrap_or(""))?)];
+            let env = [(format!("RCLONE_{}_PASS", backend.to_uppercase()), rclone_obscure(password.as_deref().unwrap_or(""), &|| self.cancelled())?)];
             let mut check = Command::new("rclone");
             check.args(["lsf", "--max-depth", "1", "--contimeout", "15s", "--timeout", "30s", "--retries", "1", "--low-level-retries", "1", "-q"]).arg(&remote);
             check.envs(env.iter().map(|(k, v)| (k, v)));
-            let (ok, error) = run_with_input(check, None)?;
+            let (ok, error) = run_with_input(check, None, &|| self.cancelled())?;
             if ok {
                 let mut mount = Command::new("rclone");
                 mount.arg("mount").arg(&remote).arg(point).args(["--daemon", "--vfs-cache-mode", "writes", "--dir-cache-time", "15s", "--contimeout", "15s"]);
                 mount.envs(env.iter().map(|(k, v)| (k, v)));
-                let (ok, error) = run_with_input(mount, None)?;
+                let (ok, error) = run_with_input(mount, None, &|| self.cancelled())?;
                 if !ok {
                     return Err(Failure::Message(last_line(&error)));
                 }
@@ -1036,7 +1079,7 @@ impl Session {
         }
         let mut fingerprint = Command::new("ssh-keygen");
         fingerprint.args(["-l", "-f", "-"]);
-        let (_, listed) = run_with_input_out(fingerprint, Some(keys.clone()))?;
+        let (_, listed) = run_with_input_out(fingerprint, Some(keys.clone()), &|| self.cancelled())?;
         let print = listed.lines().find(|l| l.contains("ED25519")).or_else(|| listed.lines().next()).and_then(|l| l.split_whitespace().nth(1)).unwrap_or("?").to_owned();
         let message = format!("The identity of the remote computer ({}) is unknown.\nThe identity sent by the remote computer is {print}.", root.host);
         match self.ask(Prompt::Question { message, choices: vec!["Log In Anyway".into(), "Cancel Login".into()] }) {
@@ -1211,10 +1254,10 @@ fn rclone_quote(value: &str) -> String {
 
 /// rclone takes passwords in its own obscured form; it reads the password on its input, so it is
 /// never seen in the list of processes.
-fn rclone_obscure(password: &str) -> Result<String, Failure> {
+fn rclone_obscure(password: &str, cancelled: &dyn Fn() -> bool) -> Result<String, Failure> {
     let mut command = Command::new("rclone");
     command.args(["obscure", "-"]);
-    let (ok, out) = run_with_input_out(command, Some(password.to_owned()))?;
+    let (ok, out) = run_with_input_out(command, Some(password.to_owned()), cancelled)?;
     if ok { Ok(out.trim().to_owned()) } else { Err(Failure::Message(last_line(&out))) }
 }
 
@@ -1223,29 +1266,29 @@ fn is_auth_error(error: &str) -> bool {
     ["530", "login incorrect", "logon_failure", "logon failure", "authenticat", "401", "permission denied", "access denied", "unable to authenticate"].iter().any(|k| lower.contains(k))
 }
 
+/// How long a program that connects to a server may take before it is stopped.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Run a command, feed it `input`, and report whether it worked with what it wrote to stderr.
-fn run_with_input(command: Command, input: Option<String>) -> Result<(bool, String), Failure> {
-    run_capturing(command, input, false)
+/// It is stopped after `CONNECT_TIMEOUT`, and when `cancelled` says the person gave up.
+fn run_with_input(command: Command, input: Option<String>, cancelled: &dyn Fn() -> bool) -> Result<(bool, String), Failure> {
+    run_capturing(command, input, false, cancelled, CONNECT_TIMEOUT)
 }
 
 /// `run_with_input`, reporting what it wrote to stdout instead.
-fn run_with_input_out(command: Command, input: Option<String>) -> Result<(bool, String), Failure> {
-    run_capturing(command, input, true)
+fn run_with_input_out(command: Command, input: Option<String>, cancelled: &dyn Fn() -> bool) -> Result<(bool, String), Failure> {
+    run_capturing(command, input, true, cancelled, CONNECT_TIMEOUT)
 }
 
-fn run_capturing(mut command: Command, input: Option<String>, stdout: bool) -> Result<(bool, String), Failure> {
-    let mut child = command
-        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| Failure::Message(e.to_string()))?;
-    if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
-        let _ = stdin.write_all(text.as_bytes());
+fn run_capturing(command: Command, input: Option<String>, stdout: bool, cancelled: &dyn Fn() -> bool, timeout: std::time::Duration) -> Result<(bool, String), Failure> {
+    use super::process::{self, run_capped_with};
+    match run_capped_with(command, input.map(String::into_bytes), 1 << 20, timeout, cancelled) {
+        Ok(output) => Ok((output.success, String::from_utf8_lossy(if stdout { &output.stdout } else { &output.stderr }).into_owned())),
+        Err(process::Failure::TimedOut) => Err(Failure::Message(tr("The server did not answer within 30 seconds").to_owned())),
+        Err(process::Failure::TooMuchOutput) => Err(Failure::Message(tr("The connection program printed too much").to_owned())),
+        Err(process::Failure::Cancelled) => Err(Failure::Cancelled),
+        Err(process::Failure::Io(e)) => Err(Failure::Message(e.to_string())),
     }
-    let output = child.wait_with_output().map_err(|e| Failure::Message(e.to_string()))?;
-    let text = if stdout { &output.stdout } else { &output.stderr };
-    Ok((output.status.success(), String::from_utf8_lossy(text).into_owned()))
 }
 
 fn last_line(text: &str) -> String {
@@ -1636,6 +1679,97 @@ mod tests {
         tx.send(login("-x", "")).unwrap();
         tx.send(Reply::Cancel).unwrap();
         assert!(session_with(rx).login(&addr("sftp://h/"), None, None, false).is_none());
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    #[test]
+    fn a_connection_program_that_hangs_is_stopped_at_the_time_limit() {
+        let started = std::time::Instant::now();
+        let result = run_capturing(sh("sleep 30"), None, false, &|| false, std::time::Duration::from_millis(200));
+        assert!(matches!(&result, Err(Failure::Message(m)) if *m == tr("The server did not answer within 30 seconds")), "wrong answer");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "it was not stopped");
+    }
+
+    #[test]
+    fn a_connection_that_is_called_off_is_stopped_at_once() {
+        let started = std::time::Instant::now();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let cancelled = || calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2;
+        let result = run_capturing(sh("sleep 30"), None, false, &cancelled, std::time::Duration::from_secs(60));
+        assert!(matches!(result, Err(Failure::Cancelled)), "it was not called off");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // The same through the sender of the replies: dropping it is giving up
+        let (tx, rx) = mpsc::channel();
+        let session = session_with(rx);
+        assert!(!session.cancelled());
+        drop(tx);
+        assert!(session.cancelled());
+        let started = std::time::Instant::now();
+        assert!(matches!(run_capturing(sh("sleep 30"), None, false, &|| session.cancelled(), std::time::Duration::from_secs(60)), Err(Failure::Cancelled)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_normal_connection_program_still_reports_its_output_and_takes_input() {
+        let secs = std::time::Duration::from_secs(10);
+        assert_eq!(run_capturing(sh("echo oops >&2; exit 1"), None, false, &|| false, secs).ok(), Some((false, "oops\n".to_owned())));
+        assert_eq!(run_capturing(sh("echo fine"), None, true, &|| false, secs).ok(), Some((true, "fine\n".to_owned())));
+        // A password goes in on standard input
+        assert_eq!(run_capturing(sh("read pw; echo \"got:$pw\" >&2"), Some("secret\n".into()), false, &|| false, secs).ok(), Some((true, "got:secret\n".to_owned())));
+    }
+
+    /// A stand-in for `gio mount`: a shell script with piped input and output, in a group of its own.
+    fn fake_gio(script: &str) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        sh(script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn().unwrap()
+    }
+
+    #[test]
+    fn a_mount_that_hangs_is_stopped_and_one_that_is_called_off_ends_cleanly() {
+        let (_tx, rx) = mpsc::channel();
+        let started = std::time::Instant::now();
+        let result = session_with(rx).drive_gio(fake_gio("sleep 30"), &addr("sftp://h/"), std::time::Duration::from_millis(300));
+        assert!(matches!(&result, Err(Failure::Message(m)) if *m == tr("The server did not answer within 30 seconds")), "wrong answer");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "the mount was not stopped");
+
+        // The window drops its sender while gio works
+        let (tx, rx) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(tx);
+        });
+        let started = std::time::Instant::now();
+        let result = session_with(rx).drive_gio(fake_gio("sleep 30"), &addr("sftp://h/"), std::time::Duration::from_secs(60));
+        assert!(matches!(result, Err(Failure::Cancelled)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "the mount was not called off");
+        dropper.join().unwrap();
+    }
+
+    #[test]
+    fn a_normal_mount_still_asks_its_questions_and_succeeds() {
+        let secs = std::time::Duration::from_secs(20);
+        let (_tx, rx) = mpsc::channel();
+        let result = session_with(rx).drive_gio(fake_gio("exit 0"), &addr("sftp://h/"), secs);
+        assert!(matches!(result, Ok(Attempt::Mounted)));
+        // gio asks for a password, which is typed in the window and answered on its input
+        let (tx, rx) = mpsc::channel();
+        tx.send(Reply::Login { user: String::new(), domain: String::new(), password: "pw".into(), remember: false }).unwrap();
+        let answered = std::env::temp_dir().join(format!("compression_gio_answer_{}", std::process::id()));
+        let _ = std::fs::remove_file(&answered);
+        let script = format!("printf 'Password: '; read pw; echo \"$pw\" > '{}'; exit 0", answered.display());
+        let result = session_with(rx).drive_gio(fake_gio(&script), &addr("sftp://h/"), secs);
+        assert!(matches!(result, Ok(Attempt::Mounted)));
+        assert_eq!(std::fs::read_to_string(&answered).unwrap(), "pw\n");
+        let _ = std::fs::remove_file(&answered);
+        // A failing mount says why
+        let (_tx, rx) = mpsc::channel();
+        let result = session_with(rx).drive_gio(fake_gio("echo 'Error mounting location: Host unreachable' >&2; exit 1"), &addr("sftp://h/"), secs);
+        assert!(matches!(result, Err(Failure::Message(m)) if m.contains("unreachable")));
     }
 
     #[test]
