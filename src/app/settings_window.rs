@@ -30,7 +30,7 @@ fn settings_log(ctx: &egui::Context, width: f32, visible: bool, t: f32) {
     let mut last = LAST.lock().unwrap();
     let frames = last.2 + 1;
     let changed = (last.0 - width).abs() > 0.5 || (last.1 - t).abs() > 0.001;
-    if changed || dt > 0.03 || frames % 120 == 0 {
+    if changed || dt > 0.03 || frames.is_multiple_of(120) {
         settings_trace(&format!("frame={frames} pass={pass} width={width:.1} sidebar_visible={visible} sidebar_t={t:.3} dt={:.1}ms ppp={repaints:?} changed={changed}", dt * 1000.0));
     }
     *last = (width, t, frames);

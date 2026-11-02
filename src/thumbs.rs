@@ -379,10 +379,8 @@ fn to_color_image(img: &image::DynamicImage) -> egui::ColorImage {
 /// every visit.
 fn cached_thumbnail(path: &Path, tier: u32) -> Option<image::DynamicImage> {
     let shared = is_image(path) && !is_ffmpeg_still(path);
-    if shared {
-        if let Some(hit) = shared_cache::read(path, tier) {
-            return Some(hit);
-        }
+    if shared && let Some(hit) = shared_cache::read(path, tier) {
+        return Some(hit);
     }
     let Some(key) = cache::key(path) else { return render_thumbnail(path, tier) };
     if let Some(hit) = cache::read(&key, tier) {

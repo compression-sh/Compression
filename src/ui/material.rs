@@ -2501,9 +2501,7 @@ mod tests {
         let id = egui::Id::unique("test_reversal");
 
         let step = |time: f64, target: bool| -> f32 {
-            let mut raw = egui::RawInput::default();
-            raw.time = Some(time);
-            raw.predicted_dt = 0.016;
+            let raw = egui::RawInput { time: Some(time), predicted_dt: 0.016, ..Default::default() };
             let mut val = 0.0;
             let mut out = ctx.run_ui(raw, |ui| {
                 val = animate(ui.ctx(), id, target);

@@ -213,15 +213,15 @@ impl WaylandDnd {
         let waker: std::task::Waker = std::sync::Arc::new(Repaint(ctx.clone())).into();
 
         // A window the resident process opened after another closed takes over that one's device
-        if let Some(mut device) = KEPT.with(|kept| kept.borrow_mut().take()) {
-            if device.display == display.display.as_ptr() as usize {
-                // SAFETY: as below, the surface comes from the live window winit created
-                let surface_id = unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.surface.as_ptr().cast()) }.ok()?;
-                device.surface = WlSurface::from_id(&device.connection, surface_id.clone()).ok()?;
-                device.state.surface = Some(surface_id);
-                device.waker = waker;
-                return Some(Self(Some(device)));
-            }
+        if let Some(mut device) = KEPT.with(|kept| kept.borrow_mut().take())
+            && device.display == display.display.as_ptr() as usize
+        {
+            // SAFETY: as below, the surface comes from the live window winit created
+            let surface_id = unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.surface.as_ptr().cast()) }.ok()?;
+            device.surface = WlSurface::from_id(&device.connection, surface_id.clone()).ok()?;
+            device.state.surface = Some(surface_id);
+            device.waker = waker;
+            return Some(Self(Some(device)));
         }
         Device::new(display.display.as_ptr() as usize, surface.surface.as_ptr() as usize, waker).map(|d| Self(Some(Box::new(d))))
     }
@@ -644,18 +644,14 @@ impl Dispatch<WlSeat, ()> for State {
             let has = caps.contains(wl_seat::Capability::Pointer);
             if has && state.pointer.is_none() {
                 state.pointer = Some(seat.get_pointer(qh, ()));
-            } else if !has && let Some(pointer) = state.pointer.take() {
-                if pointer.version() >= 3 {
-                    pointer.release();
-                }
+            } else if !has && let Some(pointer) = state.pointer.take() && pointer.version() >= 3 {
+                pointer.release();
             }
             let has = caps.contains(wl_seat::Capability::Keyboard);
             if has && state.keyboard.is_none() {
                 state.keyboard = Some(seat.get_keyboard(qh, ()));
-            } else if !has && let Some(keyboard) = state.keyboard.take() {
-                if keyboard.version() >= 3 {
-                    keyboard.release();
-                }
+            } else if !has && let Some(keyboard) = state.keyboard.take() && keyboard.version() >= 3 {
+                keyboard.release();
             }
         }
     }

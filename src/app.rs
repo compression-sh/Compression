@@ -2383,10 +2383,10 @@ impl CompressionApp {
             });
             copied
         });
-        if let Some(text) = copied.into_iter().last() {
-            if !self.wl_dnd.as_mut().is_some_and(|wl| wl.set_text(text.clone())) {
-                crate::clipboard::set_text(text);
-            }
+        if let Some(text) = copied.into_iter().last()
+            && !self.wl_dnd.as_mut().is_some_and(|wl| wl.set_text(text.clone()))
+        {
+            crate::clipboard::set_text(text);
         }
     }
 
@@ -3884,11 +3884,11 @@ impl CompressionApp {
         }
         let fields = [SortBy::Name, SortBy::Size, SortBy::Type, SortBy::Modified, SortBy::Created, SortBy::Accessed, SortBy::Owner, SortBy::Permissions];
         let labels = [tr("Name"), tr("Size"), tr("Type"), tr("Last modified"), tr("Created"), tr("Accessed"), tr("Owner"), tr("Permissions")];
-        if let Some(field) = material::chip_rows(ui, "vo_sort", &labels, |i| self.sort_by == fields[i], &low).map(|i| fields[i]) {
-            if field != self.sort_by {
-                self.sort_by = field;
-                self.apply_sort();
-            }
+        if let Some(field) = material::chip_rows(ui, "vo_sort", &labels, |i| self.sort_by == fields[i], &low).map(|i| fields[i])
+            && field != self.sort_by
+        {
+            self.sort_by = field;
+            self.apply_sort();
         }
 
         material::collapsible(ui, "vo_list_columns", self.view_mode == ViewMode::List, |ui| {
@@ -6668,13 +6668,10 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("jam.txt"), "x").unwrap();
         let ctx = egui::Context::default();
-        let mut settings = Settings::default();
-        settings.type_to_filter = true;
-        settings.vim_keys = true;
+        let settings = Settings { type_to_filter: true, vim_keys: true, ..Default::default() };
         let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), settings, &ctx);
-        let mut frame = |app: &mut CompressionApp, key: Option<&str>| {
-            let mut raw = egui::RawInput::default();
-            raw.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 600.0)));
+        let frame = |app: &mut CompressionApp, key: Option<&str>| {
+            let mut raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 600.0))), ..Default::default() };
             if let Some(k) = key {
                 raw.events.push(egui::Event::Key {
                     key: egui::Key::J,

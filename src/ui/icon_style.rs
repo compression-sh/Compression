@@ -565,7 +565,7 @@ fn tombstone(painter: &egui::Painter, center: Pos2, glyph: &str, size: f32, colo
         }
     }
     // Bats roost on about half of the stones
-    if size >= 56.0 && seed % 2 == 0 {
+    if size >= 56.0 && seed.is_multiple_of(2) {
         bat(painter, Pos2::new(stone.right() - size * 0.02, stone.top() - size * 0.02), size * 0.26, darken(color, 0.62));
     }
 }

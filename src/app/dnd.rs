@@ -210,12 +210,12 @@ impl CompressionApp {
                 self.paint_drop_hint(&painter, anchor, &hover.paths, Some(dest), copy);
             }
         }
-        if let Some(drop) = poll.dropped {
-            if let Some((dest, _)) = self.system_drop_target(to_ui(drop.pos), &drop.paths) {
-                // Most compositors leave the choice to the window dropped on, which goes by the drive
-                let copy = drop.copy || Self::copies(&drop.paths, &dest, if drop.own { modifiers } else { egui::Modifiers::NONE });
-                self.drop_items(drop.paths, dest, copy);
-            }
+        if let Some(drop) = poll.dropped
+            && let Some((dest, _)) = self.system_drop_target(to_ui(drop.pos), &drop.paths)
+        {
+            // Most compositors leave the choice to the window dropped on, which goes by the drive
+            let copy = drop.copy || Self::copies(&drop.paths, &dest, if drop.own { modifiers } else { egui::Modifiers::NONE });
+            self.drop_items(drop.paths, dest, copy);
         }
     }
 
