@@ -738,20 +738,22 @@ impl Session {
                 return Some(Account::Login(saved));
             }
         }
-        let prompt = Prompt::Login {
-            user,
-            domain: domain.or_else(|| address.domain.clone()),
-            fixed_user,
-            anonymous: address.scheme.allows_anonymous(),
-            retry: self.refused > 0,
-        };
-        match self.ask(prompt) {
-            Reply::Login { user, domain, password, remember } => {
-                self.remember = remember;
-                Some(Account::Login(Login { user, domain, password }))
+        let domain = domain.or_else(|| address.domain.clone());
+        loop {
+            let prompt = Prompt::Login { user: user.clone(), domain: domain.clone(), fixed_user, anonymous: address.scheme.allows_anonymous(), retry: self.refused > 0 };
+            match self.ask(prompt) {
+                // A name typed here ends up as an argument of sshfs and the like, so it follows the
+                // same rule as one in an address; one that breaks it is asked for again, as after a refused password
+                Reply::Login { user, domain, .. } if !is_plain_name(&user) || !is_plain_name(&domain) => {
+                    self.refused += 1;
+                }
+                Reply::Login { user, domain, password, remember } => {
+                    self.remember = remember;
+                    return Some(Account::Login(Login { user, domain, password }));
+                }
+                Reply::Anonymous => return Some(Account::Anonymous),
+                Reply::Choice(_) | Reply::Cancel => return None,
             }
-            Reply::Anonymous => Some(Account::Anonymous),
-            Reply::Choice(_) | Reply::Cancel => None,
         }
     }
 
@@ -1261,6 +1263,9 @@ pub(crate) fn find_program(name: &str) -> Option<PathBuf> {
 }
 
 /// The folder name a helper mount gets: readable and the same every time for the same server.
+/// The name of the folder a server is mounted at. It reads like the server (`smb-bob@nas-my_share`)
+/// and ends with a hash of its exact identity, because the readable part drops characters
+/// (`my share` and `my_share` look alike there) and two servers must never share a folder.
 fn helper_id(root: &Address) -> String {
     let mut id = format!("{}-", root.scheme.name());
     if let Some(user) = &root.user {
@@ -1275,7 +1280,22 @@ fn helper_id(root: &Address) -> String {
         id.push('-');
         id.push_str(share);
     }
-    id.chars().map(|c| if c.is_alphanumeric() || matches!(c, '.' | '@' | '-' | '_') { c } else { '_' }).collect()
+    let readable: String = id.chars().take(80).map(|c| if c.is_alphanumeric() || matches!(c, '.' | '@' | '-' | '_') { c } else { '_' }).collect();
+    format!("{readable}-{:016x}", identity_hash(root))
+}
+
+/// FNV-1a of what tells servers apart; unlike `DefaultHasher` it is the same in every build, so a
+/// server keeps its folder from one version to the next.
+fn identity_hash(root: &Address) -> u64 {
+    let identity = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        root.scheme.name(),
+        root.user.as_deref().unwrap_or("\u{1}"),
+        root.host,
+        root.port.map_or_else(String::new, |p| p.to_string()),
+        root.share().unwrap_or("\u{1}")
+    );
+    identity.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
 }
 
 fn write_record(id: &str, address: &Address) {
@@ -1540,7 +1560,7 @@ mod tests {
         assert_eq!(rclone_remote(&addr("smb://nas/media"), Some("bob"), Some("WORK")), ":smb,host=nas,user=bob,domain=WORK:media");
         assert_eq!(rclone_remote(&addr("davs://cloud/remote.php/dav"), None, None), ":webdav,url=\"https://cloud/remote.php/dav\":");
         assert_eq!(rclone_quote("a,b"), "\"a,b\"");
-        assert_eq!(helper_id(&addr("smb://bob@nas/my share").root()), "smb-bob@nas-my_share");
+        assert!(helper_id(&addr("smb://bob@nas/my share").root()).starts_with("smb-bob@nas-my_share-"));
     }
 
     #[test]
@@ -1569,6 +1589,53 @@ mod tests {
         assert!(Address::parse("ftp://[::1]:2121/").is_some());
         // A dash may be the first character of the path
         assert_eq!(addr("sftp://h/-rf").path, "/-rf");
+    }
+
+    #[test]
+    fn servers_that_read_alike_get_folders_of_their_own() {
+        let id = |text: &str| helper_id(&addr(text).root());
+        // The readable part drops the space, so only the hash tells these apart
+        assert_ne!(id("smb://nas/my share"), id("smb://nas/my_share"));
+        assert_ne!(id("sftp://a%20b@host/"), id("sftp://a_b@host/"));
+        assert_ne!(id("sftp://host:2222/"), id("sftp://host/"));
+        assert_ne!(id("sftp://me@host/"), id("sftp://host/"));
+        assert_ne!(id("sftp://host/"), id("ftp://host/"));
+        // The same server always gets the same folder, whatever the path inside it
+        assert_eq!(id("sftp://me@host/a"), id("sftp://me@host/b/c"));
+        assert_eq!(id("smb://nas/media/x"), id("smb://nas/media/y"));
+        // Still a plain name for a folder, of a length a file system accepts
+        for text in ["smb://nas/my share", "sftp://me@host:2222/", "ftp://[::1]/"] {
+            let name = id(text);
+            assert!(name.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '@' | '-' | '_')), "{name}");
+        }
+        assert!(id(&format!("sftp://{}/", "h".repeat(200))).len() < 120);
+        // A server keeps its folder from one version to the next
+        assert_eq!(id("sftp://me@host/"), "sftp-me@host-6e6c0e599c4f563f");
+    }
+
+    fn session_with(replies: mpsc::Receiver<Reply>) -> Session {
+        Session { report: Box::new(|_| {}), replies, preset: None, tried_saved: true, refused: 0, used: None, remember: false }
+    }
+
+    #[test]
+    fn a_user_name_typed_in_the_login_dialog_follows_the_rule_of_addresses() {
+        let login = |user: &str, domain: &str| Reply::Login { user: user.into(), domain: domain.into(), password: "pw".into(), remember: false };
+        let (tx, rx) = mpsc::channel();
+        let mut session = session_with(rx);
+        // Options and control characters are refused and asked for again; then a good name is taken
+        for bad in ["-oProxyCommand=x", "-v", "me\tx", "me\nx"] {
+            tx.send(login(bad, "")).unwrap();
+        }
+        tx.send(login("me", "-WORK")).unwrap();
+        tx.send(login("my-user", "WORK")).unwrap();
+        let Some(Account::Login(taken)) = session.login(&addr("sftp://h/"), None, None, false) else { panic!("no account") };
+        assert_eq!((taken.user.as_str(), taken.domain.as_str()), ("my-user", "WORK"));
+        assert_eq!(session.refused, 5, "each refused name counts like a refused password");
+        // And the person can still give up
+        let (tx, rx) = mpsc::channel();
+        tx.send(login("-x", "")).unwrap();
+        tx.send(Reply::Cancel).unwrap();
+        assert!(session_with(rx).login(&addr("sftp://h/"), None, None, false).is_none());
     }
 
     #[test]
