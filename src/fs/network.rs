@@ -1129,7 +1129,10 @@ impl Session {
     fn check_host_key(&mut self, root: &Address) -> Result<(), Failure> {
         let port = root.port.unwrap_or(22);
         let name = if port == 22 { root.host.clone() } else { format!("[{}]:{port}", root.host) };
-        let known = Command::new("ssh-keygen").args(["-F", &name]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        let mut lookup = Command::new("ssh-keygen");
+        lookup.args(["-F", &name]);
+        // One that does not answer counts as not known: the key is then asked about as for any new server
+        let known = output_within(lookup, QUESTION_TIMEOUT).is_ok_and(|out| out.success);
         if known || find_program("ssh-keyscan").is_none() {
             return Ok(());
         }
@@ -1223,12 +1226,14 @@ fn clean_gio_error(text: &str) -> String {
 
 /// Where GVfs shows `address` on this computer, asked of `gio info`.
 fn gvfs_local_path(address: &Address) -> Result<PathBuf, Failure> {
-    let output = Command::new("gio").args(["info", "-a", "standard::type"]).arg(address.uri()).env("LC_ALL", "C.UTF-8").env_remove("LANGUAGE").output().map_err(|e| Failure::Message(e.to_string()))?;
+    let mut command = Command::new("gio");
+    command.args(["info", "-a", "standard::type"]).arg(address.uri()).env("LC_ALL", "C.UTF-8").env_remove("LANGUAGE");
+    let output = output_within(command, QUESTION_TIMEOUT)?;
     let text = String::from_utf8_lossy(&output.stdout);
     if let Some(path) = text.lines().find_map(|l| l.strip_prefix("local path: ")) {
         return Ok(PathBuf::from(path.trim()));
     }
-    if !output.status.success() {
+    if !output.success {
         return Err(Failure::Message(clean_gio_error(&String::from_utf8_lossy(&output.stderr))));
     }
     Err(Failure::Message(tr("GVfs runs without its FUSE part (gvfsd-fuse), so the server can't be opened as a folder").to_owned()))
@@ -1342,13 +1347,41 @@ fn run_with_input_out(command: Command, input: Option<String>, cancelled: &dyn F
 }
 
 fn run_capturing(command: Command, input: Option<String>, stdout: bool, cancelled: &dyn Fn() -> bool, timeout: std::time::Duration) -> Result<(bool, String), Failure> {
-    use super::process::{self, run_capped_with};
+    use super::process::run_capped_with;
     match run_capped_with(command, input.map(String::into_bytes), 1 << 20, timeout, cancelled) {
         Ok(output) => Ok((output.success, String::from_utf8_lossy(if stdout { &output.stdout } else { &output.stderr }).into_owned())),
-        Err(process::Failure::TimedOut) => Err(Failure::Message(tr("The server did not answer within 30 seconds").to_owned())),
-        Err(process::Failure::TooMuchOutput) => Err(Failure::Message(tr("The connection program printed too much").to_owned())),
-        Err(process::Failure::Cancelled) => Err(Failure::Cancelled),
-        Err(process::Failure::Io(e)) => Err(Failure::Message(e.to_string())),
+        Err(failure) => Err(failure_of(failure)),
+    }
+}
+
+/// How long the short questions asked of programs may take: `gio info`, `ssh-keygen -F`.
+const QUESTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long disconnecting a server may take.
+const DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn failure_of(failure: super::process::Failure) -> Failure {
+    use super::process::Failure as Stopped;
+    match failure {
+        Stopped::TimedOut => Failure::Message(tr("The server did not answer within 30 seconds").to_owned()),
+        Stopped::TooMuchOutput => Failure::Message(tr("The connection program printed too much").to_owned()),
+        Stopped::Cancelled => Failure::Cancelled,
+        Stopped::Io(e) => Failure::Message(e.to_string()),
+    }
+}
+
+/// Runs a program that has a short answer to give, and stops it, with what it started, when it
+/// takes longer than `timeout`.
+fn output_within(command: Command, timeout: std::time::Duration) -> Result<super::process::Output, Failure> {
+    super::process::run_capped(command, 1 << 20, timeout).map_err(failure_of)
+}
+
+/// Runs an unmount command: `Ok` when it worked, else what it said (or that it took too long).
+fn unmount_with(command: Command, timeout: std::time::Duration) -> Result<(), String> {
+    match output_within(command, timeout) {
+        Ok(out) if out.success => Ok(()),
+        Ok(out) => Err(last_line(&String::from_utf8_lossy(&out.stderr))),
+        Err(Failure::Message(message)) => Err(message),
+        Err(_) => Err(tr("The server did not answer within 30 seconds").to_owned()),
     }
 }
 
@@ -1423,21 +1456,25 @@ fn read_record(id: &str) -> Option<Address> {
 pub fn disconnect(mount: &Mount) -> Result<(), String> {
     let result = match mount.kind {
         MountKind::Gvfs => {
-            let out = Command::new("gio").args(["mount", "-u"]).arg(&mount.local).env("LC_ALL", "C.UTF-8").output().map_err(|e| e.to_string())?;
-            if out.status.success() { Ok(()) } else { Err(clean_gio_error(&String::from_utf8_lossy(&out.stderr))) }
+            let mut command = Command::new("gio");
+            command.args(["mount", "-u"]).arg(&mount.local).env("LC_ALL", "C.UTF-8");
+            match output_within(command, DISCONNECT_TIMEOUT) {
+                Ok(out) if out.success => Ok(()),
+                Ok(out) => Err(clean_gio_error(&String::from_utf8_lossy(&out.stderr))),
+                Err(Failure::Message(message)) => Err(message),
+                Err(_) => Err(tr("The server did not answer within 30 seconds").to_owned()),
+            }
         }
         MountKind::Helper | MountKind::System => {
             let attempts: [(&str, &[&str]); 3] = [("fusermount3", &["-u"]), ("fusermount", &["-u"]), ("umount", &[])];
             let mut last = Err(tr("Nothing to disconnect it with was found").to_owned());
             for (program, args) in attempts {
                 let Some(path) = find_program(program) else { continue };
-                match Command::new(path).args(args).arg(&mount.local).output() {
-                    Ok(out) if out.status.success() => {
-                        last = Ok(());
-                        break;
-                    }
-                    Ok(out) => last = Err(last_line(&String::from_utf8_lossy(&out.stderr))),
-                    Err(e) => last = Err(e.to_string()),
+                let mut command = Command::new(path);
+                command.args(args).arg(&mount.local);
+                last = unmount_with(command, DISCONNECT_TIMEOUT);
+                if last.is_ok() {
+                    break;
                 }
             }
             if last.is_ok() && mount.kind == MountKind::Helper {
@@ -1773,6 +1810,22 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(matches!(run_capturing(sh("sleep 30"), None, false, &|| session.cancelled(), std::time::Duration::from_secs(60)), Err(Failure::Cancelled)));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn short_questions_and_unmounts_are_stopped_when_they_hang_and_work_when_they_do_not() {
+        let ms = std::time::Duration::from_millis;
+        let started = std::time::Instant::now();
+        assert!(matches!(output_within(sh("sleep 30"), ms(200)), Err(Failure::Message(m)) if m == tr("The server did not answer within 30 seconds")));
+        assert_eq!(unmount_with(sh("sleep 30"), ms(200)), Err(tr("The server did not answer within 30 seconds").to_owned()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "they were not stopped");
+        // Normal ones: the answer, the result, and what an unmount says when it fails
+        let out = output_within(sh("echo 'local path: /run/user/1000/gvfs/x'"), std::time::Duration::from_secs(10)).ok().unwrap();
+        assert!(out.success && String::from_utf8_lossy(&out.stdout).starts_with("local path: "));
+        assert!(!output_within(sh("exit 1"), std::time::Duration::from_secs(10)).ok().unwrap().success);
+        assert_eq!(unmount_with(sh("exit 0"), std::time::Duration::from_secs(10)), Ok(()));
+        assert_eq!(unmount_with(sh("echo 'target is busy' >&2; exit 32"), std::time::Duration::from_secs(10)), Err("target is busy".to_owned()));
+        assert!(unmount_with(Command::new("/nonexistent/compression-unmount"), std::time::Duration::from_secs(10)).is_err());
     }
 
     #[test]
