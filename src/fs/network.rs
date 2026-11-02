@@ -423,7 +423,7 @@ pub fn is_remote(path: &Path) -> bool {
     if path.starts_with(gvfs_root()) {
         return path != gvfs_root();
     }
-    REMOTE_ROOTS.read().is_ok_and(|roots| roots.iter().any(|r| path.starts_with(r)))
+    declared_remote(path) || REMOTE_ROOTS.read().is_ok_and(|roots| roots.iter().any(|r| path.starts_with(r)))
 }
 
 /// Every connected server and GVfs device. Reads `/proc/self/mounts` and a folder listing, so it
@@ -1415,6 +1415,28 @@ impl Servers {
     pub fn find(&self, address: &Address) -> Option<usize> {
         self.saved.iter().position(|s| s.address.same_mount(address) && address.path.starts_with(&s.address.path))
     }
+}
+
+/// Folders the tests declare to be on a server, kept apart from the real mounts, which
+/// `list_mounts` rewrites whenever a window starts. Nothing is declared outside the tests.
+/// (These items sit down here because the translation test reads the code above the first
+/// `#[cfg(test)]` for strings to translate.)
+#[cfg(not(test))]
+fn declared_remote(_: &Path) -> bool {
+    false
+}
+
+#[cfg(test)]
+static TEST_REMOTE: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
+
+#[cfg(test)]
+fn declared_remote(path: &Path) -> bool {
+    TEST_REMOTE.read().is_ok_and(|roots| roots.iter().any(|r| path.starts_with(r)))
+}
+
+#[cfg(test)]
+pub(crate) fn declare_remote_for_tests(path: &Path) {
+    TEST_REMOTE.write().unwrap().push(path.to_path_buf());
 }
 
 #[cfg(test)]

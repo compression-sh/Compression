@@ -46,6 +46,15 @@ fn file_contains(path: &std::path::Path, needle: &str, match_case: bool) -> bool
     if match_case { text.contains(needle) } else { text.to_lowercase().contains(&needle.to_lowercase()) }
 }
 
+/// Whether the walk may go into `path`. A folder on a server is skipped unless previews on servers
+/// are switched on: reading it over the network is slow and costs data, and a mount that has
+/// stopped answering would hold the search thread for good. A search that was started inside a
+/// server's folder (`root_is_remote`) is the person's own choice and goes on there.
+/// `allowed` says whether a path may be read without being asked to (`network::previews_allowed`).
+fn may_enter(path: &std::path::Path, root_is_remote: bool, allowed: impl Fn(&std::path::Path) -> bool) -> bool {
+    root_is_remote || allowed(path)
+}
+
 pub struct Search {
     generation: Arc<AtomicU64>,
     rx: Option<mpsc::Receiver<Vec<FileItem>>>,
@@ -82,11 +91,14 @@ impl Search {
             let matches = |name: &str| glob::matches(&query, name, options.match_case);
             let mut seen: HashSet<PathBuf> = HashSet::new();
             let mut found = 0usize;
+            let root_is_remote = super::network::is_remote(&root);
+            let enter = |path: &std::path::Path| may_enter(path, root_is_remote, super::network::previews_allowed);
 
             // Stage 1: files the user opened lately answer instantly, before any directory walk
             let recents: Vec<FileItem> = recent::load()
                 .into_iter()
                 .filter(|p| p.starts_with(&root))
+                .filter(|p| enter(p))
                 .filter(|p| p.file_name().is_some_and(|n| matches(&n.to_string_lossy())))
                 .filter(|p| show_hidden || !p.strip_prefix(&root).is_ok_and(|r| r.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'))))
                 .filter_map(|p| FileItem::from_path(&p).filter(|_| p.exists()))
@@ -117,6 +129,10 @@ impl Search {
                     }
                     let path = entry.path();
                     let is_real_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    // Not even looked at: asking a mount that does not answer would hold this thread
+                    if is_real_dir && !enter(&path) {
+                        continue;
+                    }
                     if is_real_dir && depth < MAX_DEPTH {
                         let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
                         subdirs.push((mtime, path.clone()));
@@ -172,6 +188,55 @@ impl Search {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folders_on_servers_are_entered_only_when_allowed_or_searched_from_inside() {
+        let remote = |p: &std::path::Path| p.starts_with("/srv/nas");
+        let allowed = |p: &std::path::Path| !remote(p);
+        assert!(may_enter(std::path::Path::new("/home/me/docs"), false, allowed));
+        assert!(!may_enter(std::path::Path::new("/srv/nas/share"), false, allowed));
+        // Previews on servers switched on: everything may be entered
+        assert!(may_enter(std::path::Path::new("/srv/nas/share"), false, |_| true));
+        // A search that begins in a server's folder goes on there
+        assert!(may_enter(std::path::Path::new("/srv/nas/share/sub"), true, allowed));
+    }
+
+    /// The paths a search from `root` finds for "needle" (waits for it to finish).
+    fn found(root: &std::path::Path) -> Vec<PathBuf> {
+        let mut search = Search::new();
+        search.start(&egui::Context::default(), root.to_path_buf(), "needle".into(), true, TypeFilter::All, SearchOptions::default());
+        let mut paths = Vec::new();
+        let started = std::time::Instant::now();
+        loop {
+            paths.extend(search.poll().into_iter().map(|i| i.path));
+            if !search.is_running() || started.elapsed() > std::time::Duration::from_secs(10) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn a_search_skips_folders_on_servers_but_finds_local_files() {
+        let dir = std::env::temp_dir().join(format!("compression_search_remote_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["local", "nas", "nas/deep"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        for file in ["needle-top.txt", "local/needle-a.txt", "nas/needle-b.txt", "nas/deep/needle-c.txt"] {
+            std::fs::write(dir.join(file), "x").unwrap();
+        }
+        super::super::network::declare_remote_for_tests(&dir.join("nas"));
+        // Previews on servers are off by default, and nothing in the tests turns them on
+        let names = |paths: Vec<PathBuf>| paths.iter().map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(names(found(&dir)), ["local/needle-a.txt", "needle-top.txt"]);
+        // Started inside the server's folder, the search is the person's own choice
+        let inside: Vec<_> = found(&dir.join("nas")).into_iter().map(|p| p.strip_prefix(dir.join("nas")).unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(inside, ["deep/needle-c.txt", "needle-b.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn contents_match_text_files_only() {
