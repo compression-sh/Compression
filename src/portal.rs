@@ -48,6 +48,22 @@ struct Results {
     choices: Option<Vec<(String, String)>>,
 }
 
+/// The path of this program, usable to start it again. When a package update replaced the binary
+/// while this process kept running (the portal lives as long as the session), Linux reports the
+/// old file as `<path> (deleted)`, which no longer exists; the new binary is at `<path>`.
+fn own_exe() -> std::io::Result<PathBuf> {
+    std::env::current_exe().map(without_deleted_suffix)
+}
+
+fn without_deleted_suffix(path: PathBuf) -> PathBuf {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    const SUFFIX: &[u8] = b" (deleted)";
+    match path.as_os_str().as_bytes().strip_suffix(SUFFIX) {
+        Some(clean) if !clean.is_empty() => PathBuf::from(std::ffi::OsString::from_vec(clean.to_vec())),
+        _ => path,
+    }
+}
+
 /// Paths travel as NUL-terminated byte strings.
 fn path_from_bytes(mut bytes: Vec<u8>) -> PathBuf {
     use std::os::unix::ffi::OsStringExt;
@@ -177,7 +193,7 @@ fn run_dialog(mode: &str, title: &str, parent: &str, app_id: &str, options: &Opt
     filter_args(options, &mut args);
     choice_args(options, &mut args);
 
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = own_exe().map_err(|e| e.to_string())?;
     let child = Command::new(exe)
         .args(&args)
         .stdin(Stdio::null())
@@ -288,7 +304,7 @@ struct FileManager;
 
 impl FileManager {
     fn show(uris: &[String]) {
-        let Ok(exe) = std::env::current_exe() else { return };
+        let Ok(exe) = own_exe() else { return };
         // Server addresses are handed on as they are; the new window connects to them
         let targets = uris.iter().filter_map(|u| {
             crate::chooser::from_uri(u).map(PathBuf::into_os_string).or_else(|| crate::fs::network::Address::looks_like(u).then(|| u.into()))
@@ -334,6 +350,20 @@ pub fn serve() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replaced_binary_is_started_from_its_own_path() {
+        let deleted = PathBuf::from("/usr/bin/compression (deleted)");
+        assert_eq!(without_deleted_suffix(deleted), PathBuf::from("/usr/bin/compression"));
+        assert_eq!(without_deleted_suffix(PathBuf::from("/usr/bin/compression")), PathBuf::from("/usr/bin/compression"));
+        // Only the suffix counts, and a name that is nothing but the suffix stays as it is
+        assert_eq!(without_deleted_suffix(PathBuf::from("/opt/a (deleted)/bin/compression")), PathBuf::from("/opt/a (deleted)/bin/compression"));
+        assert_eq!(without_deleted_suffix(PathBuf::from(" (deleted)")), PathBuf::from(" (deleted)"));
+        // A path that is not valid UTF-8 is kept byte for byte
+        let odd = PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(b"/x/\xff (deleted)".to_vec()));
+        assert_eq!(std::os::unix::ffi::OsStrExt::as_bytes(without_deleted_suffix(odd).as_os_str()), b"/x/\xff");
+        assert!(own_exe().is_ok_and(|p| p.exists()));
+    }
 
     #[test]
     fn byte_paths_lose_their_terminator() {
