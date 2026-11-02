@@ -300,6 +300,17 @@ impl Settings {
             .and_then(|f| std::fs::read_to_string(f).ok())
             .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
             .map_or_else(Self::default, Self::with_current_view_names)
+            .for_session(crate::fs::admin::is_admin())
+    }
+
+    /// The administrator's window reads the settings of the person who started it, but runs as
+    /// root: a command in them, which that person (or a program of theirs) can write, must not
+    /// run with root's rights. The terminal falls back to the one found on this system.
+    fn for_session(mut self, admin: bool) -> Self {
+        if admin {
+            self.terminal.clear();
+        }
+        self
     }
 
     /// Settings saved by Ski name the Recent and Bookmarks views `ski:recent` and `ski:bookmarks`.
@@ -340,6 +351,13 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_administrator_session_ignores_the_terminal_command_of_the_settings() {
+        let settings = Settings { terminal: "sh -c evil {}".into(), ..Default::default() };
+        assert_eq!(settings.clone().for_session(true).terminal, "");
+        assert_eq!(settings.for_session(false).terminal, "sh -c evil {}");
+    }
 
     #[test]
     fn settings_saved_by_ski_name_the_views_by_their_current_names() {

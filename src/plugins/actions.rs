@@ -89,6 +89,13 @@ impl Actions {
     }
 
     fn in_dir(dir: Option<PathBuf>) -> Self {
+        Self::in_dir_for(dir, crate::fs::admin::is_admin())
+    }
+
+    /// In an administrator session no action is read: the scripts and commands in that folder
+    /// are the person's own to write, and would run as root.
+    fn in_dir_for(dir: Option<PathBuf>, admin: bool) -> Self {
+        let dir = dir.filter(|_| !admin);
         let (done_tx, done_rx) = mpsc::channel();
         let mut actions = Self {
             entries: Vec::new(),
@@ -371,6 +378,25 @@ mod tests {
         assert!(files.applies(&[item("f", false)]));
         assert!(!files.applies(&[item("f", false), item("g", false)]));
         assert!(!files.applies(&[item("d", true)]));
+    }
+
+    #[test]
+    fn an_administrator_session_loads_no_actions() {
+        let dir = std::env::temp_dir().join(format!("compression-actions-admin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), r#"{"name":"List","command":"true"}"#).unwrap();
+        std::fs::write(dir.join("tool.sh"), "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(dir.join("tool.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut admin = Actions::in_dir_for(Some(dir.clone()), true);
+        assert!(admin.entries.is_empty() && admin.failures.is_empty());
+        // Nor later, when the folder changes, and nothing is written into it
+        assert!(!admin.refresh(true));
+        assert!(admin.entries.is_empty());
+        assert!(admin.create_template().is_err());
+        assert!(!dir.join("new-action.json").exists());
+        assert_eq!(Actions::in_dir_for(Some(dir.clone()), false).entries.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

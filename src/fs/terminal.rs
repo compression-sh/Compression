@@ -45,6 +45,12 @@ pub fn detect(custom: &str) -> Option<String> {
     TERMINALS.iter().map(|(name, _)| *name).find(|name| on_path(name)).map(str::to_owned)
 }
 
+/// The terminal command of the settings, unless this runs as root: a command the person wrote
+/// into their settings must not run with root's rights, so the terminal is found by itself.
+fn trusted(custom: &str, admin: bool) -> &str {
+    if admin { "" } else { custom }
+}
+
 fn fill(arg: &str, dir: &Path) -> String {
     arg.replace("{}", &dir.to_string_lossy())
 }
@@ -52,6 +58,7 @@ fn fill(arg: &str, dir: &Path) -> String {
 /// Start a terminal in `dir`. `custom` is the command from the settings: `{}` stands for the
 /// folder, and without it the terminal is started inside the folder.
 pub fn open_in(dir: &Path, custom: &str) -> io::Result<()> {
+    let custom = trusted(custom, crate::fs::admin::is_admin());
     let mut parts: Vec<String> = custom.split_whitespace().map(|p| fill(p, dir)).collect();
     if parts.is_empty() {
         let env = std::env::var("TERMINAL").ok().filter(|t| t.split_whitespace().next().is_some_and(on_path));
@@ -101,6 +108,7 @@ const RUNS: &[(&str, &[&str])] = &[
 /// Start a terminal that runs `command`: the one of the settings, of `$TERMINAL`, or the first one
 /// installed. `None` when that terminal is not known to take a command.
 pub fn run(command: &[String], custom: &str) -> Option<io::Result<()>> {
+    let custom = trusted(custom, crate::fs::admin::is_admin());
     let env = std::env::var("TERMINAL").ok().and_then(|t| t.split_whitespace().next().map(str::to_owned)).filter(|t| on_path(t));
     let chosen = custom
         .split_whitespace()
@@ -145,6 +153,12 @@ mod tests {
     fn folder_placeholder_is_filled() {
         assert_eq!(fill("--working-directory={}", Path::new("/a b")), "--working-directory=/a b");
         assert_eq!(detect("mycterm --flag").as_deref(), Some("mycterm"));
+    }
+
+    #[test]
+    fn root_does_not_use_the_terminal_command_of_the_settings() {
+        assert_eq!(trusted("sh -c evil {}", true), "");
+        assert_eq!(trusted("kitty --directory {}", false), "kitty --directory {}");
     }
 
     #[test]
