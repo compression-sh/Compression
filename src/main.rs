@@ -23,8 +23,9 @@ use app::CompressionApp;
 use ui::theme::SerpantinumTheme;
 
 fn main() -> eframe::Result {
+    // An elevated start carries its environment in the arguments (see fs::admin); first of all
+    let args = fs::admin::take_environment(env::args().skip(1).collect());
     compat::migrate_user_data();
-    let args: Vec<String> = env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "--portal") {
         if let Err(err) = portal::serve() {
             eprintln!("compression: {err}");

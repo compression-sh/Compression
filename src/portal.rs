@@ -53,7 +53,7 @@ struct Results {
 /// The path of this program, usable to start it again. When a package update replaced the binary
 /// while this process kept running (the portal lives as long as the session), Linux reports the
 /// old file as `<path> (deleted)`, which no longer exists; the new binary is at `<path>`.
-fn own_exe() -> std::io::Result<PathBuf> {
+pub(crate) fn own_exe() -> std::io::Result<PathBuf> {
     std::env::current_exe().map(without_deleted_suffix)
 }
 

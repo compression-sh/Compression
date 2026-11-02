@@ -176,7 +176,7 @@ fn load_paths_from(file: &std::path::Path) -> Vec<PathBuf> {
 }
 
 fn save_paths(name: &str, paths: &[PathBuf]) {
-    if let Some(file) = config_file(name) {
+    if let Some(file) = config_file_to_write(name) {
         save_paths_to(&file, paths);
     }
 }
@@ -199,7 +199,7 @@ pub fn load_folder_icons() -> HashMap<PathBuf, PathBuf> {
 }
 
 pub fn save_folder_icons(icons: &HashMap<PathBuf, PathBuf>) {
-    let Some(file) = config_file("folder_icons.json") else { return };
+    let Some(file) = config_file_to_write("folder_icons.json") else { return };
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -235,7 +235,7 @@ pub fn set_folder_glyph(folder: &std::path::Path, glyph: Option<char>) -> bool {
             Some(c) => m.insert(folder.to_path_buf(), c) != Some(c),
             None => m.remove(folder).is_some(),
         };
-        if changed && let Some(file) = config_file("folder_glyphs.json") {
+        if changed && let Some(file) = config_file_to_write("folder_glyphs.json") {
             if let Some(dir) = file.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
@@ -255,14 +255,39 @@ pub fn move_folder_glyph(old: &std::path::Path, new: &std::path::Path) {
     }
 }
 
+/// A file of the settings folder, to read. An administrator window reads the folder of the person who
+/// started it, like the settings do, and so shows the same pins.
 fn config_file(name: &str) -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("compression").join(name))
+    config_file_in(crate::fs::admin::config_override(), dirs::config_dir(), name)
+}
+
+fn config_file_in(overridden: Option<PathBuf>, default: Option<PathBuf>, name: &str) -> Option<PathBuf> {
+    overridden.or(default).map(|d| d.join("compression").join(name))
+}
+
+/// The same file, to write. Root only reads the person's files: it must not leave any in their home.
+fn config_file_to_write(name: &str) -> Option<PathBuf> {
+    config_file(name).filter(|_| !crate::fs::admin::is_admin())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn an_administrator_window_reads_the_settings_folder_of_the_person_who_started_it() {
+        let user = Some(PathBuf::from("/home/me/.config"));
+        let root = Some(PathBuf::from("/root/.config"));
+        assert_eq!(config_file_in(user.clone(), root.clone(), "pins.json"), Some(PathBuf::from("/home/me/.config/compression/pins.json")));
+        // Without the override (an ordinary start) it is the folder of whoever runs the program
+        assert_eq!(config_file_in(None, root.clone(), "pins.json"), Some(PathBuf::from("/root/.config/compression/pins.json")));
+        assert_eq!(config_file_in(None, None, "pins.json"), None);
+        // This test process is not root: it may write what it reads
+        if !crate::fs::admin::is_admin() {
+            assert_eq!(config_file_to_write("pins.json"), config_file("pins.json"));
+        }
+    }
 
     #[test]
     fn legacy_view_names_map_to_the_current_ones() {
