@@ -384,7 +384,7 @@ pub fn save_overrides(map: &HashMap<PathBuf, String>) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_string_pretty(map) {
-        let _ = std::fs::write(file, json);
+        let _ = crate::fs::atomic::write(&file, json);
     }
 }
 

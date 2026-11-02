@@ -220,7 +220,7 @@ fn save_size([w, h]: [f32; 2]) {
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(file, format!("{w}x{h}"));
+    let _ = crate::fs::atomic::write(&file, format!("{w}x{h}"));
 }
 
 fn folders_file() -> Option<PathBuf> {
@@ -247,7 +247,7 @@ fn remember_folder(app_id: Option<&str>, folder: &Path) {
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(file, lines.join("\n") + "\n");
+    let _ = crate::fs::atomic::write(&file, lines.join("\n") + "\n");
 }
 
 impl Chooser {

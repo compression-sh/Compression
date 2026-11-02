@@ -1282,7 +1282,7 @@ fn write_record(id: &str, address: &Address) {
     let Some(dir) = helper_records() else { return };
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(json) = serde_json::to_string(address) {
-        let _ = std::fs::write(dir.join(format!("{id}.json")), json);
+        let _ = crate::fs::atomic::write(&dir.join(format!("{id}.json")), json);
     }
 }
 
@@ -1400,7 +1400,7 @@ impl Servers {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(file, json);
+            let _ = crate::fs::atomic::write(&file, json);
         }
     }
 

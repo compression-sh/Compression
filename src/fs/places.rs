@@ -186,7 +186,7 @@ fn save_paths_to(file: &std::path::Path, paths: &[PathBuf]) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_string_pretty(paths) {
-        let _ = std::fs::write(file, json);
+        let _ = crate::fs::atomic::write(file, json);
     }
 }
 
@@ -204,7 +204,7 @@ pub fn save_folder_icons(icons: &HashMap<PathBuf, PathBuf>) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_string_pretty(icons) {
-        let _ = std::fs::write(file, json);
+        let _ = crate::fs::atomic::write(&file, json);
     }
 }
 
@@ -240,7 +240,7 @@ pub fn set_folder_glyph(folder: &std::path::Path, glyph: Option<char>) -> bool {
                 let _ = std::fs::create_dir_all(dir);
             }
             if let Ok(json) = serde_json::to_string_pretty(&*m) {
-                let _ = std::fs::write(file, json);
+                let _ = crate::fs::atomic::write(&file, json);
             }
         }
         changed

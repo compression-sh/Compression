@@ -71,7 +71,7 @@ pub fn record(path: &std::path::Path) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_string(&history) {
-        let _ = std::fs::write(file, json);
+        let _ = crate::fs::atomic::write(&file, json);
     }
 }
 
