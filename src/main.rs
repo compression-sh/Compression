@@ -60,6 +60,11 @@ fn main() -> eframe::Result {
 fn open_window(mut request: instance::Request) -> eframe::Result {
     let args = std::mem::take(&mut request.args);
     let chooser = if args.iter().any(|a| a == "--chooser") { chooser::Spec::parse(&args) } else { None };
+    // A dialog request that cannot be read is an error for whoever asked, not a reason to open a file manager
+    if chooser.is_none() && args.iter().any(|a| a == "--chooser") {
+        eprintln!("compression: the file dialog request could not be read");
+        std::process::exit(chooser::EXIT_FAILED);
+    }
 
     let settings = settings::Settings::load();
     i18n::set_language(i18n::resolve(&settings.language));

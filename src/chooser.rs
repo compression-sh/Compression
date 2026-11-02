@@ -87,6 +87,7 @@ impl Spec {
             choices: Vec::new(),
         };
         let mut it = args.iter();
+        let mut asked_for_choices = 0;
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--chooser" => {}
@@ -110,12 +111,12 @@ impl Spec {
                 "--app-id" => spec.app_id = it.next().cloned().filter(|s| !s.is_empty()),
                 // id, label, initial value, then option id and label pairs
                 "--choice" => {
-                    let raw = it.next()?;
-                    let mut parts = raw.split('\t').map(str::to_owned);
-                    let (id, label, initial) = (parts.next()?, parts.next()?, parts.next()?);
-                    let rest: Vec<String> = parts.collect();
-                    let options = rest.chunks(2).filter(|pair| pair.len() == 2).map(|pair| (pair[0].clone(), pair[1].clone())).collect();
-                    spec.choices.push(Choice { id, label, options, initial });
+                    asked_for_choices += 1;
+                    // One that cannot be read is skipped; the rest of the request still stands
+                    match it.next().and_then(|raw| Choice::parse(raw)) {
+                        Some(choice) => spec.choices.push(choice),
+                        None => eprintln!("compression: ignoring a --choice that cannot be read"),
+                    }
                 }
                 "--current-filter" => spec.current_filter = it.next()?.parse().unwrap_or(0),
                 // label, then patterns written `g:*.png` (glob) or `m:image/png` (MIME type)
@@ -135,8 +136,26 @@ impl Spec {
                 _ => {}
             }
         }
+        // A request whose every choice is broken is not one this dialog can answer as asked
+        if asked_for_choices > 0 && spec.choices.is_empty() {
+            return None;
+        }
         spec.current_filter = spec.current_filter.min(spec.filters.len().saturating_sub(1));
         Some(spec)
+    }
+}
+
+impl Choice {
+    /// `id`, `label`, `initial`, then pairs of option id and label, separated by tabs.
+    fn parse(raw: &str) -> Option<Choice> {
+        let mut parts = raw.split('\t').map(str::to_owned);
+        let (id, label, initial) = (parts.next()?, parts.next()?, parts.next()?);
+        if id.is_empty() {
+            return None;
+        }
+        let rest: Vec<String> = parts.collect();
+        let options = rest.chunks(2).filter(|pair| pair.len() == 2).map(|pair| (pair[0].clone(), pair[1].clone())).collect();
+        Some(Choice { id, label, options, initial })
     }
 }
 
@@ -387,6 +406,42 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(Spec::parse(&args).unwrap().files, ["passwd", "x.txt", "ok"]);
+    }
+
+    fn parse(args: &[&str]) -> Option<Spec> {
+        Spec::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_choice_that_cannot_be_read_is_skipped_and_the_rest_of_the_request_stands() {
+        let spec = parse(&[
+            "--chooser", "--mode", "save", "--name", "a.txt",
+            "--choice", "encoding\tEncoding\tutf8\tutf8\tUTF-8\tlatin1\tLatin-1",
+            "--choice", "only-an-id",
+            "--choice", "",
+            "--choice", "\tno id\tx",
+            "--choice", "bom\tAdd BOM\tfalse",
+            "--filter", "Text\tg:*.txt",
+        ])
+        .expect("the request is still readable");
+        assert_eq!(spec.mode, Mode::Save);
+        assert_eq!(spec.name.as_deref(), Some("a.txt"));
+        assert_eq!(spec.filters.len(), 1);
+        let ids: Vec<_> = spec.choices.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["encoding", "bom"]);
+        assert_eq!(spec.choices[0].options, [("utf8".to_owned(), "UTF-8".to_owned()), ("latin1".to_owned(), "Latin-1".to_owned())]);
+        assert_eq!(spec.choices[1].initial, "false");
+        // A --choice with nothing after it is one that cannot be read too
+        assert_eq!(parse(&["--chooser", "--choice", "ok\tOK\tx", "--choice"]).unwrap().choices.len(), 1);
+    }
+
+    #[test]
+    fn a_request_whose_choices_are_all_broken_is_refused_and_one_without_choices_is_fine() {
+        assert!(parse(&["--chooser", "--mode", "open", "--choice", "broken"]).is_none());
+        assert!(parse(&["--chooser", "--choice"]).is_none());
+        assert!(parse(&["--chooser", "--choice", "a", "--choice", "b\tonly label"]).is_none());
+        let plain = parse(&["--chooser", "--mode", "open"]).expect("no choices asked for");
+        assert!(plain.choices.is_empty());
     }
 
     #[test]
