@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::i18n::tr;
+use crate::i18n::{tr, trf};
 
 /// Copies keep their permissions where the file system has them. Windows shares (SMB through
 /// GVfs), FAT and exFAT drives and some FUSE mounts refuse to change them; the copy itself is
@@ -65,6 +65,10 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
             copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
         }
         keep_mode(std::fs::set_permissions(dst, meta.permissions()))
+    } else if !meta.is_file() {
+        // Opening a named pipe waits for a writer that may never come
+        let name = src.file_name().map_or_else(|| src.display().to_string(), |n| n.to_string_lossy().into_owned());
+        Err(io::Error::other(trf("Cannot copy {}: it is a named pipe, socket or device file", &[&name])))
     } else {
         // Not `std::fs::copy`: it fails the whole copy when the target refuses the permissions
         let mut reader = std::fs::File::open(src)?;
@@ -343,6 +347,32 @@ mod tests {
         std::fs::set_permissions(root.join("tree/sub/locked.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&shm).unwrap();
+    }
+
+    #[test]
+    fn the_copy_behind_trash_and_undo_refuses_a_named_pipe_instead_of_hanging() {
+        let root = std::env::temp_dir().join(format!("compression_ops_fifo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("tree")).unwrap();
+        std::fs::write(root.join("tree/a.txt"), "a").unwrap();
+        std::os::unix::fs::symlink("a.txt", root.join("tree/link")).unwrap();
+        let pipe = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(root.join("tree/pipe").as_os_str())).unwrap();
+        // SAFETY: `pipe` is a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+
+        // Run on a thread: a copy that opens the pipe would never return
+        let (from, to) = (root.join("tree"), root.join("copy"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(copy_tree(&from, &to)).unwrap());
+        let err = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the copy hung on the pipe").unwrap_err();
+        assert!(err.to_string().contains("named pipe"), "{err}");
+
+        // Regular files and symlinks still copy
+        std::fs::remove_file(root.join("tree/pipe")).unwrap();
+        copy_tree(&root.join("tree"), &root.join("whole")).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("whole/a.txt")).unwrap(), "a");
+        assert_eq!(std::fs::read_link(root.join("whole/link")).unwrap(), Path::new("a.txt"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
