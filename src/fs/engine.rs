@@ -512,10 +512,11 @@ fn copy_range(reader: &std::fs::File, writer: &std::fs::File) -> io::Result<usiz
 }
 
 fn copy_file(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
+    let mut reader = std::fs::File::open(src)?;
+    let meta = reader.metadata()?;
+    // `create_new`: a file that is already there is an error, and not ours to remove below
+    let mut writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
     let result = (|| {
-        let mut reader = std::fs::File::open(src)?;
-        let meta = reader.metadata()?;
-        let mut writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
         let mut in_kernel = true;
         let mut buffer = Vec::new();
         let mut copied = 0u64;
@@ -590,6 +591,17 @@ fn refuse_special_files(w: &Worker, path: &Path) -> io::Result<()> {
 fn same_device(src: &Path, parent: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     matches!((src.symlink_metadata(), parent.metadata()), (Ok(a), Ok(b)) if a.dev() == b.dev())
+}
+
+/// `copy_tree` for a job that is making `dst`: when the copy fails or is cancelled, everything it made
+/// there is removed again, so no half-copied folder is left. A `dst` that was already there is never touched.
+fn copy_new(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
+    let existed = dst.symlink_metadata().is_ok();
+    let result = copy_tree(w, src, dst);
+    if result.is_err() && !existed {
+        let _ = ops::remove_tree(dst);
+    }
+    result
 }
 
 fn copy_tree(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
@@ -685,7 +697,7 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
 
     match op {
         Op::Copy => {
-            copy_tree(w, src, &target)?;
+            copy_new(w, src, &target)?;
             rec.created.push(target);
         }
         Op::Move => match std::fs::rename(src, &target) {
@@ -701,7 +713,7 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
             }
             // Another filesystem: copy, then remove the original once the copy is whole
             Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                copy_tree(w, src, &target)?;
+                copy_new(w, src, &target)?;
                 ops::remove_tree(src)?;
                 rec.moved.push((src.to_path_buf(), target));
             }
@@ -1005,6 +1017,81 @@ mod tests {
         let Some(Event::Done { outcome, .. }) = wait(&mut e).into_iter().find(|ev| matches!(ev, Event::Done { .. })) else { panic!("the copy hung") };
         assert!(!outcome.ok && outcome.message.contains("named pipe"), "{}", outcome.message);
         assert!(!dir.join("pipe").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A tree whose second file cannot be read, so a copy fails after it has made the folder and the first file.
+    /// `None` as root, who can read everything.
+    fn tree_that_fails_midway(root: &Path) -> Option<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return None;
+        }
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), "first").unwrap();
+        std::fs::write(root.join("sub/locked.txt"), "second").unwrap();
+        std::fs::set_permissions(root.join("sub/locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        Some(())
+    }
+
+    #[test]
+    fn a_failed_copy_leaves_no_half_copied_folder() {
+        let dir = sandbox("failed_copy");
+        if tree_that_fails_midway(&dir.join("src/tree")).is_none() {
+            return;
+        }
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        let mut e = engine();
+        let outcome = run(&mut e, JobKind::Copy, Op::Copy, vec![(dir.join("src/tree"), dir.join("dst/tree"))]);
+        assert!(!outcome.ok);
+        assert!(!dir.join("dst/tree").exists(), "the half-copied folder was left behind");
+        assert_eq!(std::fs::read_to_string(dir.join("src/tree/a.txt")).unwrap(), "first");
+        assert!(matches!(outcome.effect, Effect::None), "nothing was made, so there is nothing to undo");
+        let _ = std::fs::set_permissions(dir.join("src/tree/sub/locked.txt"), std::os::unix::fs::PermissionsExt::from_mode(0o600));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_move_across_file_systems_leaves_the_source_whole_and_no_target() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = sandbox("failed_move");
+        let shm = PathBuf::from("/dev/shm").join(format!("compression_engine_failed_move_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&shm);
+        // The move below is a copy only where /dev/shm is another file system than the temp folder
+        if std::fs::create_dir_all(&shm).is_err() || shm.metadata().unwrap().dev() == dir.metadata().unwrap().dev() || tree_that_fails_midway(&dir.join("src/tree")).is_none() {
+            let _ = std::fs::remove_dir_all(&shm);
+            return;
+        }
+        let mut e = engine();
+        let outcome = run(&mut e, JobKind::Move, Op::Move, vec![(dir.join("src/tree"), shm.join("tree"))]);
+        assert!(!outcome.ok);
+        assert!(!shm.join("tree").exists(), "the half-copied folder was left behind");
+        assert_eq!(std::fs::read_to_string(dir.join("src/tree/a.txt")).unwrap(), "first");
+        assert!(dir.join("src/tree/sub/locked.txt").exists());
+        let _ = std::fs::set_permissions(dir.join("src/tree/sub/locked.txt"), std::os::unix::fs::PermissionsExt::from_mode(0o600));
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&shm).unwrap();
+    }
+
+    #[test]
+    fn cleaning_up_after_a_failed_copy_never_touches_a_target_that_was_already_there() {
+        let dir = sandbox("existing_target");
+        std::fs::create_dir_all(dir.join("src/folder")).unwrap();
+        std::fs::write(dir.join("src/folder/a.txt"), "new").unwrap();
+        std::fs::write(dir.join("src/file.txt"), "new").unwrap();
+        std::fs::create_dir_all(dir.join("dst/folder")).unwrap();
+        std::fs::write(dir.join("dst/folder/mine.txt"), "mine").unwrap();
+        std::fs::write(dir.join("dst/file.txt"), "mine").unwrap();
+        let mut e = engine();
+        let (src, dst) = (dir.join("src"), dir.join("dst"));
+        e.spawn(JobKind::Copy, String::new(), String::new(), move |w| {
+            let errors = [copy_new(w, &src.join("folder"), &dst.join("folder")), copy_new(w, &src.join("file.txt"), &dst.join("file.txt"))];
+            if errors.iter().all(|r| r.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::AlreadyExists)) { Outcome::done(String::new()) } else { Outcome::failed(format!("{errors:?}")) }
+        });
+        let Some(Event::Done { outcome, .. }) = wait(&mut e).into_iter().find(|ev| matches!(ev, Event::Done { .. })) else { panic!("no result") };
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dir.join("dst/folder/mine.txt")).unwrap(), "mine");
+        assert_eq!(std::fs::read_to_string(dir.join("dst/file.txt")).unwrap(), "mine");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

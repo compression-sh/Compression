@@ -80,7 +80,14 @@ pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         // Different filesystem: copy, then remove the original
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-            copy_tree(src, dst)?;
+            let existed = dst.symlink_metadata().is_ok();
+            if let Err(err) = copy_tree(src, dst) {
+                // A half-copied target is worse than none; one that was already there is not ours to remove
+                if !existed {
+                    let _ = remove_tree(dst);
+                }
+                return Err(err);
+            }
             remove_tree(src)
         }
         Err(e) => Err(e),
@@ -303,6 +310,39 @@ mod tests {
         assert!(keep_mode(Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))).is_ok());
         assert!(keep_mode(Err(io::Error::from_raw_os_error(libc::EPERM))).is_ok());
         assert!(keep_mode(Err(io::Error::from_raw_os_error(libc::ENOSPC))).is_err());
+    }
+
+    #[test]
+    fn a_failed_move_across_file_systems_leaves_no_half_copied_target() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("compression_ops_move_{}", std::process::id()));
+        let shm = std::path::PathBuf::from("/dev/shm").join(format!("compression_ops_move_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&shm);
+        std::fs::create_dir_all(root.join("tree/sub")).unwrap();
+        // Only a copy between two file systems goes through the code under test; root can read everything
+        if std::fs::create_dir_all(&shm).is_err() || shm.metadata().unwrap().dev() == root.metadata().unwrap().dev() || unsafe { libc::geteuid() } == 0 {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&shm);
+            return;
+        }
+        std::fs::write(root.join("tree/a.txt"), "first").unwrap();
+        std::fs::write(root.join("tree/sub/locked.txt"), "second").unwrap();
+        std::fs::set_permissions(root.join("tree/sub/locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(move_path(&root.join("tree"), &shm.join("tree")).is_err());
+        assert!(!shm.join("tree").exists(), "the half-copied folder was left behind");
+        assert_eq!(std::fs::read_to_string(root.join("tree/a.txt")).unwrap(), "first");
+
+        // A target that was there before is not removed
+        std::fs::create_dir_all(shm.join("there")).unwrap();
+        std::fs::write(shm.join("there/mine.txt"), "mine").unwrap();
+        assert!(move_path(&root.join("tree"), &shm.join("there")).is_err());
+        assert_eq!(std::fs::read_to_string(shm.join("there/mine.txt")).unwrap(), "mine");
+
+        std::fs::set_permissions(root.join("tree/sub/locked.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&shm).unwrap();
     }
 
     #[test]
