@@ -6,6 +6,8 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+use crate::chooser;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -219,7 +221,31 @@ fn run_dialog(mode: &str, title: &str, parent: &str, app_id: &str, options: &Opt
             _ => outcome.uris.push(line.to_owned()),
         }
     }
-    Ok((output.status.success() && !outcome.uris.is_empty()).then_some(outcome))
+    match end_of(output.status.code(), running.closed.load(Ordering::SeqCst), !outcome.uris.is_empty()) {
+        End::Chosen => Ok(Some(outcome)),
+        End::Cancelled => Ok(None),
+        End::Failed => Err(format!("the dialog ended unexpectedly ({})", output.status)),
+    }
+}
+
+/// How a dialog process ended.
+#[derive(Debug, PartialEq, Eq)]
+enum End {
+    Chosen,
+    Cancelled,
+    Failed,
+}
+
+/// What the exit of the dialog process means: 0 with a choice, 1 for a cancel (see `chooser.rs`),
+/// anything else (2 when the window could not be opened, a crash, a signal) is a failure the
+/// program should hear about. A request the program withdrew counts as cancelled, whatever the exit.
+fn end_of(code: Option<i32>, withdrawn: bool, chose_something: bool) -> End {
+    match code {
+        _ if withdrawn => End::Cancelled,
+        Some(0) if chose_something => End::Chosen,
+        Some(0 | chooser::EXIT_CANCELLED) => End::Cancelled,
+        _ => End::Failed,
+    }
 }
 
 async fn respond(server: &zbus::ObjectServer, handle: ObjectPath<'_>, mode: &'static str, app_id: String, title: String, parent: String, options: Options) -> (u32, Results) {
@@ -363,6 +389,21 @@ mod tests {
         let odd = PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(b"/x/\xff (deleted)".to_vec()));
         assert_eq!(std::os::unix::ffi::OsStrExt::as_bytes(without_deleted_suffix(odd).as_os_str()), b"/x/\xff");
         assert!(own_exe().is_ok_and(|p| p.exists()));
+    }
+
+    #[test]
+    fn the_exit_of_the_dialog_decides_the_answer() {
+        assert_eq!(end_of(Some(0), false, true), End::Chosen);
+        // The user cancelled, or confirmed with nothing chosen
+        assert_eq!(end_of(Some(chooser::EXIT_CANCELLED), false, false), End::Cancelled);
+        assert_eq!(end_of(Some(0), false, false), End::Cancelled);
+        // The window could not be opened, the dialog crashed or was killed
+        assert_eq!(end_of(Some(chooser::EXIT_FAILED), false, false), End::Failed);
+        assert_eq!(end_of(Some(101), false, false), End::Failed);
+        assert_eq!(end_of(None, false, false), End::Failed);
+        // The program closed its request: whatever the dialog did, it is not an error
+        assert_eq!(end_of(None, true, false), End::Cancelled);
+        assert_eq!(end_of(Some(chooser::EXIT_FAILED), true, false), End::Cancelled);
     }
 
     #[test]

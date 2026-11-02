@@ -46,7 +46,14 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     }
-    open_window(request)
+    let dialog = request.args.iter().any(|a| a == "--chooser");
+    let result = open_window(request);
+    // A dialog that could not be opened must not end like a cancel, which is exit code 1
+    if dialog && let Err(err) = &result {
+        eprintln!("Error: {err}");
+        std::process::exit(chooser::EXIT_FAILED);
+    }
+    result
 }
 
 /// Open a window for one launch and run it until it closes.

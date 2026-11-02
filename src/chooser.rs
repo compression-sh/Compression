@@ -1,6 +1,6 @@
 //! Chooser mode: `compression --chooser …` runs the file manager as an open / save dialog. The chosen
-//! paths go to stdout as `file://` URIs, one per line; the exit code is 0 for a choice and 1 for
-//! a cancel. The portal backend (`portal.rs`) starts it for every FileChooser request.
+//! paths go to stdout as `file://` URIs, one per line; the exit code is 0 for a choice, 1 for
+//! a cancel and 2 when the dialog could not be opened at all. The portal backend (`portal.rs`) starts it for every FileChooser request.
 
 use std::path::{Path, PathBuf};
 
@@ -318,8 +318,13 @@ pub fn finish(paths: &[PathBuf], extra: &[String]) -> ! {
     std::process::exit(0);
 }
 
+/// The exit code of a dialog the user cancelled.
+pub const EXIT_CANCELLED: i32 = 1;
+/// The exit code of a dialog that could not be opened (no display, no graphics): not a cancel.
+pub const EXIT_FAILED: i32 = 2;
+
 pub fn cancel() -> ! {
-    std::process::exit(1);
+    std::process::exit(EXIT_CANCELLED);
 }
 
 #[cfg(test)]
