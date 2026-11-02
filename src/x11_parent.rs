@@ -4,19 +4,68 @@
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 
-/// Marks `window` as a child of the window `handle` names; false when this is not an X11 window
-/// or the handle is of another kind.
+/// The window id a handle names, if it can be one. The requesting program decides what the handle
+/// says, so it is checked before it goes to the X server: X resource ids have 29 bits and are never
+/// 0 (which is `None` to X), and anything else is no window.
+fn parent_id(handle: &str) -> Option<u64> {
+    let id = u64::from_str_radix(handle.strip_prefix("x11:")?.trim_start_matches("0x"), 16).ok()?;
+    (1..=0x1fff_ffff).contains(&id).then_some(id)
+}
+
+/// Errors for requests of ours are told to nobody: a window that is gone by now or that never was
+/// is not a reason to end the process, which is what Xlib's own handler does.
+unsafe extern "C" fn ignore_error(_: *mut x11_dl::xlib::Display, _: *mut x11_dl::xlib::XErrorEvent) -> std::os::raw::c_int {
+    0
+}
+
+/// Marks `window` as a child of the window `handle` names; false when this is not an X11 window,
+/// the handle is of another kind or names no possible window. The dialog is then an ordinary window.
 pub fn attach<W: HasWindowHandle + HasDisplayHandle>(window: &W, handle: &str) -> bool {
-    let Some(parent) = handle.strip_prefix("x11:").and_then(|id| u64::from_str_radix(id.trim_start_matches("0x"), 16).ok()) else { return false };
+    let Some(parent) = parent_id(handle) else { return false };
     let (Ok(display), Ok(own)) = (window.display_handle(), window.window_handle()) else { return false };
     let (RawDisplayHandle::Xlib(display), RawWindowHandle::Xlib(own)) = (display.as_raw(), own.as_raw()) else { return false };
     let Some(display) = display.display else { return false };
     let Ok(xlib) = x11_dl::xlib::Xlib::open() else { return false };
     // SAFETY: the display and window come from the live window winit created, which outlives this
-    // call; the calls only read them and write one property.
+    // call; the calls only read them and write one property. A window that does not exist makes the
+    // server answer with an error, which the handler swallows while it is installed; the sync makes
+    // that answer arrive before the previous handler is put back.
     unsafe {
+        let previous = (xlib.XSetErrorHandler)(Some(ignore_error));
         (xlib.XSetTransientForHint)(display.as_ptr().cast(), own.window, parent);
-        (xlib.XFlush)(display.as_ptr().cast());
+        (xlib.XSync)(display.as_ptr().cast(), 0);
+        (xlib.XSetErrorHandler)(previous);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_ids_that_can_be_windows_go_to_the_server() {
+        assert_eq!(parent_id("x11:0x1a00007"), Some(0x1a0_0007));
+        assert_eq!(parent_id("x11:1a00007"), Some(0x1a0_0007));
+        assert_eq!(parent_id("x11:1"), Some(1));
+        assert_eq!(parent_id("x11:1fffffff"), Some(0x1fff_ffff));
+        // Not positive, or too big for a resource id
+        assert_eq!(parent_id("x11:0"), None);
+        assert_eq!(parent_id("x11:0x0"), None);
+        assert_eq!(parent_id("x11:20000000"), None);
+        assert_eq!(parent_id("x11:ffffffffffffffff"), None);
+        assert_eq!(parent_id("x11:fffffffffffffffff"), None);
+        // Not an id at all
+        assert_eq!(parent_id("x11:"), None);
+        assert_eq!(parent_id("x11:0x"), None);
+        assert_eq!(parent_id("x11:-5"), None);
+        assert_eq!(parent_id("x11:+5"), Some(5));
+        assert_eq!(parent_id("x11: 5"), None);
+        assert_eq!(parent_id("x11:zz"), None);
+        assert_eq!(parent_id("x11:12 34"), None);
+        // Another kind of handle
+        assert_eq!(parent_id("wayland:abc"), None);
+        assert_eq!(parent_id("1a00007"), None);
+        assert_eq!(parent_id(""), None);
+    }
 }
