@@ -521,7 +521,11 @@ fn scaled_jpeg(path: &Path, tier: u32) -> Option<image::DynamicImage> {
 
 fn render_svg(path: &Path, px: u32) -> Option<image::DynamicImage> {
     let data = std::fs::read(path).ok()?;
-    let tree = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default()).ok()?;
+    let mut options = resvg::usvg::Options::default();
+    // A picture in a folder must not be able to pull other files into its preview: only what is
+    // inside it (`data:` addresses) is drawn, not pictures that `href` names by path
+    options.image_href_resolver.resolve_string = Box::new(|_, _| None);
+    let tree = resvg::usvg::Tree::from_data(&data, &options).ok()?;
     let size = tree.size();
     let scale = px as f32 / size.width().max(size.height());
     let mut pixmap = resvg::tiny_skia::Pixmap::new((size.width() * scale).ceil().max(1.0) as u32, (size.height() * scale).ceil().max(1.0) as u32)?;
@@ -832,17 +836,24 @@ fn seven_zip_comic_page(path: &Path) -> Option<image::DynamicImage> {
     }
     let tool = ["7z", "7zz", "7za"].into_iter().find(|t| Command::new(t).arg("-h").output().is_ok())?;
     let mut list = Command::new(tool);
-    list.args(["l", "-ba", "-slt", "-sccUTF-8"]).arg(path);
+    list.args(["l", "-ba", "-slt", "-sccUTF-8", "--"]).arg(path);
     let listing = String::from_utf8(run_with_timeout(list)?).ok()?;
     let first = listing
         .lines()
         .filter_map(|l| l.strip_prefix("Path = "))
-        .filter(|n| is_page_picture(n))
+        // `@name` would be read as a list of names kept in a file
+        .filter(|n| is_page_picture(n) && !n.starts_with('@'))
         .min_by_key(|n| n.to_ascii_lowercase())?
         .to_string();
-    let mut extract = Command::new(tool);
-    extract.args(["e", "-so", "-y"]).arg(path).arg(&first);
-    image::load_from_memory(&run_with_timeout(extract)?).ok()
+    image::load_from_memory(&run_with_timeout(seven_zip_extract(tool, path, &first))?).ok()
+}
+
+/// `7z e -so -- archive entry`: after `--` a name is a name and never a switch, whatever the
+/// archive calls its entry (`-aoa.png`).
+fn seven_zip_extract(tool: &str, archive: &Path, entry: &str) -> std::process::Command {
+    let mut extract = std::process::Command::new(tool);
+    extract.args(["e", "-so", "-y", "--"]).arg(archive).arg(entry);
+    extract
 }
 
 /// Cover of a FictionBook: a base64 `<binary>` the `<coverpage>` points at. `.fb2.zip` holds the same file zipped.
@@ -1157,6 +1168,68 @@ mod cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_archive_entry_is_always_a_name_and_never_a_switch() {
+        let command = seven_zip_extract("7z", Path::new("/tmp/a.cb7"), "-aoa.png");
+        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["e", "-so", "-y", "--", "/tmp/a.cb7", "-aoa.png"]);
+        // Everything that can be taken for a switch comes after the `--`
+        let at = args.iter().position(|a| a == "--").unwrap();
+        assert!(args[..at].iter().all(|a| a == "e" || a.starts_with("-s") || a == "-y"));
+    }
+
+    fn png_bytes(color: [u8; 3]) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb(color))).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn a_comic_whose_first_page_is_named_like_a_switch_still_gets_its_preview() {
+        let tool = ["7z", "7zz", "7za"].into_iter().find(|t| std::process::Command::new(t).arg("-h").output().is_ok());
+        let Some(tool) = tool else { return };
+        let dir = std::env::temp_dir().join(format!("compression-thumb-7z-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The page is called like a 7z switch, and sorts before the other one
+        std::fs::write(dir.join("-aoa.png"), png_bytes([255, 0, 0])).unwrap();
+        std::fs::write(dir.join("page2.png"), png_bytes([0, 0, 255])).unwrap();
+        let made = std::process::Command::new(tool).current_dir(&dir).args(["a", "-bd", "comic.7z", "--", "-aoa.png", "page2.png"]).output();
+        if !made.is_ok_and(|o| o.status.success()) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let img = seven_zip_comic_page(&dir.join("comic.7z")).expect("the preview of the first page").to_rgb8();
+        assert_eq!(img.get_pixel(4, 4).0, [255, 0, 0], "the page named like a switch is the first one");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_svg_cannot_draw_files_it_names_by_path_but_keeps_what_it_holds() {
+        use base64::Engine;
+        let dir = std::env::temp_dir().join(format!("compression-thumb-svg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The build has no decoder for pixel pictures, so the other file is a drawing
+        let drawing = |color: &str| format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="{color}"/></svg>"#);
+        let red = dir.join("secret.svg");
+        std::fs::write(&red, drawing("#ff0000")).unwrap();
+        let svg = |href: &str| format!(r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="64" height="64"><image x="0" y="0" width="64" height="64" href="{href}" xlink:href="{href}"/></svg>"#);
+        let center = |name: &str, text: String| {
+            std::fs::write(dir.join(name), text).unwrap();
+            render_svg(&dir.join(name), 64).expect("the svg itself is fine").to_rgba8().get_pixel(32, 32).0
+        };
+        // A picture by path (absolute, relative or as a file address) is not drawn: nothing is there
+        assert_eq!(center("abs.svg", svg(&red.to_string_lossy()))[3], 0, "an absolute path was loaded");
+        assert_eq!(center("rel.svg", svg("secret.svg"))[3], 0, "a relative path was loaded");
+        assert_eq!(center("uri.svg", svg(&format!("file://{}", red.display())))[3], 0, "a file address was loaded");
+        // One that is inside the svg is still drawn
+        let inline = format!("data:image/svg+xml;base64,{}", base64::engine::general_purpose::STANDARD.encode(drawing("#0000ff")));
+        let pixel = center("data.svg", svg(&inline));
+        assert!(pixel[3] > 200 && pixel[2] > 200 && pixel[0] < 50, "{pixel:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_closed_queue_wakes_its_workers_and_takes_no_more_jobs() {
