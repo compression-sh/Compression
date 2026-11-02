@@ -564,6 +564,8 @@
   "{} failed: {}": "{} falló: {}",
   "it printed more than 1 MiB": "imprimió más de 1 MiB",
   "it took longer than 30 seconds": "tardó más de 30 segundos",
+  "git took longer than 10 seconds": "git tardó más de 10 segundos",
+  "git printed more than 64 MiB": "git imprimió más de 64 MiB",
   "Finished: {}": "Terminado: {}",
   "Git": "Git",
   "{} lines": "{} línea|{} líneas",

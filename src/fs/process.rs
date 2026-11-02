@@ -9,6 +9,7 @@ use std::time::Duration;
 /// What a program that ran to its end printed.
 pub struct Output {
     pub success: bool,
+    pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
 
@@ -119,7 +120,7 @@ pub fn run_capped(mut command: Command, limit: usize, timeout: Duration) -> Resu
         }
     }
     let take = |i: usize| std::mem::take(&mut *buffers[i].lock().unwrap_or_else(|e| e.into_inner()));
-    Ok(Output { success: status.is_some_and(|s| s.success()), stderr: take(1) })
+    Ok(Output { success: status.is_some_and(|s| s.success()), stdout: take(0), stderr: take(1) })
 }
 
 #[cfg(test)]
@@ -138,10 +139,11 @@ mod tests {
     fn a_normal_program_gives_its_output_and_its_result() {
         let done = run_capped(sh("echo out; echo oops >&2; exit 3"), 1024, SECS).unwrap();
         assert!(!done.success);
+        assert_eq!(done.stdout, b"out\n");
         assert_eq!(done.stderr, b"oops\n");
         assert!(run_capped(sh("true"), 1024, SECS).unwrap().success);
         // Exactly the limit is fine
-        assert!(run_capped(sh("printf aaaaaaaaaa"), 10, SECS).is_ok());
+        assert_eq!(run_capped(sh("printf aaaaaaaaaa"), 10, SECS).unwrap().stdout.len(), 10);
     }
 
     #[test]
@@ -176,8 +178,8 @@ mod tests {
     fn something_the_program_left_running_does_not_hold_the_answer() {
         // The shell ends at once; the sleep it started keeps the pipes open for a few seconds
         let started = std::time::Instant::now();
-        let done = run_capped(sh("echo hi >&2; sleep 5 &"), 1024, SECS).unwrap();
-        assert!(done.success && done.stderr == b"hi\n");
+        let done = run_capped(sh("echo hi; sleep 5 &"), 1024, SECS).unwrap();
+        assert!(done.success && done.stdout == b"hi\n");
         assert!(started.elapsed() < Duration::from_secs(4), "the answer waited for the program's child");
     }
 }

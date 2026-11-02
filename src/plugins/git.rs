@@ -11,6 +11,7 @@ use eframe::egui;
 
 use super::{Badge, MenuItem, Plugin, Reaction, Status, Tone, intern};
 use crate::fs::file_item::FileItem;
+use crate::fs::process::{self, run_capped};
 use crate::i18n::{tr, trf, trn};
 use crate::ui::icons;
 use crate::ui::theme::SerpantinumTheme;
@@ -333,12 +334,30 @@ impl Git {
 /// Runs git in `root` with these arguments (never through a shell). On failure the last
 /// non-empty line of stderr is the error, as for custom actions.
 fn run_git(root: &Path, args: &[&std::ffi::OsStr]) -> Result<Vec<u8>, String> {
-    let out = git_command(root).args(args).stdin(std::process::Stdio::null()).output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        return Ok(out.stdout);
+    let mut command = git_command(root);
+    command.args(args);
+    run_within(command, GIT_TIMEOUT)
+}
+
+/// How long a git command may take. A repository on a mount that has stopped answering would
+/// otherwise hold the thread, and its process, for ever.
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The most a git command may print: the status of a very large repository, or a diff.
+const GIT_OUTPUT_LIMIT: usize = 64 << 20;
+
+/// Runs `command`, a git command, for at most `timeout`; its output, or the last line it printed
+/// on stderr. A command that takes too long is killed.
+fn run_within(command: Command, timeout: Duration) -> Result<Vec<u8>, String> {
+    match run_capped(command, GIT_OUTPUT_LIMIT, timeout) {
+        Ok(out) if out.success => Ok(out.stdout),
+        Ok(out) => {
+            let error = String::from_utf8_lossy(&out.stderr);
+            Err(error.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("git failed").trim().to_owned())
+        }
+        Err(process::Failure::TimedOut) => Err(tr("git took longer than 10 seconds").to_owned()),
+        Err(process::Failure::TooMuchOutput) => Err(tr("git printed more than 64 MiB").to_owned()),
+        Err(process::Failure::Io(e)) => Err(e.to_string()),
     }
-    let error = String::from_utf8_lossy(&out.stderr);
-    Err(error.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("git failed").trim().to_owned())
 }
 
 /// A git command in `dir` that runs nothing the folder's own repository configuration names. Any
@@ -397,8 +416,9 @@ fn diff(root: &Path, paths: &[PathBuf]) -> Result<DiffView, String> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let out = git_command(dir).args(args).env("GIT_OPTIONAL_LOCKS", "0").output().ok()?;
-    out.status.success().then_some(out.stdout)
+    let mut command = git_command(dir);
+    command.args(args).env("GIT_OPTIONAL_LOCKS", "0");
+    run_within(command, GIT_TIMEOUT).ok()
 }
 
 fn read_repo(dir: &Path) -> Option<Repo> {
@@ -523,6 +543,32 @@ mod tests {
         let repo = read_repo(&dir).expect("repo");
         let root = std::fs::canonicalize(&dir).unwrap();
         assert_eq!(repo.files.get(&root.join("a.txt")).map(|b| b.letter), Some('?'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_git_command_that_hangs_is_stopped_at_the_time_limit() {
+        let started = std::time::Instant::now();
+        let mut hangs = Command::new("sleep");
+        hangs.arg("30");
+        assert_eq!(run_within(hangs, Duration::from_millis(200)), Err(tr("git took longer than 10 seconds").to_owned()));
+        assert!(started.elapsed() < Duration::from_secs(5), "it was not stopped");
+        // One that prints without end is stopped too, and one that cannot start says why
+        let mut loud = Command::new("sh");
+        loud.arg("-c").arg("while :; do echo xxxxxxxxxxxxxxxx; done");
+        assert_eq!(run_within(loud, Duration::from_secs(60)), Err(tr("git printed more than 64 MiB").to_owned()));
+        assert!(run_within(Command::new("/nonexistent/git"), GIT_TIMEOUT).is_err());
+    }
+
+    #[test]
+    fn a_normal_git_command_still_gives_its_output_and_its_errors() {
+        let Some((dir, root)) = sandbox("timeout") else { return };
+        let status = git(&root, &["status", "--porcelain=v1"]).expect("status");
+        assert!(String::from_utf8_lossy(&status).contains("b.txt"));
+        assert!(run_git(&root, &[os("diff"), os("--no-color"), os("--"), os("a.txt")]).unwrap().windows(7).any(|w| w == b"+changed"[..7].to_vec()));
+        // git's own error is what comes back, not a time-out
+        let err = run_git(&root, &[os("rev-parse"), os("--verify"), os("no-such-ref")]).unwrap_err();
+        assert!(!err.contains("longer than"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

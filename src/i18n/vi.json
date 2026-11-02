@@ -564,6 +564,8 @@
   "{} failed: {}": "{} thất bại: {}",
   "it printed more than 1 MiB": "đầu ra vượt quá 1 MiB",
   "it took longer than 30 seconds": "mất hơn 30 giây",
+  "git took longer than 10 seconds": "git chạy quá 10 giây",
+  "git printed more than 64 MiB": "git in ra hơn 64 MiB",
   "Finished: {}": "Hoàn tất: {}",
   "Git": "Git",
   "{} lines": "{} dòng",
