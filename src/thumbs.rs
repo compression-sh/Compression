@@ -28,8 +28,17 @@ const TEXTURE_BUDGET: usize = 256 * 1024 * 1024;
 /// ffmpeg gets this long on one frame before it is killed.
 const VIDEO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_DOC_BYTES: u64 = 64 * 1024 * 1024;
-/// A PDF is read whole to find its first page, so the limit is generous but not unbounded.
-const MAX_PDF_BYTES: u64 = 1024 * 1024 * 1024;
+/// A PDF is read whole to find its first page, and every worker may do so at once.
+const MAX_PDF_BYTES: u64 = 64 * 1024 * 1024;
+/// A PDF that has not produced its first page by now is given up on.
+const PDF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How many PDF renders may run on past their time (they cannot be stopped) before PDFs get no preview.
+const MAX_RUNAWAY_PDFS: usize = 4;
+/// What a helper process (ffmpeg, 7z) may print: one picture. More is a bomb, and is cut off.
+const MAX_HELPER_OUTPUT: u64 = 64 * 1024 * 1024;
+/// Pictures with more pixels than this (100 megapixels) get no preview: decoding one takes
+/// gigabytes, and a file header can claim any size.
+const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 
 /// What a file looked like when its preview was asked for: modification time and size. A preview
 /// made for another stamp is out of date.
@@ -439,9 +448,23 @@ fn render_thumbnail(path: &Path, tier: u32) -> Option<image::DynamicImage> {
     } else if is_raw(path) {
         raw_preview(path)?
     } else {
-        scaled_jpeg(path, tier).or_else(|| image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok())?
+        scaled_jpeg(path, tier).or_else(|| decode_within_limits(path))?
     };
     Some(img.thumbnail(tier, tier))
+}
+
+fn too_many_pixels(width: u32, height: u32) -> bool {
+    u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
+}
+
+/// A picture decoded in full, unless its header claims more than `MAX_IMAGE_PIXELS`.
+fn decode_within_limits(path: &Path) -> Option<image::DynamicImage> {
+    let open = || image::ImageReader::open(path).ok()?.with_guessed_format().ok();
+    let (width, height) = open()?.into_dimensions().ok()?;
+    if too_many_pixels(width, height) {
+        return None;
+    }
+    open()?.decode().ok()
 }
 
 /// A JPEG decoded at 1/2, 1/4 or 1/8 of its size straight from the DCT coefficients, the way
@@ -452,6 +475,11 @@ fn scaled_jpeg(path: &Path, tier: u32) -> Option<image::DynamicImage> {
     }
     let mut decoder = jpeg_decoder::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).ok()?));
     decoder.read_info().ok()?;
+    // The header says how big the picture is, before anything is allocated for it
+    let info = decoder.info()?;
+    if too_many_pixels(info.width.into(), info.height.into()) {
+        return None;
+    }
     let side = tier.min(u16::MAX as u32) as u16;
     decoder.scale(side, side).ok()?;
     let pixels = decoder.decode().ok()?;
@@ -537,24 +565,73 @@ fn raw_preview(path: &Path) -> Option<image::DynamicImage> {
 }
 
 /// Stdout of a helper process. A broken or stalled input must not hold a worker forever, so the
-/// process is killed after `VIDEO_TIMEOUT`.
-fn run_with_timeout(mut command: std::process::Command) -> Option<Vec<u8>> {
+/// process is killed after `VIDEO_TIMEOUT`, and so is one that prints more than `MAX_HELPER_OUTPUT`.
+fn run_with_timeout(command: std::process::Command) -> Option<Vec<u8>> {
+    run_with_limits(command, MAX_HELPER_OUTPUT, VIDEO_TIMEOUT)
+}
+
+/// `run_with_timeout` with the limits spelled out: `None` when the process prints more than
+/// `max_bytes`, runs longer than `timeout`, or fails to run.
+fn run_with_limits(mut command: std::process::Command, max_bytes: u64, timeout: std::time::Duration) -> Option<Vec<u8>> {
     use std::process::Stdio;
     let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     let pid = child.id();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     std::thread::spawn(move || {
-        if done_rx.recv_timeout(VIDEO_TIMEOUT).is_err() {
+        if done_rx.recv_timeout(timeout).is_err() {
             // SAFETY: plain signal to the child this function spawned; a stale pid only fails
             unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         }
     });
     let mut bytes = Vec::new();
-    let read = child.stdout.take()?.read_to_end(&mut bytes);
+    // One byte more than allowed tells "exactly the limit" from "more"
+    let read = child.stdout.take()?.take(max_bytes + 1).read_to_end(&mut bytes);
+    let too_much = bytes.len() as u64 > max_bytes;
+    if too_much {
+        let _ = child.kill();
+    }
     let _ = child.wait();
     let _ = done_tx.send(());
     read.ok()?;
-    Some(bytes)
+    (!too_much).then_some(bytes)
+}
+
+/// Runs work that cannot be interrupted (a render in a library) on a thread of its own, and stops
+/// waiting for it after a time. The thread runs on, so only `max_stuck` of those are allowed at
+/// once; past that, nothing new is started until some have finished.
+struct Guarded {
+    stuck: std::sync::atomic::AtomicUsize,
+    max_stuck: usize,
+}
+
+impl Guarded {
+    fn run<T: Send + 'static>(self: &Arc<Self>, timeout: std::time::Duration, work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        use std::sync::atomic::AtomicBool;
+        if self.stuck.load(Ordering::SeqCst) >= self.max_stuck {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel();
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let (guard, flag) = (self.clone(), abandoned.clone());
+        std::thread::Builder::new()
+            .name("compression-render".into())
+            .spawn(move || {
+                let result = work();
+                let _ = tx.send(result);
+                if flag.load(Ordering::SeqCst) {
+                    guard.stuck.fetch_sub(1, Ordering::SeqCst);
+                }
+            })
+            .ok()?;
+        match rx.recv_timeout(timeout) {
+            Ok(result) => Some(result),
+            Err(_) => {
+                self.stuck.fetch_add(1, Ordering::SeqCst);
+                abandoned.store(true, Ordering::SeqCst);
+                None
+            }
+        }
+    }
 }
 
 /// Paints sprocket-hole bands over the left and right edges, so a video reads as film.
@@ -588,8 +665,14 @@ fn film_strip(frame: image::DynamicImage) -> image::DynamicImage {
     image::DynamicImage::ImageRgba8(img)
 }
 
-/// First page of a PDF, rendered on the CPU.
+/// First page of a PDF, rendered on the CPU. A page that takes longer than `PDF_TIMEOUT` is given up on.
 fn render_pdf(path: &Path, size: u32) -> Option<image::DynamicImage> {
+    static RUNAWAY: std::sync::LazyLock<Arc<Guarded>> = std::sync::LazyLock::new(|| Arc::new(Guarded { stuck: Default::default(), max_stuck: MAX_RUNAWAY_PDFS }));
+    let path = path.to_path_buf();
+    RUNAWAY.run(PDF_TIMEOUT, move || render_pdf_page(&path, size)).flatten()
+}
+
+fn render_pdf_page(path: &Path, size: u32) -> Option<image::DynamicImage> {
     use hayro::hayro_interpret::InterpreterSettings;
     use hayro::hayro_syntax::Pdf;
     use hayro::vello_cpu::color::palette::css::WHITE;
@@ -1047,6 +1130,100 @@ mod cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_helper_that_prints_without_end_is_cut_off_at_the_limit() {
+        let started = std::time::Instant::now();
+        let mut endless = std::process::Command::new("yes");
+        endless.arg("x");
+        // `yes` is part of coreutils; where it is missing there is nothing to test
+        if endless.spawn().map(|mut c| c.kill()).is_err() {
+            return;
+        }
+        let mut endless = std::process::Command::new("yes");
+        endless.arg("x");
+        assert_eq!(run_with_limits(endless, 1024 * 1024, std::time::Duration::from_secs(30)), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "the process was not stopped at the limit");
+    }
+
+    #[test]
+    fn helper_output_up_to_the_limit_is_kept() {
+        let print = |n: usize| {
+            let mut command = std::process::Command::new("printf");
+            command.arg("%s").arg("a".repeat(n));
+            command
+        };
+        let secs = std::time::Duration::from_secs(10);
+        // `printf` is part of coreutils too
+        if print(1).output().is_err() {
+            return;
+        }
+        assert_eq!(run_with_limits(print(10), 10, secs).map(|b| b.len()), Some(10));
+        assert_eq!(run_with_limits(print(11), 10, secs), None);
+        assert_eq!(run_with_limits(print(0), 10, secs), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_helper_that_never_ends_is_killed_at_the_timeout() {
+        let mut sleeper = std::process::Command::new("sleep");
+        sleeper.arg("30");
+        let started = std::time::Instant::now();
+        if run_with_limits(sleeper, 1024, std::time::Duration::from_millis(200)).is_some() {
+            // `sleep` is missing or ended by itself
+            return;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn work_that_overruns_is_given_up_on_and_only_a_few_may_run_on() {
+        let guard = Arc::new(Guarded { stuck: Default::default(), max_stuck: 2 });
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(guard.run(ms(2000), || 7), Some(7));
+        // Two overrunning jobs are given up on, and counted until they end
+        assert_eq!(guard.run(ms(30), move || std::thread::sleep(ms(400))), None);
+        assert_eq!(guard.run(ms(30), move || std::thread::sleep(ms(400))), None);
+        assert_eq!(guard.stuck.load(Ordering::SeqCst), 2);
+        // No more start while two run on
+        assert_eq!(guard.run(ms(2000), || 8), None);
+        std::thread::sleep(ms(800));
+        assert_eq!(guard.stuck.load(Ordering::SeqCst), 0);
+        assert_eq!(guard.run(ms(2000), || 9), Some(9));
+    }
+
+    /// A small JPEG whose header then claims `width` x `height`.
+    fn jpeg_claiming(path: &Path, width: u16, height: u16) {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(16, 16, image::Rgb([200, 30, 30]))).write_to(&mut bytes, image::ImageFormat::Jpeg).unwrap();
+        let mut data = bytes.into_inner();
+        // SOF0: marker, length, precision, height, width
+        let at = data.windows(2).position(|w| w == [0xFF, 0xC0]).expect("baseline frame header");
+        data[at + 5..at + 7].copy_from_slice(&height.to_be_bytes());
+        data[at + 7..at + 9].copy_from_slice(&width.to_be_bytes());
+        std::fs::write(path, data).unwrap();
+    }
+
+    #[test]
+    fn pictures_that_claim_too_many_pixels_get_no_preview() {
+        let dir = std::env::temp_dir().join(format!("compression-thumb-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.jpg");
+        jpeg_claiming(&ok, 16, 16);
+        assert!(scaled_jpeg(&ok, 128).is_some());
+        assert!(decode_within_limits(&ok).is_some());
+        // 60000 x 60000 is 3.6 gigapixels; 10001 x 10000 is just over the limit, 10000 x 10000 is not
+        let huge = dir.join("huge.jpg");
+        jpeg_claiming(&huge, 60000, 60000);
+        assert!(scaled_jpeg(&huge, 128).is_none());
+        assert!(decode_within_limits(&huge).is_none());
+        assert!(render_thumbnail(&huge, 128).is_none());
+        let edge = dir.join("edge.jpg");
+        jpeg_claiming(&edge, 10001, 10000);
+        assert!(scaled_jpeg(&edge, 128).is_none());
+        assert!(!too_many_pixels(10000, 10000) && too_many_pixels(10001, 10000));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     const PDF: &str = "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 300]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n4 0 obj<</Length 60>>stream\nBT /F1 24 Tf 20 150 Td (Hello) Tj ET 0 0 1 rg 20 20 80 40 re f\nendstream endobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\ntrailer<</Root 1 0 R/Size 6>>\n%%EOF";
 
