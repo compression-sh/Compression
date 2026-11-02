@@ -10,11 +10,12 @@ use std::sync::mpsc;
 pub const CONFIG_ENV: &str = "COMPRESSION_ADMIN_CONFIG";
 
 /// Variables the elevated process needs to reach the display and the session. Nothing that names
-/// places to load programs or libraries from (`LD_LIBRARY_PATH`) goes along: root must not take
-/// those from the environment of the person who started it.
+/// places to load programs, libraries or data from (`LD_LIBRARY_PATH`, `XDG_DATA_DIRS`) goes along:
+/// root must not take those from the environment of the person who started it, and uses the
+/// system's own folders instead.
 const PASS_ENV: &[&str] = &[
     "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP",
-    "XDG_DATA_DIRS", "LANG", "LANGUAGE", "LC_ALL", "XCURSOR_THEME", "XCURSOR_SIZE", "GDK_SCALE",
+    "LANG", "LANGUAGE", "LC_ALL", "XCURSOR_THEME", "XCURSOR_SIZE", "GDK_SCALE",
 ];
 
 /// First argument of the elevated start: the environment follows as `NAME=VALUE` words, up to `--`.
@@ -43,6 +44,32 @@ fn pkexec() -> Option<PathBuf> {
 /// Whether administrator access can be asked for at all.
 pub fn available() -> bool {
     !is_admin() && pkexec().is_some()
+}
+
+/// Whether the program that is about to be run as root can only be changed by root and by the
+/// person asking: both it and the folder it is in must belong to one of the two and not be
+/// writable by anyone else (a folder others may write to is fine when it is sticky, like `/tmp`:
+/// there nobody can replace another's file). Otherwise anyone who can write there could have root
+/// run what they like by waiting for the password prompt to be answered.
+fn check_binary(exe: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    let refuse = || io::Error::other(crate::i18n::tr("Administrator mode only starts a program that nobody else can change"));
+    let folder = exe.parent().ok_or_else(refuse)?;
+    for (path, is_folder) in [(exe, false), (folder, true)] {
+        let meta = std::fs::metadata(path)?;
+        if !is_trusted(meta.uid(), meta.mode(), me, is_folder) {
+            return Err(refuse());
+        }
+    }
+    Ok(())
+}
+
+/// `owner` and `mode` of a program or folder: is it root's or `me`'s, and closed to others?
+fn is_trusted(owner: u32, mode: u32, me: u32, is_folder: bool) -> bool {
+    let sticky_folder = is_folder && mode & 0o1000 != 0;
+    (owner == 0 || owner == me) && (mode & 0o022 == 0 || sticky_folder)
 }
 
 /// The `NAME=VALUE` words that carry the environment to the elevated process: the variables of
@@ -98,6 +125,7 @@ pub fn take_environment(args: Vec<String>) -> Vec<String> {
 pub fn open_folder(dir: &Path) -> io::Result<mpsc::Receiver<io::Error>> {
     let pkexec = pkexec().ok_or_else(|| io::Error::other(crate::i18n::tr("pkexec was not found. Install polkit to use administrator mode")))?;
     let exe = crate::portal::own_exe()?;
+    check_binary(&exe)?;
     let environment = environment_words(|name| std::env::var_os(name), dirs::config_dir());
     let mut child = elevation_command(&pkexec, &exe, dir, environment)
         .stdin(Stdio::null())
@@ -155,6 +183,67 @@ mod tests {
         // Values that are not text are left out rather than mangled
         let odd = environment_words(|name| (name == "XAUTHORITY").then(|| std::os::unix::ffi::OsStringExt::from_vec(vec![0xff, b'x'])), None);
         assert!(odd.is_empty());
+    }
+
+    #[test]
+    fn the_environment_that_goes_to_root_has_no_places_to_load_things_from() {
+        let everything = |name: &str| Some(OsString::from(format!("/home/me/{name}")));
+        let passed: Vec<String> = environment_words(everything, None).iter().map(|w| w.split('=').next().unwrap().to_owned()).collect();
+        for allowed in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "LANG", "LANGUAGE", "LC_ALL", "XCURSOR_THEME", "XCURSOR_SIZE", "GDK_SCALE"] {
+            assert!(passed.iter().any(|n| n == allowed), "{allowed} should go along");
+        }
+        assert_eq!(passed.len(), 12);
+        // Not sent, and not taken from the arguments either
+        let forbidden = ["XDG_DATA_DIRS", "XDG_CONFIG_DIRS", "LD_LIBRARY_PATH", "LD_PRELOAD", "PATH", "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "PYTHONPATH"];
+        let args: Vec<String> = std::iter::once(ENV_FLAG.to_owned()).chain(forbidden.iter().map(|n| format!("{n}=/home/me/x"))).chain([ "--".to_owned(), "/srv".to_owned()]).collect();
+        let (taken, rest) = split_environment(&args).unwrap();
+        assert!(taken.is_empty(), "{taken:?}");
+        assert_eq!(rest, ["/srv"]);
+        for name in forbidden {
+            assert!(!passed.iter().any(|n| n == name), "{name} must not go along");
+        }
+    }
+
+    #[test]
+    fn a_program_is_run_as_root_only_when_nobody_else_can_change_it() {
+        let (root, me, other) = (0, 1000, 1001);
+        // Ordinary installs: root's file in root's folder, or the person's own build
+        assert!(is_trusted(root, 0o100755, me, false) && is_trusted(root, 0o40755, me, true));
+        assert!(is_trusted(me, 0o100755, me, false) && is_trusted(me, 0o40700, me, true));
+        // Somebody else's, or open to group and world
+        assert!(!is_trusted(other, 0o100755, me, false));
+        assert!(!is_trusted(root, 0o100775, me, false) && !is_trusted(root, 0o100757, me, false) && !is_trusted(root, 0o100777, me, false));
+        assert!(!is_trusted(root, 0o40775, me, true) && !is_trusted(me, 0o40777, me, true));
+        // A folder anyone may write to is fine only when it is sticky
+        assert!(is_trusted(root, 0o41777, me, true));
+        assert!(!is_trusted(root, 0o100777 | 0o1000, me, false), "sticky does not help a file");
+    }
+
+    #[test]
+    fn the_check_looks_at_the_real_file_and_its_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("compression_admin_bin_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let set = |path: &Path, mode: u32| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let exe = dir.join("compression");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        set(&dir, 0o755);
+        set(&exe, 0o755);
+        assert!(check_binary(&exe).is_ok(), "a program of the person's own, closed to others");
+        // Others may write to the file, or to the folder it is in
+        set(&exe, 0o775);
+        assert!(check_binary(&exe).is_err());
+        set(&exe, 0o757);
+        assert!(check_binary(&exe).is_err());
+        set(&exe, 0o755);
+        set(&dir, 0o777);
+        assert!(check_binary(&exe).is_err());
+        set(&dir, 0o1777);
+        assert!(check_binary(&exe).is_ok());
+        set(&dir, 0o755);
+        assert!(check_binary(&dir.join("missing")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

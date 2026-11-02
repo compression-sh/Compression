@@ -548,6 +548,7 @@
   "Compression already runs as administrator": "Compression s’exécute déjà en tant qu’administrateur",
   "Running as administrator. Changes to settings are not saved.": "Exécution en tant qu’administrateur. Les modifications des réglages ne sont pas enregistrées.",
   "pkexec was not found. Install polkit to use administrator mode": "pkexec est introuvable. Installez polkit pour utiliser le mode administrateur",
+  "Administrator mode only starts a program that nobody else can change": "Le mode administrateur ne lance qu’un programme que personne d’autre ne peut modifier",
   "Could not get administrator rights. Is a polkit agent running?": "Impossible d’obtenir les droits d’administrateur. Un agent polkit est-il en cours d’exécution ?",
   "Actions": "Actions",
   "Adds your scripts and commands from ~/.config/compression/actions to the context menu": "Ajoute au menu contextuel vos scripts et commandes de ~/.config/compression/actions",
