@@ -562,6 +562,8 @@
   "Each .json file or executable script in the actions folder becomes an entry in the context menu. The selected files are passed as arguments and in COMPRESSION_SELECTED_FILES.": "Cada archivo .json o script ejecutable de la carpeta de acciones se convierte en una entrada del menú contextual. Los archivos seleccionados se pasan como argumentos y en COMPRESSION_SELECTED_FILES.",
   "Error": "Error",
   "{} failed: {}": "{} falló: {}",
+  "it printed more than 1 MiB": "imprimió más de 1 MiB",
+  "it took longer than 30 seconds": "tardó más de 30 segundos",
   "Finished: {}": "Terminado: {}",
   "Git": "Git",
   "{} lines": "{} línea|{} líneas",

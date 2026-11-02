@@ -25,6 +25,7 @@ use serde::Deserialize;
 
 use super::{MenuItem, Plugin, Reaction, intern};
 use crate::fs::file_item::FileItem;
+use crate::fs::process::{self, Output, run_capped};
 use crate::i18n::{tr, trf};
 use crate::ui::icons;
 use crate::ui::material;
@@ -77,6 +78,26 @@ pub struct Actions {
     /// An action finished, and may have changed the files in the open folder.
     finished: Arc<AtomicBool>,
     running: Arc<AtomicUsize>,
+}
+
+/// The most an action may print on each of its two streams before it is stopped.
+const OUTPUT_LIMIT: usize = 1 << 20;
+/// How long an action may run before it is stopped. The window is not kept awake for longer.
+const RUN_LIMIT: Duration = Duration::from_secs(30);
+
+/// The toast for an action that has ended, or was stopped.
+fn message_for(label: &str, result: Result<Output, process::Failure>) -> String {
+    match result {
+        Ok(out) if out.success => trf("Finished: {}", &[&label]),
+        Ok(out) => {
+            let error = String::from_utf8_lossy(&out.stderr);
+            let error = error.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_owned();
+            trf("{} failed: {}", &[&label, &error])
+        }
+        Err(process::Failure::TooMuchOutput) => trf("{} failed: {}", &[&label, &tr("it printed more than 1 MiB")]),
+        Err(process::Failure::TimedOut) => trf("{} failed: {}", &[&label, &tr("it took longer than 30 seconds")]),
+        Err(process::Failure::Io(e)) => trf("{} failed: {}", &[&label, &e]),
+    }
 }
 
 pub fn dir() -> Option<PathBuf> {
@@ -322,15 +343,7 @@ impl Plugin for Actions {
         let (tx, label, running, finished) = (self.done_tx.clone(), entry.label, Arc::clone(&self.running), Arc::clone(&self.finished));
         running.fetch_add(1, Ordering::Relaxed);
         std::thread::spawn(move || {
-            let message = match command.output() {
-                Ok(out) if out.status.success() => trf("Finished: {}", &[&label]),
-                Ok(out) => {
-                    let error = String::from_utf8_lossy(&out.stderr);
-                    let error = error.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_owned();
-                    trf("{} failed: {}", &[&label, &error])
-                }
-                Err(e) => trf("{} failed: {}", &[&label, &e]),
-            };
+            let message = message_for(label, run_capped(command, OUTPUT_LIMIT, RUN_LIMIT));
             let _ = tx.send(message);
             finished.store(true, Ordering::Relaxed);
             running.fetch_sub(1, Ordering::Relaxed);
@@ -378,6 +391,36 @@ mod tests {
         assert!(files.applies(&[item("f", false)]));
         assert!(!files.applies(&[item("f", false), item("g", false)]));
         assert!(!files.applies(&[item("d", true)]));
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    #[test]
+    fn an_action_with_endless_output_is_stopped_at_the_limit() {
+        let started = std::time::Instant::now();
+        let result = run_capped(sh("while :; do echo xxxxxxxxxxxxxxxxxxxxxxxx; done"), 64 * 1024, Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(10), "it was not stopped");
+        assert_eq!(message_for("Loud", result), trf("{} failed: {}", &[&"Loud", &tr("it printed more than 1 MiB")]));
+    }
+
+    #[test]
+    fn an_action_that_hangs_is_stopped_at_the_time_limit() {
+        let started = std::time::Instant::now();
+        let result = run_capped(sh("sleep 30"), OUTPUT_LIMIT, Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(5), "it was not stopped");
+        assert_eq!(message_for("Stuck", result), trf("{} failed: {}", &[&"Stuck", &tr("it took longer than 30 seconds")]));
+    }
+
+    #[test]
+    fn short_actions_still_report_what_happened() {
+        assert_eq!(message_for("Quick", run_capped(sh("echo fine"), OUTPUT_LIMIT, RUN_LIMIT)), trf("Finished: {}", &[&"Quick"]));
+        assert_eq!(message_for("Bad", run_capped(sh("echo first >&2; echo it broke >&2; exit 1"), OUTPUT_LIMIT, RUN_LIMIT)), trf("{} failed: {}", &[&"Bad", &"it broke"]));
+        let missing = message_for("Gone", run_capped(Command::new("/nonexistent/compression-action"), OUTPUT_LIMIT, RUN_LIMIT));
+        assert!(missing.starts_with("Gone failed: "), "{missing}");
     }
 
     #[test]
