@@ -85,17 +85,32 @@ struct Reader {
     timeout: std::time::Duration,
     /// The source did not finish in time: `data` is dropped, and the drop is not carried out.
     timed_out: bool,
+    /// The most a source may send; a list that is longer is cut off and not used.
+    limit: usize,
+    /// The list was cut off (it passed `limit`, or the pipe broke): `data` is dropped, and the
+    /// drop is not carried out. Half a list is not a smaller selection, it is the wrong one.
+    truncated: bool,
 }
 
 impl Default for Reader {
     fn default() -> Self {
-        Self { fd: None, data: Vec::new(), started: std::time::Instant::now(), timeout: SOURCE_TIMEOUT, timed_out: false }
+        Self { fd: None, data: Vec::new(), started: std::time::Instant::now(), timeout: SOURCE_TIMEOUT, timed_out: false, limit: 16 << 20, truncated: false }
     }
 }
 
 impl Reader {
     fn done(&self) -> bool {
         self.fd.is_none()
+    }
+
+    /// Whether what was read cannot be used because it is not the whole list.
+    fn unusable(&self) -> bool {
+        self.timed_out || self.truncated
+    }
+
+    fn give_up(&mut self) {
+        self.fd = None;
+        self.data.clear();
     }
 
     /// Starts the wait over, for a source that has had no reason to hurry until the drop.
@@ -111,21 +126,33 @@ impl Reader {
             let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
                 self.data.extend_from_slice(&buf[..n as usize]);
-                if self.data.len() > 16 << 20 {
-                    self.fd = None;
+                if self.data.len() > self.limit {
+                    self.give_up();
+                    self.truncated = true;
                     return;
                 }
-            } else if n == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+            } else if n == 0 {
+                // The source closed the pipe: that is the end of the list
                 self.fd = None;
                 return;
             } else {
-                // Nothing to read just now, and the source keeps the pipe open
-                if self.started.elapsed() >= self.timeout {
-                    self.fd = None;
-                    self.data.clear();
-                    self.timed_out = true;
+                match std::io::Error::last_os_error().kind() {
+                    std::io::ErrorKind::Interrupted => {}
+                    std::io::ErrorKind::WouldBlock => {
+                        // Nothing to read just now, and the source keeps the pipe open
+                        if self.started.elapsed() >= self.timeout {
+                            self.give_up();
+                            self.timed_out = true;
+                        }
+                        return;
+                    }
+                    // The pipe broke half way
+                    _ => {
+                        self.give_up();
+                        self.truncated = true;
+                        return;
+                    }
                 }
-                return;
             }
         }
     }
@@ -329,8 +356,8 @@ impl Device {
         }
         if let Some(d) = &mut self.state.dropping {
             d.reader.pump();
-            if d.reader.timed_out {
-                // The source never finished sending the files: nothing is dropped, and nothing waits on it
+            if d.reader.unusable() {
+                // The source never finished sending the files, or sent more than a list can be: nothing is dropped
                 if let Some(d) = self.state.dropping.take() {
                     self.state.offers.remove(&d.offer.id());
                     d.offer.destroy();
@@ -891,6 +918,47 @@ mod tests {
         reader.restart();
         reader.pump();
         assert!(!reader.done());
+    }
+
+    #[test]
+    fn a_list_cut_off_at_the_limit_is_not_taken_as_complete() {
+        let cut_off = |extra: usize| {
+            let (read, write) = pipe();
+            let mut reader = Reader { fd: Some(read), limit: 100_000, ..Default::default() };
+            let list = "file:///tmp/a\r\n".repeat((reader.limit + extra) / 15 + 1);
+            let list = list.as_bytes()[..reader.limit + extra].to_vec();
+            let sender = std::thread::spawn(move || write_all_within(write, &list, std::time::Duration::from_secs(5)));
+            let started = std::time::Instant::now();
+            while !reader.done() && started.elapsed() < std::time::Duration::from_secs(5) {
+                reader.pump();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let _ = sender.join();
+            reader
+        };
+        // One byte over the limit is already too long, and nothing of it is kept
+        let reader = cut_off(1);
+        assert!(reader.done() && reader.truncated && reader.unusable() && !reader.timed_out);
+        assert!(reader.data.is_empty());
+        let reader = cut_off(50_000);
+        assert!(reader.truncated && reader.data.is_empty());
+
+        // A list that fits, even exactly, is complete once the source closes the pipe
+        let (read, write) = pipe();
+        let mut reader = Reader { fd: Some(read), limit: 20_000, ..Default::default() };
+        let exact = vec![b'u'; 20_000];
+        let sender = std::thread::spawn({
+            let exact = exact.clone();
+            move || write_all_within(write, &exact, std::time::Duration::from_secs(5))
+        });
+        let started = std::time::Instant::now();
+        while !reader.done() && started.elapsed() < std::time::Duration::from_secs(5) {
+            reader.pump();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        sender.join().unwrap().unwrap();
+        assert!(reader.done() && !reader.unusable());
+        assert_eq!(reader.data, exact);
     }
 
     #[test]
