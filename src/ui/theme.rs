@@ -184,14 +184,14 @@ pub struct CustomTheme {
 /// The user's themes as last read from their folder, for `from_settings` and the settings page.
 static USER_THEMES: RwLock<Vec<CustomTheme>> = RwLock::new(Vec::new());
 
-/// Where the user's themes are kept, a JSON file each: `~/.local/state/ski/themes`.
+/// Where the user's themes are kept, a JSON file each: `~/.local/state/compression/themes`.
 pub fn user_themes_dir() -> Option<PathBuf> {
     let state = match crate::fs::admin::config_override() {
         // As administrator: the state folder next to the config folder of whoever started Compression
         Some(config) => config.parent().map(|home| home.join(".local/state")),
         None => dirs::state_dir().or_else(dirs::data_local_dir),
     };
-    state.map(|dir| dir.join("ski").join("themes"))
+    state.map(|dir| dir.join("compression").join("themes"))
 }
 
 fn read_user_themes() -> Vec<CustomTheme> {

@@ -204,7 +204,7 @@ pub const DEFAULT_SIZE: [f32; 2] = [760.0, 520.0];
 const SIZE_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
 
 fn size_file() -> Option<PathBuf> {
-    dirs::state_dir().or_else(dirs::config_dir).map(|d| d.join("ski").join("chooser-size"))
+    dirs::state_dir().or_else(dirs::config_dir).map(|d| d.join("compression").join("chooser-size"))
 }
 
 /// The size the dialog was last left at.
@@ -224,7 +224,7 @@ fn save_size([w, h]: [f32; 2]) {
 }
 
 fn folders_file() -> Option<PathBuf> {
-    dirs::state_dir().or_else(dirs::config_dir).map(|d| d.join("ski").join("chooser-folders"))
+    dirs::state_dir().or_else(dirs::config_dir).map(|d| d.join("compression").join("chooser-folders"))
 }
 
 /// The folder a program last chose something in (`app_id` is empty for programs the portal cannot name).

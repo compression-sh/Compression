@@ -1,14 +1,17 @@
 # NixOS module: Compression as the default file manager and as the system's open / save dialog.
 #
 #   imports = [ /path/to/Compression/nix/module.nix ];
-#   programs.ski.enable = true;
+#   programs.compression.enable = true;
 { config, lib, pkgs, ... }:
 
 let
-  cfg = config.programs.ski;
+  cfg = config.programs.compression;
 in
 {
-  options.programs.ski = {
+  # Configurations written for Ski (programs.ski.*) keep working
+  imports = [ (lib.mkRenamedOptionModule [ "programs" "ski" ] [ "programs" "compression" ]) ];
+
+  options.programs.compression = {
     enable = lib.mkEnableOption "Compression, a small keyboard-friendly file manager";
 
     package = lib.mkOption {
@@ -50,7 +53,7 @@ in
     { environment.systemPackages = [ cfg.package ]; }
 
     (lib.mkIf cfg.defaultFileManager {
-      xdg.mime.defaultApplications."inode/directory" = "ski.desktop";
+      xdg.mime.defaultApplications."inode/directory" = "compression.desktop";
       services.dbus.packages = [ cfg.package ];
     })
 
@@ -61,7 +64,7 @@ in
     (lib.mkIf cfg.filePicker {
       xdg.portal.enable = true;
       xdg.portal.extraPortals = [ cfg.package ];
-      xdg.portal.config.common."org.freedesktop.impl.portal.FileChooser" = "ski";
+      xdg.portal.config.common."org.freedesktop.impl.portal.FileChooser" = "compression";
       # GTK 3 programs only ask the portal when told to
       environment.sessionVariables.GTK_USE_PORTAL = "1";
     })

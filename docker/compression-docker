@@ -1,10 +1,10 @@
 #!/bin/sh
 # Run the Compression container on this desktop (Wayland or X11) with your home folder mounted at the same path.
-# Usage: compression-docker [folder]        Env: SKI_IMAGE (default ghcr.io/compression-sh/compression:latest), SKI_ENGINE (docker|podman)
+# Usage: compression-docker [folder]        Env (the old SKI_IMAGE and SKI_ENGINE still work): COMPRESSION_IMAGE (default ghcr.io/compression-sh/compression:latest), COMPRESSION_ENGINE (docker|podman)
 set -eu
 
-image=${SKI_IMAGE:-ghcr.io/compression-sh/compression:latest}
-engine=${SKI_ENGINE:-docker}
+image=${COMPRESSION_IMAGE:-${SKI_IMAGE:-ghcr.io/compression-sh/compression:latest}}
+engine=${COMPRESSION_ENGINE:-${SKI_ENGINE:-docker}}
 uid=$(id -u)
 start=${1:-$HOME}
 

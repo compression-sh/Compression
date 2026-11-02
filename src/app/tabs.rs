@@ -240,6 +240,7 @@ impl CompressionApp {
 
     /// `new_tab`, with the choice of listing the folder in Recent; a restored session is not a visit.
     fn open_tab(&mut self, path: PathBuf, record: bool) {
+        let path = crate::fs::places::normalize(path);
         let path = if is_virtual(&path) { path } else { path.canonicalize().unwrap_or(path) };
         let state = self.take_tab_state();
         self.tabs[self.active_tab].saved = Some(state);

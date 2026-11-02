@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use zbus::zvariant::{DeserializeDict, ObjectPath, OwnedObjectPath, SerializeDict, Type};
 use zbus::{blocking as zblocking, interface};
 
-const PORTAL_NAME: &str = "org.freedesktop.impl.portal.desktop.ski";
+const PORTAL_NAME: &str = "org.freedesktop.impl.portal.desktop.compression";
 const FILE_MANAGER_NAME: &str = "org.freedesktop.FileManager1";
 
 /// Portal response codes: 0 = chosen, 1 = cancelled by the user, 2 = something else ended it.

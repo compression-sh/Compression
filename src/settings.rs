@@ -1,4 +1,4 @@
-//! User preferences, stored as JSON in `~/.config/ski/settings.json`.
+//! User preferences, stored as JSON in `~/.config/compression/settings.json`.
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use crate::ui::material::Column;
 #[serde(default)]
 pub struct Settings {
     /// Palette name: `system` follows the Serpantinum colors, `custom:<id>` is the user's theme in
-    /// `~/.local/state/ski/themes/<id>.json`, otherwise the id of a file in `assets/themes`.
+    /// `~/.local/state/compression/themes/<id>.json`, otherwise the id of a file in `assets/themes`.
     pub theme: String,
     /// `system` follows the desktop language, otherwise a code from `i18n::Language`.
     pub language: String,
@@ -291,15 +291,25 @@ impl Default for Settings {
 }
 
 fn file() -> Option<PathBuf> {
-    crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("ski").join("settings.json"))
+    crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("compression").join("settings.json"))
 }
 
 impl Settings {
     pub fn load() -> Self {
         file()
             .and_then(|f| std::fs::read_to_string(f).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
+            .map_or_else(Self::default, Self::with_current_view_names)
+    }
+
+    /// Settings saved by Ski name the Recent and Bookmarks views `ski:recent` and `ski:bookmarks`.
+    fn with_current_view_names(mut self) -> Self {
+        use crate::fs::places::normalize;
+        self.start_path = self.start_path.map(normalize);
+        self.last_dir = self.last_dir.map(normalize);
+        self.session_tabs = self.session_tabs.into_iter().map(normalize).collect();
+        self.folder_views = self.folder_views.into_iter().map(|(path, view)| (normalize(path), view)).collect();
+        self
     }
 
     /// The tabs of the last session that can still be opened, and the position of the one that was
@@ -324,5 +334,20 @@ impl Settings {
         if let Ok(json) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(file, json);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_saved_by_ski_name_the_views_by_their_current_names() {
+        let json = r#"{"start_path":"ski:recent","last_dir":"ski:bookmarks","session_tabs":["ski:recent","/tmp"],"folder_views":{"ski:bookmarks":"List"}}"#;
+        let settings = serde_json::from_str::<Settings>(json).unwrap().with_current_view_names();
+        assert_eq!(settings.start_path, Some(PathBuf::from("compression:recent")));
+        assert_eq!(settings.last_dir, Some(PathBuf::from("compression:bookmarks")));
+        assert_eq!(settings.session_tabs, [PathBuf::from("compression:recent"), PathBuf::from("/tmp")]);
+        assert!(settings.folder_views.contains_key(&PathBuf::from("compression:bookmarks")));
     }
 }

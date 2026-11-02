@@ -727,7 +727,7 @@ mod tests {
     fn new_kinds_get_their_own_icons() {
         assert_eq!(specific_icon("disc.cue"), Some((icons::PLAYLIST, Tint::Peach)));
         assert_eq!(specific_icon("notebook.ipynb"), Some((icons::JUPYTER, Tint::Peach)));
-        assert_eq!(specific_icon("ski.desktop"), Some((icons::SHORTCUT, Tint::Blue)));
+        assert_eq!(specific_icon("compression.desktop"), Some((icons::SHORTCUT, Tint::Blue)));
         assert_eq!(specific_icon("libssl.so.3"), Some((icons::LIBRARY, Tint::Muted)));
         assert_eq!(specific_icon("notes.txt~"), Some((icons::BACKUP, Tint::Muted)));
         assert_eq!(specific_icon("DSC_1.NEF"), Some((icons::CAMERA_RAW, Tint::Peach)));

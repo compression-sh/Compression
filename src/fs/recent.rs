@@ -5,7 +5,7 @@ use std::path::PathBuf;
 const HISTORY_LIMIT: usize = 200;
 
 fn history_file() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("ski").join("recent.json"))
+    dirs::data_dir().map(|d| d.join("compression").join("recent.json"))
 }
 
 fn shared_file() -> Option<PathBuf> {

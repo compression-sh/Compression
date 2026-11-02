@@ -1,4 +1,4 @@
-# Usage in configuration.nix (or import nix/module.nix and set programs.ski.enable = true):
+# Usage in configuration.nix (or import nix/module.nix and set programs.compression.enable = true):
 #   environment.systemPackages = [ (pkgs.callPackage /path/to/Compression { }) ];
 #
 # By default this is the binary of the latest release (nix/release.json), which installs in seconds.

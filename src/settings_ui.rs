@@ -966,7 +966,7 @@ impl CompressionApp {
             material::section_label(ui, tr("Custom actions"), &theme);
             group_card(ui, &theme, |ui| {
                 let dir = crate::plugins::actions::dir();
-                let hint = tr("Each .json file or executable script in the actions folder becomes an entry in the context menu. The selected files are passed as arguments and in SKI_SELECTED_FILES.");
+                let hint = tr("Each .json file or executable script in the actions folder becomes an entry in the context menu. The selected files are passed as arguments and in COMPRESSION_SELECTED_FILES.");
                 let open = material::control_row(ui, &theme, material::row_hint(hint, &theme), |ui| {
                     button(ui, "open_actions", Some(icons::FOLDER_OPEN), tr("Open actions folder"), &theme, ButtonKind::Tonal, dir.is_some()).clicked()
                 });

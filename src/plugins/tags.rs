@@ -1,7 +1,7 @@
 //! Tags: coloured labels on files. The names are stored in the extended attribute
 //! `user.xdg.tags` (comma separated), the one Dolphin reads, so tags show in both managers.
-//! Colours are Compression's own (`~/.config/ski/tags.json`). Because there is no index, Compression remembers
-//! the paths it has seen tagged (`~/.local/share/ski/tag-paths.json`) to answer `tag:work`.
+//! Colours are Compression's own (`~/.config/compression/tags.json`). Because there is no index, Compression remembers
+//! the paths it has seen tagged (`~/.local/share/compression/tag-paths.json`) to answer `tag:work`.
 use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -96,7 +96,7 @@ pub struct Registry(BTreeMap<PathBuf, Vec<String>>);
 
 impl Registry {
     fn file() -> Option<PathBuf> {
-        dirs::data_dir().map(|d| d.join("ski").join("tag-paths.json"))
+        dirs::data_dir().map(|d| d.join("compression").join("tag-paths.json"))
     }
 
     fn load() -> Self {
@@ -275,7 +275,7 @@ pub struct Tags {
 }
 
 fn colors_file() -> Option<PathBuf> {
-    crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("ski").join("tags.json"))
+    crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("compression").join("tags.json"))
 }
 
 impl Tags {

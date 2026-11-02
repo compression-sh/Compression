@@ -1,5 +1,5 @@
 //! Custom actions: your own commands in the context menu. Every `*.json` file and every
-//! executable script in `~/.config/ski/actions/` is one entry.
+//! executable script in `~/.config/compression/actions/` is one entry.
 //!
 //! ```json
 //! { "name": "Convert to WebP", "command": "for f in \"$@\"; do cwebp \"$f\" -o \"${f%.*}.webp\"; done",
@@ -7,7 +7,8 @@
 //! ```
 //!
 //! `command` runs in `sh -c` inside the open folder with the selected files as arguments (`"$@"`).
-//! Both kinds also get `SKI_SELECTED_FILES` (one path per line) and `SKI_CURRENT_DIR`.
+//! Both kinds also get `COMPRESSION_SELECTED_FILES` (one path per line) and `COMPRESSION_CURRENT_DIR`,
+//! and the same two as `SKI_SELECTED_FILES` and `SKI_CURRENT_DIR`, so scripts written for Ski keep working.
 //! Optional filters: `extensions`, `dirs_only`, `files_only`, `single` (exactly one item).
 //!
 //! The folder is read again whenever a file in it changes, so edits show up without a restart.
@@ -79,7 +80,7 @@ pub struct Actions {
 }
 
 pub fn dir() -> Option<PathBuf> {
-    crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("ski").join("actions"))
+    crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("compression").join("actions"))
 }
 
 impl Actions {
@@ -235,7 +236,7 @@ impl Plugin for Actions {
     }
 
     fn description(&self) -> &'static str {
-        tr("Adds your scripts and commands from ~/.config/ski/actions to the context menu")
+        tr("Adds your scripts and commands from ~/.config/compression/actions to the context menu")
     }
 
     fn icon(&self) -> &'static str {
@@ -310,7 +311,7 @@ impl Plugin for Actions {
             }
         };
         let selected = paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join("\n");
-        command.current_dir(dir).env("SKI_SELECTED_FILES", selected).env("SKI_CURRENT_DIR", dir).stdin(std::process::Stdio::null());
+        command.current_dir(dir).env("COMPRESSION_SELECTED_FILES", &selected).env("COMPRESSION_CURRENT_DIR", dir).env("SKI_SELECTED_FILES", &selected).env("SKI_CURRENT_DIR", dir).stdin(std::process::Stdio::null());
         let (tx, label, running, finished) = (self.done_tx.clone(), entry.label, Arc::clone(&self.running), Arc::clone(&self.finished));
         running.fetch_add(1, Ordering::Relaxed);
         std::thread::spawn(move || {
@@ -377,7 +378,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("compression-actions-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.json"), r#"{"name":"List","command":"printf '%s\n' \"$@\" > out.txt; echo \"$SKI_CURRENT_DIR\" >> out.txt"}"#).unwrap();
+        std::fs::write(dir.join("a.json"), r#"{"name":"List","command":"printf '%s\n' \"$@\" > out.txt; echo \"$COMPRESSION_CURRENT_DIR\" \"$SKI_CURRENT_DIR\" >> out.txt"}"#).unwrap();
         std::fs::write(dir.join("broken.json"), "not json").unwrap();
         std::fs::write(dir.join("notes.txt"), "not executable").unwrap();
         std::fs::write(dir.join("tool.sh"), "#!/bin/sh\ntrue\n").unwrap();
@@ -396,7 +397,7 @@ mod tests {
         let message = actions.done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(message.contains("List"), "{message}");
         let out = std::fs::read_to_string(dir.join("out.txt")).unwrap();
-        assert_eq!(out, format!("one\ntwo words\n{}\n", dir.display()));
+        assert_eq!(out, format!("one\ntwo words\n{0} {0}\n", dir.display()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

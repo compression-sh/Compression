@@ -3,9 +3,22 @@ use std::path::PathBuf;
 use crate::ui::icons;
 
 /// Stand-in location of the Recent view, which lists files from many folders.
-pub const RECENT_PATH: &str = "ski:recent";
+pub const RECENT_PATH: &str = "compression:recent";
 /// Stand-in location of the Bookmarks view, which lists the hearted files and folders.
-pub const BOOKMARKS_PATH: &str = "ski:bookmarks";
+pub const BOOKMARKS_PATH: &str = "compression:bookmarks";
+
+/// The names the Recent and Bookmarks views had in Ski, still found in saved settings and given on the command line.
+const LEGACY_RECENT_PATH: &str = "ski:recent";
+const LEGACY_BOOKMARKS_PATH: &str = "ski:bookmarks";
+
+/// `path` with a legacy Ski view name replaced by the current one.
+pub fn normalize(path: PathBuf) -> PathBuf {
+    match path.to_str() {
+        Some(LEGACY_RECENT_PATH) => PathBuf::from(RECENT_PATH),
+        Some(LEGACY_BOOKMARKS_PATH) => PathBuf::from(BOOKMARKS_PATH),
+        _ => path,
+    }
+}
 
 /// Whether `path` names a view that lists items from many folders instead of a folder.
 pub fn is_virtual(path: &std::path::Path) -> bool {
@@ -73,7 +86,7 @@ impl Place {
         Self { name: name.into(), path, icon, kind: PlaceKind::Folder, group, drive: None, builtin: None }
     }
 
-    /// Pinned folders and files, saved in `~/.config/ski/pins.json`.
+    /// Pinned folders and files, saved in `~/.config/compression/pins.json`.
     pub fn load_pins() -> Vec<PathBuf> {
         load_paths("pins.json")
     }
@@ -82,7 +95,7 @@ impl Place {
         save_paths("pins.json", pins);
     }
 
-    /// Bookmarked files and folders, saved in `$XDG_STATE_HOME/ski/bookmarks.json`.
+    /// Bookmarked files and folders, saved in `$XDG_STATE_HOME/compression/bookmarks.json`.
     pub fn load_bookmarks() -> Vec<PathBuf> {
         bookmarks_file().map(|f| load_paths_from(&f)).unwrap_or_default()
     }
@@ -146,7 +159,7 @@ impl Place {
 
 /// Bookmarks are state rather than settings; platforms without a state directory use the data one.
 fn bookmarks_file() -> Option<PathBuf> {
-    dirs::state_dir().or_else(dirs::data_dir).map(|d| d.join("ski").join("bookmarks.json"))
+    dirs::state_dir().or_else(dirs::data_dir).map(|d| d.join("compression").join("bookmarks.json"))
 }
 
 fn load_paths(name: &str) -> Vec<PathBuf> {
@@ -177,7 +190,7 @@ fn save_paths_to(file: &std::path::Path, paths: &[PathBuf]) {
     }
 }
 
-/// Custom folder icons: folder path -> image path, saved in `~/.config/ski/folder_icons.json`.
+/// Custom folder icons: folder path -> image path, saved in `~/.config/compression/folder_icons.json`.
 pub fn load_folder_icons() -> HashMap<PathBuf, PathBuf> {
     config_file("folder_icons.json")
         .and_then(|f| std::fs::read_to_string(f).ok())
@@ -198,7 +211,7 @@ pub fn save_folder_icons(icons: &HashMap<PathBuf, PathBuf>) {
 static FOLDER_GLYPHS: std::sync::RwLock<Option<HashMap<PathBuf, char>>> = std::sync::RwLock::new(None);
 
 /// Custom folder glyphs: folder path -> a glyph of the bundled icon font, saved in
-/// `~/.config/ski/folder_glyphs.json`. Held globally, like the icon style, so every place a folder's
+/// `~/.config/compression/folder_glyphs.json`. Held globally, like the icon style, so every place a folder's
 /// icon is drawn can look it up.
 fn with_glyphs<R>(f: impl FnOnce(&mut HashMap<PathBuf, char>) -> R) -> R {
     let mut guard = FOLDER_GLYPHS.write().unwrap_or_else(|e| e.into_inner());
@@ -243,5 +256,22 @@ pub fn move_folder_glyph(old: &std::path::Path, new: &std::path::Path) {
 }
 
 fn config_file(name: &str) -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("ski").join(name))
+    dirs::config_dir().map(|d| d.join("compression").join(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn legacy_view_names_map_to_the_current_ones() {
+        assert_eq!(normalize(PathBuf::from("ski:recent")), PathBuf::from("compression:recent"));
+        assert_eq!(normalize(PathBuf::from("ski:bookmarks")), PathBuf::from("compression:bookmarks"));
+        assert_eq!(normalize(PathBuf::from("compression:recent")), PathBuf::from(RECENT_PATH));
+        assert_eq!(normalize(PathBuf::from("/home/me/ski:recent")), PathBuf::from("/home/me/ski:recent"));
+        assert!(is_virtual(&normalize(PathBuf::from("ski:recent"))));
+        assert!(is_virtual(&normalize(PathBuf::from("ski:bookmarks"))));
+        assert!(!is_virtual(Path::new("ski:recent")));
+    }
 }

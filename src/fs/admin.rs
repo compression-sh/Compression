@@ -7,7 +7,7 @@ use std::sync::mpsc;
 
 /// Tells the elevated Compression where the settings of the person who started it live. They are read
 /// from there but never written, so root does not leave files in someone else's home.
-pub const CONFIG_ENV: &str = "SKI_ADMIN_CONFIG";
+pub const CONFIG_ENV: &str = "COMPRESSION_ADMIN_CONFIG";
 
 /// Variables the elevated process needs to reach the display, the session and the same libraries.
 const PASS_ENV: &[&str] = &[
@@ -23,7 +23,7 @@ pub fn is_admin() -> bool {
 
 /// Whether the elevated Compression was started from another one, and so reads that one's settings.
 pub fn config_override() -> Option<PathBuf> {
-    std::env::var_os(CONFIG_ENV).map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+    crate::compat::env_var("ADMIN_CONFIG").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
 }
 
 fn pkexec() -> Option<PathBuf> {

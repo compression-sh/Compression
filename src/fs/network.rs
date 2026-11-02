@@ -388,7 +388,7 @@ fn helper_root() -> PathBuf {
 /// The addresses of the servers Compression mounted with a helper, kept beyond a restart so a pinned folder
 /// on one can still be reconnected.
 fn helper_records() -> Option<PathBuf> {
-    dirs::state_dir().or_else(dirs::data_dir).map(|d| d.join("ski").join("mounts"))
+    dirs::state_dir().or_else(dirs::data_dir).map(|d| d.join("compression").join("mounts"))
 }
 
 /// Whether files on servers get previews and folder counts, which reads them over the network.
@@ -695,7 +695,7 @@ struct Session {
 
 impl Session {
     fn run(&mut self, address: &Address) -> Result<PathBuf, Failure> {
-        let helpers_only = std::env::var("SKI_NETWORK_BACKEND").is_ok_and(|b| b == "fuse");
+        let helpers_only = crate::compat::env_var("NETWORK_BACKEND").is_some_and(|b| b == "fuse");
         if !helpers_only && find_program("gio").is_some() {
             match self.run_gvfs(address) {
                 Err(Failure::Unsupported(message)) => {
@@ -1361,7 +1361,7 @@ impl Server {
     }
 }
 
-/// The sidebar's servers and the addresses connected to lately, saved in `~/.config/ski/servers.json`.
+/// The sidebar's servers and the addresses connected to lately, saved in `~/.config/compression/servers.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Servers {
@@ -1374,7 +1374,7 @@ const RECENT_KEPT: usize = 8;
 
 impl Servers {
     fn file() -> Option<PathBuf> {
-        crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("ski").join("servers.json"))
+        crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("compression").join("servers.json"))
     }
 
     pub fn load() -> Servers {

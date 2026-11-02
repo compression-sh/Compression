@@ -35,13 +35,13 @@ chmod +x compression-docker
 ./compression-docker [folder]
 ```
 
-The script detects Wayland or X11 and mounts your home folder so you see your real files. Use `SKI_ENGINE=podman` for Podman. In the container, "Open with…" can't launch your host apps, so for everyday use install Compression natively.
+The script detects Wayland or X11 and mounts your home folder so you see your real files. Use `COMPRESSION_ENGINE=podman` for Podman. In the container, "Open with…" can't launch your host apps, so for everyday use install Compression natively.
 
 To build the image yourself:
 
 ```sh
 docker build -t compression .
-SKI_IMAGE=compression ./docker/compression-docker
+COMPRESSION_IMAGE=compression ./docker/compression-docker
 ```
 
 ### Cargo
@@ -85,45 +85,45 @@ This installs the binary of the latest release, patched for Nix, in a few second
 ```nix
 {
   imports = [ /path/to/Compression/nix/module.nix ];
-  programs.ski.enable = true;
-  # programs.ski.defaultFileManager = false;  # keep your current file manager
-  # programs.ski.filePicker = false;          # keep your current file dialog
-  # programs.ski.package = pkgs.callPackage /path/to/Compression { fromSource = true; };  # compile instead of the release binary
+  programs.compression.enable = true;
+  # programs.compression.defaultFileManager = false;  # keep your current file manager
+  # programs.compression.filePicker = false;          # keep your current file dialog
+  # programs.compression.package = pkgs.callPackage /path/to/Compression { fromSource = true; };  # compile instead of the release binary
 }
 ```
 
 It sets `inode/directory` to Compression, adds Compression as an xdg-desktop-portal backend for `org.freedesktop.impl.portal.FileChooser`, and sets `GTK_USE_PORTAL=1`. Log out and in after `nixos-rebuild switch`. Programs that use the portal then show Compression for "Open" and "Save as". Firefox also needs `widget.use-xdg-desktop-portal.file-picker = 1` (`programs.firefox.preferences` on NixOS); Chromium needs `--enable-features=UseXdgDesktopPortal` unless it picks it up itself. Programs with a dialog of their own don't use the portal and keep it.
 
-If you also use home-manager's `xdg.portal`, it takes over: it writes `~/.config/xdg-desktop-portal/portals.conf`, which beats the system one, and points `NIX_XDG_DESKTOP_PORTAL_DIR` at the per-user profile, which doesn't contain `ski.portal`. Then the dialogs stay GTK's. Add Compression there as well:
+If you also use home-manager's `xdg.portal`, it takes over: it writes `~/.config/xdg-desktop-portal/portals.conf`, which beats the system one, and points `NIX_XDG_DESKTOP_PORTAL_DIR` at the per-user profile, which doesn't contain `compression.portal`. Then the dialogs stay GTK's. Add Compression there as well:
 
 ```nix
 xdg.portal = {
   enable = true;
-  extraPortals = [ pkgs.xdg-desktop-portal-gtk osConfig.programs.ski.package ];  # osConfig: the NixOS config, needs `osConfig` in the module arguments
+  extraPortals = [ pkgs.xdg-desktop-portal-gtk osConfig.programs.compression.package ];  # osConfig: the NixOS config, needs `osConfig` in the module arguments
   config.common = {
     default = "*";
-    "org.freedesktop.impl.portal.FileChooser" = "ski";
+    "org.freedesktop.impl.portal.FileChooser" = "compression";
   };
 };
 ```
 
-The dialog attaches itself to the window that asked for it (Wayland, xdg-foreign), so compositors float it and center it on that window, as they do for GTK dialogs. When the program gives no window, the dialog is a fixed-size window, which most compositors float and center too. It opens at the size you last left it at (760×520 the first time). The dialog only browses and chooses: no moving, renaming or deleting (making a folder is allowed when saving or picking a folder). Saving asks before replacing each existing file, typing a folder name in the file name field goes into that folder, and `*/*` MIME filters use the system's shared-mime-info database. It starts in the folder the program last chose something in, and ends cleanly when the program withdraws the request. Its app id is `ski-chooser`; if yours tiles it, add a rule, e.g. sway: `for_window [app_id="ski-chooser"] floating enable, move position center`.
+The dialog attaches itself to the window that asked for it (Wayland, xdg-foreign), so compositors float it and center it on that window, as they do for GTK dialogs. When the program gives no window, the dialog is a fixed-size window, which most compositors float and center too. It opens at the size you last left it at (760×520 the first time). The dialog only browses and chooses: no moving, renaming or deleting (making a folder is allowed when saving or picking a folder). Saving asks before replacing each existing file, typing a folder name in the file name field goes into that folder, and `*/*` MIME filters use the system's shared-mime-info database. It starts in the folder the program last chose something in, and ends cleanly when the program withdraws the request. Its app id is `compression-chooser`; if yours tiles it, add a rule, e.g. sway: `for_window [app_id="compression-chooser"] floating enable, move position center`.
 
 ### Application menu and default file manager
 
 ```sh
-install -Dm644 assets/ski.desktop ~/.local/share/applications/ski.desktop
-install -Dm644 assets/logo.svg ~/.local/share/icons/hicolor/scalable/apps/ski.svg
-xdg-mime default ski.desktop inode/directory   # optional: open folders with Compression
+install -Dm644 assets/compression.desktop ~/.local/share/applications/compression.desktop
+install -Dm644 assets/logo.svg ~/.local/share/icons/hicolor/scalable/apps/compression.svg
+xdg-mime default compression.desktop inode/directory   # optional: open folders with Compression
 ```
 
 ### Other distributions: file dialog and file manager service
 
-Compression can answer `org.freedesktop.FileManager1` (browsers' "Show in folder") and be the portal FileChooser. Install the files in `assets/` (`ski.portal` into `share/xdg-desktop-portal/portals/`, the two `.service` files into `share/dbus-1/services/` with `@out@` replaced by your prefix), then add this to `~/.config/xdg-desktop-portal/portals.conf`. (`ski.portal` also lists the desktops it may serve in `UseIn=`, but when several installed portals offer a file dialog the one named here wins, so this line is what makes Compression the choice.)
+Compression can answer `org.freedesktop.FileManager1` (browsers' "Show in folder") and be the portal FileChooser. Install the files in `assets/` (`compression.portal` into `share/xdg-desktop-portal/portals/`, the two `.service` files into `share/dbus-1/services/` with `@out@` replaced by your prefix), then add this to `~/.config/xdg-desktop-portal/portals.conf`. (`compression.portal` also lists the desktops it may serve in `UseIn=`, but when several installed portals offer a file dialog the one named here wins, so this line is what makes Compression the choice.)
 
 ```ini
 [preferred]
-org.freedesktop.impl.portal.FileChooser=ski
+org.freedesktop.impl.portal.FileChooser=compression
 ```
 
 `compression --portal` is the service itself; D-Bus starts it when needed. Each dialog is `compression --chooser --mode open|folder|save|save-files` in a window of its own, which prints the chosen `file://` URIs and exits with 0 (or 1 if cancelled).
@@ -225,7 +225,7 @@ The default theme follows your [Serpantinum](https://github.com/ilyamiro) colors
 
 ### Custom themes
 
-The **+** card in Settings → Appearance opens the theme editor: give the theme a name, set every color with a picker or a hex code (or start from any built-in palette), and press Save. Your themes are listed under the divider, each with an edit button beside it, and each is one JSON file in `~/.local/state/ski/themes/`, named after the theme (`mine.json` is selected by `"theme": "custom:mine"` in the settings). A color generator (matugen, wallust, pywal, …) can write such a file from a template; Compression follows the folder while it runs:
+The **+** card in Settings → Appearance opens the theme editor: give the theme a name, set every color with a picker or a hex code (or start from any built-in palette), and press Save. Your themes are listed under the divider, each with an edit button beside it, and each is one JSON file in `~/.local/state/compression/themes/`, named after the theme (`mine.json` is selected by `"theme": "custom:mine"` in the settings). A color generator (matugen, wallust, pywal, …) can write such a file from a template; Compression follows the folder while it runs:
 
 ```json
 {
@@ -240,7 +240,7 @@ The **+** card in Settings → Appearance opens the theme editor: give the theme
 A color that is missing or not `#rrggbb` keeps the Dark palette's. The built-in palettes are plain JSON files of the same shape in `assets/themes/`.
 
 
-Settings are stored in `~/.config/ski/settings.json`, and the trash in `~/.local/share/Trash`.
+Settings are stored in `~/.config/compression/settings.json`, and the trash in `~/.local/share/Trash`.
 
 ## Plugins
 
@@ -248,17 +248,17 @@ Compression bundles a few optional features as plugins. Switch them on or off in
 
 - **Git** marks changed (`M`), staged (`A`, `S`, `R`), deleted (`D`), conflicted (`!`) and untracked (`?`) files, marks folders that contain changes, and shows the branch and the number of changes in the corner. In a repository the context menu gets a Git group: Stage, Unstage, Show diff (staged and unstaged changes against the last commit, in a window) and Discard changes (asks first; the changes cannot be brought back and are not part of Undo).
 - **Checksums** adds MD5, SHA-1, SHA-256 and SHA-512 to Properties and says whether one of them matches a hash on the clipboard or the checksum file next to the download (`name.sha256`, `name.sha1`, `name.md5`, `SHA256SUMS`, `sha256sums.txt`, `MD5SUMS` and similar, in the GNU or BSD format). On a checksum file, "Verify files listed" checks every file it names as a file operation (progress, pause, cancel) and reports how many are OK, failed or missing. Names that point outside the folder are refused.
-- **Tags** puts coloured labels on files. Right-click → Tags (or `Alt+T`) adds a tag; the colours show as dots on the icon, and Settings → Plugins lets you pick them. The names are stored in the extended attribute `user.xdg.tags`, the one Dolphin reads, so both managers show them; the colours are Compression's own (`~/.config/ski/tags.json`). Copies and cross-disk moves keep the tags; archives do not. The sidebar lists the tags Compression has seen, and `tag:work` in the search finds them (Compression remembers paths it tagged or saw tagged; "Find tags in this folder" rebuilds that list after other programs moved files). File systems without extended attributes (FAT, exFAT, some network shares) can't store tags, and links can't carry them.
+- **Tags** puts coloured labels on files. Right-click → Tags (or `Alt+T`) adds a tag; the colours show as dots on the icon, and Settings → Plugins lets you pick them. The names are stored in the extended attribute `user.xdg.tags`, the one Dolphin reads, so both managers show them; the colours are Compression's own (`~/.config/compression/tags.json`). Copies and cross-disk moves keep the tags; archives do not. The sidebar lists the tags Compression has seen, and `tag:work` in the search finds them (Compression remembers paths it tagged or saw tagged; "Find tags in this folder" rebuilds that list after other programs moved files). File systems without extended attributes (FAT, exFAT, some network shares) can't store tags, and links can't carry them.
 - **Duplicate finder** looks for files with identical contents. Right-click a folder (or the empty space of the open folder) → Find duplicate files… The search runs as a file operation (progress, pause, cancel) and skips empty files, links and hard links of the same file. It compares sizes first, then the start and end of the files, and reads whole only what still looks alike (SHA-256). Nothing is selected for you: tick copies by hand or let a rule pick (keep the newest, the oldest, the shortest path, or the copy inside a folder). One copy of every group always stays; a copy that changed since the search is left alone; the rest go to the trash as one undo step.
 - **Compare folders** shows how two folders differ. Select two folders → Compare, or right-click empty space → Compare with the other tab (when exactly two tabs are open) or Compare folders… (two path fields). Each item is listed as only on the left or right, newer on one side, different with equal times, or identical (hidden until you switch it on); a folder that exists on one side only is one row. Items count as equal when size and modification time match (two seconds apart is still equal, for FAT); "Compare contents" reads files of equal size instead. Tick rows and copy them to the other side (name clashes ask, progress and Undo work as for any copy), move one side's copy to the trash, or open it. It never deletes by itself, so it is a compare-and-copy tool, not a mirror.
 - **Quick Look** previews the selected file when you press Space: text and code with line numbers, pictures and documents (not folders) and the contents of archives (a folder tree with sizes, the unpacked size, the compression ratio and a lock on encrypted entries; nothing is extracted). `.zip` is read from its index; tar archives are streamed and listing stops after 2,000 entries or 10 seconds; `.tar.xz`, `.tar.bz2`, `.tar.zst`, `.7z`, `.rar`, `.iso`, `.deb` and `.rpm` need the tools from the Archives table below. Up and Down browse, Space or Esc closes.
-- **Custom actions** adds your own commands to the context menu. Put a `.json` file or an executable script in `~/.config/ski/actions/`; changes are picked up while Compression runs, and Settings → Plugins lists the files that failed to load:
+- **Custom actions** adds your own commands to the context menu. Put a `.json` file or an executable script in `~/.config/compression/actions/`; changes are picked up while Compression runs, and Settings → Plugins lists the files that failed to load:
 
   ```json
   { "name": "Convert to WebP", "command": "for f in \"$@\"; do cwebp \"$f\" -o \"${f%.*}.webp\"; done", "extensions": ["jpg", "png"] }
   ```
 
-  The command runs in the open folder with the selected files as arguments, and `SKI_SELECTED_FILES` and `SKI_CURRENT_DIR` are set. Filters: `extensions`, `dirs_only`, `files_only`, `single`.
+  The command runs in the open folder with the selected files as arguments, and `COMPRESSION_SELECTED_FILES` and `COMPRESSION_CURRENT_DIR` are set. Filters: `extensions`, `dirs_only`, `files_only`, `single`.
 
 Folder sizes: the Size column shows how many items a folder holds. Right-click a folder → Calculate size (Settings → Files & View → Details → Folder sizes: Off, On demand, Always) measures it; sizes appear in the column, in the status line for a selection and in sorting. Two folders are measured at a time, hard-linked files count once, links are not followed and other mounted disks are skipped. A folder Compression could not fully read shows `≥`. Sizes are remembered for the session and dropped when Compression changes something inside, or on refresh (`F5`); changes made by other programs show after a refresh. "Size on disk" counts allocated blocks instead of file lengths.
 

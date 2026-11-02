@@ -672,6 +672,7 @@ impl CompressionApp {
     }
 
     pub fn navigate_to(&mut self, target: PathBuf) {
+        let target = crate::fs::places::normalize(target);
         if target == self.current_path {
             return;
         }

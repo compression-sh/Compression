@@ -1,6 +1,7 @@
 mod app;
 mod chooser;
 mod clipboard;
+mod compat;
 mod fs;
 mod i18n;
 mod instance;
@@ -22,6 +23,7 @@ use app::CompressionApp;
 use ui::theme::SerpantinumTheme;
 
 fn main() -> eframe::Result {
+    compat::migrate_user_data();
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "--portal") {
         if let Err(err) = portal::serve() {
@@ -80,7 +82,7 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
             kept_session = Some(settings.restorable_session().0);
         }
         // A launcher passes what was dropped on it as `file://` URIs
-        let path = chooser::from_uri(&arg).unwrap_or_else(|| PathBuf::from(arg));
+        let path = fs::places::normalize(chooser::from_uri(&arg).unwrap_or_else(|| PathBuf::from(arg)));
         // Relative to where the launch was made, which a resident process does not share
         let path = if fs::places::is_virtual(&path) { path } else { request.cwd.join(path) };
         match path.parent() {
@@ -123,7 +125,7 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
         .with_inner_size([1080.0, 720.0])
         .with_min_inner_size([360.0, 420.0]);
     if let Some(spec) = &chooser {
-        viewport = viewport.with_inner_size(chooser::saved_size().unwrap_or(chooser::DEFAULT_SIZE)).with_app_id("ski-chooser");
+        viewport = viewport.with_inner_size(chooser::saved_size().unwrap_or(chooser::DEFAULT_SIZE)).with_app_id("compression-chooser");
         // Tied to its requester (see wayland_parent.rs) it is floated and centered as a dialog and can
         // stay resizable; without a parent, a fixed size is what makes tiling compositors float it
         if !spec.parent.as_deref().is_some_and(|p| p.starts_with("wayland:") || p.starts_with("x11:")) {
@@ -144,7 +146,7 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
     };
 
     eframe::run_native(
-        "ski-file-manager",
+        "compression-file-manager",
         native_options,
         Box::new(move |cc| {
             ui::fonts::install(&cc.egui_ctx, settings.font.as_deref());

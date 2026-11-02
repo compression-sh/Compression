@@ -74,11 +74,11 @@ craneLib.buildPackage (common // {
   inherit src version cargoArtifacts;
 
   postInstall = ''
-    install -Dm644 assets/ski.desktop $out/share/applications/ski.desktop
-    install -Dm644 assets/logo.svg $out/share/icons/hicolor/scalable/apps/ski.svg
+    install -Dm644 assets/compression.desktop $out/share/applications/compression.desktop
+    install -Dm644 assets/logo.svg $out/share/icons/hicolor/scalable/apps/compression.svg
 
-    install -Dm644 assets/ski.portal $out/share/xdg-desktop-portal/portals/ski.portal
-    for name in org.freedesktop.impl.portal.desktop.ski org.freedesktop.FileManager1; do
+    install -Dm644 assets/compression.portal $out/share/xdg-desktop-portal/portals/compression.portal
+    for name in org.freedesktop.impl.portal.desktop.compression org.freedesktop.FileManager1; do
       install -Dm644 assets/$name.service $out/share/dbus-1/services/$name.service
       substituteInPlace $out/share/dbus-1/services/$name.service --replace-fail @out@ $out
     done

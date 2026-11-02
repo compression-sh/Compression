@@ -368,7 +368,7 @@ pub fn launch(app: &AppEntry, file: &Path) -> std::io::Result<()> {
 
 /// Per-file "always open with" choices: file path -> desktop entry id.
 fn overrides_file() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("ski").join("open_with.json"))
+    dirs::config_dir().map(|d| d.join("compression").join("open_with.json"))
 }
 
 pub fn load_overrides() -> HashMap<PathBuf, String> {

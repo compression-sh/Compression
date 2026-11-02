@@ -8,5 +8,5 @@ Icon=compression
 Terminal=false
 Categories=System;FileTools;FileManager;Utility;
 MimeType=inode/directory;
-StartupWMClass=ski-file-manager
+StartupWMClass=compression-file-manager
 Keywords=files;folders;browser;explorer;
