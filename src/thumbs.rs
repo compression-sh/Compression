@@ -71,20 +71,40 @@ struct Waiting {
     /// How many waiting jobs each file has, so a worker asks the few files on screen whether they
     /// wait instead of hashing every job of a big folder on each turn.
     count: HashMap<PathBuf, usize>,
+    /// The queue was closed: nothing new is taken, and the workers leave.
+    closed: bool,
 }
 
 impl Queue {
     fn push(&self, job: Job) {
         if let Ok(mut waiting) = self.jobs.lock() {
+            if waiting.closed {
+                return;
+            }
             *waiting.count.entry(job.path.clone()).or_default() += 1;
             waiting.jobs.push_back(job);
         }
         self.wake.notify_one();
     }
 
-    fn pop(&self) -> Job {
+    /// Ends the workers' wait for jobs: the jobs still waiting are dropped, a job a worker is
+    /// busy with is finished, and every worker leaves the queue after that.
+    fn close(&self) {
+        let mut waiting = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        waiting.closed = true;
+        waiting.jobs.clear();
+        waiting.count.clear();
+        drop(waiting);
+        self.wake.notify_all();
+    }
+
+    /// The next job, waiting for one; `None` once the queue is closed.
+    fn pop(&self) -> Option<Job> {
         let mut waiting = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
         loop {
+            if waiting.closed {
+                return None;
+            }
             if !waiting.jobs.is_empty() {
                 let at = {
                     let visible = self.visible.lock().unwrap_or_else(|e| e.into_inner());
@@ -101,7 +121,7 @@ impl Queue {
                         waiting.count.remove(&job.path);
                     }
                 }
-                return job;
+                return Some(job);
             }
             waiting = self.wake.wait(waiting).unwrap_or_else(|e| e.into_inner());
         }
@@ -131,6 +151,14 @@ pub struct Thumbnails {
     queue: Arc<Queue>,
     result_rx: mpsc::Receiver<(PathBuf, Stamp, Outcome)>,
     generation: Arc<AtomicU64>,
+}
+
+impl Drop for Thumbnails {
+    /// The workers wait for jobs for ever otherwise, and every window that was opened would leave
+    /// its workers behind in a process that keeps running.
+    fn drop(&mut self) {
+        self.queue.close();
+    }
 }
 
 /// Smallest tier that is at least `px` physical pixels, or the largest one.
@@ -222,8 +250,7 @@ impl Thumbnails {
             std::thread::spawn(move || {
                 // Decoding is background work: it yields to the UI thread instead of competing with it
                 unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::syscall(libc::SYS_gettid) as libc::id_t, 15) };
-                loop {
-                let job = queue.pop();
+                while let Some(job) = queue.pop() {
                 // Skip work for folders the user already left
                 if job.generation != generation.load(Ordering::Relaxed) {
                     let _ = result_tx.send((job.path, job.stamp, Outcome::Cancelled));
@@ -1130,6 +1157,61 @@ mod cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_queue_wakes_its_workers_and_takes_no_more_jobs() {
+        let queue = Arc::new(Queue::default());
+        let (left_tx, left_rx) = mpsc::channel();
+        let workers: Vec<_> = (0..3)
+            .map(|_| {
+                let (queue, left_tx) = (queue.clone(), left_tx.clone());
+                std::thread::spawn(move || {
+                    // Waits here, with nothing queued
+                    let got = queue.pop();
+                    let _ = left_tx.send(got.is_none());
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(left_rx.try_recv().is_err(), "the workers should be waiting");
+        queue.close();
+        for _ in 0..3 {
+            assert_eq!(left_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true), "a worker did not leave");
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        // Closed for good: a job pushed now is not kept, and popping does not wait
+        queue.push(Job { path: PathBuf::from("/x"), stamp: (None, 0), tier: 128, generation: 0 });
+        assert!(queue.jobs.lock().unwrap().jobs.is_empty());
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn jobs_waiting_when_the_queue_closes_are_dropped_not_started() {
+        let queue = Queue::default();
+        for name in ["a", "b", "c"] {
+            queue.push(Job { path: PathBuf::from(name), stamp: (None, 0), tier: 128, generation: 0 });
+        }
+        queue.close();
+        assert!(queue.pop().is_none());
+        assert!(queue.jobs.lock().unwrap().count.is_empty());
+    }
+
+    #[test]
+    fn dropping_the_thumbnails_ends_their_workers() {
+        let thumbs = Thumbnails::new(&egui::Context::default());
+        let queue = thumbs.queue.clone();
+        // The workers and the instance each hold the queue
+        assert!(Arc::strong_count(&queue) > WORKERS);
+        drop(thumbs);
+        // Once every worker has left, only this test holds it
+        let started = std::time::Instant::now();
+        while Arc::strong_count(&queue) > 1 && started.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(Arc::strong_count(&queue), 1, "the workers were still running");
+    }
 
     #[test]
     fn a_helper_that_prints_without_end_is_cut_off_at_the_limit() {
