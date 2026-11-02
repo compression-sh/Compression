@@ -5,7 +5,47 @@
 //! compositor without data-control) the caller falls back to pasting the paths as text.
 
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// The most that is read from another program's clipboard offer; more than this is refused.
+const READ_LIMIT: usize = 16 << 20;
+/// How long a program may take to send its clipboard offer. The window waits meanwhile.
+const READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// What another program sends through `reader`, a pipe from the clipboard owner. The owner decides
+/// when it writes and when it closes the pipe, and may never do either, so waiting is bounded:
+/// `None` when it takes longer than `timeout` or sends more than `limit` bytes.
+fn read_limited<R: Read + AsRawFd>(reader: &mut R, limit: usize, timeout: Duration) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let mut data = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd { fd: reader.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd
+        let ready = unsafe { libc::poll(&mut pfd, 1, left) };
+        if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if ready <= 0 {
+            return None;
+        }
+        // Data is waiting, or the owner closed the pipe: this read does not block
+        match reader.read(&mut buf) {
+            Ok(0) => return Some(data),
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                if data.len() > limit {
+                    return None;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+}
 
 const URI_LIST: &str = "text/uri-list";
 const GNOME_FILES: &str = "x-special/gnome-copied-files";
@@ -108,9 +148,7 @@ pub fn get_text() -> Option<String> {
     if on_wayland() {
         use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents};
         let (mut pipe, _) = get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text).ok()?;
-        let mut text = String::new();
-        pipe.read_to_string(&mut text).ok()?;
-        Some(text)
+        String::from_utf8(read_limited(&mut pipe, READ_LIMIT, READ_TIMEOUT)?).ok()
     } else {
         arboard::Clipboard::new().ok()?.get_text().ok()
     }
@@ -127,8 +165,7 @@ pub fn get_image_png() -> Option<Vec<u8>> {
             offered.iter().find(|m| m.starts_with("image/") && !m.contains("svg")).map(String::as_str)?
         };
         let (mut pipe, _) = get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Specific(mime)).ok()?;
-        let mut bytes = Vec::new();
-        pipe.read_to_end(&mut bytes).ok()?;
+        let bytes = read_limited(&mut pipe, READ_LIMIT, READ_TIMEOUT)?;
         if mime == "image/png" {
             return (!bytes.is_empty()).then_some(bytes);
         }
@@ -149,9 +186,7 @@ fn get_wayland() -> Option<(Vec<PathBuf>, bool)> {
     use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents};
     let read = |mime: &str| -> Option<String> {
         let (mut pipe, _) = get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Specific(mime)).ok()?;
-        let mut text = String::new();
-        pipe.read_to_string(&mut text).ok()?;
-        Some(text)
+        String::from_utf8(read_limited(&mut pipe, READ_LIMIT, READ_TIMEOUT)?).ok()
     };
     if let Some(text) = read(GNOME_FILES) {
         let mut lines = text.lines();
@@ -180,6 +215,61 @@ mod tests {
         let uri = percent_encode(&path);
         assert_eq!(uri, "file:///home/me/My%20Photos/%C3%BCn%C3%AF%20%231%20%28a%29%25.png");
         assert_eq!(percent_decode(&uri), Some(path));
+    }
+
+    /// A pipe, as a clipboard owner would hand one over: the reading end, and the writing end the
+    /// test plays the owner with.
+    fn pipe() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe2 fills two descriptors that the files then own
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn a_clipboard_owner_that_never_writes_is_given_up_on() {
+        use std::io::Write;
+        let (mut read, mut write) = pipe();
+        // Nothing is sent and the pipe stays open: the read ends at the timeout instead of waiting for good
+        let started = Instant::now();
+        assert_eq!(read_limited(&mut read, 1024, Duration::from_millis(150)), None);
+        assert!(started.elapsed() >= Duration::from_millis(100) && started.elapsed() < Duration::from_secs(5));
+        // An owner that sends some and then stalls does not get the half either
+        write.write_all(b"half of it").unwrap();
+        assert_eq!(read_limited(&mut read, 1024, Duration::from_millis(150)), None);
+    }
+
+    #[test]
+    fn a_clipboard_offer_over_the_limit_is_refused() {
+        use std::io::Write;
+        let (mut read, write) = pipe();
+        let owner = std::thread::spawn(move || {
+            let mut write = write;
+            // Keeps sending until the reader stops listening
+            let chunk = [b'x'; 4096];
+            while write.write_all(&chunk).is_ok() {}
+        });
+        assert_eq!(read_limited(&mut read, 64 * 1024, Duration::from_secs(10)), None);
+        drop(read);
+        owner.join().unwrap();
+    }
+
+    #[test]
+    fn a_complete_clipboard_offer_is_read_whole() {
+        use std::io::Write;
+        let (mut read, mut write) = pipe();
+        write.write_all(b"file:///tmp/a\r\nfile:///tmp/b\r\n").unwrap();
+        drop(write);
+        assert_eq!(read_limited(&mut read, 1024, Duration::from_secs(5)).as_deref(), Some(&b"file:///tmp/a\r\nfile:///tmp/b\r\n"[..]));
+        // An exact fit is fine too, and an empty offer is an empty answer
+        let (mut read, mut write) = pipe();
+        write.write_all(&[1u8; 100]).unwrap();
+        drop(write);
+        assert_eq!(read_limited(&mut read, 100, Duration::from_secs(5)).map(|d| d.len()), Some(100));
+        let (mut read, write) = pipe();
+        drop(write);
+        assert_eq!(read_limited(&mut read, 100, Duration::from_secs(5)), Some(Vec::new()));
     }
 
     #[test]
