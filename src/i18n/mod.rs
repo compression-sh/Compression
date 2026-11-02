@@ -85,7 +85,7 @@ impl Language {
         TABLES[self.index()].get_or_init(|| match self.catalog() {
             Ok(entries) => entries.into_iter().filter(|(_, t)| !t.is_empty()).collect(),
             Err(e) => {
-                eprintln!("ski: the {} translation is broken: {e}", self.code());
+                eprintln!("compression: the {} translation is broken: {e}", self.code());
                 HashMap::new()
             }
         })

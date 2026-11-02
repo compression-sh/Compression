@@ -109,7 +109,7 @@ pub(super) fn visible_rows(rects: &[(usize, egui::Rect)], viewport: egui::Rect) 
     }
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// The listing with the rows on screen first, then the ones above them, then the ones below.
     fn visible_first(&self) -> impl Iterator<Item = &FileItem> {
         let end = self.visible_rows.end.min(self.items.len());
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn scrolled_to_folders_jump_the_queue() {
-        let (a, b, c) = (Path::new("/ski-test/queue/a"), Path::new("/ski-test/queue/b"), Path::new("/ski-test/queue/c"));
+        let (a, b, c) = (Path::new("/compression-test/queue/a"), Path::new("/compression-test/queue/b"), Path::new("/compression-test/queue/c"));
         let mut scheduler = SizeScheduler::default();
         scheduler.request(a);
         scheduler.request(b);

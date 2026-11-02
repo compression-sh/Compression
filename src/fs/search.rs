@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn contents_match_text_files_only() {
-        let dir = std::env::temp_dir().join(format!("ski_search_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression_search_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("note.txt"), "Remember the Milk").unwrap();

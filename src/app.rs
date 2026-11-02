@@ -87,7 +87,7 @@ enum MenuTarget {
 
 type MenuEntry = (&'static str, &'static str, MenuAction);
 
-/// "Open as administrator" for a real folder, unless Ski already is one or cannot elevate.
+/// "Open as administrator" for a real folder, unless Compression already is one or cannot elevate.
 fn admin_entry(path: &Path) -> Option<MenuEntry> {
     (path.is_dir() && !trash::is_trash_folder(path) && crate::fs::admin::available())
         .then(|| (icons::SHIELD, tr("Open as administrator"), MenuAction::OpenAsAdmin(path.to_path_buf())))
@@ -329,7 +329,7 @@ fn by_file_name(a: &Path, b: &Path) -> std::cmp::Ordering {
     natural_cmp(&name(a), &name(b))
 }
 
-pub struct SkiApp {
+pub struct CompressionApp {
     current_path: PathBuf,
     items: Vec<FileItem>,
     selected_index: Option<usize>,
@@ -434,7 +434,7 @@ pub struct SkiApp {
     folder_icons: HashMap<PathBuf, PathBuf>,
     open_overrides: HashMap<PathBuf, String>,
     pub(crate) app_icons: HashMap<String, Option<egui::TextureHandle>>,
-    /// Failure report of the administrator Ski being started, if it has one to give
+    /// Failure report of the administrator Compression being started, if it has one to give
     admin_launch: Option<std::sync::mpsc::Receiver<std::io::Error>>,
 
     // Persisted preferences, and what the next frame has to re-apply to egui
@@ -481,7 +481,7 @@ pub struct SkiApp {
     visible_rows: std::ops::Range<usize>,
     /// Tiles per row in the grid view, so the vertical arrows move by a whole row.
     grid_cols: usize,
-    /// Set when Ski runs as the open / save dialog of other programs.
+    /// Set when Compression runs as the open / save dialog of other programs.
     pub(crate) chooser: Option<crate::chooser::Chooser>,
     pub(crate) closing_dialog: Option<Dialog>,
     /// Kind of the dialog on screen, to notice when a new one appears and should take keyboard focus.
@@ -521,7 +521,7 @@ pub struct SkiApp {
     type_ahead: (String, std::time::Instant),
 }
 
-impl SkiApp {
+impl CompressionApp {
     pub fn new(initial_path: PathBuf, theme: SerpantinumTheme, settings: Settings, ctx: &egui::Context) -> Self {
         apps::preload();
         crate::ui::fonts::preload();
@@ -1327,13 +1327,13 @@ impl SkiApp {
         }
     }
 
-    /// Another Ski window on the current folder.
+    /// Another Compression window on the current folder.
     fn new_window(&mut self) {
         let here = self.current_path.clone();
         self.open_window(&here);
     }
 
-    /// Another Ski window on `path`.
+    /// Another Compression window on `path`.
     fn open_window(&mut self, path: &Path) {
         if let Some((address, password)) = Self::server_target(path) {
             self.open_address(address, password, OpenIn::NewWindow);
@@ -2151,7 +2151,7 @@ const CRUMB_HEIGHT: f32 = 26.0;
 const CRUMB_INSET: f32 = (material::CONTROL_HEIGHT - CRUMB_HEIGHT) / 2.0;
 const CRUMB_ICON_STEP: f32 = material::INSET_LABEL - material::INSET_ICON + 8.0;
 
-impl eframe::App for SkiApp {
+impl eframe::App for CompressionApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0; 4]
     }
@@ -2245,7 +2245,7 @@ impl eframe::App for SkiApp {
             self.resort_items();
         }
 
-        let title = format!("{} — Ski", self.location_name());
+        let title = format!("{} — Compression", self.location_name());
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.window_title = title;
@@ -2367,7 +2367,7 @@ impl eframe::App for SkiApp {
     }
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// Sends the text copied this frame in the window of `ctx` to the system clipboard, since
     /// egui's own clipboard is left out of the build (see wayland_dnd.rs).
     fn copy_text_out(&mut self, ctx: &egui::Context) {
@@ -2397,7 +2397,7 @@ impl SkiApp {
     }
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// The window has no frame of its own, so its outer few pixels resize it, like Nautilus's.
     fn window_resize_edges(ctx: &egui::Context) {
         use egui::viewport::ResizeDirection as D;
@@ -3956,7 +3956,7 @@ impl SkiApp {
 }
 
 /// Context menu, pinning, file creation and the properties dialog.
-impl SkiApp {
+impl CompressionApp {
     fn toggle_pin(&mut self, path: PathBuf) {
         let path = path.canonicalize().unwrap_or(path);
         if let Some(idx) = self.pins.iter().position(|p| *p == path) {
@@ -5463,7 +5463,7 @@ impl SkiApp {
     /// keeps up when the main window is out of sight.
     fn render_picker(&mut self, ctx: &egui::Context) {
         let Some(picker) = self.picker.as_ref() else {
-            chrome::reap_closed_viewport(ctx, egui::ViewportId::from_hash_of("ski_folder_picker"));
+            chrome::reap_closed_viewport(ctx, egui::ViewportId::from_hash_of("compression_folder_picker"));
             return;
         };
         let title = match picker.op {
@@ -5480,7 +5480,7 @@ impl SkiApp {
             .with_inner_size([880.0, 600.0])
             .with_min_inner_size([560.0, 380.0]);
         let app = settings_window::AppPtr::new(self);
-        ctx.show_viewport_deferred(egui::ViewportId::from_hash_of("ski_folder_picker"), builder, move |ui, _class| {
+        ctx.show_viewport_deferred(egui::ViewportId::from_hash_of("compression_folder_picker"), builder, move |ui, _class| {
             // SAFETY: see `AppPtr`; the app outlives every window
             let app = unsafe { &mut *app.get() };
             app.picker_ui(ui);
@@ -6227,10 +6227,10 @@ mod tests {
     use super::*;
 
     /// "Always" measures the folders of the listing, the selection's status line adds them up, and
-    /// changing a folder from inside Ski makes its total (and its parents') stale.
+    /// changing a folder from inside Compression makes its total (and its parents') stale.
     #[test]
     fn folder_sizes_are_measured_shown_and_invalidated() {
-        let work = std::env::temp_dir().join(format!("ski_app_sizes_{}", std::process::id()));
+        let work = std::env::temp_dir().join(format!("compression_app_sizes_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(work.join("big")).unwrap();
         std::fs::create_dir_all(work.join("empty")).unwrap();
@@ -6239,7 +6239,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         let settings = Settings { folder_sizes: crate::settings::FolderSizeMode::Always, ..Settings::default() };
-        let mut app = SkiApp::new(work.clone(), SerpantinumTheme::default(), settings, &ctx);
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), settings, &ctx);
         let big = work.join("big");
         for _ in 0..300 {
             app.tick_folder_sizes(&ctx);
@@ -6267,17 +6267,17 @@ mod tests {
     /// leaving for another folder, and tells the total in a toast.
     #[test]
     fn calculate_size_reports_in_a_toast() {
-        let work = std::env::temp_dir().join(format!("ski_app_calcsize_{}", std::process::id()));
+        let work = std::env::temp_dir().join(format!("compression_app_calcsize_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(work.join("place/inner")).unwrap();
         std::fs::create_dir_all(work.join("elsewhere")).unwrap();
         std::fs::write(work.join("place/inner/data.bin"), vec![0u8; 3000]).unwrap();
 
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(work.join("elsewhere"), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut app = CompressionApp::new(work.join("elsewhere"), SerpantinumTheme::default(), Settings::default(), &ctx);
         let place = work.join("place");
         app.calculate_sizes(std::slice::from_ref(&place));
-        let toast = |app: &SkiApp| app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+        let toast = |app: &CompressionApp| app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
         assert_eq!(toast(&app), "Calculating the size of “place”…");
         app.sizes.cancel_all();
         for _ in 0..300 {
@@ -6294,7 +6294,7 @@ mod tests {
     /// Sorting by size orders folders by how many items they hold, not by their bytes.
     #[test]
     fn sorting_by_size_orders_folders_by_item_count() {
-        let work = std::env::temp_dir().join(format!("ski_app_sortsize_{}", std::process::id()));
+        let work = std::env::temp_dir().join(format!("compression_app_sortsize_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
         // The fewest items hold the most bytes, so a sort by bytes would come out the other way
         for (name, files, bytes) in [("a-small", 1, 9000), ("b-big", 5, 1), ("c-mid", 3, 10)] {
@@ -6306,11 +6306,11 @@ mod tests {
 
         let ctx = egui::Context::default();
         let settings = Settings { folder_sizes: crate::settings::FolderSizeMode::Always, ..Settings::default() };
-        let mut app = SkiApp::new(work.clone(), SerpantinumTheme::default(), settings, &ctx);
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), settings, &ctx);
         app.sort_by = SortBy::Size;
         app.sort_order = SortOrder::Descending;
         app.apply_sort();
-        let names = |app: &SkiApp| app.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
+        let names = |app: &CompressionApp| app.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
         for _ in 0..300 {
             app.tick_folder_sizes(&ctx);
             if names(&app) == ["b-big", "c-mid", "a-small"] {
@@ -6325,7 +6325,7 @@ mod tests {
     /// Drives rename, trash, undo and permanent delete through the app, in a sandboxed data folder.
     #[test]
     fn rename_trash_restore_delete() {
-        let base = std::env::temp_dir().join(format!("ski_app_test_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("compression_app_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let work = base.join("work");
         std::fs::create_dir_all(work.join("sub")).unwrap();
@@ -6338,8 +6338,8 @@ mod tests {
         }
 
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
-        let names = |app: &SkiApp| app.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let names = |app: &CompressionApp| app.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
         assert_eq!(names(&app), ["sub", "a.txt", "taken.txt"]);
 
         // Rename keeps the item selected, refuses clashes and bad names
@@ -6352,7 +6352,7 @@ mod tests {
         assert_eq!(app.selected_index.map(|i| app.items[i].name.as_str()), Some("b.txt"));
         assert!(app.rename_entry(&app.current_path.join("b.txt"), "b.txt").is_ok(), "same name is a no-op");
 
-        let settle = |app: &mut SkiApp| {
+        let settle = |app: &mut CompressionApp| {
             for _ in 0..200 {
                 app.poll_jobs();
                 if !app.engine.running() { break; }
@@ -6407,15 +6407,15 @@ mod tests {
 
     #[test]
     fn typing_a_name_jumps_to_it_and_a_pause_starts_over() {
-        let base = std::env::temp_dir().join(format!("ski_typeahead_test_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("compression_typeahead_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         for name in ["alpha.txt", "beta.txt", "bravo.txt", "Charlie.txt"] {
             std::fs::write(base.join(name), "x").unwrap();
         }
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
-        let selected = |app: &SkiApp| app.selected_index.map(|i| app.items[i].name.clone());
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let selected = |app: &CompressionApp| app.selected_index.map(|i| app.items[i].name.clone());
 
         app.type_ahead("b");
         assert_eq!(selected(&app).as_deref(), Some("beta.txt"));
@@ -6440,18 +6440,18 @@ mod tests {
 
     #[test]
     fn plugin_entries_follow_their_switch() {
-        let base = std::env::temp_dir().join(format!("ski_plugin_menu_test_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("compression_plugin_menu_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("a.txt"), "x").unwrap();
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
         assert!(app.plugins.is_enabled("quick_look") && app.plugins.is_enabled("git"));
         app.plugins.set_enabled("git", false);
         assert!(!app.plugins.is_enabled("git"));
         let item = app.items[0].clone();
         // No action definitions in the test's config folder: the menu gains nothing
-        let count = |app: &SkiApp| app.menu_entries(&MenuTarget::Item(item.clone())).len();
+        let count = |app: &CompressionApp| app.menu_entries(&MenuTarget::Item(item.clone())).len();
         let before = count(&app);
         app.plugins.set_enabled("actions", false);
         assert_eq!(count(&app), before);
@@ -6470,7 +6470,7 @@ mod tests {
 
     #[test]
     fn tabs_keep_their_own_folder_history_and_selection() {
-        let base = std::env::temp_dir().join(format!("ski_tabs_test_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("compression_tabs_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (one, two) = (base.join("one"), base.join("two"));
         std::fs::create_dir_all(one.join("inner")).unwrap();
@@ -6480,7 +6480,7 @@ mod tests {
         std::fs::write(two.join("c.txt"), "c").unwrap();
 
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(one.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut app = CompressionApp::new(one.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
         app.selection = BTreeSet::from([1, 2]);
         app.selected_index = Some(1);
         app.last_cursor = Some(1);
@@ -6510,14 +6510,14 @@ mod tests {
 
     #[test]
     fn tabs_are_saved_restored_and_reopened() {
-        let base = std::env::temp_dir().join(format!("ski_session_test_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("compression_session_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (a, b, c) = (base.join("a"), base.join("b"), base.join("c"));
         for d in [&a, &b, &c] {
             std::fs::create_dir_all(d).unwrap();
         }
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(a.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut app = CompressionApp::new(a.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
         app.new_tab(b.clone());
         app.new_tab(c.clone());
         app.switch_tab(1);
@@ -6532,7 +6532,7 @@ mod tests {
         let (kept, shown) = settings.restorable_session();
         assert_eq!(kept, vec![canon(&b), canon(&c)]);
         assert_eq!(shown, 0);
-        let mut again = SkiApp::new(kept[0].clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut again = CompressionApp::new(kept[0].clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
         again.restore_tabs(&kept, shown);
         assert_eq!((again.tabs.len(), again.active_tab), (2, 0));
         assert_eq!(again.session().0, kept);
@@ -6553,7 +6553,7 @@ mod tests {
     #[test]
     fn connect_to_server_is_opt_in() {
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(std::env::temp_dir(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut app = CompressionApp::new(std::env::temp_dir(), SerpantinumTheme::default(), Settings::default(), &ctx);
         assert!(!app.place_shown(SidebarPlace::ConnectToServer));
         assert!(app.place_shown(SidebarPlace::Home));
         app.settings.hidden_places.push(SidebarPlace::ConnectToServer);
@@ -6565,7 +6565,7 @@ mod tests {
 
     #[test]
     fn a_reopened_tab_keeps_its_place_history_and_selection() {
-        let base = std::env::temp_dir().join(format!("ski_reopen_test_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("compression_reopen_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (a, b, c) = (base.join("a"), base.join("b"), base.join("c"));
         std::fs::create_dir_all(b.join("inner")).unwrap();
@@ -6575,7 +6575,7 @@ mod tests {
         std::fs::write(b.join("y.txt"), "y").unwrap();
 
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(a.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut app = CompressionApp::new(a.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
         app.new_tab(b.clone());
         app.new_tab(c.clone());
         app.switch_tab(1);
@@ -6599,7 +6599,7 @@ mod tests {
 
     #[test]
     fn rubberband_drag_selects_from_any_point() {
-        let base = std::env::temp_dir().join(format!("ski_drag_test_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("compression_drag_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         for name in ["alpha.txt", "beta.txt", "gamma.txt", "delta.txt"] {
@@ -6607,7 +6607,7 @@ mod tests {
         }
 
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
         app.view_mode = ViewMode::Grid;
 
         let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
@@ -6662,7 +6662,7 @@ mod tests {
     #[test]
     fn type_to_filter_takes_the_first_letter_even_when_it_is_a_vim_key() {
         use eframe::App;
-        let base = std::env::temp_dir().join(format!("ski_ttf_test_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("compression_ttf_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("jam.txt"), "x").unwrap();
@@ -6670,8 +6670,8 @@ mod tests {
         let mut settings = Settings::default();
         settings.type_to_filter = true;
         settings.vim_keys = true;
-        let mut app = SkiApp::new(base.clone(), SerpantinumTheme::default(), settings, &ctx);
-        let mut frame = |app: &mut SkiApp, key: Option<&str>| {
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), settings, &ctx);
+        let mut frame = |app: &mut CompressionApp, key: Option<&str>| {
             let mut raw = egui::RawInput::default();
             raw.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 600.0)));
             if let Some(k) = key {
@@ -6702,17 +6702,17 @@ mod tests {
     /// size, deletions go, and the selection stays on the same file.
     #[test]
     fn changes_made_outside_reach_the_listing() {
-        let work = std::env::temp_dir().join(format!("ski_app_watch_{}", std::process::id()));
+        let work = std::env::temp_dir().join(format!("compression_app_watch_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).unwrap();
         std::fs::write(work.join("a.txt"), "1").unwrap();
         std::fs::write(work.join("c.txt"), "1").unwrap();
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
         app.selected_index = app.items.iter().position(|i| i.name == "c.txt");
         app.sync_selection(true);
-        let names = |app: &SkiApp| app.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
-        let settle = |app: &mut SkiApp, done: &dyn Fn(&SkiApp) -> bool| {
+        let names = |app: &CompressionApp| app.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
+        let settle = |app: &mut CompressionApp, done: &dyn Fn(&CompressionApp) -> bool| {
             for _ in 0..200 {
                 app.poll_watch(&ctx);
                 app.poll_reload();
@@ -6748,7 +6748,7 @@ mod tests {
     /// with the selection where it was; a search follows the files it found.
     #[test]
     fn parked_tabs_and_search_results_follow_the_disk() {
-        let base = std::env::temp_dir().join(format!("ski_app_tabwatch_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("compression_app_tabwatch_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (a, b) = (base.join("a"), base.join("b"));
         std::fs::create_dir_all(&a).unwrap();
@@ -6757,13 +6757,13 @@ mod tests {
             std::fs::write(a.join(n), "x").unwrap();
         }
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(a.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut app = CompressionApp::new(a.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
         app.new_tab(b.clone());
         app.switch_tab(0);
         app.selection = app.items.iter().enumerate().filter(|(_, i)| i.name != "one.txt").map(|(n, _)| n).collect();
         app.selected_index = app.selection.iter().next().copied();
         app.switch_tab(1);
-        let pump = |app: &mut SkiApp, done: &dyn Fn(&SkiApp) -> bool| {
+        let pump = |app: &mut CompressionApp, done: &dyn Fn(&CompressionApp) -> bool| {
             for _ in 0..200 {
                 app.poll_watch(&ctx);
                 app.poll_reload();
@@ -6778,7 +6778,7 @@ mod tests {
         // Changed while tab 0 is parked: its listing is patched without anyone looking at it
         std::fs::write(a.join("zed.txt"), "x").unwrap();
         std::fs::remove_file(a.join("one.txt")).unwrap();
-        let parked = |app: &SkiApp| app.tabs[0].saved.as_ref().and_then(|s| s.items.as_ref()).map(|v| v.iter().map(|i| i.name.clone()).collect::<Vec<_>>());
+        let parked = |app: &CompressionApp| app.tabs[0].saved.as_ref().and_then(|s| s.items.as_ref()).map(|v| v.iter().map(|i| i.name.clone()).collect::<Vec<_>>());
         assert!(pump(&mut app, &|a| parked(a).is_some_and(|n| n.contains(&"zed.txt".to_owned()) && !n.contains(&"one.txt".to_owned()))), "{:?}", parked(&app));
         app.switch_tab(0);
         assert!(!app.loading && app.pending_reload.is_none(), "switching back reads nothing");

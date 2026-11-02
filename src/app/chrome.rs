@@ -1,4 +1,4 @@
-//! The frame every Ski window is built from: the main window, the file dialog and the Copy to /
+//! The frame every Compression window is built from: the main window, the file dialog and the Copy to /
 //! Move to picker all take their window settings and their panels from here, so a change to how
 //! the window looks reaches all of them at once.
 
@@ -45,7 +45,7 @@ pub(super) fn reap_closed_viewport(ctx: &egui::Context, id: egui::ViewportId) {
         return;
     }
     let pass = ctx.cumulative_pass_nr();
-    let key = egui::Id::unique("ski_reaped_viewport").with(id);
+    let key = egui::Id::unique("compression_reaped_viewport").with(id);
     // Declared every pass it would be kept; every other pass lets it go
     if ctx.data(|d| d.get_temp::<u64>(key)).is_some_and(|last| last + 1 == pass) {
         return;

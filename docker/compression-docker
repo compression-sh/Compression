@@ -1,16 +1,16 @@
 #!/bin/sh
-# Run the Ski container on this desktop (Wayland or X11) with your home folder mounted at the same path.
-# Usage: ski-docker [folder]        Env: SKI_IMAGE (default ghcr.io/ilyamiro/ski:latest), SKI_ENGINE (docker|podman)
+# Run the Compression container on this desktop (Wayland or X11) with your home folder mounted at the same path.
+# Usage: compression-docker [folder]        Env: SKI_IMAGE (default ghcr.io/compression-sh/compression:latest), SKI_ENGINE (docker|podman)
 set -eu
 
-image=${SKI_IMAGE:-ghcr.io/ilyamiro/ski:latest}
+image=${SKI_IMAGE:-ghcr.io/compression-sh/compression:latest}
 engine=${SKI_ENGINE:-docker}
 uid=$(id -u)
 start=${1:-$HOME}
 
 set -- --rm --user "$uid:$(id -g)" -e "HOME=$HOME" -v "$HOME:$HOME" -w "$HOME"
 case $start in /*) ;; *) start=$PWD/$start ;; esac
-[ -d "$start" ] || { echo "ski-docker: $start is not a folder" >&2; exit 1; }
+[ -d "$start" ] || { echo "compression-docker: $start is not a folder" >&2; exit 1; }
 # Folders outside $HOME (e.g. /mnt/data) have to be mounted too
 case $start in "$HOME"|"$HOME"/*) ;; *) set -- "$@" -v "$start:$start" ;; esac
 
@@ -21,7 +21,7 @@ elif [ -n "${DISPLAY:-}" ]; then
   set -- "$@" -e DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix:ro
   [ -n "${XAUTHORITY:-}" ] && [ -f "$XAUTHORITY" ] && set -- "$@" -e XAUTHORITY -v "$XAUTHORITY:$XAUTHORITY:ro"
 else
-  echo "ski-docker: no Wayland or X11 display found" >&2
+  echo "compression-docker: no Wayland or X11 display found" >&2
   exit 1
 fi
 

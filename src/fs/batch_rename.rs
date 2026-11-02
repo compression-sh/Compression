@@ -287,7 +287,7 @@ pub fn apply(entries: &[Entry], names: &[String]) -> (Vec<(PathBuf, PathBuf)>, O
     let mut staged: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new(); // old, temp, final
     let mut done: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (i, (entry, new)) in changes.iter().enumerate() {
-        let temp = entry.path.with_file_name(format!(".ski-rename-{}-{i}", std::process::id()));
+        let temp = entry.path.with_file_name(format!(".compression-rename-{}-{i}", std::process::id()));
         if let Err(err) = std::fs::rename(&entry.path, &temp) {
             // Put back what was already moved aside
             for (old, temp, _) in staged.into_iter().rev() {
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn apply_renames_and_swaps() {
-        let dir = std::env::temp_dir().join(format!("ski-batch-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-batch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "A").unwrap();

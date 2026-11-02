@@ -4,7 +4,7 @@ use crate::i18n::{self, tr, tr_dyn, trf, Language};
 
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Vec2};
 
-use crate::app::{app_row, SkiApp, ViewMode};
+use crate::app::{app_row, CompressionApp, ViewMode};
 use crate::fs::apps::{self, AppEntry};
 use crate::fs::file_item::{FileItem, ICON_SAMPLES};
 use crate::fs::scanner::{SortBy, SortOrder};
@@ -54,7 +54,7 @@ fn categories() -> [(usize, &'static str, &'static str); CATEGORY_COUNT as usize
     ]
 }
 
-impl SkiApp {
+impl CompressionApp {
     pub(crate) fn open_settings_dialog(&mut self) {
         self.open_settings_at(0);
     }
@@ -266,7 +266,7 @@ impl SkiApp {
             let locations = [StartLocation::Launch, StartLocation::Home, StartLocation::LastVisited, StartLocation::RestoreTabs, StartLocation::Custom];
             let labels = [tr("Launch folder"), tr("Home"), tr("Last visited"), tr("Restore last tabs"), tr("Custom")];
             let current = locations.iter().position(|l| *l == self.settings.start_location).unwrap_or(0);
-            if let Some(i) = choice_row(ui, "start_loc", icons::HOME, tr("Open Ski in"), &labels, current, &theme) {
+            if let Some(i) = choice_row(ui, "start_loc", icons::HOME, tr("Open Compression in"), &labels, current, &theme) {
                 self.settings.start_location = locations[i];
                 self.persist_settings();
             }
@@ -289,7 +289,7 @@ impl SkiApp {
                     }
                 });
                 if !valid {
-                    material::hint_label(ui, tr("That folder does not exist; Ski opens in Home instead"), &theme);
+                    material::hint_label(ui, tr("That folder does not exist; Compression opens in Home instead"), &theme);
                 }
             });
         });

@@ -89,7 +89,7 @@ pub(super) enum NetEvent {
     ConnectMenu(egui::Pos2),
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// Apply what finished, ask for a new listing every few seconds, and cancel the questions whose dialog was dismissed.
     pub(super) fn poll_network(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.net.rx.try_recv() {
@@ -767,7 +767,7 @@ fn describe_question(message: &str) -> (String, String) {
         let print = message.split("remote computer is ").nth(1).and_then(|r| r.split_whitespace().next()).map(|p| p.trim_end_matches('.').to_owned()).unwrap_or_default();
         let body = format!(
             "{}\n\n{}",
-            trf("Ski has not connected to {} before, so it can't be sure the server is the one it claims to be. Its key fingerprint is {}.", &[&host, &print]),
+            trf("Compression has not connected to {} before, so it can't be sure the server is the one it claims to be. Its key fingerprint is {}.", &[&host, &print]),
             tr("Connect only if you trust this network, or if the fingerprint matches the one the server's administrator gave you."),
         );
         return (tr("Unknown server").to_owned(), body);

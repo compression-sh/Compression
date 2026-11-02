@@ -9,7 +9,7 @@ use std::sync::{Arc, mpsc};
 
 use eframe::egui;
 
-use super::{Dialog, SkiApp};
+use super::{Dialog, CompressionApp};
 use crate::fs::archive_list::{self, Cut, Failure, Listing, Node};
 use crate::fs::file_item::{FileItem, format_bytes};
 use crate::fs::props::format_datetime;
@@ -111,7 +111,7 @@ fn read_text(path: &Path) -> Option<Body> {
     Some(Body::Text { text: shown.join("\n").replace('\t', "    "), numbers, lines, words, cut })
 }
 
-impl SkiApp {
+impl CompressionApp {
     pub(crate) fn open_quick_look(&mut self) {
         let Some(item) = self.selected_index.and_then(|i| self.items.get(i)).filter(|i| !i.is_dir).cloned() else { return };
         self.thumbs.ensure(&item.path);
@@ -308,7 +308,7 @@ mod tests {
     use super::*;
 
     fn temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("ski-ql-{}-{name}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("compression-ql-{}-{name}", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
         path
     }
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn archives_are_listed_on_a_worker() {
-        let dir = std::env::temp_dir().join(format!("ski-ql-archive-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-ql-archive-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src/inner")).unwrap();
         std::fs::write(dir.join("src/inner/a.txt"), "hello").unwrap();

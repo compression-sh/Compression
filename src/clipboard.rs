@@ -199,7 +199,7 @@ mod live {
         if !on_wayland() {
             return;
         }
-        let paths = vec![PathBuf::from("/tmp/ski clip test.png")];
+        let paths = vec![PathBuf::from("/tmp/compression clip test.png")];
         if !set_files(&paths, true) {
             return;
         }

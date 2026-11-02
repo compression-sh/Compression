@@ -1,11 +1,11 @@
-//! Open a folder in a second Ski that runs as root. The person asks for the password through
-//! polkit (`pkexec`), the same way graphical tools elevate, so Ski never sees it.
+//! Open a folder in a second Compression that runs as root. The person asks for the password through
+//! polkit (`pkexec`), the same way graphical tools elevate, so Compression never sees it.
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
-/// Tells the elevated Ski where the settings of the person who started it live. They are read
+/// Tells the elevated Compression where the settings of the person who started it live. They are read
 /// from there but never written, so root does not leave files in someone else's home.
 pub const CONFIG_ENV: &str = "SKI_ADMIN_CONFIG";
 
@@ -21,7 +21,7 @@ pub fn is_admin() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// Whether the elevated Ski was started from another one, and so reads that one's settings.
+/// Whether the elevated Compression was started from another one, and so reads that one's settings.
 pub fn config_override() -> Option<PathBuf> {
     std::env::var_os(CONFIG_ENV).map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
 }
@@ -38,7 +38,7 @@ pub fn available() -> bool {
     !is_admin() && pkexec().is_some()
 }
 
-/// Start Ski as root on `dir`. The result arrives once polkit is done: `Err` carries what went
+/// Start Compression as root on `dir`. The result arrives once polkit is done: `Err` carries what went
 /// wrong, and nothing is sent when the person simply dismissed the password prompt.
 pub fn open_folder(dir: &Path) -> io::Result<mpsc::Receiver<io::Error>> {
     let pkexec = pkexec().ok_or_else(|| io::Error::other(crate::i18n::tr("pkexec was not found. Install polkit to use administrator mode")))?;

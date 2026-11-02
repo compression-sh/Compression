@@ -84,14 +84,14 @@ pub(super) fn permission_card(ui: &mut egui::Ui, theme: &SerpantinumTheme, full:
     action
 }
 
-/// Whether the person running Ski may change the permissions of this item.
+/// Whether the person running Compression may change the permissions of this item.
 pub(super) fn can_change(item: &crate::fs::file_item::FileItem) -> bool {
     // SAFETY: geteuid has no preconditions.
     let euid = unsafe { libc::geteuid() };
     !item.is_symlink && (euid == 0 || euid == item.uid)
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// Set the permission bits of one item and keep the way back.
     pub(super) fn set_mode(&mut self, props: &mut Properties, mode: u32) {
         let path = props.item.path.clone();

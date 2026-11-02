@@ -1,4 +1,4 @@
-//! Keeps Ski resident after its window closes, the way Nautilus stays running, so a later launch
+//! Keeps Compression resident after its window closes, the way Nautilus stays running, so a later launch
 //! only has to open a window: starting the process and loading the graphics driver are paid once.
 //! A launch hands its request to the resident process over a socket in `$XDG_RUNTIME_DIR`. While
 //! that process already shows a window, the launch opens its own as a separate process.
@@ -16,11 +16,11 @@ use std::time::{Duration, Instant};
 
 /// The activation tokens a launcher passes so the new window may take the focus.
 const TOKEN_VARS: [&str; 2] = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"];
-const PROTOCOL: &[u8] = b"ski-1";
+const PROTOCOL: &[u8] = b"compression-1";
 
 /// Answers to a launch. Anything else, or no answer, means "open the window yourself".
 const SHOWN: u8 = b'y';
-/// The resident process belongs to another build of Ski and has quit; start a fresh one.
+/// The resident process belongs to another build of Compression and has quit; start a fresh one.
 const RETIRED: u8 = b'r';
 const BUSY: u8 = b'n';
 
@@ -89,15 +89,15 @@ impl Request {
     }
 }
 
-/// The socket of the resident Ski for this user and display; `None` where there is no such place.
+/// The socket of the resident Compression for this user and display; `None` where there is no such place.
 fn socket_path() -> Option<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty())?;
     let display = ["WAYLAND_DISPLAY", "DISPLAY"].iter().find_map(|var| std::env::var(var).ok().filter(|d| !d.is_empty()))?;
     let display: String = display.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect();
-    Some(PathBuf::from(runtime).join(format!("ski-{display}.sock")))
+    Some(PathBuf::from(runtime).join(format!("compression-{display}.sock")))
 }
 
-/// Have the resident Ski open the window for `request`, starting it first when none runs.
+/// Have the resident Compression open the window for `request`, starting it first when none runs.
 /// False when this process should open the window itself.
 pub fn hand_off(request: &Request) -> bool {
     let Some(path) = socket_path() else { return false };
@@ -119,7 +119,7 @@ pub fn hand_off(request: &Request) -> bool {
     false
 }
 
-/// Let an idle resident Ski quit, as the user turned it off.
+/// Let an idle resident Compression quit, as the user turned it off.
 pub fn dismiss(request: &Request) {
     if let Some(path) = socket_path() {
         send(&path, request);
@@ -140,7 +140,7 @@ fn send(path: &Path, request: &Request) -> Option<u8> {
     })
 }
 
-/// Start `ski --resident` in a session of its own, so it outlives the terminal or launcher.
+/// Start `compression --resident` in a session of its own, so it outlives the terminal or launcher.
 fn start_resident() -> std::io::Result<Child> {
     let mut command = Command::new(std::env::current_exe()?);
     // Out of the launch folder, which may be a drive the user wants to unmount
@@ -248,7 +248,7 @@ mod tests {
             cwd: PathBuf::from("/home/a b"),
             args: vec!["dir".into(), String::new(), "--x".into()],
             tokens: ["tok".into(), String::new()],
-            exe: PathBuf::from("/usr/bin/ski"),
+            exe: PathBuf::from("/usr/bin/compression"),
             reply: None,
         };
         let back = Request::decode(&request.encode()).unwrap();

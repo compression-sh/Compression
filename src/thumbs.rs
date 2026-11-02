@@ -832,7 +832,7 @@ fn mobi_cover(path: &Path) -> Option<image::DynamicImage> {
     image::load_from_memory(&record(&mut file, index, 16 * 1024 * 1024)?).ok()
 }
 
-/// On-disk preview cache under `$XDG_CACHE_HOME/ski/thumbs`. An entry is named by a hash of the
+/// On-disk preview cache under `$XDG_CACHE_HOME/compression/thumbs`. An entry is named by a hash of the
 /// file's path, size and modification time, so editing a file makes its old entry unreachable
 /// instead of stale. Everything is best effort: any I/O error just means a cache miss.
 /// The thumbnail cache shared with Nautilus and other file managers (freedesktop thumbnail
@@ -936,7 +936,7 @@ mod cache {
 
     fn root() -> Option<&'static Path> {
         static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
-        ROOT.get_or_init(|| dirs::cache_dir().map(|d| d.join("ski").join("thumbs").join(format!("v{VERSION}")))).as_deref()
+        ROOT.get_or_init(|| dirs::cache_dir().map(|d| d.join("compression").join("thumbs").join(format!("v{VERSION}")))).as_deref()
     }
 
     pub fn key(path: &Path) -> Option<Key> {
@@ -1054,7 +1054,7 @@ mod tests {
 
     #[test]
     fn renders_first_pdf_page() {
-        let dir = std::env::temp_dir().join("ski-thumb-test");
+        let dir = std::env::temp_dir().join("compression-thumb-test");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("sample.pdf");
         std::fs::write(&file, PDF).unwrap();
@@ -1066,7 +1066,7 @@ mod tests {
 
     #[test]
     fn grabs_a_video_frame() {
-        let dir = std::env::temp_dir().join("ski-thumb-video-test");
+        let dir = std::env::temp_dir().join("compression-thumb-video-test");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("clip.mp4");
         let made = std::process::Command::new("ffmpeg")
@@ -1107,7 +1107,7 @@ mod tests {
 
     #[test]
     fn previews_are_cached_per_tier_and_follow_the_file() {
-        let dir = std::env::temp_dir().join("ski-thumb-cache-test");
+        let dir = std::env::temp_dir().join("compression-thumb-cache-test");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join(format!("pic-{}.png", std::process::id()));
         std::fs::write(&file, png([255, 0, 0])).unwrap();
@@ -1131,7 +1131,7 @@ mod tests {
     fn a_changed_file_is_drawn_again_even_when_its_old_preview_is_loaded() {
         let ctx = egui::Context::default();
         let mut thumbs = Thumbnails::new(&ctx);
-        let dir = std::env::temp_dir().join(format!("ski-thumb-stale-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-thumb-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("pic.png");
@@ -1183,7 +1183,7 @@ mod tests {
 
     #[test]
     fn audio_shows_its_attached_cover() {
-        let dir = std::env::temp_dir().join("ski-thumb-audio-test");
+        let dir = std::env::temp_dir().join("compression-thumb-audio-test");
         std::fs::create_dir_all(&dir).unwrap();
         let cover = dir.join("cover.png");
         std::fs::write(&cover, png([255, 0, 0])).unwrap();
@@ -1207,7 +1207,7 @@ mod tests {
 
     #[test]
     fn comic_shows_its_first_page() {
-        let dir = std::env::temp_dir().join("ski-thumb-comic-test");
+        let dir = std::env::temp_dir().join("compression-thumb-comic-test");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("issue.cbz");
         zip_of(&file, &[("02.png", &png([0, 0, 255])), ("01.png", &png([255, 0, 0])), ("notes.txt", b"x")]);
@@ -1216,7 +1216,7 @@ mod tests {
 
     #[test]
     fn epub_uses_the_cover_named_in_its_package() {
-        let dir = std::env::temp_dir().join("ski-thumb-epub-test");
+        let dir = std::env::temp_dir().join("compression-thumb-epub-test");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("book.epub");
         let container = br#"<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>"#;
@@ -1228,7 +1228,7 @@ mod tests {
     #[test]
     fn fb2_shows_the_cover_binary() {
         use base64::Engine;
-        let dir = std::env::temp_dir().join("ski-thumb-fb2-test");
+        let dir = std::env::temp_dir().join("compression-thumb-fb2-test");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("novel.fb2");
         let b64 = |c| base64::engine::general_purpose::STANDARD.encode(png(c));
@@ -1254,7 +1254,7 @@ mod tests {
 
     #[test]
     fn common_video_containers_get_a_frame() {
-        let dir = std::env::temp_dir().join("ski-thumb-containers-test");
+        let dir = std::env::temp_dir().join("compression-thumb-containers-test");
         std::fs::create_dir_all(&dir).unwrap();
         for (name, extra) in [
             ("a.mkv", vec![]),
@@ -1276,7 +1276,7 @@ mod tests {
 
     #[test]
     fn typescript_is_not_a_transport_stream() {
-        let dir = std::env::temp_dir().join("ski-thumb-ts-test");
+        let dir = std::env::temp_dir().join("compression-thumb-ts-test");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("app.ts");
         std::fs::write(&file, "export const x: number = 1;\n".repeat(20)).unwrap();
@@ -1285,7 +1285,7 @@ mod tests {
 
     #[test]
     fn pictures_in_other_formats_get_previews() {
-        let dir = std::env::temp_dir().join("ski-thumb-stills-test");
+        let dir = std::env::temp_dir().join("compression-thumb-stills-test");
         std::fs::create_dir_all(&dir).unwrap();
         // The image crate reads these itself
         for ext in ["tga", "ppm", "qoi", "ico", "tiff"] {
@@ -1318,7 +1318,7 @@ mod tests {
         raw.extend(b"more sensor data");
         raw.extend(jpeg(200, [255, 0, 0]));
         raw.extend(b"trailer");
-        let dir = std::env::temp_dir().join("ski-thumb-raw-test");
+        let dir = std::env::temp_dir().join("compression-thumb-raw-test");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("shot.cr2");
         std::fs::write(&file, raw).unwrap();

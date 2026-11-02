@@ -1,16 +1,16 @@
 [package]
-name = "ski"
+name = "compression"
 version = "0.4.5"
 edition = "2024"
 description = "A small, fast, keyboard-friendly file manager"
 license = "MIT"
-repository = "https://github.com/ilyamiro/Ski"
+repository = "https://github.com/compression-sh/Compression"
 
 [dependencies]
 dirs = "7.0.0"
 # The defaults without "clipboard": egui's clipboard makes a Wayland data device of its own, and
 # Hyprland sends drags only to a program's first one; wayland_dnd.rs carries the clipboard instead
-# No "wgpu" either: Ski draws with OpenGL (glow), and wgpu with naga and Vulkan is a quarter of the build
+# No "wgpu" either: Compression draws with OpenGL (glow), and wgpu with naga and Vulkan is a quarter of the build
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "accesskit", "default_fonts", "links", "system_fonts", "wayland", "web_screen_reader", "x11"] }
 # eframe's default "winit/default", which a feature list cannot name: loads the Wayland libraries at run time
 winit = "0.30"
@@ -61,7 +61,7 @@ extended-description = "A small, fast, keyboard-friendly file manager, which can
 depends = "libc6, libwayland-client0, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libxcursor1, libxi6, libxrandr2, libgl1, libegl1, xdg-utils"
 recommends = "ffmpeg, p7zip-full, shared-mime-info, gvfs-backends, gvfs-fuse"
 assets = [
-    ["target/stage/usr/bin/ski", "usr/bin/", "755"],
+    ["target/stage/usr/bin/compression", "usr/bin/", "755"],
     ["target/stage/usr/share/applications/ski.desktop", "usr/share/applications/", "644"],
     ["target/stage/usr/share/icons/hicolor/scalable/apps/ski.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
     ["target/stage/usr/share/xdg-desktop-portal/portals/ski.portal", "usr/share/xdg-desktop-portal/portals/", "644"],
@@ -71,15 +71,15 @@ assets = [
 
 [package.metadata.generate-rpm]
 summary = "A small, fast, keyboard-friendly file manager"
-url = "https://github.com/ilyamiro/Ski"
+url = "https://github.com/compression-sh/Compression"
 assets = [
-    { source = "target/stage/usr/bin/ski", dest = "/usr/bin/ski", mode = "755" },
+    { source = "target/stage/usr/bin/compression", dest = "/usr/bin/compression", mode = "755" },
     { source = "target/stage/usr/share/applications/ski.desktop", dest = "/usr/share/applications/ski.desktop", mode = "644" },
     { source = "target/stage/usr/share/icons/hicolor/scalable/apps/ski.svg", dest = "/usr/share/icons/hicolor/scalable/apps/ski.svg", mode = "644" },
     { source = "target/stage/usr/share/xdg-desktop-portal/portals/ski.portal", dest = "/usr/share/xdg-desktop-portal/portals/ski.portal", mode = "644" },
     { source = "target/stage/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.ski.service", dest = "/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.ski.service", mode = "644" },
     { source = "target/stage/usr/share/dbus-1/services/org.freedesktop.FileManager1.service", dest = "/usr/share/dbus-1/services/org.freedesktop.FileManager1.service", mode = "644" },
-    { source = "target/stage/usr/share/licenses/ski/LICENSE", dest = "/usr/share/licenses/ski/LICENSE", mode = "644", doc = false },
+    { source = "target/stage/usr/share/licenses/compression/LICENSE", dest = "/usr/share/licenses/compression/LICENSE", mode = "644", doc = false },
 ]
 
 [package.metadata.generate-rpm.recommends]

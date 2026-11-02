@@ -305,7 +305,7 @@ impl Plugin for Actions {
             }
             None => {
                 let mut c = Command::new("sh");
-                c.arg("-c").arg(&entry.def.command).arg("ski-action").args(paths);
+                c.arg("-c").arg(&entry.def.command).arg("compression-action").args(paths);
                 c
             }
         };
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn reads_json_and_scripts_and_runs_them() {
-        let dir = std::env::temp_dir().join(format!("ski-actions-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-actions-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.json"), r#"{"name":"List","command":"printf '%s\n' \"$@\" > out.txt; echo \"$SKI_CURRENT_DIR\" >> out.txt"}"#).unwrap();
@@ -401,7 +401,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ski-actions-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-actions-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

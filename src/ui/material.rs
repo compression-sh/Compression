@@ -260,7 +260,7 @@ struct InputMode {
 }
 
 fn input_mode_id() -> egui::Id {
-    egui::Id::unique("ski_input_mode")
+    egui::Id::unique("compression_input_mode")
 }
 
 /// Call once per frame, before drawing. `overlay` is true while a dialog, menu or popover is open.
@@ -294,7 +294,7 @@ pub fn track_input_mode(ctx: &egui::Context, overlay: bool) {
 }
 
 fn dialog_fresh_id() -> egui::Id {
-    egui::Id::unique("ski_dialog_fresh")
+    egui::Id::unique("compression_dialog_fresh")
 }
 
 /// True on the first frame a dialog is shown, when it should put keyboard focus somewhere sensible.
@@ -313,7 +313,7 @@ pub fn focus_visible(ctx: &egui::Context) -> bool {
 }
 
 fn focus_color_id() -> egui::Id {
-    egui::Id::unique("ski_focus_color")
+    egui::Id::unique("compression_focus_color")
 }
 
 /// The accent the focus ring is drawn in; set whenever the theme is applied.

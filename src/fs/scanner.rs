@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn folders_sort_by_item_count_and_uncounted_ones_last_either_way() {
         use super::super::dirsize;
-        let root = std::env::temp_dir().join(format!("ski-sortsize-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("compression-sortsize-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for name in ["big", "small", "unknown-a", "unknown-b"] {
             std::fs::create_dir_all(root.join(name)).unwrap();

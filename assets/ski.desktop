@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=Ski
+Name=Compression
 GenericName=File Manager
 Comment=A small, fast, keyboard-friendly file manager
-Exec=ski %U
-Icon=ski
+Exec=compression %U
+Icon=compression
 Terminal=false
 Categories=System;FileTools;FileManager;Utility;
 MimeType=inode/directory;

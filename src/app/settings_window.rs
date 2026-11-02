@@ -9,11 +9,11 @@ const SETTINGS_SIDEBAR_BREAKPOINT: f32 = 600.0;
 const SETTINGS_SIZE: egui::Vec2 = egui::vec2(1000.0, 720.0);
 const SETTINGS_MIN_SIZE: egui::Vec2 = egui::vec2(420.0, 400.0);
 
-/// Appends a line to `~/.cache/ski/settings.log`, so a run started from anywhere leaves its trace.
+/// Appends a line to `~/.cache/compression/settings.log`, so a run started from anywhere leaves its trace.
 pub(crate) fn settings_trace(line: &str) {
     use std::io::Write;
     let Some(dir) = std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))) else { return };
-    let dir = dir.join("ski");
+    let dir = dir.join("compression");
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("settings.log")) {
         let _ = writeln!(file, "[settings] {line}");
@@ -37,7 +37,7 @@ fn settings_log(ctx: &egui::Context, width: f32, visible: bool, t: f32) {
 }
 
 /// A pointer back to the app for the redraws of a window of its own.
-pub(super) struct AppPtr(*mut SkiApp);
+pub(super) struct AppPtr(*mut CompressionApp);
 
 // SAFETY: eframe runs every viewport's UI on the one thread that owns the app, one frame at a
 // time and never inside the main window's `update`, so the pointer is never used from two places.
@@ -45,22 +45,22 @@ unsafe impl Send for AppPtr {}
 unsafe impl Sync for AppPtr {}
 
 impl AppPtr {
-    pub(super) fn new(app: &mut SkiApp) -> Self {
+    pub(super) fn new(app: &mut CompressionApp) -> Self {
         Self(app)
     }
 
-    pub(super) fn get(&self) -> *mut SkiApp {
+    pub(super) fn get(&self) -> *mut CompressionApp {
         self.0
     }
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// Declares the Settings window each frame of the main window. Its contents are drawn by
     /// its own redraws, so that it keeps up when the main window is out of sight (on another
     /// workspace the compositor sends the main window no frame callbacks, and a window drawn
     /// inside the main window's frame would only move when that one did).
     pub(super) fn render_settings_window(&mut self, ctx: &egui::Context) {
-        let id = egui::ViewportId::from_hash_of("ski_settings");
+        let id = egui::ViewportId::from_hash_of("compression_settings");
         if self.settings_win.is_none() {
             chrome::reap_closed_viewport(ctx, id);
             if self.theme_editor {

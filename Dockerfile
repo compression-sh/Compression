@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
-# Ski in a container. Build:   docker build -t ski .
-# Run (see docker/ski-docker): the window is drawn on the host's Wayland or X11 display.
+# Compression in a container. Build:   docker build -t compression .
+# Run (see docker/compression-docker): the window is drawn on the host's Wayland or X11 display.
 
 FROM rust:1-bookworm AS build
 WORKDIR /src
@@ -11,7 +11,7 @@ COPY assets ./assets
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
-# GUI libraries are loaded at run time (Wayland, X11, OpenGL), plus the tools Ski shells out to
+# GUI libraries are loaded at run time (Wayland, X11, OpenGL), plus the tools Compression shells out to
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       libwayland-client0 libxkbcommon0 libxkbcommon-x11-0 libx11-6 libx11-xcb1 libxcursor1 libxi6 libxrandr2 \
@@ -19,7 +19,7 @@ RUN apt-get update \
       xdg-utils shared-mime-info \
       tar xz-utils bzip2 zstd p7zip-full \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/ski /usr/local/bin/ski
+COPY --from=build /src/target/release/compression /usr/local/bin/compression
 # Run as the caller's uid (`--user`) with their home mounted, so settings and the trash are the real ones
 ENV HOME=/tmp
-ENTRYPOINT ["ski"]
+ENTRYPOINT ["compression"]

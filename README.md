@@ -1,45 +1,47 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="Ski logo" width="128">
+  <img src="assets/logo.svg" alt="Compression logo" width="128">
 </p>
 
-<h1 align="center">Ski</h1>
+<h1 align="center">Compression</h1>
 
 A small, fast, keyboard-friendly file manager for Linux, written in Rust. Flat Material look, instant previews, vim keys.
 
-![Ski showing a Pictures folder as a grid of thumbnails](docs/screenshots/hero.png)
+Compression is a fork of [ilyamiro/Ski](https://github.com/ilyamiro/Ski), starting from Ski 0.4.5.
+
+![Compression showing a Pictures folder as a grid of thumbnails](docs/screenshots/hero.png)
 
 ## Install
 
 ### Prebuilt packages
 
-Every [release](https://github.com/ilyamiro/Ski/releases/latest) has x86_64 Linux builds. They need no Rust or Nix, only the graphics libraries listed under Cargo below (the `.deb` and `.rpm` pull them in for you).
+Every [release](https://github.com/compression-sh/Compression/releases/latest) has x86_64 Linux builds. They need no Rust or Nix, only the graphics libraries listed under Cargo below (the `.deb` and `.rpm` pull them in for you).
 
 ```sh
 # Debian, Ubuntu
-sudo apt install ./ski_*_amd64.deb
+sudo apt install ./compression_*_amd64.deb
 # Fedora, openSUSE
-sudo dnf install ./ski-*.x86_64.rpm
+sudo dnf install ./compression-*.x86_64.rpm
 # Any other distribution (Arch included): unpack into /usr
-sudo tar -xzf ski-*-x86_64-linux.tar.gz -C /
+sudo tar -xzf compression-*-x86_64-linux.tar.gz -C /
 ```
 
-Each package installs the desktop entry, the icon, and the portal and D-Bus files, so Ski shows up in your launcher and can be made the system file dialog. `SHA256SUMS` lists the checksums.
+Each package installs the desktop entry, the icon, and the portal and D-Bus files, so Compression shows up in your launcher and can be made the system file dialog. `SHA256SUMS` lists the checksums.
 
 ### Docker or Podman
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ilyamiro/Ski/master/docker/ski-docker -o ski-docker
-chmod +x ski-docker
-./ski-docker [folder]
+curl -fsSL https://raw.githubusercontent.com/compression-sh/Compression/master/docker/compression-docker -o compression-docker
+chmod +x compression-docker
+./compression-docker [folder]
 ```
 
-The script detects Wayland or X11 and mounts your home folder so you see your real files. Use `SKI_ENGINE=podman` for Podman. In the container, "Open with…" can't launch your host apps, so for everyday use install Ski natively.
+The script detects Wayland or X11 and mounts your home folder so you see your real files. Use `SKI_ENGINE=podman` for Podman. In the container, "Open with…" can't launch your host apps, so for everyday use install Compression natively.
 
 To build the image yourself:
 
 ```sh
-docker build -t ski .
-SKI_IMAGE=ski ./docker/ski-docker
+docker build -t compression .
+SKI_IMAGE=compression ./docker/compression-docker
 ```
 
 ### Cargo
@@ -47,10 +49,10 @@ SKI_IMAGE=ski ./docker/ski-docker
 Needs Rust 1.85 or newer.
 
 ```sh
-cargo install --git https://github.com/ilyamiro/Ski
+cargo install --git https://github.com/compression-sh/Compression
 ```
 
-Ski loads its graphics libraries at run time. If it fails to start, install them:
+Compression loads its graphics libraries at run time. If it fails to start, install them:
 
 ```sh
 # Debian, Ubuntu
@@ -64,35 +66,35 @@ sudo pacman -S wayland libxkbcommon libxkbcommon-x11 libx11 libxcursor libxi lib
 ### Nix
 
 ```sh
-git clone https://github.com/ilyamiro/Ski && cd Ski
+git clone https://github.com/compression-sh/Compression && cd Compression
 nix-shell --run 'cargo run --release'
 ```
 
 To install it on NixOS, import the package in `configuration.nix`. It ships its own desktop entry and icon:
 
 ```nix
-environment.systemPackages = [ (pkgs.callPackage /path/to/Ski { }) ];
+environment.systemPackages = [ (pkgs.callPackage /path/to/Compression { }) ];
 ```
 
-This installs the binary of the latest release, patched for Nix, in a few seconds; `git pull` and rebuild to update. To compile your checkout instead (several minutes the first time, and after each change to the dependencies), use `(pkgs.callPackage /path/to/Ski { fromSource = true; })`. Other architectures than x86_64 always compile.
+This installs the binary of the latest release, patched for Nix, in a few seconds; `git pull` and rebuild to update. To compile your checkout instead (several minutes the first time, and after each change to the dependencies), use `(pkgs.callPackage /path/to/Compression { fromSource = true; })`. Other architectures than x86_64 always compile.
 
 ### NixOS: default file manager and system file dialog
 
-`nix/module.nix` installs Ski and makes it the default file manager and the system's open / save dialog:
+`nix/module.nix` installs Compression and makes it the default file manager and the system's open / save dialog:
 
 ```nix
 {
-  imports = [ /path/to/Ski/nix/module.nix ];
+  imports = [ /path/to/Compression/nix/module.nix ];
   programs.ski.enable = true;
   # programs.ski.defaultFileManager = false;  # keep your current file manager
   # programs.ski.filePicker = false;          # keep your current file dialog
-  # programs.ski.package = pkgs.callPackage /path/to/Ski { fromSource = true; };  # compile instead of the release binary
+  # programs.ski.package = pkgs.callPackage /path/to/Compression { fromSource = true; };  # compile instead of the release binary
 }
 ```
 
-It sets `inode/directory` to Ski, adds Ski as an xdg-desktop-portal backend for `org.freedesktop.impl.portal.FileChooser`, and sets `GTK_USE_PORTAL=1`. Log out and in after `nixos-rebuild switch`. Programs that use the portal then show Ski for "Open" and "Save as". Firefox also needs `widget.use-xdg-desktop-portal.file-picker = 1` (`programs.firefox.preferences` on NixOS); Chromium needs `--enable-features=UseXdgDesktopPortal` unless it picks it up itself. Programs with a dialog of their own don't use the portal and keep it.
+It sets `inode/directory` to Compression, adds Compression as an xdg-desktop-portal backend for `org.freedesktop.impl.portal.FileChooser`, and sets `GTK_USE_PORTAL=1`. Log out and in after `nixos-rebuild switch`. Programs that use the portal then show Compression for "Open" and "Save as". Firefox also needs `widget.use-xdg-desktop-portal.file-picker = 1` (`programs.firefox.preferences` on NixOS); Chromium needs `--enable-features=UseXdgDesktopPortal` unless it picks it up itself. Programs with a dialog of their own don't use the portal and keep it.
 
-If you also use home-manager's `xdg.portal`, it takes over: it writes `~/.config/xdg-desktop-portal/portals.conf`, which beats the system one, and points `NIX_XDG_DESKTOP_PORTAL_DIR` at the per-user profile, which doesn't contain `ski.portal`. Then the dialogs stay GTK's. Add Ski there as well:
+If you also use home-manager's `xdg.portal`, it takes over: it writes `~/.config/xdg-desktop-portal/portals.conf`, which beats the system one, and points `NIX_XDG_DESKTOP_PORTAL_DIR` at the per-user profile, which doesn't contain `ski.portal`. Then the dialogs stay GTK's. Add Compression there as well:
 
 ```nix
 xdg.portal = {
@@ -112,26 +114,26 @@ The dialog attaches itself to the window that asked for it (Wayland, xdg-foreign
 ```sh
 install -Dm644 assets/ski.desktop ~/.local/share/applications/ski.desktop
 install -Dm644 assets/logo.svg ~/.local/share/icons/hicolor/scalable/apps/ski.svg
-xdg-mime default ski.desktop inode/directory   # optional: open folders with Ski
+xdg-mime default ski.desktop inode/directory   # optional: open folders with Compression
 ```
 
 ### Other distributions: file dialog and file manager service
 
-Ski can answer `org.freedesktop.FileManager1` (browsers' "Show in folder") and be the portal FileChooser. Install the files in `assets/` (`ski.portal` into `share/xdg-desktop-portal/portals/`, the two `.service` files into `share/dbus-1/services/` with `@out@` replaced by your prefix), then add this to `~/.config/xdg-desktop-portal/portals.conf`. (`ski.portal` also lists the desktops it may serve in `UseIn=`, but when several installed portals offer a file dialog the one named here wins, so this line is what makes Ski the choice.)
+Compression can answer `org.freedesktop.FileManager1` (browsers' "Show in folder") and be the portal FileChooser. Install the files in `assets/` (`ski.portal` into `share/xdg-desktop-portal/portals/`, the two `.service` files into `share/dbus-1/services/` with `@out@` replaced by your prefix), then add this to `~/.config/xdg-desktop-portal/portals.conf`. (`ski.portal` also lists the desktops it may serve in `UseIn=`, but when several installed portals offer a file dialog the one named here wins, so this line is what makes Compression the choice.)
 
 ```ini
 [preferred]
 org.freedesktop.impl.portal.FileChooser=ski
 ```
 
-`ski --portal` is the service itself; D-Bus starts it when needed. Each dialog is `ski --chooser --mode open|folder|save|save-files` in a window of its own, which prints the chosen `file://` URIs and exits with 0 (or 1 if cancelled).
+`compression --portal` is the service itself; D-Bus starts it when needed. Each dialog is `compression --chooser --mode open|folder|save|save-files` in a window of its own, which prints the chosen `file://` URIs and exits with 0 (or 1 if cancelled).
 
 ## Usage
 
 ```sh
-ski              # open the current folder
-ski ~/Downloads  # open a specific folder
-ski sftp://me@example.com/srv  # connect to a server and open a folder on it
+compression              # open the current folder
+compression ~/Downloads  # open a specific folder
+compression sftp://me@example.com/srv  # connect to a server and open a folder on it
 ```
 
 | To | Do this |
@@ -141,7 +143,7 @@ ski sftp://me@example.com/srv  # connect to a server and open a folder on it
 | Search | `/`, then type a name. `Esc` leaves the results. |
 | Pin a folder or file to the sidebar | Select it and press `Ctrl+D` (with nothing selected: the open folder). Drag pinned rows to reorder. |
 | Move or copy by dragging | Drag items onto a folder, sidebar place, breadcrumb or tab. Hold `Ctrl` to copy. |
-| Open a folder in a tab | Middle-click it, or `Ctrl+T` for a new tab. Settings → General → Open Ski in → Restore last tabs brings back the tabs of the last session. |
+| Open a folder in a tab | Middle-click it, or `Ctrl+T` for a new tab. Settings → General → Open Compression in → Restore last tabs brings back the tabs of the last session. |
 | Eject a drive | Hover it in the sidebar and click the eject button |
 | Open a folder on a server | `Ctrl+K`, or type its address (`smb://nas/media`) into the path field. See [Servers](#servers). |
 | Switch list and grid | `Ctrl+1` and `Ctrl+2` |
@@ -217,13 +219,13 @@ Settings, the context menu, the operations list and every dialog work without a 
 
 The default theme follows your [Serpantinum](https://github.com/ilyamiro) colors if you use them. Midnight, Nord, Gruvbox, Light, Catppuccin (Mocha and Latte), Dracula, Tokyo Night, Rosé Pine, One Dark, Everforest and Solarized (dark and light) are built in.
 
-**Open as administrator** is in the main menu and in the folder context menus. It asks for your password through polkit (`pkexec`) and opens a second Ski, running as root, on that folder, so you can browse and edit system files. It reads your settings but never writes them. You can give it a shortcut under Settings → Keybindings.
+**Open as administrator** is in the main menu and in the folder context menus. It asks for your password through polkit (`pkexec`) and opens a second Compression, running as root, on that folder, so you can browse and edit system files. It reads your settings but never writes them. You can give it a shortcut under Settings → Keybindings.
 
 ![Themes](docs/screenshots/themes.png)
 
 ### Custom themes
 
-The **+** card in Settings → Appearance opens the theme editor: give the theme a name, set every color with a picker or a hex code (or start from any built-in palette), and press Save. Your themes are listed under the divider, each with an edit button beside it, and each is one JSON file in `~/.local/state/ski/themes/`, named after the theme (`mine.json` is selected by `"theme": "custom:mine"` in the settings). A color generator (matugen, wallust, pywal, …) can write such a file from a template; Ski follows the folder while it runs:
+The **+** card in Settings → Appearance opens the theme editor: give the theme a name, set every color with a picker or a hex code (or start from any built-in palette), and press Save. Your themes are listed under the divider, each with an edit button beside it, and each is one JSON file in `~/.local/state/ski/themes/`, named after the theme (`mine.json` is selected by `"theme": "custom:mine"` in the settings). A color generator (matugen, wallust, pywal, …) can write such a file from a template; Compression follows the folder while it runs:
 
 ```json
 {
@@ -242,15 +244,15 @@ Settings are stored in `~/.config/ski/settings.json`, and the trash in `~/.local
 
 ## Plugins
 
-Ski bundles a few optional features as plugins. Switch them on or off in Settings → Plugins.
+Compression bundles a few optional features as plugins. Switch them on or off in Settings → Plugins.
 
 - **Git** marks changed (`M`), staged (`A`, `S`, `R`), deleted (`D`), conflicted (`!`) and untracked (`?`) files, marks folders that contain changes, and shows the branch and the number of changes in the corner. In a repository the context menu gets a Git group: Stage, Unstage, Show diff (staged and unstaged changes against the last commit, in a window) and Discard changes (asks first; the changes cannot be brought back and are not part of Undo).
 - **Checksums** adds MD5, SHA-1, SHA-256 and SHA-512 to Properties and says whether one of them matches a hash on the clipboard or the checksum file next to the download (`name.sha256`, `name.sha1`, `name.md5`, `SHA256SUMS`, `sha256sums.txt`, `MD5SUMS` and similar, in the GNU or BSD format). On a checksum file, "Verify files listed" checks every file it names as a file operation (progress, pause, cancel) and reports how many are OK, failed or missing. Names that point outside the folder are refused.
-- **Tags** puts coloured labels on files. Right-click → Tags (or `Alt+T`) adds a tag; the colours show as dots on the icon, and Settings → Plugins lets you pick them. The names are stored in the extended attribute `user.xdg.tags`, the one Dolphin reads, so both managers show them; the colours are Ski's own (`~/.config/ski/tags.json`). Copies and cross-disk moves keep the tags; archives do not. The sidebar lists the tags Ski has seen, and `tag:work` in the search finds them (Ski remembers paths it tagged or saw tagged; "Find tags in this folder" rebuilds that list after other programs moved files). File systems without extended attributes (FAT, exFAT, some network shares) can't store tags, and links can't carry them.
+- **Tags** puts coloured labels on files. Right-click → Tags (or `Alt+T`) adds a tag; the colours show as dots on the icon, and Settings → Plugins lets you pick them. The names are stored in the extended attribute `user.xdg.tags`, the one Dolphin reads, so both managers show them; the colours are Compression's own (`~/.config/ski/tags.json`). Copies and cross-disk moves keep the tags; archives do not. The sidebar lists the tags Compression has seen, and `tag:work` in the search finds them (Compression remembers paths it tagged or saw tagged; "Find tags in this folder" rebuilds that list after other programs moved files). File systems without extended attributes (FAT, exFAT, some network shares) can't store tags, and links can't carry them.
 - **Duplicate finder** looks for files with identical contents. Right-click a folder (or the empty space of the open folder) → Find duplicate files… The search runs as a file operation (progress, pause, cancel) and skips empty files, links and hard links of the same file. It compares sizes first, then the start and end of the files, and reads whole only what still looks alike (SHA-256). Nothing is selected for you: tick copies by hand or let a rule pick (keep the newest, the oldest, the shortest path, or the copy inside a folder). One copy of every group always stays; a copy that changed since the search is left alone; the rest go to the trash as one undo step.
 - **Compare folders** shows how two folders differ. Select two folders → Compare, or right-click empty space → Compare with the other tab (when exactly two tabs are open) or Compare folders… (two path fields). Each item is listed as only on the left or right, newer on one side, different with equal times, or identical (hidden until you switch it on); a folder that exists on one side only is one row. Items count as equal when size and modification time match (two seconds apart is still equal, for FAT); "Compare contents" reads files of equal size instead. Tick rows and copy them to the other side (name clashes ask, progress and Undo work as for any copy), move one side's copy to the trash, or open it. It never deletes by itself, so it is a compare-and-copy tool, not a mirror.
 - **Quick Look** previews the selected file when you press Space: text and code with line numbers, pictures and documents (not folders) and the contents of archives (a folder tree with sizes, the unpacked size, the compression ratio and a lock on encrypted entries; nothing is extracted). `.zip` is read from its index; tar archives are streamed and listing stops after 2,000 entries or 10 seconds; `.tar.xz`, `.tar.bz2`, `.tar.zst`, `.7z`, `.rar`, `.iso`, `.deb` and `.rpm` need the tools from the Archives table below. Up and Down browse, Space or Esc closes.
-- **Custom actions** adds your own commands to the context menu. Put a `.json` file or an executable script in `~/.config/ski/actions/`; changes are picked up while Ski runs, and Settings → Plugins lists the files that failed to load:
+- **Custom actions** adds your own commands to the context menu. Put a `.json` file or an executable script in `~/.config/ski/actions/`; changes are picked up while Compression runs, and Settings → Plugins lists the files that failed to load:
 
   ```json
   { "name": "Convert to WebP", "command": "for f in \"$@\"; do cwebp \"$f\" -o \"${f%.*}.webp\"; done", "extensions": ["jpg", "png"] }
@@ -258,7 +260,7 @@ Ski bundles a few optional features as plugins. Switch them on or off in Setting
 
   The command runs in the open folder with the selected files as arguments, and `SKI_SELECTED_FILES` and `SKI_CURRENT_DIR` are set. Filters: `extensions`, `dirs_only`, `files_only`, `single`.
 
-Folder sizes: the Size column shows how many items a folder holds. Right-click a folder → Calculate size (Settings → Files & View → Details → Folder sizes: Off, On demand, Always) measures it; sizes appear in the column, in the status line for a selection and in sorting. Two folders are measured at a time, hard-linked files count once, links are not followed and other mounted disks are skipped. A folder Ski could not fully read shows `≥`. Sizes are remembered for the session and dropped when Ski changes something inside, or on refresh (`F5`); changes made by other programs show after a refresh. "Size on disk" counts allocated blocks instead of file lengths.
+Folder sizes: the Size column shows how many items a folder holds. Right-click a folder → Calculate size (Settings → Files & View → Details → Folder sizes: Off, On demand, Always) measures it; sizes appear in the column, in the status line for a selection and in sorting. Two folders are measured at a time, hard-linked files count once, links are not followed and other mounted disks are skipped. A folder Compression could not fully read shows `≥`. Sizes are remembered for the session and dropped when Compression changes something inside, or on refresh (`F5`); changes made by other programs show after a refresh. "Size on disk" counts allocated blocks instead of file lengths.
 
 File operations: copies, and moves to another disk, that write to the same disk run one after the other, since several at once slow each other down on a spinning disk (Settings → General → File operations → Run copies to the same disk one at a time). A queued job shows "Waiting for the disk" in the operations list (`Ctrl+J`), where you can cancel it, start it now, or move it up or down. Moves within one file system and deletes are never queued. A paused job keeps its place; use Start now to run another one beside it.
 
@@ -266,7 +268,7 @@ Typing in a folder jumps to the file whose name starts with what you typed (Sett
 
 ## Servers
 
-Ski opens folders on other computers like any other folder: Windows and NAS shares (SMB), SSH servers (SFTP), FTP and FTPS, WebDAV, Apple shares (AFP) and NFS. Press `Ctrl+K` or click **Connect to server…** at the bottom of the sidebar, then type an address:
+Compression opens folders on other computers like any other folder: Windows and NAS shares (SMB), SSH servers (SFTP), FTP and FTPS, WebDAV, Apple shares (AFP) and NFS. Press `Ctrl+K` or click **Connect to server…** at the bottom of the sidebar, then type an address:
 
 | Server | Address |
 | --- | --- |
@@ -275,7 +277,7 @@ Ski opens folders on other computers like any other folder: Windows and NAS shar
 | FTP | `ftp://ftp.example.com/pub`, `ftps://` for FTP over TLS |
 | WebDAV (Nextcloud and others) | `davs://cloud.example.com/remote.php/dav/files/me` |
 
-The same addresses work in the path field (`Ctrl+L`) and on the command line. When a server wants a password, Ski asks for it. **Remember password** keeps it in your keyring (GNOME Keyring, KWallet or KeePassXC), filed the way GNOME Files files it, so a password saved by either is found by the other. SSH logs in with your keys and `ssh-agent` first. An SSH server Ski has never seen shows its key fingerprint before connecting. FTP servers and shares that allow it can be opened anonymously or as a guest.
+The same addresses work in the path field (`Ctrl+L`) and on the command line. When a server wants a password, Compression asks for it. **Remember password** keeps it in your keyring (GNOME Keyring, KWallet or KeePassXC), filed the way GNOME Files files it, so a password saved by either is found by the other. SSH logs in with your keys and `ssh-agent` first. An SSH server Compression has never seen shows its key fingerprint before connecting. FTP servers and shares that allow it can be opened anonymously or as a guest.
 
 Connected servers appear under the drives in the sidebar, with a button to disconnect. **Keep in sidebar** keeps a server there while it is disconnected, and clicking it connects again. Right-click a server to rename it, change its address, forget its password or remove it. A folder on a server can be pinned too, and opening the pin reconnects.
 
@@ -285,7 +287,7 @@ Copying, opening files with other apps, Quick Look and dragging to other program
 - Thumbnails and folder item counts are skipped on servers, because they read every file over the network. Settings → Files → **Previews on servers** turns them on.
 - **Open in terminal** (`F4`) on an SSH server logs in with `ssh` and opens a shell in the same folder there.
 
-Ski mounts servers through GVfs, the service GNOME Files uses, which most desktops have. Without GVfs it uses `sshfs` for SSH and `rclone` for the others, if they are installed.
+Compression mounts servers through GVfs, the service GNOME Files uses, which most desktops have. Without GVfs it uses `sshfs` for SSH and `rclone` for the others, if they are installed.
 
 ## Archives
 
@@ -302,14 +304,14 @@ On Debian or Ubuntu: `sudo apt install xz-utils bzip2 zstd p7zip-full`.
 
 ## Troubleshooting
 
-- **No window, or errors about Wayland or libxkbcommon:** install the libraries listed under Cargo above. On Nix, start Ski from `nix-shell`.
-- **Blank window in a VM:** try `LIBGL_ALWAYS_SOFTWARE=1 ski`.
-- **Want X11 on a Wayland session:** `env -u WAYLAND_DISPLAY ski`.
+- **No window, or errors about Wayland or libxkbcommon:** install the libraries listed under Cargo above. On Nix, start Compression from `nix-shell`.
+- **Blank window in a VM:** try `LIBGL_ALWAYS_SOFTWARE=1 compression`.
+- **Want X11 on a Wayland session:** `env -u WAYLAND_DISPLAY compression`.
 - **Interface too small or large:** Settings → Appearance → Size.
 - **Missing `.7z` or `.tar.xz` when compressing:** install the tools listed under Archives.
 - **"Install GVfs…" when connecting to a server:** install GVfs with its FUSE part and backends (`gvfs-backends` and `gvfs-fuse` on Debian or Ubuntu, `gvfs-fuse` and `gvfs-smb` on Fedora, `services.gvfs.enable = true` on NixOS), or `sshfs` / `rclone`. Log out and back in afterwards.
 
-Found a bug? Open an [issue](https://github.com/ilyamiro/Ski/issues) with your distribution and whether you use Wayland or X11.
+Found a bug? Open an [issue](https://github.com/compression-sh/Compression/issues) with your distribution and whether you use Wayland or X11.
 
 ## License
 

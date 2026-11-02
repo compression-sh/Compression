@@ -1,11 +1,11 @@
-# Ski built from this checkout. default.nix uses it with `fromSource = true`, and on systems
+# Compression built from this checkout. default.nix uses it with `fromSource = true`, and on systems
 # other than x86_64-linux, which have no release binary.
 { pkgs, lib ? pkgs.lib }:
 
 let
   runtime = import ./runtime.nix { inherit lib pkgs; };
 
-  # Crane builds the dependencies as a derivation of their own, so editing src/ recompiles only Ski
+  # Crane builds the dependencies as a derivation of their own, so editing src/ recompiles only Compression
   # and not egui, resvg and the rest
   crane = fetchTarball {
     url = "https://github.com/ipetkov/crane/archive/refs/tags/v0.24.0.tar.gz";
@@ -26,16 +26,16 @@ let
     ];
   };
 
-  # The dependencies are built from a Cargo.toml and Cargo.lock in which Ski's own version is 0.0.0,
+  # The dependencies are built from a Cargo.toml and Cargo.lock in which Compression's own version is 0.0.0,
   # so bumping the version for a release doesn't rebuild all of them; only a change to the
   # dependencies (or to nixpkgs' Rust) does
   lockText = builtins.readFile ../Cargo.lock;
   lockWithoutVersion = builtins.replaceStrings
-    [ "name = \"ski\"\nversion = \"${version}\"" ]
-    [ "name = \"ski\"\nversion = \"0.0.0\"" ]
+    [ "name = \"compression\"\nversion = \"${version}\"" ]
+    [ "name = \"compression\"\nversion = \"0.0.0\"" ]
     lockText;
   depsLock =
-    assert lib.assertMsg (lockWithoutVersion != lockText) "Cargo.lock has no ski ${version} entry";
+    assert lib.assertMsg (lockWithoutVersion != lockText) "Cargo.lock has no compression ${version} entry";
     builtins.toFile "Cargo.lock" lockWithoutVersion;
   depsManifest = craneLib.writeTOML "Cargo.toml" (lib.recursiveUpdate
     (craneLib.cleanCargoToml { cargoToml = ../Cargo.toml; })
@@ -49,11 +49,11 @@ let
   '';
 
   common = {
-    pname = "ski";
+    pname = "compression";
     strictDeps = true;
     cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = depsLock; };
 
-    # The tests are run during development; a user's build doesn't need to compile Ski a second time for them
+    # The tests are run during development; a user's build doesn't need to compile Compression a second time for them
     doCheck = false;
 
     # rustc already uses several threads per crate, so one job per core can exhaust the RAM.
@@ -88,9 +88,9 @@ craneLib.buildPackage (common // {
 
   meta = {
     description = "A small, fast, keyboard-friendly file manager";
-    homepage = "https://github.com/ilyamiro/Ski";
+    homepage = "https://github.com/compression-sh/Compression";
     license = lib.licenses.mit;
-    mainProgram = "ski";
+    mainProgram = "compression";
     platforms = lib.platforms.linux;
   };
 })

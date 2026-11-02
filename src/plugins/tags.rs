@@ -1,6 +1,6 @@
 //! Tags: coloured labels on files. The names are stored in the extended attribute
 //! `user.xdg.tags` (comma separated), the one Dolphin reads, so tags show in both managers.
-//! Colours are Ski's own (`~/.config/ski/tags.json`). Because there is no index, Ski remembers
+//! Colours are Compression's own (`~/.config/ski/tags.json`). Because there is no index, Compression remembers
 //! the paths it has seen tagged (`~/.local/share/ski/tag-paths.json`) to answer `tag:work`.
 use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::MetadataExt;
@@ -90,7 +90,7 @@ pub fn write_tags(path: &Path, tags: &[String]) -> std::io::Result<()> {
     if tags.is_empty() { xattr::remove(path, ATTR) } else { xattr::set(path, ATTR, format(tags).as_bytes()) }
 }
 
-/// The paths Ski has seen tagged, with their tags.
+/// The paths Compression has seen tagged, with their tags.
 #[derive(Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Registry(BTreeMap<PathBuf, Vec<String>>);
 
@@ -797,7 +797,7 @@ mod tests {
 
     #[test]
     fn registry_drops_missing_paths_and_follows_renames() {
-        let dir = std::env::temp_dir().join(format!("ski-tag-registry-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-tag-registry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/a"), "x").unwrap();

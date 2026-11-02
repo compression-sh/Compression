@@ -30,7 +30,7 @@ impl DriveState {
     }
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// Apply finished work and ask for a new listing every few seconds.
     pub(super) fn poll_drives(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.drive_state.rx.try_recv() {

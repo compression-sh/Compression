@@ -347,7 +347,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ski-archive-list-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-archive-list-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src/d/e")).unwrap();
         std::fs::write(dir.join("src/a.txt"), "hello").unwrap();

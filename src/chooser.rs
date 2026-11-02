@@ -1,4 +1,4 @@
-//! Chooser mode: `ski --chooser …` runs the file manager as an open / save dialog. The chosen
+//! Chooser mode: `compression --chooser …` runs the file manager as an open / save dialog. The chosen
 //! paths go to stdout as `file://` URIs, one per line; the exit code is 0 for a choice and 1 for
 //! a cancel. The portal backend (`portal.rs`) starts it for every FileChooser request.
 
@@ -171,7 +171,7 @@ impl Chooser {
     }
 
     /// Remembers the size the user gave the dialog, once a resize has settled. Kept in a file of its
-    /// own: the settings file is whole-file rewritten by whichever Ski window saves last.
+    /// own: the settings file is whole-file rewritten by whichever Compression window saves last.
     pub fn remember_size(&mut self, ctx: &eframe::egui::Context) {
         let Some(rect) = ctx.input(|i| i.viewport().inner_rect) else { return };
         let zoom = ctx.zoom_factor();

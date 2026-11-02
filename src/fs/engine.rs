@@ -503,7 +503,7 @@ fn name_of(path: &Path) -> String {
 const CHUNK: usize = 1 << 20;
 
 /// Up to `CHUNK` bytes from `reader` to `writer` inside the kernel, at both files' positions. The data
-/// never passes through Ski, and file systems that can (btrfs, XFS, NFS) share the blocks instead of copying them.
+/// never passes through Compression, and file systems that can (btrfs, XFS, NFS) share the blocks instead of copying them.
 fn copy_range(reader: &std::fs::File, writer: &std::fs::File) -> io::Result<usize> {
     use std::os::fd::AsRawFd;
     // SAFETY: two open descriptors; null offsets make the kernel use and advance the files' own positions
@@ -803,7 +803,7 @@ mod tests {
     }
 
     fn sandbox(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ski_engine_{name}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression_engine_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

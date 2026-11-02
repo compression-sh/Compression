@@ -1,10 +1,10 @@
 //! Servers opened as folders: Windows shares (SMB), SSH (SFTP), FTP, WebDAV, AFP and NFS.
 //!
-//! Ski never talks to a server itself. A server is mounted as a FUSE filesystem and browsed like
+//! Compression never talks to a server itself. A server is mounted as a FUSE filesystem and browsed like
 //! any other folder, so copying, previews, "Open with" and dragging to other programs work on it
 //! unchanged, the way Nautilus does it. GVfs mounts it when the desktop has GVfs (`gio mount`,
 //! the folders showing up under `$XDG_RUNTIME_DIR/gvfs`); without GVfs, `sshfs` or `rclone` mount
-//! it under `$XDG_RUNTIME_DIR/ski-net`. Either way the questions a server asks (a password, an
+//! it under `$XDG_RUNTIME_DIR/compression-net`. Either way the questions a server asks (a password, an
 //! unknown host key) come back to the window as `Prompt`s and their answers go back as `Reply`s.
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -342,7 +342,7 @@ fn normalize_path(path: &str) -> String {
 pub enum MountKind {
     /// GVfs, under `$XDG_RUNTIME_DIR/gvfs`.
     Gvfs,
-    /// `sshfs` or `rclone`, started by Ski under `$XDG_RUNTIME_DIR/ski-net`.
+    /// `sshfs` or `rclone`, started by Compression under `$XDG_RUNTIME_DIR/compression-net`.
     Helper,
     /// Mounted by the system or by hand (`/etc/fstab`, `mount -t cifs`).
     System,
@@ -380,12 +380,12 @@ pub fn gvfs_root() -> &'static Path {
     ROOT.get_or_init(|| runtime_dir().join("gvfs"))
 }
 
-/// Where `sshfs` and `rclone` mount servers for Ski.
+/// Where `sshfs` and `rclone` mount servers for Compression.
 fn helper_root() -> PathBuf {
-    runtime_dir().join("ski-net")
+    runtime_dir().join("compression-net")
 }
 
-/// The addresses of the servers Ski mounted with a helper, kept beyond a restart so a pinned folder
+/// The addresses of the servers Compression mounted with a helper, kept beyond a restart so a pinned folder
 /// on one can still be reconnected.
 fn helper_records() -> Option<PathBuf> {
     dirs::state_dir().or_else(dirs::data_dir).map(|d| d.join("ski").join("mounts"))
@@ -486,7 +486,7 @@ fn is_mount_point(path: &Path) -> bool {
     proc_mounts().iter().any(|(_, point, _)| point == path)
 }
 
-/// A server mounted outside Ski: `//nas/share` (cifs), `host:/export` (nfs), `me@host:/dir` (sshfs).
+/// A server mounted outside Compression: `//nas/share` (cifs), `host:/export` (nfs), `me@host:/dir` (sshfs).
 fn address_of_system_mount(source: &str, kind: &str) -> Option<Address> {
     match kind {
         "cifs" | "smb3" | "smbfs" => Address::parse(source),
@@ -750,7 +750,7 @@ impl Session {
         let Some(login) = self.used.as_ref().filter(|_| self.remember) else { return };
         let address = Address { user: Some(login.user.clone()).filter(|u| !u.is_empty()), domain: Some(login.domain.clone()).filter(|d| !d.is_empty()), ..address.root() };
         if crate::fs::secrets::store(&address, &login.user, &login.domain, &login.password).is_err() {
-            // Without a keyring the password lasts until Ski closes
+            // Without a keyring the password lasts until Compression closes
             if let Ok(mut memory) = SESSION_PASSWORDS.lock() {
                 memory.insert(Address { user: None, ..address.clone() }.keyring_key(), login.clone());
                 memory.insert(address.keyring_key(), login.clone());
@@ -1320,7 +1320,7 @@ pub fn disconnect(mount: &Mount) -> Result<(), String> {
 // Passwords
 // ---------------------------------------------------------------------------------------------
 
-/// Passwords kept until Ski closes when there is no keyring to save them in.
+/// Passwords kept until Compression closes when there is no keyring to save them in.
 static SESSION_PASSWORDS: LazyLock<Mutex<HashMap<String, Login>>> = LazyLock::new(Default::default);
 
 /// A saved account for `address`: from this session, then from the keyring.

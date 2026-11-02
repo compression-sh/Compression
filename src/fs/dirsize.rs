@@ -1,6 +1,6 @@
 //! What the listing knows about folders: how many items they hold and, once measured, how big
 //! they are. A folder's own modification time does not change when a nested file does, so sizes
-//! are never trusted by time; they live for the session and are dropped when Ski itself changes
+//! are never trusted by time; they live for the session and are dropped when Compression itself changes
 //! something below them (or on refresh).
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn labels_follow_what_is_known() {
-        let p = Path::new("/ski-test/labels");
+        let p = Path::new("/compression-test/labels");
         assert_eq!(label(p), "—");
         store_count(p, Some(3));
         assert_eq!(label(p), "3 items");
@@ -184,14 +184,14 @@ mod tests {
     #[test]
     fn invalidating_drops_the_folder_its_parents_and_its_children() {
         let t = Totals { bytes: 1, disk: 1, files: 1, folders: 0, partial: false };
-        for p in ["/ski-test/inv", "/ski-test/inv/a", "/ski-test/inv/a/b", "/ski-test/inv/other", "/ski-test/elsewhere"] {
+        for p in ["/compression-test/inv", "/compression-test/inv/a", "/compression-test/inv/a/b", "/compression-test/inv/other", "/compression-test/elsewhere"] {
             store(Path::new(p), t);
         }
-        invalidate(Path::new("/ski-test/inv/a"));
-        assert!(totals(Path::new("/ski-test/inv")).is_none());
-        assert!(totals(Path::new("/ski-test/inv/a")).is_none());
-        assert!(totals(Path::new("/ski-test/inv/a/b")).is_none());
-        assert!(totals(Path::new("/ski-test/inv/other")).is_some());
-        assert!(totals(Path::new("/ski-test/elsewhere")).is_some());
+        invalidate(Path::new("/compression-test/inv/a"));
+        assert!(totals(Path::new("/compression-test/inv")).is_none());
+        assert!(totals(Path::new("/compression-test/inv/a")).is_none());
+        assert!(totals(Path::new("/compression-test/inv/a/b")).is_none());
+        assert!(totals(Path::new("/compression-test/inv/other")).is_some());
+        assert!(totals(Path::new("/compression-test/elsewhere")).is_some());
     }
 }

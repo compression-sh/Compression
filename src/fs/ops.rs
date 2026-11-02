@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let root = std::env::temp_dir().join(format!("ski_ops_test_{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("compression_ops_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let src = root.join("src");
         std::fs::create_dir_all(src.join("d/e")).unwrap();

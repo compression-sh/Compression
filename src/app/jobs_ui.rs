@@ -54,7 +54,7 @@ fn format_eta(eta: std::time::Duration) -> String {
     }
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// Called once per frame: take in what finished jobs report and open the next question.
     pub(super) fn poll_jobs(&mut self) {
         self.engine.sample();

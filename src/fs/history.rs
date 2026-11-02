@@ -123,7 +123,7 @@ pub fn apply(entry: UndoEntry) -> (Option<UndoEntry>, Option<String>) {
 pub fn rename_many(pairs: &[(PathBuf, PathBuf)]) -> io::Result<()> {
     let mut staged: Vec<(&Path, PathBuf, &Path)> = Vec::new();
     for (i, (from, to)) in pairs.iter().enumerate() {
-        let temp = from.with_file_name(format!(".ski-rename-{}-{i}", std::process::id()));
+        let temp = from.with_file_name(format!(".compression-rename-{}-{i}", std::process::id()));
         if let Err(err) = std::fs::rename(from, &temp) {
             for (old, temp, _) in staged.into_iter().rev() {
                 let _ = std::fs::rename(temp, old);
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn rename_swap_and_chmod_round_trip() {
-        let dir = std::env::temp_dir().join(format!("ski_history_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression_history_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (a, b) = (dir.join("a"), dir.join("b"));

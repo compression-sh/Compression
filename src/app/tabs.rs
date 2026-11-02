@@ -1,4 +1,4 @@
-//! Browser-style tabs. The tab being shown lives in the `SkiApp` fields everything else already
+//! Browser-style tabs. The tab being shown lives in the `CompressionApp` fields everything else already
 //! reads; the others are parked in `TabSlot::saved` and swapped in when picked.
 use super::*;
 use crate::fs::search::Search;
@@ -84,7 +84,7 @@ impl TabState {
     }
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// Park the tab on screen so another can take its place.
     fn take_tab_state(&mut self) -> TabState {
         self.search.cancel();

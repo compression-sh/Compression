@@ -656,7 +656,7 @@ mod tests {
     #[test]
     fn executable_bit_does_not_hide_a_known_format() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join("ski-item-kind-test");
+        let dir = std::env::temp_dir().join("compression-item-kind-test");
         std::fs::create_dir_all(&dir).unwrap();
         for (name, kind) in [("book.fb2", FileType::Document), ("comic.cbz", FileType::Document), ("run-me", FileType::Executable)] {
             let file = dir.join(name);
@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn read_only_files_are_locked() {
         use std::os::unix::fs::PermissionsExt;
-        let file = std::env::temp_dir().join("ski-item-lock-test");
+        let file = std::env::temp_dir().join("compression-item-lock-test");
         std::fs::write(&file, b"x").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
         // Root can write anywhere, so there is nothing to lock for it

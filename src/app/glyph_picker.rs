@@ -19,7 +19,7 @@ pub(crate) struct GlyphPicker {
 }
 
 #[allow(deprecated)] // a stable id keeps the grid scrolled where it was
-impl SkiApp {
+impl CompressionApp {
     pub(super) fn open_glyph_picker(&mut self, folder: PathBuf) {
         let chosen = crate::fs::places::folder_glyph(&folder);
         self.glyph_picker = Some(GlyphPicker { folder, chosen });

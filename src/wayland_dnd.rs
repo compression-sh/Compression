@@ -1,7 +1,7 @@
 //! Drag and drop between windows on Wayland. winit offers neither side of it there, so this talks
 //! to the compositor itself, on its own event queue of the window's display: it starts a drag
 //! (`wl_data_device.start_drag`) when files are carried out of the window, and takes part as a
-//! target for drags from any window, Ski's own or another program's. Files travel as
+//! target for drags from any window, Compression's own or another program's. Files travel as
 //! `text/uri-list`, like in Nautilus. The same data device carries the text clipboard: some
 //! compositors (Hyprland) talk to only the first data device a client makes, so egui's own
 //! clipboard, which would make another one, is left out of the build. For the same reason the data
@@ -34,10 +34,10 @@ use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum
 
 const URI_LIST: &str = "text/uri-list";
 const PLAIN_TEXT: &str = "text/plain;charset=utf-8";
-/// Offered only by Ski, so a drag that comes back to it is known without reading the files.
-const OWN_MIME: &str = "application/x-ski-drag";
-/// Marks text Ski put on the clipboard, which is then read without a round trip through the compositor.
-const OWN_TEXT_MIME: &str = "application/x-ski-text";
+/// Offered only by Compression, so a drag that comes back to it is known without reading the files.
+const OWN_MIME: &str = "application/x-compression-drag";
+/// Marks text Compression put on the clipboard, which is then read without a round trip through the compositor.
+const OWN_TEXT_MIME: &str = "application/x-compression-text";
 /// Text types other programs offer, the most precise first.
 const TEXT_MIMES: [&str; 5] = [PLAIN_TEXT, "UTF8_STRING", "text/plain", "STRING", "TEXT"];
 const ICON_SIZE: i32 = 64;
@@ -440,7 +440,7 @@ impl Device {
         let size = (ICON_SIZE * style.scale) as usize;
         let pixels = render_icon(size, style.scale as f32, count, style);
         // SAFETY: memfd_create takes a name and flags and returns a new descriptor we own
-        let raw = unsafe { libc::memfd_create(c"ski-drag-icon".as_ptr(), libc::MFD_CLOEXEC) };
+        let raw = unsafe { libc::memfd_create(c"compression-drag-icon".as_ptr(), libc::MFD_CLOEXEC) };
         if raw < 0 {
             return None;
         }
@@ -683,8 +683,8 @@ impl Dispatch<WlDataDevice, ()> for State {
                 }
                 let Some(offer) = id else { return };
                 let Some(info) = state.offers.get(&offer.id()) else { return };
-                // Every Ski offers its own type; only a drag this window started has its files at hand.
-                // One from another Ski window (a process of its own) is read like any other program's
+                // Every Compression offers its own type; only a drag this window started has its files at hand.
+                // One from another Compression window (a process of its own) is read like any other program's
                 let own = info.mimes.iter().any(|m| m == OWN_MIME) && state.out.is_some();
                 let has_files = info.mimes.iter().any(|m| m == URI_LIST);
                 let mut reader = Reader::default();

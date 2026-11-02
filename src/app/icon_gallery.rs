@@ -18,17 +18,17 @@ const TILE_HEIGHT: f32 = 96.0;
 /// Height of the caption strip along the bottom of a tile.
 const CAPTION: f32 = 26.0;
 
-impl SkiApp {
+impl CompressionApp {
     /// Declares the icon gallery each frame of the Settings window, which it is opened from; its
     /// contents are drawn by its own redraws, so it keeps up when the other windows are out of sight.
     pub(super) fn render_icon_gallery(&mut self, ctx: &egui::Context) {
         if self.icon_gallery.is_none() {
-            chrome::reap_closed_viewport(ctx, egui::ViewportId::from_hash_of("ski_icon_gallery"));
+            chrome::reap_closed_viewport(ctx, egui::ViewportId::from_hash_of("compression_icon_gallery"));
             return;
         }
         let builder = chrome::viewport(tr("Icon style")).with_inner_size([920.0, 660.0]).with_min_inner_size([600.0, 420.0]);
         let app = AppPtr::new(self);
-        ctx.show_viewport_deferred(egui::ViewportId::from_hash_of("ski_icon_gallery"), builder, move |ui, _class| {
+        ctx.show_viewport_deferred(egui::ViewportId::from_hash_of("compression_icon_gallery"), builder, move |ui, _class| {
             // SAFETY: see `AppPtr`; the app outlives every window
             let app = unsafe { &mut *app.get() };
             app.icon_gallery_ui(ui);
@@ -143,7 +143,7 @@ impl SkiApp {
             self.persist_settings();
             // The other windows show the style too, and get their turn when they can
             ctx.request_repaint_of(egui::ViewportId::ROOT);
-            ctx.request_repaint_of(egui::ViewportId::from_hash_of("ski_settings"));
+            ctx.request_repaint_of(egui::ViewportId::from_hash_of("compression_settings"));
         }
         if close {
             self.icon_gallery = None;

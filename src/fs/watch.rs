@@ -66,7 +66,7 @@ impl Watcher {
         let (tx, rx) = mpsc::channel();
         let (thread_state, thread_stop, ctx) = (state.clone(), stop.clone(), ctx.clone());
         std::thread::Builder::new()
-            .name("ski-watch".into())
+            .name("compression-watch".into())
             .spawn(move || run(fd, thread_state, thread_stop, tx, ctx))
             .ok()?;
         Some(Self { fd, state, rx, stop, dirs: Vec::new() })
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn changes_in_a_watched_folder_arrive_and_a_removed_folder_is_reported() {
-        let dir = std::env::temp_dir().join(format!("ski-watch-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-watch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut watcher = Watcher::new(&egui::Context::default()).expect("inotify");
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn a_folder_that_cannot_be_watched_is_polled() {
         let mut watcher = Watcher::new(&egui::Context::default()).expect("inotify");
-        let missing = std::env::temp_dir().join(format!("ski-watch-missing-{}", std::process::id()));
+        let missing = std::env::temp_dir().join(format!("compression-watch-missing-{}", std::process::id()));
         watcher.set(std::slice::from_ref(&missing));
         assert!(watcher.state.lock().unwrap().polled.contains_key(&missing));
     }

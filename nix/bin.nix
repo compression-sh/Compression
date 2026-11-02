@@ -1,4 +1,4 @@
-# Ski from the binary of the latest GitHub release, which installs in seconds instead of compiling.
+# Compression from the binary of the latest GitHub release, which installs in seconds instead of compiling.
 # release.json names that release; the release workflow updates it on master after each one.
 { pkgs, lib ? pkgs.lib }:
 
@@ -7,11 +7,11 @@ let
   release = lib.importJSON ./release.json;
 in
 pkgs.stdenv.mkDerivation {
-  pname = "ski";
+  pname = "compression";
   inherit (release) version;
 
   src = pkgs.fetchurl {
-    url = "https://github.com/ilyamiro/Ski/releases/download/v${release.version}/ski-${release.version}-x86_64-linux.tar.gz";
+    url = "https://github.com/compression-sh/Compression/releases/download/v${release.version}/compression-${release.version}-x86_64-linux.tar.gz";
     inherit (release) hash;
   };
 
@@ -30,7 +30,7 @@ pkgs.stdenv.mkDerivation {
     mkdir -p $out
     cp -r bin share $out/
     for service in $out/share/dbus-1/services/*.service; do
-      substituteInPlace $service --replace-fail /usr/bin/ski $out/bin/ski
+      substituteInPlace $service --replace-fail /usr/bin/compression $out/bin/compression
     done
     ${runtime.wrapProgram}
     runHook postInstall
@@ -38,9 +38,9 @@ pkgs.stdenv.mkDerivation {
 
   meta = {
     description = "A small, fast, keyboard-friendly file manager";
-    homepage = "https://github.com/ilyamiro/Ski";
+    homepage = "https://github.com/compression-sh/Compression";
     license = lib.licenses.mit;
-    mainProgram = "ski";
+    mainProgram = "compression";
     platforms = [ "x86_64-linux" ];
     sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
   };

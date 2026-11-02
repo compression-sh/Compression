@@ -1,5 +1,5 @@
 //! Watches the files a theme can come from, so a color generator that rewrites them is followed
-//! while Ski runs: the user's theme files and Serpantinum's `qs_colors.json`.
+//! while Compression runs: the user's theme files and Serpantinum's `qs_colors.json`.
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};

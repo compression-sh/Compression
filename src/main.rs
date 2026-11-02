@@ -18,14 +18,14 @@ mod x11_parent;
 
 use std::env;
 use std::path::PathBuf;
-use app::SkiApp;
+use app::CompressionApp;
 use ui::theme::SerpantinumTheme;
 
 fn main() -> eframe::Result {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "--portal") {
         if let Err(err) = portal::serve() {
-            eprintln!("ski: {err}");
+            eprintln!("compression: {err}");
             std::process::exit(1);
         }
         return Ok(());
@@ -119,7 +119,7 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
         }
     };
 
-    let mut viewport = app::chrome::viewport(chooser.as_ref().and_then(|c| c.title.clone()).unwrap_or_else(|| if fs::admin::is_admin() { format!("Ski ({})", i18n::tr("Administrator")) } else { "Ski".to_owned() }))
+    let mut viewport = app::chrome::viewport(chooser.as_ref().and_then(|c| c.title.clone()).unwrap_or_else(|| if fs::admin::is_admin() { format!("Compression ({})", i18n::tr("Administrator")) } else { "Compression".to_owned() }))
         .with_inner_size([1080.0, 720.0])
         .with_min_inner_size([360.0, 420.0]);
     if let Some(spec) = &chooser {
@@ -137,7 +137,7 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
         // Starts several times faster than wgpu, which has to bring up Vulkan first
         renderer: eframe::Renderer::Glow,
         // egui-winit would answer Ctrl+V from its own clipboard, which is left out of the build (see
-        // wayland_dnd.rs), so it pasted nothing; `SkiApp::raw_input_hook` turns the shortcuts into
+        // wayland_dnd.rs), so it pasted nothing; `CompressionApp::raw_input_hook` turns the shortcuts into
         // clipboard events with the system's text instead, in every window
         clipboard_shortcuts: false,
         ..Default::default()
@@ -151,7 +151,7 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
             ui::theme::apply(&cc.egui_ctx, &theme, &theme);
             cc.egui_ctx.set_zoom_factor(settings.scale);
 
-            let mut app = SkiApp::new(initial_path, theme, settings, &cc.egui_ctx);
+            let mut app = CompressionApp::new(initial_path, theme, settings, &cc.egui_ctx);
             if fs::admin::is_admin() {
                 app.set_toast(i18n::tr("Running as administrator. Changes to settings are not saved."));
             }

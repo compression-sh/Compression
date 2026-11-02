@@ -1,5 +1,5 @@
 //! Recently used paths, so searches can look at files the user touched lately before walking
-//! the whole disk. Combines Ski's own history with the desktop-wide `recently-used.xbel`.
+//! the whole disk. Combines Compression's own history with the desktop-wide `recently-used.xbel`.
 use std::path::PathBuf;
 
 const HISTORY_LIMIT: usize = 200;
@@ -12,14 +12,14 @@ fn shared_file() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("recently-used.xbel"))
 }
 
-/// The files the Recent view is made from: Ski's own history and the desktop-wide list.
+/// The files the Recent view is made from: Compression's own history and the desktop-wide list.
 pub fn sources() -> Vec<PathBuf> {
     history_file().into_iter().chain(shared_file()).collect()
 }
 
 static LAST_OWN_WRITE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
-/// Whether Ski itself wrote the history a moment ago, as opposed to another window or app: the Recent
+/// Whether Compression itself wrote the history a moment ago, as opposed to another window or app: the Recent
 /// view stays put when its own click is what changed it.
 pub fn written_here_lately() -> bool {
     LAST_OWN_WRITE.lock().ok().and_then(|t| *t).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3))
@@ -36,7 +36,7 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// Ski's own history, newest first. Files written before entries carried times get the
+/// Compression's own history, newest first. Files written before entries carried times get the
 /// file's modification time, one second apart, so they still interleave sensibly with other apps.
 fn load_history() -> Vec<Entry> {
     let Some(file) = history_file() else { return Vec::new() };
@@ -75,7 +75,7 @@ pub fn record(path: &std::path::Path) {
     }
 }
 
-/// Most recently used first, by when each path was last used in Ski or any other app.
+/// Most recently used first, by when each path was last used in Compression or any other app.
 pub fn load() -> Vec<PathBuf> {
     let history = load_history().into_iter().map(|e| (e.at, e.path)).collect();
     let shared = dirs::data_dir()
@@ -86,7 +86,7 @@ pub fn load() -> Vec<PathBuf> {
     merge(history, shared)
 }
 
-/// Both sources newest first (Ski's wins a tie), each path once.
+/// Both sources newest first (Compression's wins a tie), each path once.
 fn merge(mut all: Vec<(u64, PathBuf)>, shared: Vec<(u64, PathBuf)>) -> Vec<PathBuf> {
     all.extend(shared);
     all.sort_by_key(|e| std::cmp::Reverse(e.0));
@@ -160,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_by_ski_counts_as_ours_only_for_a_moment() {
+    fn a_write_by_compression_counts_as_ours_only_for_a_moment() {
         *LAST_OWN_WRITE.lock().unwrap() = None;
         assert!(!written_here_lately());
         *LAST_OWN_WRITE.lock().unwrap() = Some(std::time::Instant::now());
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn newest_use_wins_across_sources() {
         let p = |s: &str| PathBuf::from(s);
-        let merged = merge(vec![(100, p("/old-in-ski")), (500, p("/both"))], vec![(900, p("/in-gimp")), (400, p("/both"))]);
-        assert_eq!(merged, [p("/in-gimp"), p("/both"), p("/old-in-ski")]);
+        let merged = merge(vec![(100, p("/old-in-compression")), (500, p("/both"))], vec![(900, p("/in-gimp")), (400, p("/both"))]);
+        assert_eq!(merged, [p("/in-gimp"), p("/both"), p("/old-in-compression")]);
     }
 }

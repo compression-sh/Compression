@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn reads_a_real_repository() {
-        let dir = std::env::temp_dir().join(format!("ski-git-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-git-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         if git(&dir, &["init", "-q"]).is_none() {
@@ -518,7 +518,7 @@ mod tests {
 
     /// A repository in a temp folder with `a.txt` committed, then edited, and `b.txt` untracked.
     fn sandbox(name: &str) -> Option<(PathBuf, PathBuf)> {
-        let dir = std::env::temp_dir().join(format!("ski-git-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-git-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok()?;
         git(&dir, &["init", "-q"])?;
@@ -570,7 +570,7 @@ mod tests {
 
     #[test]
     fn unstaging_before_the_first_commit_works_and_errors_say_why() {
-        let dir = std::env::temp_dir().join(format!("ski-git-fresh-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-git-fresh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         if git(&dir, &["init", "-q"]).is_none() {
@@ -583,7 +583,7 @@ mod tests {
         change(&root, Action::Unstage, &[root.join("f")]).unwrap();
         assert_eq!(state(&root, "f"), Some(('?', '?')));
         // Outside a repository git's own last line is the message
-        let outside = std::env::temp_dir().join(format!("ski-git-none-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("compression-git-none-{}", std::process::id()));
         std::fs::create_dir_all(&outside).unwrap();
         let error = change(&outside, Action::Stage, &[outside.join("x")]).unwrap_err();
         assert!(!error.is_empty());

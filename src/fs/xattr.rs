@@ -104,7 +104,7 @@ pub(crate) mod tests {
 
     /// A temp file on a file system that stores attributes, or None when the test cannot run here.
     pub(crate) fn scratch_file(tag: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        let dir = std::env::temp_dir().join(format!("ski-xattr-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-xattr-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok()?;
         let file = dir.join("a.txt");

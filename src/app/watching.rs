@@ -77,7 +77,7 @@ impl Watching {
     }
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// The folders whose changes the open listing follows.
     fn watch_targets(&self) -> Vec<PathBuf> {
         if self.is_mixed_listing() {
@@ -220,7 +220,7 @@ impl SkiApp {
     /// Search results, Recent and Bookmarks: only the items already listed follow the disk. A changed
     /// file is read again, a removed one goes; nothing new is added, since it was not asked for.
     fn patch_mixed(&mut self, changed: &BTreeMap<PathBuf, bool>) {
-        // Another window or app used a file: Recent is made again. Ski's own click on a file does not
+        // Another window or app used a file: Recent is made again. Compression's own click on a file does not
         // reorder the list under the pointer.
         if self.showing_recent_list() && recent::sources().iter().any(|s| changed.contains_key(s)) {
             if !recent::written_here_lately() {

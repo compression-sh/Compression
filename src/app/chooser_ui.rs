@@ -1,8 +1,8 @@
-//! Chooser mode (`ski --chooser`): the open / save dialog behind the system file picker.
+//! Chooser mode (`compression --chooser`): the open / save dialog behind the system file picker.
 use super::*;
 use crate::chooser::{self, Chooser, Mode};
 
-impl SkiApp {
+impl CompressionApp {
     /// The folder of `path` is already shown; this puts the cursor on the file itself.
     pub fn select_path(&mut self, path: &Path) {
         if let Some(idx) = self.items.iter().position(|i| i.path == path) {
@@ -247,9 +247,9 @@ mod tests {
     use crate::settings::Settings;
     use crate::ui::theme::SerpantinumTheme;
 
-    fn app_in(dir: &Path, args: &[&str]) -> SkiApp {
+    fn app_in(dir: &Path, args: &[&str]) -> CompressionApp {
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(dir.to_path_buf(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut app = CompressionApp::new(dir.to_path_buf(), SerpantinumTheme::default(), Settings::default(), &ctx);
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         app.chooser = Spec::parse(&args).map(Chooser::new);
         app.reload_items();
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn answers_follow_the_mode() {
-        let work = std::env::temp_dir().join(format!("ski_chooser_test_{}", std::process::id()));
+        let work = std::env::temp_dir().join(format!("compression_chooser_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(work.join("sub")).unwrap();
         std::fs::write(work.join("a.txt"), "a").unwrap();
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn a_mime_filter_keeps_the_images() {
-        let work = std::env::temp_dir().join(format!("ski_chooser_mime_{}", std::process::id()));
+        let work = std::env::temp_dir().join(format!("compression_chooser_mime_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).unwrap();
         std::fs::write(work.join("Screenshot_2026-10-22-22403.png"), "a").unwrap();

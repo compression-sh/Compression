@@ -1,4 +1,4 @@
-//! Plugins bundled with Ski. Each one adds a feature through a few small hooks (a badge on a file,
+//! Plugins bundled with Compression. Each one adds a feature through a few small hooks (a badge on a file,
 //! a context menu entry, rows in Properties, a line of status) and can be switched off in
 //! Settings → Plugins. There is no dynamic loading: a plugin is a type in this folder that is
 //! listed in `Plugins::bundled`.
@@ -111,7 +111,7 @@ pub struct SidebarEntry {
     pub editable: bool,
 }
 
-/// A change Ski made to files, reported to plugins once it is done.
+/// A change Compression made to files, reported to plugins once it is done.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileOpEvent {
     /// `(from, to)` for each renamed or moved path.
@@ -207,7 +207,7 @@ pub trait Plugin {
     }
     /// The edit button of the sidebar row `id` was pressed.
     fn sidebar_edit(&mut self, _id: &str) {}
-    /// Files were renamed, moved or removed by Ski.
+    /// Files were renamed, moved or removed by Compression.
     fn file_op_done(&mut self, _op: &FileOpEvent) {}
     /// A search query the plugin understands (`tag:work`): the paths it matches, or None when the
     /// query is not meant for it.

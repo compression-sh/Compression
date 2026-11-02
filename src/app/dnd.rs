@@ -40,7 +40,7 @@ pub(super) struct DropZone {
     pub dest: PathBuf,
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// Part of an item that picks it up: the icon and name of a row, or a whole grid tile.
     fn drag_grip(&self, ui: &egui::Ui, idx: usize, rect: egui::Rect) -> egui::Rect {
         if self.view_mode == ViewMode::Grid {
@@ -334,14 +334,14 @@ mod tests {
 
     #[test]
     fn drops_need_a_different_folder_that_is_not_inside_the_items() {
-        let base = std::env::temp_dir().join(format!("ski_dnd_test_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("compression_dnd_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("a/inner")).unwrap();
         std::fs::create_dir_all(base.join("b")).unwrap();
         std::fs::write(base.join("a/file.txt"), "x").unwrap();
 
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
         let items = vec![base.join("a/file.txt")];
         assert!(app.accepts(&base.join("b"), &items));
         assert!(!app.accepts(&base.join("a"), &items), "already there");
@@ -361,7 +361,7 @@ mod tests {
     /// user picked something else in the meantime.
     #[test]
     fn dropped_files_are_selected_once_they_arrive() {
-        let base = std::env::temp_dir().join(format!("ski_dnd_arrive_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("compression_dnd_arrive_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (here, there) = (base.join("here"), base.join("there"));
         std::fs::create_dir_all(&here).unwrap();
@@ -373,10 +373,10 @@ mod tests {
         std::fs::write(there.join("n.txt"), "x").unwrap();
 
         let ctx = egui::Context::default();
-        let mut app = SkiApp::new(here.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut app = CompressionApp::new(here.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
         app.reload_items();
         app.select_path(&here.join("a.txt"));
-        let wait = |paths: &[&str], app: &SkiApp| Arrivals {
+        let wait = |paths: &[&str], app: &CompressionApp| Arrivals {
             folder: here.clone(),
             paths: paths.iter().map(|n| here.join(n)).collect(),
             shown: app.selected_paths().into_iter().collect(),

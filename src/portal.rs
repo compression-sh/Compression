@@ -1,7 +1,7 @@
-//! `ski --portal`: a session D-Bus service that makes Ski the system's file dialog and file
+//! `compression --portal`: a session D-Bus service that makes Compression the system's file dialog and file
 //! manager. It implements the FileChooser backend of xdg-desktop-portal
 //! (`org.freedesktop.impl.portal.FileChooser`) and `org.freedesktop.FileManager1`, the interface
-//! browsers use for "Show in folder". Each dialog request runs `ski --chooser …` in a window of
+//! browsers use for "Show in folder". Each dialog request runs `compression --chooser …` in a window of
 //! its own and reads the choice from its stdout (see `chooser.rs`).
 
 use std::path::PathBuf;
@@ -231,7 +231,7 @@ async fn respond(server: &zbus::ObjectServer, handle: ObjectPath<'_>, mode: &'st
         ),
         Ok(None) => (RESPONSE_CANCELLED, Results::default()),
         Err(err) => {
-            eprintln!("ski portal: could not start the dialog: {err}");
+            eprintln!("compression portal: could not start the dialog: {err}");
             (RESPONSE_FAILED, Results::default())
         }
     }
@@ -324,7 +324,7 @@ pub fn serve() -> Result<(), String> {
         .map_err(|e| format!("could not claim {PORTAL_NAME}: {e}"))?;
     // Another file manager may already own this name; the portal works without it
     if let Err(err) = connection.request_name(FILE_MANAGER_NAME) {
-        eprintln!("ski portal: {FILE_MANAGER_NAME} is not available: {err}");
+        eprintln!("compression portal: {FILE_MANAGER_NAME} is not available: {err}");
     }
     loop {
         std::thread::park();

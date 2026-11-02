@@ -2,7 +2,7 @@
 use super::*;
 use crate::fs::glob;
 
-impl SkiApp {
+impl CompressionApp {
     /// Copy each item next to itself under a free "(copy)" name.
     pub(super) fn duplicate(&mut self, paths: Vec<PathBuf>) {
         if self.in_trash() || paths.is_empty() {
@@ -81,13 +81,13 @@ impl SkiApp {
         }
     }
 
-    /// Another Ski on `dir` that runs as root, after the password prompt of polkit.
+    /// Another Compression on `dir` that runs as root, after the password prompt of polkit.
     pub(super) fn open_as_admin(&mut self, dir: &Path) {
         if self.chooser.is_some() {
             return;
         }
         if crate::fs::admin::is_admin() {
-            self.set_toast(tr("Ski already runs as administrator"));
+            self.set_toast(tr("Compression already runs as administrator"));
             return;
         }
         let dir = if dir.is_dir() { dir.to_path_buf() } else { dir.parent().map(Path::to_path_buf).unwrap_or_else(|| self.current_path.clone()) };

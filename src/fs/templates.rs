@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn builtin_and_user_templates_create_files() {
-        let dir = std::env::temp_dir().join(format!("ski_tpl_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression_tpl_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("tpl/sub")).unwrap();
         std::fs::write(dir.join("tpl/Invoice.odt"), "odt").unwrap();

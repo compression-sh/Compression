@@ -36,7 +36,7 @@ enum Exit {
     Delete,
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// Opens the editor on a new theme, which starts from the colors in use, or on a saved one.
     pub(crate) fn open_theme_editor(&mut self, id: Option<&str>) {
         let saved = id.and_then(|id| theme::user_themes().into_iter().find(|c| c.id == id));

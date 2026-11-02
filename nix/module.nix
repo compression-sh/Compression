@@ -1,6 +1,6 @@
-# NixOS module: Ski as the default file manager and as the system's open / save dialog.
+# NixOS module: Compression as the default file manager and as the system's open / save dialog.
 #
-#   imports = [ /path/to/Ski/nix/module.nix ];
+#   imports = [ /path/to/Compression/nix/module.nix ];
 #   programs.ski.enable = true;
 { config, lib, pkgs, ... }:
 
@@ -9,20 +9,20 @@ let
 in
 {
   options.programs.ski = {
-    enable = lib.mkEnableOption "Ski, a small keyboard-friendly file manager";
+    enable = lib.mkEnableOption "Compression, a small keyboard-friendly file manager";
 
     package = lib.mkOption {
       type = lib.types.package;
       default = pkgs.callPackage ../default.nix { };
       defaultText = lib.literalExpression "pkgs.callPackage ./default.nix { }";
-      description = "The Ski package to use: the latest release binary by default; `pkgs.callPackage /path/to/Ski { fromSource = true; }` compiles the checkout.";
+      description = "The Compression package to use: the latest release binary by default; `pkgs.callPackage /path/to/Compression { fromSource = true; }` compiles the checkout.";
     };
 
     defaultFileManager = lib.mkOption {
       type = lib.types.bool;
       default = true;
       description = ''
-        Open folders with Ski (the `inode/directory` handler) and answer
+        Open folders with Compression (the `inode/directory` handler) and answer
         `org.freedesktop.FileManager1`, which browsers use for "Show in folder".
       '';
     };
@@ -31,7 +31,7 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Turn on GVfs, which Ski uses to open folders on servers (SMB, SFTP, FTP, WebDAV)
+        Turn on GVfs, which Compression uses to open folders on servers (SMB, SFTP, FTP, WebDAV)
         from Connect to server.
       '';
     };
@@ -40,8 +40,8 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Use Ski as the xdg-desktop-portal FileChooser, so the "Open" and "Save as" dialogs of
-        browsers, Telegram and other portal-aware programs are Ski.
+        Use Compression as the xdg-desktop-portal FileChooser, so the "Open" and "Save as" dialogs of
+        browsers, Telegram and other portal-aware programs are Compression.
       '';
     };
   };

@@ -2,7 +2,7 @@
 //! first, and the file changes plugins are told about. Each hook in `app.rs` is a call into here.
 use eframe::egui;
 
-use super::{ConfirmAction, Dialog, SkiApp, paint_badge};
+use super::{ConfirmAction, Dialog, CompressionApp, paint_badge};
 use crate::fs::history::{Edit, UndoEntry};
 use crate::i18n::tr;
 use crate::plugins::{FileOpEvent, Mark, Reaction};
@@ -35,7 +35,7 @@ pub(super) fn paint_marks(ui: &egui::Ui, theme: &SerpantinumTheme, marks: &[Mark
     }
 }
 
-impl SkiApp {
+impl CompressionApp {
     /// Runs a plugin entry, after the question it asked, if any.
     pub(super) fn run_plugin_entry(&mut self, ctx: &egui::Context, plugin: &'static str, id: String, paths: Vec<std::path::PathBuf>, confirm: Option<&'static str>) {
         match confirm {

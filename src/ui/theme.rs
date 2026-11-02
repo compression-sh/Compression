@@ -187,7 +187,7 @@ static USER_THEMES: RwLock<Vec<CustomTheme>> = RwLock::new(Vec::new());
 /// Where the user's themes are kept, a JSON file each: `~/.local/state/ski/themes`.
 pub fn user_themes_dir() -> Option<PathBuf> {
     let state = match crate::fs::admin::config_override() {
-        // As administrator: the state folder next to the config folder of whoever started Ski
+        // As administrator: the state folder next to the config folder of whoever started Compression
         Some(config) => config.parent().map(|home| home.join(".local/state")),
         None => dirs::state_dir().or_else(dirs::data_local_dir),
     };

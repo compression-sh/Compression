@@ -937,7 +937,7 @@ mod tests {
     }
 
     fn folder(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ski-checksum-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("compression-checksum-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[test]
     fn hashes_a_file_and_gives_up_when_abandoned() {
-        let path = std::env::temp_dir().join(format!("ski-hash-test-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("compression-hash-test-{}", std::process::id()));
         std::fs::write(&path, b"abc").unwrap();
         let job = Job { done: AtomicU64::new(0), total: 3, seen: AtomicU64::new(0), epoch: Instant::now(), cancelled: AtomicBool::new(false), result: Mutex::new(None) };
         let hashes = run_job(&path, &job).unwrap();

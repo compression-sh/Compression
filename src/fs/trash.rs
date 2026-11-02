@@ -304,7 +304,7 @@ mod tests {
         if std::fs::metadata(&home).map(|m| m.dev()).ok() == std::fs::metadata(shm).map(|m| m.dev()).ok() {
             return; // no second filesystem to test with
         }
-        let dir = shm.join(format!("ski_drive_trash_{}", std::process::id()));
+        let dir = shm.join(format!("compression_drive_trash_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("f.txt");
         std::fs::write(&file, "x").unwrap();
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn trash_and_restore() {
-        let base = std::env::temp_dir().join(format!("ski_trash_test_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("compression_trash_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (root, work) = (base.join("Trash"), base.join("work dir"));
         std::fs::create_dir_all(work.join("sub")).unwrap();

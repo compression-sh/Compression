@@ -109,7 +109,7 @@ pub enum StartLocation {
     Home,
     LastVisited,
     Custom,
-    /// Every tab that was open when Ski closed.
+    /// Every tab that was open when Compression closed.
     RestoreTabs,
 }
 

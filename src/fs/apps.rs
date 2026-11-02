@@ -58,7 +58,7 @@ fn rescan() -> Arc<Vec<AppEntry>> {
 }
 
 /// Scan the `.desktop` files in the background so the first use does not stall the UI. Each window
-/// rescans, as a resident Ski would otherwise miss the applications installed since it started.
+/// rescans, as a resident Compression would otherwise miss the applications installed since it started.
 pub fn preload() {
     std::thread::spawn(rescan);
 }
