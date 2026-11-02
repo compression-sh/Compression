@@ -6,6 +6,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+/// Overwrites `bytes` with zeros in a way the compiler may not leave out, for what must not stay in
+/// memory after use (a password). It cannot reach copies made elsewhere, such as in the program that
+/// received it, or memory that was already given back.
+pub fn wipe(bytes: &mut [u8]) {
+    for byte in bytes.iter_mut() {
+        // SAFETY: a plain write to a byte of the slice; volatile so that it is not optimised away
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
 /// What a program that ran to its end printed.
 pub struct Output {
     pub success: bool,
@@ -77,7 +88,10 @@ pub fn run_capped_with(mut command: Command, input: Option<Vec<u8>>, limit: usiz
     if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
         // On a thread of its own: a program that does not read must not hold up the wait
         std::thread::spawn(move || {
+            let mut bytes = bytes;
             let _ = stdin.write_all(&bytes);
+            // It may have been a password: it does not stay here once it was handed over
+            wipe(&mut bytes);
         });
     }
     let (tx, rx) = mpsc::channel();
@@ -205,6 +219,14 @@ mod tests {
         let done = run_capped_with(sh("cat >&2"), Some(b"secret\n".to_vec()), 1024, SECS, &|| false).unwrap();
         assert!(done.success);
         assert_eq!(done.stderr, b"secret\n");
+    }
+
+    #[test]
+    fn wiped_bytes_are_zero() {
+        let mut bytes = b"hunter2 and more".to_vec();
+        wipe(&mut bytes);
+        assert_eq!(bytes, vec![0u8; 16]);
+        wipe(&mut []);
     }
 
     #[test]

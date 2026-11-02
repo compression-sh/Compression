@@ -634,12 +634,24 @@ pub enum Prompt {
 }
 
 /// The answer to a `Prompt`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Reply {
     Login { user: String, domain: String, password: String, remember: bool },
     Anonymous,
     Choice(usize),
     Cancel,
+}
+
+/// Like the derived one, except that a password is not shown.
+impl std::fmt::Debug for Reply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Reply::Login { user, domain, remember, .. } => f.debug_struct("Login").field("user", user).field("domain", domain).field("password", &"…").field("remember", remember).finish(),
+            Reply::Anonymous => f.write_str("Anonymous"),
+            Reply::Choice(i) => f.debug_tuple("Choice").field(i).finish(),
+            Reply::Cancel => f.write_str("Cancel"),
+        }
+    }
 }
 
 /// What a connection reports to the window.
@@ -669,12 +681,47 @@ pub fn connect(address: Address, password: Option<String>, report: impl Fn(Progr
     tx
 }
 
-/// An account to log in with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An account to log in with. The password is overwritten when this goes away, and is not
+/// shown by `Debug`, so it cannot get into a log by accident.
+#[derive(Clone, PartialEq, Eq)]
 struct Login {
     user: String,
     domain: String,
     password: String,
+}
+
+impl Login {
+    fn wipe(&mut self) {
+        wipe_string(&mut self.password);
+    }
+}
+
+impl Drop for Login {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Login").field("user", &self.user).field("domain", &self.domain).field("password", &"…").finish()
+    }
+}
+
+/// Overwrites a password and empties the string. Copies the string made earlier are not reached.
+fn wipe_string(text: &mut String) {
+    // SAFETY: zero bytes are valid text, and the string is emptied right after
+    super::process::wipe(unsafe { text.as_bytes_mut() });
+    text.clear();
+}
+
+/// A secret held for a while: overwritten when it is dropped.
+struct Secret(String);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        wipe_string(&mut self.0);
+    }
 }
 
 enum Failure {
@@ -701,6 +748,15 @@ struct Session {
     /// The account of the last attempt, saved once it worked when `remember`.
     used: Option<Login>,
     remember: bool,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // A password typed into the address that was never needed
+        if let Some(password) = self.preset.as_mut() {
+            wipe_string(password);
+        }
+    }
 }
 
 impl Session {
@@ -902,7 +958,7 @@ impl Session {
                             Some(Account::Login(login)) if fixed && !login.user.is_empty() && suggested.as_deref() != Some(login.user.as_str()) => {
                                 self.preset = Some(login.password.clone());
                                 self.used = Some(login.clone());
-                                outcome = Some(Ok(Attempt::Again { user: Some(login.user), anonymous: false }));
+                                outcome = Some(Ok(Attempt::Again { user: Some(login.user.clone()), anonymous: false }));
                                 break;
                             }
                             Some(Account::Login(login)) => entering = Some(login),
@@ -910,17 +966,22 @@ impl Session {
                     }
                     let login = entering.clone().unwrap_or(Login { user: String::new(), domain: String::new(), password: String::new() });
                     match prompt {
-                        GioPrompt::User(_) => login.user,
-                        GioPrompt::Domain(_) => login.domain,
+                        GioPrompt::User(_) => login.user.clone(),
+                        GioPrompt::Domain(_) => login.domain.clone(),
                         _ => {
                             self.used = entering.take();
                             self.refused += 1;
-                            login.password
+                            login.password.clone()
                         }
                     }
                 }
             };
-            let written = stdin.as_mut().is_some_and(|s| s.write_all(format!("{answer}\n").as_bytes()).and_then(|_| s.flush()).is_ok());
+            let mut answer = answer;
+            let mut line = format!("{answer}\n");
+            let written = stdin.as_mut().is_some_and(|s| s.write_all(line.as_bytes()).and_then(|_| s.flush()).is_ok());
+            // The answer may be the password: it does not stay here once gio has it
+            wipe_string(&mut line);
+            wipe_string(&mut answer);
             if !written {
                 break;
             }
@@ -1030,15 +1091,15 @@ impl Session {
             };
             let remote = rclone_remote(root, user.as_deref(), domain.as_deref());
             // Always given, if only empty: rclone's FTP refuses a remote without one
-            let env = [(format!("RCLONE_{}_PASS", backend.to_uppercase()), rclone_obscure(password.as_deref().unwrap_or(""), &|| self.cancelled())?)];
+            let env = [(format!("RCLONE_{}_PASS", backend.to_uppercase()), Secret(rclone_obscure(password.as_deref().unwrap_or(""), &|| self.cancelled())?))];
             let mut check = Command::new("rclone");
             check.args(["lsf", "--max-depth", "1", "--contimeout", "15s", "--timeout", "30s", "--retries", "1", "--low-level-retries", "1", "-q"]).arg(&remote);
-            check.envs(env.iter().map(|(k, v)| (k, v)));
+            check.envs(env.iter().map(|(k, v)| (k, v.0.as_str())));
             let (ok, error) = run_with_input(check, None, &|| self.cancelled())?;
             if ok {
                 let mut mount = Command::new("rclone");
                 mount.arg("mount").arg(&remote).arg(point).args(["--daemon", "--vfs-cache-mode", "writes", "--dir-cache-time", "15s", "--contimeout", "15s"]);
-                mount.envs(env.iter().map(|(k, v)| (k, v)));
+                mount.envs(env.iter().map(|(k, v)| (k, v.0.as_str())));
                 let (ok, error) = run_with_input(mount, None, &|| self.cancelled())?;
                 if !ok {
                     return Err(Failure::Message(last_line(&error)));
@@ -1770,6 +1831,47 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         let result = session_with(rx).drive_gio(fake_gio("echo 'Error mounting location: Host unreachable' >&2; exit 1"), &addr("sftp://h/"), secs);
         assert!(matches!(result, Err(Failure::Message(m)) if m.contains("unreachable")));
+    }
+
+    #[test]
+    fn a_password_is_overwritten_when_it_is_done_with_and_never_shown() {
+        // The buffer is read through a pointer while the string still owns it
+        let mut password = String::from("hunter2-correct-horse");
+        let (ptr, len) = (password.as_ptr(), password.len());
+        wipe_string(&mut password);
+        assert!(password.is_empty());
+        // SAFETY: the string still owns its buffer, which `wipe_string` only overwrote
+        assert!(unsafe { std::slice::from_raw_parts(ptr, len) }.iter().all(|b| *b == 0), "the password was still in memory");
+
+        let mut login = Login { user: "me".into(), domain: "WORK".into(), password: "hunter2-correct-horse".into() };
+        let (ptr, len) = (login.password.as_ptr(), login.password.len());
+        login.wipe();
+        // SAFETY: as above, for the buffer of the login's password
+        assert!(unsafe { std::slice::from_raw_parts(ptr, len) }.iter().all(|b| *b == 0));
+        assert_eq!((login.user.as_str(), login.domain.as_str()), ("me", "WORK"));
+
+        let mut secret = Secret("obscured-value".into());
+        let (ptr, len) = (secret.0.as_ptr(), secret.0.len());
+        wipe_string(&mut secret.0);
+        // SAFETY: as above
+        assert!(unsafe { std::slice::from_raw_parts(ptr, len) }.iter().all(|b| *b == 0));
+
+        // Debug output, as in a log, shows the account and not the password
+        let shown = format!("{:?} {:?}", Login { user: "me".into(), domain: String::new(), password: "hunter2".into() }, Reply::Login { user: "me".into(), domain: String::new(), password: "hunter2".into(), remember: true });
+        assert!(!shown.contains("hunter2") && shown.contains("me"), "{shown}");
+    }
+
+    #[test]
+    fn passwords_never_reach_the_saved_server_data() {
+        let (address, password) = Address::parse_login("ftp://user:s%40cret-pw@ftp.example.com/pub").unwrap();
+        assert_eq!(password.as_deref(), Some("s@cret-pw"));
+        // What is written to servers.json and shown in the window holds no password
+        let mut servers = Servers::default();
+        servers.used(&address);
+        let saved = serde_json::to_string(&servers).unwrap();
+        for text in [saved, address.uri(), address.display(), address.name(), format!("{address:?}")] {
+            assert!(!text.contains("cret-pw") && !text.contains("s%40cret") && !text.contains("s@cret"), "{text}");
+        }
     }
 
     #[test]
