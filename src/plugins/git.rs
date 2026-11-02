@@ -333,12 +333,21 @@ impl Git {
 /// Runs git in `root` with these arguments (never through a shell). On failure the last
 /// non-empty line of stderr is the error, as for custom actions.
 fn run_git(root: &Path, args: &[&std::ffi::OsStr]) -> Result<Vec<u8>, String> {
-    let out = Command::new("git").arg("-C").arg(root).args(args).stdin(std::process::Stdio::null()).output().map_err(|e| e.to_string())?;
+    let out = git_command(root).args(args).stdin(std::process::Stdio::null()).output().map_err(|e| e.to_string())?;
     if out.status.success() {
         return Ok(out.stdout);
     }
     let error = String::from_utf8_lossy(&out.stderr);
     Err(error.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("git failed").trim().to_owned())
+}
+
+/// A git command in `dir` that runs nothing the folder's own repository configuration names. Any
+/// folder can come with a `.git/config`, and `core.fsmonitor` in it is a command that even
+/// `git status` runs; git must never be a way for a downloaded folder to run programs.
+fn git_command(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.args(["-c", "core.fsmonitor=false"]).arg("-C").arg(dir).env("GIT_TERMINAL_PROMPT", "0");
+    command
 }
 
 fn os(text: &str) -> &std::ffi::OsStr {
@@ -373,7 +382,8 @@ fn change(root: &Path, action: Action, paths: &[PathBuf]) -> Result<String, Stri
 /// `git diff` of one path against the last commit (staged and unstaged together).
 fn diff(root: &Path, paths: &[PathBuf]) -> Result<DiffView, String> {
     let path = paths.first().ok_or_else(String::new)?;
-    let mut args: Vec<&std::ffi::OsStr> = vec![os("diff"), os("--no-color"), os("--no-ext-diff")];
+    // No external diff or text conversion programs either: the repository's configuration names them
+    let mut args: Vec<&std::ffi::OsStr> = vec![os("-c"), os("diff.external="), os("diff"), os("--no-color"), os("--no-ext-diff"), os("--no-textconv")];
     args.push(if has_head(root) { os("HEAD") } else { os("--cached") });
     args.push(os("--"));
     args.push(path.as_os_str());
@@ -387,7 +397,7 @@ fn diff(root: &Path, paths: &[PathBuf]) -> Result<DiffView, String> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).env("GIT_OPTIONAL_LOCKS", "0").output().ok()?;
+    let out = git_command(dir).args(args).env("GIT_OPTIONAL_LOCKS", "0").output().ok()?;
     out.status.success().then_some(out.stdout)
 }
 
@@ -513,6 +523,32 @@ mod tests {
         let repo = read_repo(&dir).expect("repo");
         let root = std::fs::canonicalize(&dir).unwrap();
         assert_eq!(repo.files.get(&root.join("a.txt")).map(|b| b.letter), Some('?'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_repository_cannot_make_git_run_its_own_commands() {
+        let dir = std::env::temp_dir().join(format!("compression-git-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `git()` is the hardened runner, so the repository is made with plain git
+        if Command::new("git").arg("-C").arg(&dir).args(["init", "-q"]).output().map_or(true, |o| !o.status.success()) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let marker = dir.join("MARKER");
+        let hook = dir.join("hook.sh");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // A downloaded folder can bring this in its own `.git/config`
+        let config = dir.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!("[core]\n\tfsmonitor = {}\n", hook.display()));
+        std::fs::write(&config, text).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let repo = read_repo(&dir).expect("git still reads the repository");
+        assert!(repo.files.values().any(|b| b.letter == '?'));
+        assert!(!marker.exists(), "git ran the program named by the repository's core.fsmonitor");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
