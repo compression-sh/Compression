@@ -444,6 +444,7 @@
   "Show all disks and partitions": "Hiện tất cả ổ đĩa và phân vùng",
   "Internal disks and partitions too; off shows only Computer and the drives you plug in": "Gồm cả ổ đĩa và phân vùng bên trong; nếu tắt chỉ hiện “Máy tính” và các ổ bạn cắm vào",
   "Cannot put {} inside itself": "Không thể đặt {} vào bên trong chính nó",
+  "Cannot copy {}: it is a named pipe, socket or device file": "Không thể sao chép {}: đây là named pipe, socket hoặc tệp thiết bị",
   "Copy of {}": "Sao chép {}",
   "Move of {}": "Di chuyển {}",
   "Copied {} to “{}”": "Đã sao chép {} đến “{}”",

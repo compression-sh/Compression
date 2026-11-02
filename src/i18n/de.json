@@ -444,6 +444,7 @@
   "Show all disks and partitions": "Alle Datenträger und Partitionen anzeigen",
   "Internal disks and partitions too; off shows only Computer and the drives you plug in": "Auch interne Datenträger und Partitionen; aus zeigt nur „Rechner“ und angeschlossene Laufwerke",
   "Cannot put {} inside itself": "{} kann nicht in sich selbst abgelegt werden",
+  "Cannot copy {}: it is a named pipe, socket or device file": "{} kann nicht kopiert werden: Es ist eine benannte Pipe, ein Socket oder eine Gerätedatei",
   "Copy of {}": "Kopieren von {}",
   "Move of {}": "Verschieben von {}",
   "Copied {} to “{}”": "{} nach „{}“ kopiert",

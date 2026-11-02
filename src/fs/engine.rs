@@ -565,6 +565,33 @@ fn copy_file(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
     result
 }
 
+fn special_file_error(path: &Path) -> io::Error {
+    io::Error::other(trf("Cannot copy {}: it is a named pipe, socket or device file", &[&name_of(path)]))
+}
+
+/// Refuse a tree with a named pipe, socket or device file in it before anything is created: opening
+/// a pipe to copy it waits for a writer that may never come, and the job would hang for good.
+fn refuse_special_files(w: &Worker, path: &Path) -> io::Result<()> {
+    w.shared.checkpoint()?;
+    let meta = path.symlink_metadata()?;
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            refuse_special_files(w, &entry?.path())?;
+        }
+        Ok(())
+    } else if meta.is_file() || meta.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err(special_file_error(path))
+    }
+}
+
+/// Whether a rename from `src` into `parent` stays on one file system, so nothing is copied.
+fn same_device(src: &Path, parent: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    matches!((src.symlink_metadata(), parent.metadata()), (Ok(a), Ok(b)) if a.dev() == b.dev())
+}
+
 fn copy_tree(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
     w.shared.checkpoint()?;
     let meta = src.symlink_metadata()?;
@@ -580,11 +607,14 @@ fn copy_tree(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
         }
         super::xattr::copy_user(src, dst);
         ops::keep_mode(std::fs::set_permissions(dst, meta.permissions()))
-    } else {
+    } else if meta.is_file() {
         w.shared.set_current(&name_of(src));
         copy_file(w, src, dst)?;
         w.file_done();
         Ok(())
+    } else {
+        // Made after the check above, or not seen by it
+        Err(special_file_error(src))
     }
 }
 
@@ -606,6 +636,10 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
     let name = target.file_name().ok_or_else(|| io::Error::other("no file name"))?.to_owned();
     if src.is_dir() && !src.is_symlink() && parent.canonicalize().is_ok_and(|p| src.canonicalize().is_ok_and(|s| p.starts_with(s))) {
         return Err(io::Error::other(trf("Cannot put {} inside itself", &[&name_of(src)])));
+    }
+    // Before a conflict is answered, so a refused item does not first send the old target to the trash
+    if op == Op::Copy || !same_device(src, parent) {
+        refuse_special_files(w, src)?;
     }
     let mut target = target.to_path_buf();
     let mut merge = false;
@@ -907,6 +941,70 @@ mod tests {
         e.spawn(JobKind::Copy, "Copy".into(), String::new(), move |w| transfer(w, Op::Copy, pairs));
         wait(&mut e);
         assert!(dir.join("big (copy)").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn mkfifo(path: &Path) {
+        let c = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())).unwrap();
+        // SAFETY: `c` is a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    fn run(e: &mut Engine, kind: JobKind, op: Op, pairs: Vec<(PathBuf, PathBuf)>) -> Outcome {
+        e.spawn(kind, String::new(), String::new(), move |w| transfer(w, op, pairs));
+        let events = wait(e);
+        let Some(Event::Done { outcome, .. }) = events.into_iter().find(|ev| matches!(ev, Event::Done { .. })) else { panic!("the job never finished") };
+        outcome
+    }
+
+    #[test]
+    fn a_named_pipe_is_refused_instead_of_hanging_the_copy() {
+        let dir = sandbox("fifo");
+        std::fs::create_dir_all(dir.join("src/folder")).unwrap();
+        std::fs::write(dir.join("src/folder/a.txt"), "a").unwrap();
+        mkfifo(&dir.join("src/folder/pipe"));
+        mkfifo(&dir.join("src/lonely"));
+        std::fs::write(dir.join("src/fine.txt"), "f").unwrap();
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+
+        let mut e = engine();
+        let pairs = vec![
+            (dir.join("src/folder"), dir.join("dst/folder")),
+            (dir.join("src/lonely"), dir.join("dst/lonely")),
+            (dir.join("src/fine.txt"), dir.join("dst/fine.txt")),
+        ];
+        let outcome = run(&mut e, JobKind::Copy, Op::Copy, pairs);
+        assert!(!outcome.ok);
+        assert!(outcome.message.contains("folder") && outcome.message.contains("lonely"), "{}", outcome.message);
+        assert!(outcome.message.contains("named pipe"), "{}", outcome.message);
+        // Nothing half-made for the refused items, and the other item in the same job still copied
+        assert!(!dir.join("dst/folder").exists() && !dir.join("dst/lonely").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("dst/fine.txt")).unwrap(), "f");
+        assert!(dir.join("src/folder/pipe").exists());
+
+        // Moving on one file system is a rename, which never opens the pipe
+        let outcome = run(&mut e, JobKind::Move, Op::Move, vec![(dir.join("src/folder"), dir.join("dst/folder"))]);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(dir.join("dst/folder/pipe").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pipe_made_after_the_check_is_still_refused_by_the_copy_itself() {
+        let dir = sandbox("fifo_late");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        mkfifo(&dir.join("src/pipe"));
+        let mut e = engine();
+        e.spawn(JobKind::Copy, String::new(), String::new(), {
+            let (src, dst) = (dir.join("src/pipe"), dir.join("pipe"));
+            move |w| match copy_tree(w, &src, &dst) {
+                Ok(()) => Outcome::done(String::new()),
+                Err(err) => Outcome::failed(err.to_string()),
+            }
+        });
+        let Some(Event::Done { outcome, .. }) = wait(&mut e).into_iter().find(|ev| matches!(ev, Event::Done { .. })) else { panic!("the copy hung") };
+        assert!(!outcome.ok && outcome.message.contains("named pipe"), "{}", outcome.message);
+        assert!(!dir.join("pipe").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

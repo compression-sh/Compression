@@ -444,6 +444,7 @@
   "Show all disks and partitions": "Показывать все диски и разделы",
   "Internal disks and partitions too; off shows only Computer and the drives you plug in": "Внутренние диски и разделы тоже; если выключено, видны только «Компьютер» и подключённые накопители",
   "Cannot put {} inside itself": "Нельзя поместить {} внутрь самого себя",
+  "Cannot copy {}: it is a named pipe, socket or device file": "Нельзя скопировать {}: это именованный канал, сокет или файл устройства",
   "Copy of {}": "Копирование {}",
   "Move of {}": "Перемещение {}",
   "Copied {} to “{}”": "{} скопировано в «{}»",
