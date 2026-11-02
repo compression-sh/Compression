@@ -69,15 +69,38 @@ pub struct Poll {
     pub busy: bool,
 }
 
-#[derive(Default)]
+/// How long a drag source has to send its list of files, counted from the drag coming over the
+/// window and again from the drop. A source that sends nothing and keeps the pipe open would
+/// otherwise hold the window waiting for ever.
+const SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a program may leave what this window offers it (a drop's files, the clipboard's text)
+/// unread before the write is given up.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 struct Reader {
     fd: Option<OwnedFd>,
     data: Vec<u8>,
+    /// When the wait for the source began.
+    started: std::time::Instant,
+    timeout: std::time::Duration,
+    /// The source did not finish in time: `data` is dropped, and the drop is not carried out.
+    timed_out: bool,
+}
+
+impl Default for Reader {
+    fn default() -> Self {
+        Self { fd: None, data: Vec::new(), started: std::time::Instant::now(), timeout: SOURCE_TIMEOUT, timed_out: false }
+    }
 }
 
 impl Reader {
     fn done(&self) -> bool {
         self.fd.is_none()
+    }
+
+    /// Starts the wait over, for a source that has had no reason to hurry until the drop.
+    fn restart(&mut self) {
+        self.started = std::time::Instant::now();
     }
 
     fn pump(&mut self) {
@@ -96,6 +119,12 @@ impl Reader {
                 self.fd = None;
                 return;
             } else {
+                // Nothing to read just now, and the source keeps the pipe open
+                if self.started.elapsed() >= self.timeout {
+                    self.fd = None;
+                    self.data.clear();
+                    self.timed_out = true;
+                }
                 return;
             }
         }
@@ -300,7 +329,13 @@ impl Device {
         }
         if let Some(d) = &mut self.state.dropping {
             d.reader.pump();
-            if d.reader.done() || d.own {
+            if d.reader.timed_out {
+                // The source never finished sending the files: nothing is dropped, and nothing waits on it
+                if let Some(d) = self.state.dropping.take() {
+                    self.state.offers.remove(&d.offer.id());
+                    d.offer.destroy();
+                }
+            } else if d.reader.done() || d.own {
                 let d = self.state.dropping.take().unwrap();
                 let paths = Self::paths_of(&d, &self.state.out);
                 // Before version 3 there are no actions: a drop is a move
@@ -603,8 +638,43 @@ impl State {
 
 fn write_async(fd: OwnedFd, data: String) {
     std::thread::spawn(move || {
-        let _ = std::fs::File::from(fd).write_all(data.as_bytes());
+        let _ = write_all_within(fd, data.as_bytes(), WRITE_TIMEOUT);
     });
+}
+
+/// Writes all of `data` to the pipe `fd`, unless the program on the other end does not read it
+/// within `timeout`: a blocking write would hold this thread for ever.
+fn write_all_within(fd: OwnedFd, mut data: &[u8], timeout: std::time::Duration) -> std::io::Result<()> {
+    // SAFETY: plain flag changes on a descriptor we own
+    unsafe {
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    while !data.is_empty() {
+        // SAFETY: writes from a slice of the given length to a descriptor we own
+        let n = unsafe { libc::write(fd.as_raw_fd(), data.as_ptr().cast(), data.len()) };
+        if n >= 0 {
+            data = &data[n as usize..];
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.kind() {
+            std::io::ErrorKind::Interrupted => {}
+            std::io::ErrorKind::WouldBlock => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now()).as_millis().min(i32::MAX as u128) as i32;
+                let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+                // SAFETY: one valid pollfd
+                if left == 0 || unsafe { libc::poll(&mut pfd, 1, left) } == 0 {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+            }
+            _ => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 fn dnd_action(action: WEnum<DndAction>) -> DndAction {
@@ -710,7 +780,17 @@ impl Dispatch<WlDataDevice, ()> for State {
                     old.offer.destroy();
                 }
             }
-            wl_data_device::Event::Drop => state.dropping = state.hover.take(),
+            wl_data_device::Event::Drop => {
+                // A drop still being read is replaced by this one; its offer has to go first
+                if let Some(old) = state.dropping.take() {
+                    state.offers.remove(&old.offer.id());
+                    old.offer.destroy();
+                }
+                state.dropping = state.hover.take();
+                if let Some(d) = &mut state.dropping {
+                    d.reader.restart();
+                }
+            }
             wl_data_device::Event::Selection { id } => {
                 // Clipboard offers are of no use here
                 if let Some(old) = state.selection.take() {
@@ -785,6 +865,99 @@ impl Dispatch<WlDataSource, ()> for State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pipe: the end to read from (not blocking, as the reader of a drop has it) and the end to write to.
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: pipe2 fills two descriptors that are owned from here on
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn a_source_that_sends_nothing_is_given_up_on_after_the_limit() {
+        let (read, _write_kept_open) = pipe();
+        let mut reader = Reader { fd: Some(read), timeout: std::time::Duration::from_millis(60), ..Default::default() };
+        reader.pump();
+        assert!(!reader.done() && !reader.timed_out, "still within the time");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        reader.pump();
+        assert!(reader.done() && reader.timed_out);
+        assert!(reader.data.is_empty());
+        // Restarting the wait gives a source new time
+        let (read, _write) = pipe();
+        let mut reader = Reader { fd: Some(read), timeout: std::time::Duration::from_millis(60), ..Default::default() };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        reader.restart();
+        reader.pump();
+        assert!(!reader.done());
+    }
+
+    #[test]
+    fn half_a_list_from_a_stalled_source_is_thrown_away() {
+        let (read, write) = pipe();
+        let mut reader = Reader { fd: Some(read), timeout: std::time::Duration::from_millis(60), ..Default::default() };
+        let half = b"file:///tmp/a\r\nfile:///tm";
+        assert_eq!(unsafe { libc::write(write.as_raw_fd(), half.as_ptr().cast(), half.len()) }, half.len() as isize);
+        reader.pump();
+        assert!(!reader.done());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        reader.pump();
+        assert!(reader.done() && reader.timed_out && reader.data.is_empty());
+    }
+
+    #[test]
+    fn a_source_that_sends_everything_and_closes_is_read_whole() {
+        let (read, write) = pipe();
+        let mut reader = Reader { fd: Some(read), ..Default::default() };
+        let list = b"file:///tmp/a\r\n";
+        assert_eq!(unsafe { libc::write(write.as_raw_fd(), list.as_ptr().cast(), list.len()) }, list.len() as isize);
+        drop(write);
+        reader.pump();
+        assert!(reader.done() && !reader.timed_out);
+        assert_eq!(reader.data, b"file:///tmp/a\r\n");
+    }
+
+    #[test]
+    fn writing_to_a_program_that_never_reads_gives_up_at_the_timeout() {
+        let (read, write) = pipe();
+        // More than a pipe holds, so the write has to wait for the reader, which is not coming
+        let big = vec![b'x'; 4 << 20];
+        let started = std::time::Instant::now();
+        let err = write_all_within(write, &big, std::time::Duration::from_millis(150)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        drop(read);
+    }
+
+    #[test]
+    fn writing_to_a_program_that_reads_slowly_and_one_that_left() {
+        let (read, write) = pipe();
+        let big = vec![b'y'; 1 << 20];
+        let expect = big.clone();
+        let reader = std::thread::spawn(move || {
+            let mut file = std::fs::File::from(read);
+            let mut all = Vec::new();
+            let mut buf = [0u8; 4096];
+            while all.len() < expect.len() {
+                match std::io::Read::read(&mut file, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => all.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    Err(_) => break,
+                }
+            }
+            all == expect
+        });
+        write_all_within(write, &big, std::time::Duration::from_secs(10)).unwrap();
+        assert!(reader.join().unwrap());
+        // A program that closed its end is an error at once, not a wait
+        let (read, write) = pipe();
+        drop(read);
+        let started = std::time::Instant::now();
+        assert_eq!(write_all_within(write, b"data", std::time::Duration::from_secs(10)).unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
 
     #[test]
     fn icon_stacks_the_files_and_shows_the_count() {
