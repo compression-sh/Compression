@@ -1341,7 +1341,7 @@ impl CompressionApp {
             return;
         }
         let started = std::env::current_exe()
-            .and_then(|exe| std::process::Command::new(exe).arg(path).spawn());
+            .and_then(|exe| crate::instance::spawn_reaped(std::process::Command::new(exe).arg(path)));
         if let Err(err) = started {
             self.set_toast(trf("Could not open a new window: {}", &[&err]));
         }
@@ -3211,7 +3211,7 @@ impl CompressionApp {
         if item.is_dir {
             if self.settings.open_in_new_window && self.chooser.is_none() {
                 let started = std::env::current_exe()
-                    .and_then(|exe| std::process::Command::new(exe).arg(&item.path).spawn());
+                    .and_then(|exe| crate::instance::spawn_reaped(std::process::Command::new(exe).arg(&item.path)));
                 if let Err(err) = started {
                     self.set_toast(trf("Could not open a new window: {}", &[&err]));
                 }

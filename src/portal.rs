@@ -336,7 +336,7 @@ impl FileManager {
             crate::chooser::from_uri(u).map(PathBuf::into_os_string).or_else(|| crate::fs::network::Address::looks_like(u).then(|| u.into()))
         });
         for target in targets {
-            let _ = Command::new(&exe).arg(target).stdin(Stdio::null()).spawn();
+            let _ = crate::instance::spawn_reaped(Command::new(&exe).arg(target).stdin(Stdio::null()));
         }
     }
 }

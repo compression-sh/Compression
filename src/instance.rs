@@ -140,6 +140,18 @@ fn send(path: &Path, request: &Request) -> Option<u8> {
     })
 }
 
+/// Starts `command` and collects its exit status on a thread of its own, which ends with the child.
+/// A child that is never waited for stays in the process table as a zombie until this process
+/// exits, and the resident process and the portal run for the whole session. Returns the child's id.
+pub fn spawn_reaped(command: &mut Command) -> std::io::Result<u32> {
+    let mut child = command.spawn()?;
+    let id = child.id();
+    let _ = std::thread::Builder::new().name("compression-reap".into()).spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(id)
+}
+
 /// Start `compression --resident` in a session of its own, so it outlives the terminal or launcher.
 fn start_resident() -> std::io::Result<Child> {
     let mut command = Command::new(std::env::current_exe()?);
@@ -241,6 +253,43 @@ fn release_memory() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether the process `id` still has an entry in the process table (a zombie has one).
+    fn listed(id: u32) -> bool {
+        Path::new(&format!("/proc/{id}")).exists()
+    }
+
+    fn gone_within(id: u32, secs: u64) -> bool {
+        let started = Instant::now();
+        while listed(id) && started.elapsed() < Duration::from_secs(secs) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        !listed(id)
+    }
+
+    #[test]
+    fn a_child_that_ended_is_collected_and_not_left_as_a_zombie() {
+        // A child nobody waits for: once it ended, it stays listed as a zombie. Shown here with
+        // a plain spawn, so the next check means something.
+        let mut forgotten = Command::new("true").spawn().unwrap();
+        let forgotten_id = forgotten.id();
+        std::thread::sleep(Duration::from_millis(300));
+        let zombie = std::fs::read_to_string(format!("/proc/{forgotten_id}/stat")).map(|s| s.contains(") Z ")).unwrap_or(false);
+        assert!(zombie, "a child that ended and is not waited for should be a zombie");
+        forgotten.wait().unwrap();
+
+        // The same child through the reaper leaves nothing behind
+        let id = spawn_reaped(&mut Command::new("true")).unwrap();
+        assert!(gone_within(id, 5), "the child was not collected");
+        let id = spawn_reaped(Command::new("sleep").arg("0.3")).unwrap();
+        assert!(listed(id), "still running");
+        assert!(gone_within(id, 5), "the child was not collected after it ended");
+    }
+
+    #[test]
+    fn a_program_that_cannot_be_started_is_an_error() {
+        assert!(spawn_reaped(&mut Command::new("/nonexistent/compression-test-program")).is_err());
+    }
 
     #[test]
     fn requests_survive_the_wire() {

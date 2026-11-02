@@ -79,7 +79,7 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
     // Several items dropped on the launcher at once: the first fills this window, each other gets its own
     if chooser.is_none() {
         for extra in args.iter().skip(1).filter(|a| !a.starts_with("--")) {
-            let _ = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg(extra).current_dir(&request.cwd).spawn());
+            let _ = std::env::current_exe().and_then(|exe| instance::spawn_reaped(std::process::Command::new(exe).arg(extra).current_dir(&request.cwd)));
         }
     }
     // Tabs to keep beside a folder given on the command line, so that launch does not replace the saved session
