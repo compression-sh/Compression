@@ -181,6 +181,9 @@ impl Address {
                 _ => user = Some(name).filter(|u| !u.is_empty()),
             }
         }
+        if ![Some(host.as_str()), user.as_deref(), domain.as_deref()].into_iter().flatten().all(is_plain_name) {
+            return None;
+        }
         // A query or fragment is not part of a folder
         let path = path.split(['?', '#']).next().unwrap_or("/");
         Some((Address { scheme, user, domain, host, port, path: normalize_path(&decode(path)) }, password))
@@ -194,7 +197,7 @@ impl Address {
         let (user, rest) = text.split_once('@')?;
         let (host, path) = rest.split_once(':')?;
         let valid_host = !host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
-        if user.is_empty() || user.contains('/') || !valid_host {
+        if user.is_empty() || user.contains('/') || !valid_host || !is_plain_name(user) || !is_plain_name(host) {
             return None;
         }
         let path = if path.starts_with('/') { path.to_owned() } else { format!("/{path}") };
@@ -296,6 +299,13 @@ impl Address {
     fn keyring_key(&self) -> String {
         format!("{}://{}@{}:{}/{}", self.scheme.name(), self.user.as_deref().unwrap_or(""), self.host.to_lowercase(), self.port.unwrap_or(self.scheme.default_port()), self.share().unwrap_or(""))
     }
+}
+
+/// Whether a user, domain or host name can be handed to `sshfs`, `ssh-keygen` and the like as an
+/// argument: one that starts with a dash would be read as an option (`-oProxyCommand=…` runs a
+/// program), and control characters have no place in a name.
+fn is_plain_name(name: &str) -> bool {
+    !name.starts_with('-') && !name.chars().any(char::is_control)
 }
 
 fn split_host_port(text: &str) -> Option<(String, Option<u16>)> {
@@ -1509,6 +1519,34 @@ mod tests {
         assert_eq!(rclone_remote(&addr("davs://cloud/remote.php/dav"), None, None), ":webdav,url=\"https://cloud/remote.php/dav\":");
         assert_eq!(rclone_quote("a,b"), "\"a,b\"");
         assert_eq!(helper_id(&addr("smb://bob@nas/my share").root()), "smb-bob@nas-my_share");
+    }
+
+    #[test]
+    fn names_that_would_be_read_as_options_are_not_addresses() {
+        // The user name begins with a dash, so `user@host:/` would be an option for sshfs
+        assert!(Address::parse("sftp://-oProxyCommand=x@h/").is_none());
+        assert!(Address::parse("sftp://-oProxyCommand=touch%20/tmp/x@h/").is_none());
+        assert!(Address::parse("me@-oProxyCommand:/dir").is_none());
+        assert!(Address::parse("-oProxyCommand=x@h:/dir").is_none());
+        // A host, a domain or a user that starts with a dash
+        assert!(Address::parse("sftp://-v/").is_none());
+        assert!(Address::parse("sftp://me@-v:2222/dir").is_none());
+        assert!(Address::parse("smb://-WORK;bob@nas/share").is_none());
+        assert!(Address::parse("smb://-WORK%5Cbob@nas/share").is_none());
+        assert!(Address::parse("me@-v:/dir").is_none());
+        // Control characters in any of them, escaped or not
+        assert!(Address::parse("sftp://me%09x@h/").is_none());
+        assert!(Address::parse("sftp://me%0Ax@h/").is_none());
+        assert!(Address::parse("sftp://h\tx/").is_none());
+        assert!(Address::parse("smb://WO%09RK;bob@nas/share").is_none());
+        // Dashes inside a name are fine, and so are ordinary addresses
+        assert_eq!(addr("sftp://my-user@my-host:2222/dir").host, "my-host");
+        assert_eq!(addr("sftp://my-user@my-host/").user.as_deref(), Some("my-user"));
+        assert_eq!(addr("smb://WORK;bob@nas/share").domain.as_deref(), Some("WORK"));
+        assert_eq!(addr("me@host.example:/srv").host, "host.example");
+        assert!(Address::parse("ftp://[::1]:2121/").is_some());
+        // A dash may be the first character of the path
+        assert_eq!(addr("sftp://h/-rf").path, "/-rf");
     }
 
     #[test]
