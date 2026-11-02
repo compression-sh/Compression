@@ -278,14 +278,18 @@ pub fn uri(path: &Path) -> String {
     out
 }
 
-/// Path behind a `file://` URI (or a plain path); `None` for other schemes.
+/// Path behind a `file://` URI (or a plain path); `None` for other schemes, and for a `file://`
+/// URI that names another computer.
 pub fn from_uri(text: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     let Some(rest) = text.strip_prefix("file://") else {
         return (!text.contains("://")).then(|| PathBuf::from(text));
     };
     // `file://host/path`: only the local host is ours
-    let rest = rest.find('/').map_or("", |i| &rest[i..]);
+    let (host, rest) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
+    if !crate::clipboard::is_local_host(host) {
+        return None;
+    }
     let bytes = rest.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -367,6 +371,13 @@ mod tests {
         assert_eq!(from_uri("file:///home/a%20b"), Some(PathBuf::from("/home/a b")));
         assert_eq!(from_uri("rel/dir"), Some(PathBuf::from("rel/dir")));
         assert_eq!(from_uri("https://x/y"), None);
+        // A file on another computer is not opened as a local one
+        assert_eq!(from_uri("file://other-host/pfad"), None);
+        assert_eq!(from_uri("file://nas/"), None);
+        assert_eq!(from_uri("file://localhost/home/a%20b"), Some(PathBuf::from("/home/a b")));
+        assert_eq!(from_uri("file://LOCALHOST/x"), Some(PathBuf::from("/x")));
+        assert_eq!(from_uri("file:///x"), Some(PathBuf::from("/x")));
+        assert_eq!(from_uri("file://"), Some(PathBuf::new()));
     }
 
     #[test]

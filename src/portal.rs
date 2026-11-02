@@ -328,14 +328,30 @@ impl FileChooser {
 
 struct FileManager;
 
+/// What a `FileManager1` call may ask to open: `file://` URIs of this computer, server addresses,
+/// and absolute paths. The caller is any program on the bus, and what it names becomes an argument
+/// of a new window: a string that starts with a dash would be read as an option (`--portal`), and a
+/// relative path means nothing here.
+fn show_targets(uris: &[String]) -> Vec<std::ffi::OsString> {
+    uris.iter()
+        .filter(|u| !u.starts_with('-'))
+        .filter_map(|u| {
+            if u.starts_with("file://") {
+                crate::chooser::from_uri(u).map(PathBuf::into_os_string)
+            } else if u.starts_with('/') {
+                Some(u.into())
+            } else {
+                // Server addresses are handed on as they are; the new window connects to them
+                crate::fs::network::Address::looks_like(u).then(|| u.into())
+            }
+        })
+        .collect()
+}
+
 impl FileManager {
     fn show(uris: &[String]) {
         let Ok(exe) = own_exe() else { return };
-        // Server addresses are handed on as they are; the new window connects to them
-        let targets = uris.iter().filter_map(|u| {
-            crate::chooser::from_uri(u).map(PathBuf::into_os_string).or_else(|| crate::fs::network::Address::looks_like(u).then(|| u.into()))
-        });
-        for target in targets {
+        for target in show_targets(uris) {
             let _ = crate::instance::spawn_reaped(Command::new(&exe).arg(target).stdin(Stdio::null()));
         }
     }
@@ -404,6 +420,20 @@ mod tests {
         // The program closed its request: whatever the dialog did, it is not an error
         assert_eq!(end_of(None, true, false), End::Cancelled);
         assert_eq!(end_of(Some(chooser::EXIT_FAILED), true, false), End::Cancelled);
+    }
+
+    #[test]
+    fn only_places_are_opened_for_other_programs() {
+        let uris = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let os = |list: &[&str]| list.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(show_targets(&uris(&["file:///home/me/a%20b", "/home/me/c", "sftp://me@host/srv", "smb://nas/share"])), os(&["/home/me/a b", "/home/me/c", "sftp://me@host/srv", "smb://nas/share"]));
+        assert_eq!(show_targets(&uris(&["file://localhost/tmp/x"])), os(&["/tmp/x"]));
+        // Options, relative paths, and files on other computers are not opened
+        assert!(show_targets(&uris(&["--portal", "--chooser", "--resident", "-v", "--x://y", "-"])).is_empty());
+        assert!(show_targets(&uris(&["relative/path", "file", "~/home", "ski:recent", ""])).is_empty());
+        assert!(show_targets(&uris(&["file://other-host/tmp/x", "file://nas/"])).is_empty());
+        // A file name that starts with a dash is fine as part of a path
+        assert_eq!(show_targets(&uris(&["/tmp/-rf", "file:///tmp/--portal"])), os(&["/tmp/-rf", "/tmp/--portal"]));
     }
 
     #[test]

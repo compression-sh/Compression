@@ -63,11 +63,21 @@ pub(crate) fn percent_encode(path: &Path) -> String {
     out
 }
 
+/// Whether the host of a `file://host/path` URI is this computer: none, or `localhost`. A path on
+/// another computer is not a path here, and must not be opened as one.
+pub(crate) fn is_local_host(host: &str) -> bool {
+    host.is_empty() || host.eq_ignore_ascii_case("localhost")
+}
+
 pub(crate) fn percent_decode(text: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     let rest = text.strip_prefix("file://")?;
     // `file://host/path` carries a host before the first slash
-    let rest = &rest[rest.find('/')?..];
+    let slash = rest.find('/')?;
+    if !is_local_host(&rest[..slash]) {
+        return None;
+    }
+    let rest = &rest[slash..];
     let bytes = rest.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -276,6 +286,11 @@ mod tests {
     fn decode_skips_other_schemes_and_host() {
         assert_eq!(percent_decode("https://example.org/a"), None);
         assert_eq!(percent_decode("file://localhost/tmp/a"), Some(PathBuf::from("/tmp/a")));
+        // The path on another computer is not a path here
+        assert_eq!(percent_decode("file://other-host/tmp/a"), None);
+        assert_eq!(percent_decode("file://me@nas/tmp/a"), None);
+        assert_eq!(percent_decode("file://LocalHost/tmp/a"), Some(PathBuf::from("/tmp/a")));
+        assert_eq!(percent_decode("file:///tmp/a"), Some(PathBuf::from("/tmp/a")));
     }
 }
 

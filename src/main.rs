@@ -70,7 +70,7 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
     let mut select = None;
     // Tabs of the last session, which only a normal launch without a folder argument brings back
     let mut session = None;
-    let given = if chooser.is_some() { None } else { args.first().filter(|a| !a.starts_with("--")).cloned() };
+    let given = if chooser.is_some() { None } else { args.first().filter(|a| !a.starts_with("--")).filter(|a| !a.starts_with("file://") || chooser::from_uri(a).is_some()).cloned() };
     // A server address opens the usual start folder and connects; the server's folder follows once it is reachable
     let (given, server) = match given {
         Some(arg) if fs::network::Address::looks_like(&arg) && !arg.starts_with("file://") => (None, Some(arg)),
