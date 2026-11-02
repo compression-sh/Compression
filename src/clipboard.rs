@@ -193,8 +193,10 @@ mod tests {
 mod live {
     use super::*;
 
-    /// Needs a running Wayland session; skipped elsewhere.
+    /// Replaces whatever is on the real system clipboard, so it never runs by itself. Run it on
+    /// purpose, in a Wayland session, with `cargo test live -- --ignored`.
     #[test]
+    #[ignore = "overwrites the system clipboard; run with `cargo test live -- --ignored`"]
     fn files_round_trip_through_the_system_clipboard() {
         if !on_wayland() {
             return;
