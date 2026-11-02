@@ -71,13 +71,17 @@ pub(crate) fn is_local_host(host: &str) -> bool {
 
 pub(crate) fn percent_decode(text: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
-    let rest = text.strip_prefix("file://")?;
-    // `file://host/path` carries a host before the first slash
-    let slash = rest.find('/')?;
-    if !is_local_host(&rest[..slash]) {
-        return None;
-    }
-    let rest = &rest[slash..];
+    let rest = if let Some(rest) = text.strip_prefix("file://") {
+        // `file://host/path` carries a host before the first slash
+        let slash = rest.find('/')?;
+        if !is_local_host(&rest[..slash]) {
+            return None;
+        }
+        &rest[slash..]
+    } else {
+        // `file:/path` has no host, and means the same as `file:///path`
+        text.strip_prefix("file:").filter(|p| p.starts_with('/'))?
+    };
     let bytes = rest.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -291,6 +295,11 @@ mod tests {
         assert_eq!(percent_decode("file://me@nas/tmp/a"), None);
         assert_eq!(percent_decode("file://LocalHost/tmp/a"), Some(PathBuf::from("/tmp/a")));
         assert_eq!(percent_decode("file:///tmp/a"), Some(PathBuf::from("/tmp/a")));
+        // One slash is a local path too
+        assert_eq!(percent_decode("file:/tmp/example"), Some(PathBuf::from("/tmp/example")));
+        assert_eq!(percent_decode("file:/tmp/a%20b"), percent_decode("file:///tmp/a%20b"));
+        assert_eq!(percent_decode("file:relative"), None);
+        assert_eq!(percent_decode("file://other-host/tmp/example"), None);
     }
 }
 

@@ -336,7 +336,7 @@ fn show_targets(uris: &[String]) -> Vec<std::ffi::OsString> {
     uris.iter()
         .filter(|u| !u.starts_with('-'))
         .filter_map(|u| {
-            if u.starts_with("file://") {
+            if u.starts_with("file:") {
                 crate::chooser::from_uri(u).map(PathBuf::into_os_string)
             } else if u.starts_with('/') {
                 Some(u.into())
@@ -427,7 +427,7 @@ mod tests {
         let uris = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let os = |list: &[&str]| list.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
         assert_eq!(show_targets(&uris(&["file:///home/me/a%20b", "/home/me/c", "sftp://me@host/srv", "smb://nas/share"])), os(&["/home/me/a b", "/home/me/c", "sftp://me@host/srv", "smb://nas/share"]));
-        assert_eq!(show_targets(&uris(&["file://localhost/tmp/x"])), os(&["/tmp/x"]));
+        assert_eq!(show_targets(&uris(&["file://localhost/tmp/x", "file:/tmp/y", "file:///tmp/z"])), os(&["/tmp/x", "/tmp/y", "/tmp/z"]));
         // Options, relative paths, and files on other computers are not opened
         assert!(show_targets(&uris(&["--portal", "--chooser", "--resident", "-v", "--x://y", "-"])).is_empty());
         assert!(show_targets(&uris(&["relative/path", "file", "~/home", "ski:recent", ""])).is_empty());

@@ -301,11 +301,15 @@ pub fn uri(path: &Path) -> String {
 /// URI that names another computer.
 pub fn from_uri(text: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
-    let Some(rest) = text.strip_prefix("file://") else {
+    let (host, rest) = if let Some(rest) = text.strip_prefix("file://") {
+        // `file://host/path`: only the local host is ours
+        rest.find('/').map_or((rest, ""), |i| rest.split_at(i))
+    } else if let Some(path) = text.strip_prefix("file:").filter(|p| p.starts_with('/')) {
+        // `file:/path` has no host at all, and means the same as `file:///path`
+        ("", path)
+    } else {
         return (!text.contains("://")).then(|| PathBuf::from(text));
     };
-    // `file://host/path`: only the local host is ours
-    let (host, rest) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
     if !crate::clipboard::is_local_host(host) {
         return None;
     }
@@ -397,6 +401,13 @@ mod tests {
         assert_eq!(from_uri("file://LOCALHOST/x"), Some(PathBuf::from("/x")));
         assert_eq!(from_uri("file:///x"), Some(PathBuf::from("/x")));
         assert_eq!(from_uri("file://"), Some(PathBuf::new()));
+        // One slash is a local path too, and means the same as three
+        assert_eq!(from_uri("file:/tmp/example"), Some(PathBuf::from("/tmp/example")));
+        assert_eq!(from_uri("file:/tmp/a%20b"), from_uri("file:///tmp/a%20b"));
+        assert_eq!(from_uri("file:///tmp/example"), Some(PathBuf::from("/tmp/example")));
+        assert_eq!(from_uri("file://other-host/tmp/example"), None);
+        // `file:` without a slash is not a URI of ours
+        assert_eq!(from_uri("file:relative"), Some(PathBuf::from("file:relative")));
     }
 
     #[test]
