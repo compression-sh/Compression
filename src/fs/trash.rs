@@ -4,7 +4,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::ops::{move_path, remove_tree, unique_path};
+use super::ops::{move_path, remove_tree, unique_path, unique_path_where};
 use crate::i18n::tr;
 
 pub fn root() -> Option<PathBuf> {
@@ -174,9 +174,26 @@ fn trash_in(root: &Path, topdir: Option<&Path>, original: &Path) -> io::Result<P
     std::fs::create_dir_all(&info)?;
 
     let name = original.file_name().ok_or_else(|| io::Error::other("no file name"))?;
-    let target = unique_path(&files, name, "copy");
-    let record = info.join(format!("{}.trashinfo", target.file_name().unwrap_or_default().to_string_lossy()));
-    std::fs::write(&record, format!("[Trash Info]\nPath={}\nDeletionDate={}\n", encode(topdir.and_then(|t| original.strip_prefix(t).ok()).unwrap_or(original)), now()))?;
+    // The record is made first and exclusively: it is what reserves the name, so two items with the
+    // same name, trashed at the same moment (by two windows), cannot end up with one record or
+    // replace each other in `files`.
+    let record_of_name = |p: &Path| info.join(format!("{}.trashinfo", p.file_name().unwrap_or_default().to_string_lossy()));
+    let (target, record, mut record_file) = loop {
+        let target = unique_path_where(&files, name, "copy", |p| record_of_name(p).symlink_metadata().is_ok());
+        let record = record_of_name(&target);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&record) {
+            Ok(file) => break (target, record, file),
+            // Someone took the name since it was chosen: choose again, now steering clear of that record
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    };
+    let text = format!("[Trash Info]\nPath={}\nDeletionDate={}\n", encode(topdir.and_then(|t| original.strip_prefix(t).ok()).unwrap_or(original)), now());
+    if let Err(err) = io::Write::write_all(&mut record_file, text.as_bytes()) {
+        let _ = std::fs::remove_file(&record);
+        return Err(err);
+    }
+    drop(record_file);
     if let Err(err) = move_path(path, &target) {
         let _ = std::fs::remove_file(&record);
         return Err(err);
@@ -315,6 +332,71 @@ mod tests {
         assert_eq!(restore(&kept).unwrap(), file);
         std::fs::remove_dir_all(&dir).unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn items_with_one_name_get_a_record_each_and_a_record_in_the_way_is_never_replaced() {
+        let base = std::env::temp_dir().join(format!("compression_trash_record_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, work) = (base.join("Trash"), base.join("work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let record = |kept: &Path| record_of(&root, kept);
+
+        // One after the other
+        std::fs::write(work.join("a.txt"), "first").unwrap();
+        let first = trash_in(&root, None, &absolute(&work.join("a.txt")).unwrap()).unwrap();
+        std::fs::write(work.join("a.txt"), "second").unwrap();
+        let second = trash_in(&root, None, &absolute(&work.join("a.txt")).unwrap()).unwrap();
+        assert_ne!(first, second);
+        for (kept, content) in [(&first, "first"), (&second, "second")] {
+            assert_eq!(std::fs::read_to_string(kept).unwrap(), content);
+            assert!(std::fs::read_to_string(record(kept)).unwrap().contains(&format!("Path={}", encode(&work.join("a.txt")))));
+        }
+
+        // A record already in the way, as another window's trashing would have left it, keeps its content
+        let reserved = root.join("info").join("b.txt.trashinfo");
+        std::fs::write(&reserved, "[Trash Info]\nPath=/somewhere/else/b.txt\n").unwrap();
+        std::fs::write(work.join("b.txt"), "mine").unwrap();
+        let kept = trash_in(&root, None, &absolute(&work.join("b.txt")).unwrap()).unwrap();
+        assert_ne!(kept.file_name().unwrap(), "b.txt", "the reserved name is not used");
+        assert_eq!(std::fs::read_to_string(&reserved).unwrap(), "[Trash Info]\nPath=/somewhere/else/b.txt\n");
+        assert!(std::fs::read_to_string(record(&kept)).unwrap().contains("Path="));
+        assert_eq!(restore(&kept).unwrap(), work.join("b.txt"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn many_items_with_one_name_trashed_at_once_each_keep_their_own_record() {
+        let base = std::env::temp_dir().join(format!("compression_trash_race_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("Trash");
+        let sources: Vec<PathBuf> = (0..12).map(|i| base.join(format!("w{i}")).join("same.txt")).collect();
+        for (i, source) in sources.iter().enumerate() {
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(source, format!("content {i}")).unwrap();
+        }
+        let start = std::sync::Arc::new(std::sync::Barrier::new(sources.len()));
+        let threads: Vec<_> = sources
+            .iter()
+            .cloned()
+            .map(|source| {
+                let (root, start) = (root.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    trash_in(&root, None, &absolute(&source).unwrap()).unwrap()
+                })
+            })
+            .collect();
+        let kept: Vec<PathBuf> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let distinct: std::collections::HashSet<_> = kept.iter().collect();
+        assert_eq!(distinct.len(), sources.len(), "two items got one name");
+        for (i, (source, kept)) in sources.iter().zip(&kept).enumerate() {
+            assert_eq!(std::fs::read_to_string(kept).unwrap(), format!("content {i}"));
+            let text = std::fs::read_to_string(record_of(&root, kept)).unwrap();
+            assert!(text.contains(&format!("Path={}", encode(source))), "{text}");
+        }
+        assert_eq!(std::fs::read_dir(root.join("info")).unwrap().count(), sources.len());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
