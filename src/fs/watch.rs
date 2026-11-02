@@ -6,6 +6,7 @@
 //! watch (no room left for watches, an odd filesystem) is checked by its modification time instead.
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +28,9 @@ pub enum Event {
 
 #[derive(Default)]
 struct State {
-    watches: HashMap<i32, PathBuf>,
+    /// The folders each watch descriptor stands for. Several paths that lead to one folder (a link,
+    /// a bind mount) share a descriptor, and each of them is told about what happens in it.
+    watches: HashMap<i32, Vec<PathBuf>>,
     /// Folders watched by looking at their modification time, with the last one seen.
     polled: HashMap<PathBuf, Option<SystemTime>>,
 }
@@ -56,20 +59,26 @@ const POLL_EVERY: Duration = Duration::from_secs(2);
 
 impl Watcher {
     pub fn new(ctx: &egui::Context) -> Option<Self> {
-        // SAFETY: plain system call; the descriptor is owned by this struct until it is dropped.
+        // SAFETY: plain system call
         let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
         if fd < 0 {
             return None;
         }
+        // SAFETY: a new descriptor that nothing else owns
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        Self::start(fd, ctx, |work| std::thread::Builder::new().name("compression-watch".into()).spawn(work).map(|_| ()))
+    }
+
+    /// Hands the reading of `fd` to a thread made by `spawn`. The thread owns the descriptor, so it is
+    /// closed when the thread ends, and also when the thread could not be started.
+    fn start(fd: OwnedFd, ctx: &egui::Context, spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>) -> Option<Self> {
+        let raw = fd.as_raw_fd();
         let state = Arc::new(Mutex::new(State::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let (thread_state, thread_stop, ctx) = (state.clone(), stop.clone(), ctx.clone());
-        std::thread::Builder::new()
-            .name("compression-watch".into())
-            .spawn(move || run(fd, thread_state, thread_stop, tx, ctx))
-            .ok()?;
-        Some(Self { fd, state, rx, stop, dirs: Vec::new() })
+        spawn(Box::new(move || run(fd, thread_state, thread_stop, tx, ctx))).ok()?;
+        Some(Self { fd: raw, state, rx, stop, dirs: Vec::new() })
     }
 
     /// Watch exactly these folders (nothing is done when they already are the ones watched).
@@ -90,7 +99,11 @@ impl Watcher {
             // SAFETY: `c_path` is a NUL-terminated path that outlives the call.
             let wd = unsafe { libc::inotify_add_watch(self.fd, c_path.as_ptr(), WATCHED) };
             if wd >= 0 {
-                state.watches.insert(wd, dir.clone());
+                // The same folder again, under another path, gets the same descriptor
+                let paths = state.watches.entry(wd).or_default();
+                if !paths.contains(dir) {
+                    paths.push(dir.clone());
+                }
             } else {
                 state.polled.insert(dir.clone(), None);
             }
@@ -109,7 +122,9 @@ impl Drop for Watcher {
     }
 }
 
-fn run(fd: i32, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>, tx: mpsc::Sender<Event>, ctx: egui::Context) {
+fn run(owned: OwnedFd, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>, tx: mpsc::Sender<Event>, ctx: egui::Context) {
+    // `owned` closes the descriptor when this function ends, however it ends
+    let fd = owned.as_raw_fd();
     let mut buf = vec![0u8; 64 * 1024];
     let mut polled_at = std::time::Instant::now();
     while !stop.load(Ordering::Relaxed) {
@@ -132,8 +147,6 @@ fn run(fd: i32, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>, tx: mpsc::Sende
             ctx.request_repaint();
         }
     }
-    // SAFETY: the descriptor is only used by this thread now.
-    unsafe { libc::close(fd) };
 }
 
 /// Turn a buffer of `inotify_event` records into `Event`s; whether any were sent.
@@ -148,21 +161,21 @@ fn decode(buf: &[u8], state: &Mutex<State>, tx: &mpsc::Sender<Event>) -> bool {
         let name = buf.get(at + HEADER..at + HEADER + len).unwrap_or_default();
         at += HEADER + len;
         let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
-        let event = if mask & libc::IN_Q_OVERFLOW != 0 {
-            Some(Event::Overflow)
-        } else if let Some(dir) = state.watches.get(&wd) {
-            if mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_UNMOUNT) != 0 {
-                Some(Event::Gone(dir.clone()))
-            } else if name.is_empty() {
-                None
-            } else {
-                let path = dir.join(std::ffi::OsString::from_vec(name.to_vec()));
-                Some(Event::Path { path, settled: mask & SETTLED != 0 })
-            }
+        let mut events = Vec::new();
+        if mask & libc::IN_Q_OVERFLOW != 0 {
+            events.push(Event::Overflow);
         } else {
-            None
-        };
-        if let Some(event) = event {
+            // One event for every path the folder was registered under
+            for dir in state.watches.get(&wd).into_iter().flatten() {
+                if mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_UNMOUNT) != 0 {
+                    events.push(Event::Gone(dir.clone()));
+                } else if !name.is_empty() {
+                    let path = dir.join(std::ffi::OsString::from_vec(name.to_vec()));
+                    events.push(Event::Path { path, settled: mask & SETTLED != 0 });
+                }
+            }
+        }
+        for event in events {
             sent |= tx.send(event).is_ok();
         }
     }
@@ -228,6 +241,97 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(wait_for(&watcher, |e| *e == Event::Gone(dir.clone())));
+    }
+
+    /// Every event that arrives within a while.
+    fn collect(watcher: &Watcher, until: impl Fn(&[Event]) -> bool) -> Vec<Event> {
+        let mut all = Vec::new();
+        for _ in 0..100 {
+            all.extend(watcher.events());
+            if until(&all) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        all
+    }
+
+    #[test]
+    fn a_folder_reached_by_two_paths_reports_to_both() {
+        let dir = std::env::temp_dir().join(format!("compression-watch-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        let (real, alias) = (dir.join("real"), dir.join("alias"));
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let mut watcher = Watcher::new(&egui::Context::default()).expect("inotify");
+        watcher.set(&[real.clone(), alias.clone()]);
+        // One descriptor, two paths
+        assert_eq!(watcher.state.lock().unwrap().watches.len(), 1);
+
+        std::fs::write(real.join("a.txt"), "x").unwrap();
+        let both = |events: &[Event]| [&real, &alias].iter().all(|d| events.iter().any(|e| matches!(e, Event::Path { path, settled: true } if *path == d.join("a.txt"))));
+        let events = collect(&watcher, both);
+        assert!(both(&events), "each path hears of the new file: {events:?}");
+
+        // A folder that is gone is gone under both names
+        std::fs::remove_dir_all(&real).unwrap();
+        let gone = |events: &[Event]| events.contains(&Event::Gone(real.clone())) && events.contains(&Event::Gone(alias.clone()));
+        let events = collect(&watcher, gone);
+        assert!(gone(&events), "{events:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn registering_the_same_path_twice_does_not_report_twice() {
+        let dir = std::env::temp_dir().join(format!("compression-watch-twice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut watcher = Watcher::new(&egui::Context::default()).expect("inotify");
+        watcher.set(&[dir.clone(), dir.clone()]);
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let events = collect(&watcher, |e| e.iter().any(|e| matches!(e, Event::Path { settled: true, .. })));
+        std::thread::sleep(Duration::from_millis(100));
+        let more: Vec<_> = watcher.events().collect();
+        let settled = events.iter().chain(&more).filter(|e| matches!(e, Event::Path { settled: true, .. })).count();
+        assert_eq!(settled, 1, "{events:?} {more:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_descriptor_is_closed_when_the_thread_cannot_be_started() {
+        // A pipe stands in for the inotify descriptor: its read end sees the end of the data
+        // once the write end, which the watcher owns, is closed
+        let mut fds = [0 as std::os::fd::RawFd; 2];
+        // SAFETY: pipe2 fills two descriptors that are owned from here on
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }, 0);
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let started = Watcher::start(write, &egui::Context::default(), |_work| Err(std::io::Error::other("no thread")));
+        assert!(started.is_none());
+        let mut byte = 0u8;
+        // SAFETY: reads one byte into a variable of ours
+        let n = unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+        assert_eq!(n, 0, "the write end was still open (a read would give EAGAIN)");
+    }
+
+    #[test]
+    fn the_descriptor_is_closed_when_the_watcher_stops() {
+        let mut fds = [0 as std::os::fd::RawFd; 2];
+        // SAFETY: as above
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }, 0);
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let watcher = Watcher::start(write, &egui::Context::default(), |work| std::thread::Builder::new().spawn(work).map(|_| ())).expect("started");
+        drop(watcher);
+        // The thread notices the stop within a poll round (half a second)
+        let started = std::time::Instant::now();
+        let mut byte = 0u8;
+        loop {
+            let n = unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+            if n == 0 {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "the descriptor stayed open");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
