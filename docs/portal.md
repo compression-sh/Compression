@@ -47,7 +47,7 @@ The `.deb`, `.rpm` and tarball install the portal files. If you build from sourc
 | --- | --- |
 | `compression.portal` | `share/xdg-desktop-portal/portals/` |
 | `org.freedesktop.impl.portal.desktop.compression.service` | `share/dbus-1/services/`, with `@out@` replaced by your install prefix |
-| `org.freedesktop.FileManager1.service` | `share/dbus-1/services/`, with `@out@` replaced the same way |
+| `org.compression.Compression.FileManager1.service` | `share/dbus-1/services/`, with `@out@` replaced the same way |
 
 Then tell the portal to prefer Compression in `~/.config/xdg-desktop-portal/portals.conf`:
 

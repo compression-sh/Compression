@@ -9,7 +9,7 @@ install -Dm755 target/release/compression "$dest/usr/bin/compression"
 install -Dm644 assets/compression.desktop "$dest/usr/share/applications/compression.desktop"
 install -Dm644 assets/logo.svg "$dest/usr/share/icons/hicolor/scalable/apps/compression.svg"
 install -Dm644 assets/compression.portal "$dest/usr/share/xdg-desktop-portal/portals/compression.portal"
-for name in org.freedesktop.impl.portal.desktop.compression org.freedesktop.FileManager1; do
+for name in org.freedesktop.impl.portal.desktop.compression org.compression.Compression.FileManager1; do
   install -Dm644 "assets/$name.service" "$dest/usr/share/dbus-1/services/$name.service"
   sed -i 's|@out@|/usr|' "$dest/usr/share/dbus-1/services/$name.service"
 done

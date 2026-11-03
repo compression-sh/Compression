@@ -78,7 +78,7 @@ craneLib.buildPackage (common // {
     install -Dm644 assets/logo.svg $out/share/icons/hicolor/scalable/apps/compression.svg
 
     install -Dm644 assets/compression.portal $out/share/xdg-desktop-portal/portals/compression.portal
-    for name in org.freedesktop.impl.portal.desktop.compression org.freedesktop.FileManager1; do
+    for name in org.freedesktop.impl.portal.desktop.compression org.compression.Compression.FileManager1; do
       install -Dm644 assets/$name.service $out/share/dbus-1/services/$name.service
       substituteInPlace $out/share/dbus-1/services/$name.service --replace-fail @out@ $out
     done
