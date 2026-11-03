@@ -59,6 +59,64 @@ impl NetState {
     }
 }
 
+/// What the dot in front of a server in the sidebar says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LinkState {
+    Connected,
+    /// The server answers slowly, or not yet.
+    Slow,
+    /// The mount is there but answers with an error.
+    Broken,
+    /// A saved server that is not connected: normal, not a fault.
+    Offline,
+}
+
+impl LinkState {
+    /// The state of a row: `None` for what is no server (a phone, a camera).
+    pub(super) fn of(mounted: bool, has_address: bool, health: Health) -> Option<LinkState> {
+        match (mounted, has_address, health) {
+            (false, _, _) => Some(LinkState::Offline),
+            (true, false, _) => None,
+            (true, true, Health::Connected) => Some(LinkState::Connected),
+            (true, true, Health::Slow) => Some(LinkState::Slow),
+            (true, true, Health::Broken) => Some(LinkState::Broken),
+        }
+    }
+
+    /// The words of the tooltip, so the state is not told by color alone.
+    pub(super) fn words(self) -> &'static str {
+        match self {
+            LinkState::Connected => tr("Connected"),
+            LinkState::Slow => tr("Answering slowly"),
+            LinkState::Broken => tr("Not answering"),
+            LinkState::Offline => tr("Not connected"),
+        }
+    }
+
+    /// The color of the dot, and whether it is filled; a ring for a server that is just not connected.
+    pub(super) fn look(self, theme: &SerpantinumTheme) -> (egui::Color32, bool) {
+        match self {
+            LinkState::Connected => (theme.green, true),
+            LinkState::Slow => (theme.yellow, true),
+            LinkState::Broken => (theme.red, true),
+            LinkState::Offline => (theme.subtext0, false),
+        }
+    }
+
+    fn paint(self, ui: &egui::Ui, row: egui::Rect, theme: &SerpantinumTheme) {
+        let center = egui::pos2(row.left() + material::INSET_ICON + 8.0, row.center().y + 8.0);
+        let (color, filled) = self.look(theme);
+        let painter = ui.painter();
+        // A rim in the sidebar's color keeps the dot apart from the icon
+        painter.circle_filled(center, 5.5, theme.crust);
+        if filled {
+            painter.circle_filled(center, 3.5, color);
+        } else {
+            painter.circle_stroke(center, 3.0, egui::Stroke::new(1.5, color));
+        }
+    }
+}
+
 /// A row of the Network section: a saved server, a connected one, or both.
 #[derive(Clone)]
 pub(super) struct NetRow {
@@ -68,6 +126,8 @@ pub(super) struct NetRow {
     /// Where a click goes while connected.
     pub(super) open: Option<PathBuf>,
     pub(super) mount: Option<Mount>,
+    /// What the dot in front of the name says.
+    pub(super) state: Option<LinkState>,
     /// Index into the saved servers.
     pub(super) saved: Option<usize>,
 }
@@ -157,7 +217,6 @@ impl CompressionApp {
     }
 
     /// How the server mounted at `mount` is doing.
-    #[expect(dead_code, reason = "the sidebar draws it in the next change")]
     pub(super) fn mount_health(&self, mount: &Mount) -> Health {
         self.net.probes.health(&mount.local, Instant::now())
     }
@@ -375,6 +434,7 @@ impl CompressionApp {
                 icon: icons::SERVER_NETWORK,
                 address: Some(server.address.clone()),
                 open: mount.as_ref().map(|m| local_in(m, &server.address)),
+                state: LinkState::of(mount.is_some(), true, mount.as_ref().map_or(Health::Connected, |m| self.mount_health(m))),
                 mount,
                 saved: Some(index),
             });
@@ -385,6 +445,7 @@ impl CompressionApp {
                 icon: if mount.is_device() { icons::CELLPHONE } else { icons::SERVER_NETWORK },
                 address: mount.address.clone(),
                 open: Some(mount.local.clone()),
+                state: LinkState::of(true, mount.address.is_some(), self.mount_health(mount)),
                 mount: Some(mount.clone()),
                 saved: None,
             });
@@ -400,7 +461,11 @@ impl CompressionApp {
             let busy = row.address.as_ref().is_some_and(|a| self.connecting(a)) || row.mount.as_ref().is_some_and(|m| self.net.leaving.contains(&m.local));
             let reserve = if row.mount.is_some() || busy { material::NAV_TRAILING } else { 0.0 };
             let here = browsing && row.open.as_ref().is_some_and(|p| *p == self.current_path);
-            let resp = material::nav_item_with(ui, ("net", idx, &row.name), row.icon, &row.name, &theme, here, reserve);
+            let mut resp = material::nav_item_with(ui, ("net", idx, &row.name), row.icon, &row.name, &theme, here, reserve);
+            if let Some(state) = row.state {
+                state.paint(ui, resp.rect, &theme);
+                resp = resp.on_hover_text(state.words());
+            }
             if busy {
                 let spot = egui::Rect::from_center_size(egui::pos2(resp.rect.right() - 8.0 - 14.0, resp.rect.center().y), egui::vec2(16.0, 16.0));
                 ui.put(spot, egui::Spinner::new().size(14.0).color(theme.subtext0));
