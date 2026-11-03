@@ -809,5 +809,8 @@
   "There may not be enough room in “{}”.": "Il se peut qu’il n’y ait pas assez de place dans « {} ».",
   "Needed: {} · Available: {} · Missing: {}": "Nécessaire : {} · Disponible : {} · Manquant : {}",
   "Replaced files are not counted, so the job may still fit. Continue anyway?": "Les fichiers remplacés ne sont pas déduits : cela peut donc suffire. Continuer quand même ?",
-  "Continue anyway": "Continuer quand même"
+  "Continue anyway": "Continuer quand même",
+  "Duplicate tab": "Dupliquer l’onglet",
+  "Close other tabs": "Fermer les autres onglets",
+  "Close tabs to the right": "Fermer les onglets à droite"
 }

@@ -809,5 +809,8 @@
   "There may not be enough room in “{}”.": "Có thể không đủ chỗ trong “{}”.",
   "Needed: {} · Available: {} · Missing: {}": "Cần: {} · Còn trống: {} · Thiếu: {}",
   "Replaced files are not counted, so the job may still fit. Continue anyway?": "Các tệp bị thay thế không được trừ đi nên vẫn có thể đủ chỗ. Vẫn tiếp tục?",
-  "Continue anyway": "Vẫn tiếp tục"
+  "Continue anyway": "Vẫn tiếp tục",
+  "Duplicate tab": "Nhân đôi thẻ",
+  "Close other tabs": "Đóng các thẻ khác",
+  "Close tabs to the right": "Đóng các thẻ bên phải"
 }

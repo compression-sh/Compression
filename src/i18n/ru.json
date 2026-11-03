@@ -809,5 +809,8 @@
   "There may not be enough room in “{}”.": "В папке «{}» может не хватить места.",
   "Needed: {} · Available: {} · Missing: {}": "Нужно: {} · Доступно: {} · Не хватает: {}",
   "Replaced files are not counted, so the job may still fit. Continue anyway?": "Заменяемые файлы не вычитаются, поэтому места всё же может хватить. Продолжить?",
-  "Continue anyway": "Всё равно продолжить"
+  "Continue anyway": "Всё равно продолжить",
+  "Duplicate tab": "Дублировать вкладку",
+  "Close other tabs": "Закрыть другие вкладки",
+  "Close tabs to the right": "Закрыть вкладки справа"
 }

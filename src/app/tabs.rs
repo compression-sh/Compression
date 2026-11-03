@@ -208,6 +208,59 @@ impl CompressionApp {
         self.switch_tab(0);
     }
 
+    pub(super) fn tab_index(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
+    /// Open a second tab on the folder of tab `id`, right of it, and show it. It starts without history.
+    pub(super) fn duplicate_tab(&mut self, id: u64) {
+        let Some(idx) = self.tab_index(id) else { return };
+        // Shown first, so the new tab takes the sorting of the tab it copies
+        self.switch_tab(idx);
+        let here = self.current_path.clone();
+        self.new_tab(here);
+    }
+
+    /// Close every tab but `id`, which is shown.
+    pub(super) fn close_other_tabs(&mut self, ctx: &egui::Context, id: u64) {
+        let Some(idx) = self.tab_index(id) else { return };
+        self.switch_tab(idx);
+        let others: Vec<u64> = self.tabs.iter().map(|t| t.id).filter(|t| *t != id).collect();
+        for other in others.into_iter().rev() {
+            if let Some(at) = self.tab_index(other) {
+                self.close_tab(ctx, at);
+            }
+        }
+    }
+
+    /// Close the tabs right of `id`. If the one on screen is among them, `id` is shown instead.
+    pub(super) fn close_tabs_right_of(&mut self, ctx: &egui::Context, id: u64) {
+        let Some(idx) = self.tab_index(id) else { return };
+        if self.active_tab > idx {
+            self.switch_tab(idx);
+        }
+        let right: Vec<u64> = self.tabs[idx + 1..].iter().map(|t| t.id).collect();
+        for other in right.into_iter().rev() {
+            if let Some(at) = self.tab_index(other) {
+                self.close_tab(ctx, at);
+            }
+        }
+    }
+
+    /// The entries of the tab menu; those that would do nothing are left out.
+    pub(super) fn tab_entries(&self, id: u64) -> Vec<Vec<MenuEntry>> {
+        let Some(idx) = self.tab_index(id) else { return Vec::new() };
+        let mut close = Vec::new();
+        if self.tabs.len() > 1 {
+            close.push((icons::CLOSE, tr("Close other tabs"), MenuAction::CloseOtherTabs(id)));
+        }
+        if idx + 1 < self.tabs.len() {
+            close.push((icons::CLOSE, tr("Close tabs to the right"), MenuAction::CloseTabsRight(id)));
+        }
+        close.push((icons::CLOSE, tr("Close tab"), MenuAction::CloseTab(id)));
+        vec![vec![(icons::DUPLICATE, tr("Duplicate tab"), MenuAction::DuplicateTab(id))], close]
+    }
+
     /// Bring back the tab that was closed last.
     pub(super) fn reopen_tab(&mut self) {
         while let Some((index, state)) = self.closed_tabs.pop() {
@@ -357,6 +410,7 @@ impl CompressionApp {
             let width = ((strip.width() - 4.0 * (count as f32 - 1.0)) / count as f32).clamp(TAB_MIN_W, TAB_MAX_W);
 
             let mut switch_to = None;
+            let mut menu_at = None;
             let mut close = None;
             let mut drag_to: Option<(usize, usize)> = None;
             let mut rects = Vec::with_capacity(count);
@@ -403,6 +457,9 @@ impl CompressionApp {
                 let label_right = rect.right() - 8.0 - 22.0 * close_t.max(if idx == active { 1.0 } else { 0.0 }) - 4.0;
                 material::paint_label(ui, rect.left() + 32.0, rect.center().y, &title, material::FONT_BODY, color, (label_right - rect.left() - 32.0).max(12.0));
 
+                if resp.secondary_clicked() {
+                    menu_at = Some((resp.interact_pointer_pos().unwrap_or(rect.left_bottom()), id));
+                }
                 if close_resp.clicked() || resp.middle_clicked() {
                     close = Some(idx);
                 } else if resp.clicked() {
@@ -425,6 +482,9 @@ impl CompressionApp {
             material::paint_icon(ui.painter(), plus.center(), icons::ADD, material::ICON_MD, material::lerp_color(theme.subtext1, theme.text, fx.hover));
             let new_tab = resp.clicked();
 
+            if let Some((pos, id)) = menu_at {
+                self.open_menu(&ctx, pos, MenuTarget::Tab(id));
+            }
             if let Some((from, to)) = drag_to {
                 self.move_tab(from, to);
             }
@@ -445,5 +505,160 @@ impl CompressionApp {
         if std::mem::take(&mut self.restart_search) {
             self.on_query_changed(ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An app with tabs on folders `t0..t{n-1}` (in this order), the last one shown.
+    fn app_with(n: usize, name: &str) -> (CompressionApp, Vec<PathBuf>, egui::Context, PathBuf) {
+        let root = std::env::temp_dir().join(format!("compression_tabs_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let folders: Vec<PathBuf> = (0..n)
+            .map(|i| {
+                std::fs::create_dir_all(root.join(format!("t{i}"))).unwrap();
+                root.join(format!("t{i}")).canonicalize().unwrap()
+            })
+            .collect();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(folders[0].clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        for folder in &folders[1..] {
+            app.new_tab(folder.clone());
+        }
+        (app, folders, ctx, root)
+    }
+
+    fn ids(app: &CompressionApp) -> Vec<u64> {
+        app.tabs.iter().map(|t| t.id).collect()
+    }
+
+    fn shown(app: &CompressionApp) -> Vec<PathBuf> {
+        app.session().0
+    }
+
+    #[test]
+    fn duplicating_a_parked_tab_opens_its_folder_and_sorting_right_of_it() {
+        let (mut app, f, _ctx, root) = app_with(3, "dup");
+        app.switch_tab(0);
+        app.sort_by = SortBy::Size;
+        app.switch_tab(2);
+        assert_eq!(app.sort_by, SortBy::Name);
+        let first = ids(&app)[0];
+        app.duplicate_tab(first);
+        assert_eq!(app.tabs.len(), 4);
+        assert_eq!(shown(&app), vec![f[0].clone(), f[0].clone(), f[1].clone(), f[2].clone()]);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.current_path, f[0]);
+        assert_eq!(app.sort_by, SortBy::Size);
+        assert!(app.back_history.is_empty() && app.forward_history.is_empty());
+        // Its source is still there and keeps its own state
+        assert!(!ids(&app).iter().skip(1).any(|id| *id == first) && ids(&app)[0] == first);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn duplicating_the_tab_on_screen_works_too() {
+        let (mut app, f, _ctx, root) = app_with(2, "dup_active");
+        let last = ids(&app)[1];
+        app.duplicate_tab(last);
+        assert_eq!(shown(&app), vec![f[0].clone(), f[1].clone(), f[1].clone()]);
+        assert_eq!(app.active_tab, 2);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn closing_the_other_tabs_keeps_only_the_one_clicked() {
+        let (mut app, f, ctx, root) = app_with(4, "others");
+        assert_eq!(app.active_tab, 3);
+        let second = ids(&app)[1];
+        app.close_other_tabs(&ctx, second);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].id, second);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.current_path, f[1]);
+        assert_eq!(app.closed_tabs.len(), 3);
+        // Alone, there is nothing to close and the window stays
+        app.close_other_tabs(&ctx, second);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.closed_tabs.len(), 3);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn closing_the_tabs_to_the_right_keeps_the_left_ones_and_shows_the_clicked_one() {
+        let (mut app, f, ctx, root) = app_with(4, "right");
+        let before = ids(&app);
+        // The tab on screen (the last) is among those closed
+        app.close_tabs_right_of(&ctx, before[1]);
+        assert_eq!(ids(&app), before[..2].to_vec());
+        assert_eq!(shown(&app), f[..2].to_vec());
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.current_path, f[1]);
+        assert_eq!(app.closed_tabs.len(), 2);
+        // The last tab has nothing right of it
+        app.close_tabs_right_of(&ctx, before[1]);
+        assert_eq!(ids(&app), before[..2].to_vec());
+        assert_eq!(app.closed_tabs.len(), 2);
+        // Closed tabs can be brought back
+        app.reopen_tab();
+        assert_eq!(app.tabs.len(), 3);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_tab_on_screen_stays_when_it_is_left_of_the_clicked_one() {
+        let (mut app, f, ctx, root) = app_with(4, "right_keep");
+        app.switch_tab(0);
+        let before = ids(&app);
+        app.close_tabs_right_of(&ctx, before[1]);
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.current_path, f[0]);
+        assert_eq!(shown(&app), f[..2].to_vec());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_tab_changes_nothing() {
+        let (mut app, f, ctx, root) = app_with(3, "unknown");
+        let before = ids(&app);
+        let unknown = before.iter().max().unwrap() + 100;
+        app.duplicate_tab(unknown);
+        app.close_other_tabs(&ctx, unknown);
+        app.close_tabs_right_of(&ctx, unknown);
+        assert_eq!(ids(&app), before);
+        assert_eq!(shown(&app), f);
+        assert_eq!(app.active_tab, 2);
+        assert!(app.closed_tabs.is_empty());
+        assert!(app.tab_entries(unknown).is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_menu_leaves_out_what_would_do_nothing() {
+        let kinds = |app: &CompressionApp, id: u64| -> Vec<&'static str> {
+            app.menu_entries(&MenuTarget::Tab(id))
+                .into_iter()
+                .flatten()
+                .map(|(_, _, action)| match action {
+                    MenuAction::DuplicateTab(_) => "duplicate",
+                    MenuAction::CloseOtherTabs(_) => "others",
+                    MenuAction::CloseTabsRight(_) => "right",
+                    MenuAction::CloseTab(_) => "close",
+                    _ => "?",
+                })
+                .collect()
+        };
+        let (app, _f, _ctx, root) = app_with(1, "menu_one");
+        assert_eq!(kinds(&app, app.tabs[0].id), ["duplicate", "close"]);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let (app, _f, _ctx, root) = app_with(3, "menu_three");
+        let ids = ids(&app);
+        assert_eq!(kinds(&app, ids[0]), ["duplicate", "others", "right", "close"]);
+        assert_eq!(kinds(&app, ids[1]), ["duplicate", "others", "right", "close"]);
+        assert_eq!(kinds(&app, ids[2]), ["duplicate", "others", "close"]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

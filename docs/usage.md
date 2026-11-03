@@ -26,6 +26,8 @@ Compression can be used with the keyboard alone, and with the mouse as you would
 | Open a folder in a new tab | Middle-click it, or press `Ctrl+T` for a new tab |
 | Open a folder in a new window | `Ctrl+N` for a new window; Settings → General can make every folder open in its own |
 
+Right-click a tab for its menu: duplicate it, close the other tabs, close the tabs to its right, or close it. Closed tabs can be brought back like any other.
+
 Tabs can be switched with `Ctrl+Tab` and `Ctrl+Shift+Tab` (or `Ctrl+PageDown` and `Ctrl+PageUp`), closed with `Ctrl+W` and brought back with `Ctrl+Shift+T`. Settings → General → Open Compression in → Restore last tabs opens the tabs of your last session again at the next start.
 
 ## Selecting

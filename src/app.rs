@@ -64,6 +64,8 @@ pub enum ViewMode {
 /// What a right click landed on.
 #[derive(Clone)]
 enum MenuTarget {
+    /// A tab of the tab bar, by its id.
+    Tab(u64),
     Item(FileItem),
     Folder,
     Pin(PathBuf),
@@ -146,6 +148,11 @@ enum MenuAction {
     NewFolder,
     Refresh,
     NewWindow,
+    /// The tab menu: the tab it was opened on, by id.
+    DuplicateTab(u64),
+    CloseTab(u64),
+    CloseOtherTabs(u64),
+    CloseTabsRight(u64),
     OpenSettings,
     Shortcuts,
     NewTab,
@@ -4394,6 +4401,14 @@ impl CompressionApp {
             MenuAction::NewFolder => self.open_create_dialog(true),
             MenuAction::Refresh => self.refresh(),
             MenuAction::NewWindow => self.new_window(),
+            MenuAction::DuplicateTab(id) => self.duplicate_tab(id),
+            MenuAction::CloseTab(id) => {
+                if let Some(idx) = self.tab_index(id) {
+                    self.close_tab(ctx, idx);
+                }
+            }
+            MenuAction::CloseOtherTabs(id) => self.close_other_tabs(ctx, id),
+            MenuAction::CloseTabsRight(id) => self.close_tabs_right_of(ctx, id),
             MenuAction::NewTab => {
                 let here = self.current_path.clone();
                 self.new_tab(here);
@@ -4474,6 +4489,10 @@ impl CompressionApp {
                     | MenuAction::SelectPattern
                     | MenuAction::Refresh
                     | MenuAction::NewTab
+                    | MenuAction::DuplicateTab(_)
+                    | MenuAction::CloseTab(_)
+                    | MenuAction::CloseOtherTabs(_)
+                    | MenuAction::CloseTabsRight(_)
                     | MenuAction::OpenSettings
                     | MenuAction::Shortcuts
                     | MenuAction::Mount(..)
@@ -4745,6 +4764,7 @@ impl CompressionApp {
                 self.sidebar_entries(Some(*place)),
             ],
             MenuTarget::Sidebar => vec![self.sidebar_entries(None)],
+            MenuTarget::Tab(id) => self.tab_entries(*id),
             MenuTarget::Place(path, place) => {
                 let mut groups = match FileItem::from_path(path) {
                     Some(item) => single_groups(&item, false, true),
