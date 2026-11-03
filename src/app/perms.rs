@@ -107,7 +107,7 @@ impl CompressionApp {
                 self.history.record(UndoEntry::new(trf("Permissions of {}", &[&props.item.name]), vec![Edit::Chmod { path, mode: old }]));
                 self.reread_items();
             }
-            Err(err) => self.set_toast(trf("Could not change permissions: {}", &[&err])),
+            Err(err) => self.set_toast(trf("Could not change permissions: {}", &[&crate::fs::describe::io_error(&err)])),
         }
     }
 
@@ -123,7 +123,7 @@ impl CompressionApp {
             let effect = if edits.is_empty() { Effect::None } else { Effect::Record(UndoEntry::new(trn(edits.len(), "Permissions of {} item", "Permissions of {} items"), edits.clone())) };
             match result {
                 Ok(()) => Outcome::done(trn(edits.len(), "Changed permissions of {} item", "Changed permissions of {} items")).with(effect),
-                Err(err) => Outcome::failed(err.to_string()).with(effect),
+                Err(err) => Outcome::failed(crate::fs::describe::io_error(&err)).with(effect),
             }
         });
     }

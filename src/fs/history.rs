@@ -111,7 +111,7 @@ pub fn apply(entry: UndoEntry) -> (Option<UndoEntry>, Option<String>) {
         match result {
             Ok(reverse) => inverse.push(reverse),
             Err(err) => {
-                error.get_or_insert(err.to_string());
+                error.get_or_insert(crate::fs::describe::io_error(&err));
             }
         }
     }

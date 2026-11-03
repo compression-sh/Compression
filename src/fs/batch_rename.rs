@@ -299,7 +299,7 @@ pub fn apply(entries: &[Entry], names: &[String]) -> (Vec<(PathBuf, PathBuf)>, O
             for (old, temp, _) in staged.into_iter().rev() {
                 let _ = std::fs::rename(&temp, &old);
             }
-            return (done, Some(err.to_string()));
+            return (done, Some(crate::fs::describe::io_error(&err)));
         }
         staged.push((entry.path.clone(), temp, entry.path.with_file_name(new.as_str())));
     }
@@ -310,7 +310,7 @@ pub fn apply(entries: &[Entry], names: &[String]) -> (Vec<(PathBuf, PathBuf)>, O
             Ok(()) => done.push((old, target)),
             Err(err) => {
                 let _ = std::fs::rename(&temp, &old);
-                failure.get_or_insert(err.to_string());
+                failure.get_or_insert(crate::fs::describe::io_error(&err));
             }
         }
     }

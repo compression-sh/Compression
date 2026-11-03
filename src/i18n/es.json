@@ -817,5 +817,13 @@
   "Slow": "Lenta",
   "Fast": "Rápida",
   "Faster": "Más rápida",
-  "{} results. Narrow down the search.": "{} resultados. Acota la búsqueda."
+  "{} results. Narrow down the search.": "{} resultados. Acota la búsqueda.",
+  "Permission denied": "Permiso denegado",
+  "Not found": "No encontrado",
+  "Already exists": "Ya existe",
+  "The folder is not empty": "La carpeta no está vacía",
+  "Not enough space on the disk": "No hay espacio suficiente en el disco",
+  "The file system is read-only": "El sistema de archivos es de solo lectura",
+  "The name is too long": "El nombre es demasiado largo",
+  "It is in use": "Está en uso"
 }

@@ -7,6 +7,7 @@ pub mod search;
 pub mod props;
 pub mod recent;
 pub mod apps;
+pub mod describe;
 pub mod ops;
 pub mod trash;
 pub mod batch_rename;

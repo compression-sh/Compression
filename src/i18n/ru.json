@@ -817,5 +817,13 @@
   "Slow": "Медленно",
   "Fast": "Быстро",
   "Faster": "Быстрее",
-  "{} results. Narrow down the search.": "{} результатов. Сузьте поиск."
+  "{} results. Narrow down the search.": "{} результатов. Сузьте поиск.",
+  "Permission denied": "Отказано в доступе",
+  "Not found": "Не найдено",
+  "Already exists": "Уже существует",
+  "The folder is not empty": "Папка не пуста",
+  "Not enough space on the disk": "Недостаточно места на диске",
+  "The file system is read-only": "Файловая система доступна только для чтения",
+  "The name is too long": "Имя слишком длинное",
+  "It is in use": "Используется"
 }

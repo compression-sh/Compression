@@ -817,5 +817,13 @@
   "Slow": "Chậm",
   "Fast": "Nhanh",
   "Faster": "Nhanh hơn",
-  "{} results. Narrow down the search.": "{} kết quả. Hãy thu hẹp tìm kiếm."
+  "{} results. Narrow down the search.": "{} kết quả. Hãy thu hẹp tìm kiếm.",
+  "Permission denied": "Không có quyền truy cập",
+  "Not found": "Không tìm thấy",
+  "Already exists": "Đã tồn tại",
+  "The folder is not empty": "Thư mục không trống",
+  "Not enough space on the disk": "Không đủ dung lượng trên ổ đĩa",
+  "The file system is read-only": "Hệ thống tệp ở chế độ chỉ đọc",
+  "The name is too long": "Tên quá dài",
+  "It is in use": "Đang được sử dụng"
 }

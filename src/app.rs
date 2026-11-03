@@ -958,7 +958,7 @@ impl CompressionApp {
             Err(err) => {
                 self.items.clear();
                 self.selected_index = None;
-                self.error_message = Some(err.to_string());
+                self.error_message = Some(crate::fs::describe::io_error(&err));
             }
         }
         self.sync_selection(true);
@@ -1050,7 +1050,7 @@ impl CompressionApp {
             match app {
                 Some(app) => {
                     if let Err(err) = apps::launch(&app, path) {
-                        self.set_toast(trf("Failed to start {}: {}", &[&app.name, &err]));
+                        self.set_toast(trf("Failed to start {}: {}", &[&app.name, &crate::fs::describe::io_error(&err)]));
                     }
                     return;
                 }
@@ -1062,7 +1062,7 @@ impl CompressionApp {
             }
         }
         if let Err(err) = open::that_detached(path) {
-            self.set_toast(trf("Failed to open file: {}", &[&err]));
+            self.set_toast(trf("Failed to open file: {}", &[&crate::fs::describe::io_error(&err)]));
         }
     }
 
@@ -1156,7 +1156,7 @@ impl CompressionApp {
         let path = match ops::write_new(&self.current_path, std::ffi::OsStr::new("Pasted image.png"), "copy", png) {
             Ok(path) => path,
             Err(err) => {
-                self.set_toast(err.to_string());
+                self.set_toast(crate::fs::describe::io_error(&err));
                 return;
             }
         };
@@ -1249,7 +1249,7 @@ impl CompressionApp {
                         }
                         match w.archive_control(done, *size, |control| ops::extract(item, &dest, control)) {
                             Err(err) if engine::is_cancel(&err) => return Outcome::stopped(),
-                            Err(err) => failures.push(format!("{}: {err}", item.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+                            Err(err) => failures.push(format!("{}: {}", item.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), crate::fs::describe::io_error(&err))),
                             Ok(()) => {}
                         }
                         done += size;
@@ -1303,7 +1303,7 @@ impl CompressionApp {
                         stopped = true;
                         break;
                     }
-                    Err(err) => failures.push(format!("{}: {err}", archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+                    Err(err) => failures.push(format!("{}: {}", archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), crate::fs::describe::io_error(&err))),
                 }
                 done += size;
                 w.shared.bytes_done.store(done, Relaxed);
@@ -4215,7 +4215,7 @@ impl CompressionApp {
         };
         result.map_err(|err| match err.kind() {
             std::io::ErrorKind::AlreadyExists => trf("“{}” already exists", &[&name]),
-            _ => err.to_string(),
+            _ => crate::fs::describe::io_error(&err),
         })?;
 
         self.add_listed(&path);
@@ -4249,7 +4249,7 @@ impl CompressionApp {
         // A name taken since the check above must not be replaced
         crate::compat::rename_noreplace(path, &target).map_err(|err| match err.kind() {
             std::io::ErrorKind::AlreadyExists => trf("“{}” already exists", &[&new_name]),
-            _ => err.to_string(),
+            _ => crate::fs::describe::io_error(&err),
         })?;
 
         self.retarget_path(path, &target);
@@ -4296,7 +4296,7 @@ impl CompressionApp {
                     trashed.push(t);
                     removed.push(path.clone());
                 }
-                Err(err) => failed.push(format!("{}: {err}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+                Err(err) => failed.push(format!("{}: {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), crate::fs::describe::io_error(&err))),
             }
         }
         let next = self.items.iter().position(|i| removed.contains(&i.path));
@@ -4334,7 +4334,7 @@ impl CompressionApp {
         for path in &paths {
             match trash::restore(path) {
                 Ok(back) => restored.push(back),
-                Err(err) => failed.push(err.to_string()),
+                Err(err) => failed.push(crate::fs::describe::io_error(&err)),
             }
         }
         self.selected_index = None;
@@ -4395,7 +4395,7 @@ impl CompressionApp {
         let title = tr("Emptying the trash").to_owned();
         self.engine.spawn(JobKind::Delete, title, String::new(), |_| match trash::empty() {
             Ok(()) => Outcome::done(tr("The trash is empty").to_owned()),
-            Err(err) => Outcome::failed(err.to_string()),
+            Err(err) => Outcome::failed(crate::fs::describe::io_error(&err)),
         });
     }
 
@@ -5924,7 +5924,7 @@ impl CompressionApp {
                     Ok(()) => Outcome::done(trf("Created “{}”", &[&shown])).with(Effect::Record(UndoEntry::new(trf("Compression into {}", &[&shown]), vec![Edit::Trash(out)]))),
                     // The unfinished archive is already gone
                     Err(err) if engine::is_cancel(&err) => Outcome::stopped(),
-                    Err(err) => Outcome::failed(err.to_string()),
+                    Err(err) => Outcome::failed(crate::fs::describe::io_error(&err)),
                 }
             });
             close = true;
@@ -6068,7 +6068,7 @@ impl CompressionApp {
                         }
                         close = true;
                     }
-                    Err(err) => self.set_toast(trf("Failed to start {}: {}", &[&app.name, &err])),
+                    Err(err) => self.set_toast(trf("Failed to start {}: {}", &[&app.name, &crate::fs::describe::io_error(&err)])),
                 }
             }
         close

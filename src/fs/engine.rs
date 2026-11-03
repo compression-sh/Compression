@@ -871,7 +871,7 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
                 was_cancelled = true;
                 break;
             }
-            Err(e) => failures.push(format!("{}: {e}", name_of(src))),
+            Err(e) => failures.push(format!("{}: {}", name_of(src), crate::fs::describe::io_error(&e))),
         }
     }
 
@@ -926,7 +926,7 @@ pub fn delete_forever(w: &mut Worker, paths: Vec<PathBuf>) -> Outcome {
         }
         w.shared.set_current(&name_of(path));
         if let Err(err) = trash::delete_forever(path) {
-            failures.push(format!("{}: {err}", name_of(path)));
+            failures.push(format!("{}: {}", name_of(path), crate::fs::describe::io_error(&err)));
         }
         w.file_done();
     }
