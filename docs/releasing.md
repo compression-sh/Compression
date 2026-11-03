@@ -1,6 +1,6 @@
 # Releasing
 
-Compression is a fork of [ilyamiro/Ski](https://github.com/ilyamiro/Ski) (first release 0.5.0, based on Ski 0.4.5). The project lives at <https://github.com/compression-sh/Compression>. Upstream is only a reference; releases are cut here.
+Compression is a fork of [Ski](https://github.com/ilyamiro/Ski) by ilyamiro, developed further independently. The project lives at <https://github.com/compression-sh/Compression>; releases are cut here.
 
 Pushing a tag `vMAJOR.MINOR.PATCH` runs `.github/workflows/release.yml`, which builds Compression and publishes a GitHub release with the `.tar.gz`, `.deb`, `.rpm` and `SHA256SUMS`. The same tag also makes `docker.yml` push the container image. Nothing is built or uploaded by hand. A patch release takes about 15 minutes in total, most of it waiting for builds.
 
@@ -59,10 +59,10 @@ Pushing a tag `vMAJOR.MINOR.PATCH` runs `.github/workflows/release.yml`, which b
 4. Push `master` (this also runs `docker.yml` and updates `latest`), then tag and push the tag:
    ```sh
    git push origin master
-   git tag -a v0.5.0 -m "Compression 0.5.0 (fork of ilyamiro/Ski 0.4.5)"
+   git tag -a v0.5.0 -m "Compression 0.5.0"
    git push origin v0.5.0
    ```
-   Use your own version. The tag message has the form `Compression X.Y.Z`; the fork note is used for the first release.
+   Use your own version. The tag message has the form `Compression X.Y.Z`.
 5. Wait for the run (about 7 minutes):
    ```sh
    gh run list --repo compression-sh/Compression --workflow release.yml --limit 1
@@ -101,7 +101,7 @@ Never edit or re-upload a release's tarball after that commit: its hash would no
 
 - `nix/bin.nix` installs the release binary `compression-<version>-x86_64-linux.tar.gz` from the GitHub release named in `nix/release.json`. The release workflow updates `nix/release.json` itself; do not edit it by hand for a normal release.
 - Until the follow-up commit is on `master`, `release.json` still names the previous version, which may not exist as a release. Until then, install from the source build: `pkgs.callPackage /path/to/Compression { fromSource = true; }`, or `programs.compression.package` set to it.
-- Old `programs.ski.*` options keep working through an alias in `nix/module.nix`.
+- The option names from before the rename keep working through an alias in `nix/module.nix`.
 - Compression is not in nixpkgs, so there is no nixpkgs package or pull request to update.
 
 ## Things that go wrong
