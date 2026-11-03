@@ -30,6 +30,8 @@ Right-click a tab for its menu: duplicate it, close the other tabs, close the ta
 
 Tabs can be switched with `Ctrl+Tab` and `Ctrl+Shift+Tab` (or `Ctrl+PageDown` and `Ctrl+PageUp`), closed with `Ctrl+W` and brought back with `Ctrl+Shift+T`. Settings → General → Open Compression in → Restore last tabs opens the tabs of your last session again at the next start.
 
+One notch of the mouse wheel scrolls 60 points. Settings → Behavior → Mouse and touchpad has a "Wheel scroll speed" slider with marks for Slow, Default, Fast and Faster; the button before the value (shown as `1×` at the default) puts the default back.
+
 ## Selecting
 
 Click, or move with the arrow keys (or `j` and `k` with the vim keys on). `Shift` with the arrows, and `Shift` or `Ctrl` with a click, select several items. `Ctrl+A` selects everything, `Ctrl+Shift+A` clears the selection and `Ctrl+Shift+I` inverts it. `Ctrl+S` asks for a pattern such as `*.png` and selects every item whose name matches.
@@ -63,6 +65,8 @@ Deleted items go to the trash of your home folder (`~/.local/share/Trash`); the 
 ## Search
 
 `/` opens the search bar. The search runs in the background, shows results as they are found, looks in recently used files first and never goes into folders on servers unless you started in one (or turned on "Previews on servers" in Settings → Files & View). The chips on the bar choose where it looks ("This folder" or "Everywhere", which is your home folder), narrow it to folders, documents, images, audio, video, archives or code, and set two options: "Match case" and "File contents" (text files up to 1 MiB are searched inside, too). `tag:work` finds the files carrying a tag.
+
+In the search field `↓` moves on to the first result (`Shift+↓` does the same). From there the arrow keys walk through the results as they do in a folder, and `Enter` opens the one you reached. Typing more letters narrows the results on screen instead of emptying the list first.
 
 Patterns understand `*` and `?`, so `*.png` or `report-??` work as you would expect.
 
