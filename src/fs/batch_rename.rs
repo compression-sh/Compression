@@ -177,6 +177,11 @@ fn replace_text(text: &str, find: &str, with: &str, match_case: bool) -> String 
     let mut out = String::new();
     let mut at = 0;
     while let Some(i) = lower_text[at..].find(&lower_find) {
+        // Equal total lengths do not make equal positions (one letter grows, another shrinks):
+        // a match that does not sit on letter boundaries of the real text cannot be cut out of it
+        if !text.get(at + i..at + i + find.len()).is_some_and(|real| real.to_lowercase() == lower_find) {
+            return text.replace(find, with);
+        }
         out.push_str(&text[at..at + i]);
         out.push_str(with);
         at += i + find.len();
@@ -219,7 +224,8 @@ pub fn preview(entries: &[Entry], rules: &Rules) -> Vec<String> {
             let name = entry.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let (stem, ext) = split_name(&name, entry.is_dir);
             let folder = entry.path.parent().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let number = start + rank[index] as i64 * step;
+            // A start or step typed as a huge number must not overflow
+            let number = start.saturating_add((rank[index] as i64).saturating_mul(step));
             let base = trim_chars(stem, cut_start, cut_end);
             let mut new_stem = match rules.mode {
                 Mode::Template => expand(&rules.template, &base, number, &entry.date, &folder, ext.trim_start_matches('.')),
@@ -404,5 +410,28 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "A");
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "B");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_name_whose_lowercase_form_has_other_positions_does_not_panic() {
+        // "İ" (2 bytes) lowercases to 3 bytes and the Kelvin sign U+212A (3 bytes) to the letter k (1 byte):
+        // the text and its lowercase form are both 8 bytes long, but a match in one is not at the place it
+        // is in the other
+        let text = "İaİ\u{212A}";
+        // Used to cut the text inside a letter (a panic); now the exact match counts, and finds nothing
+        assert_eq!(replace_text(text, "k", "x", false), text);
+        // Used to cut it at the wrong place; now the exact match counts
+        assert_eq!(replace_text(text, "a", "x", false), "İxİ\u{212A}");
+        // A plain case-insensitive replace still works
+        assert_eq!(replace_text("Photo PHOTO photo", "photo", "x", false), "x x x");
+    }
+
+    #[test]
+    fn a_huge_start_or_step_does_not_overflow() {
+        let entries = [entry("/d/a.txt"), entry("/d/b.txt"), entry("/d/c.txt")];
+        let r = Rules { template: "[1, 2, 3]".to_owned(), step: i64::MAX.to_string(), start: i64::MAX.to_string(), ..Rules::new() };
+        let names = preview(&entries, &r);
+        assert_eq!(names.len(), 3);
+        assert_eq!(names[2], format!("{}.txt", i64::MAX));
     }
 }
