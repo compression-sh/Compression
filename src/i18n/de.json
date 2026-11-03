@@ -284,6 +284,7 @@
   "Copied to clipboard": "In die Zwischenablage kopiert",
   "Failed to start {}: {}": "{} konnte nicht gestartet werden: {}",
   "Failed to open file: {}": "Datei konnte nicht geöffnet werden: {}",
+  "No app is set to open this file. Choose one.": "Für diesen Dateityp ist keine App festgelegt. Wähle eine aus.",
   "Cut {}": "{} ausgeschnitten",
   "Copied {}": "{} kopiert",
   "to “{}”": "nach „{}“",

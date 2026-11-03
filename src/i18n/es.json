@@ -284,6 +284,7 @@
   "Copied to clipboard": "Copiado al portapapeles",
   "Failed to start {}: {}": "No se pudo iniciar {}: {}",
   "Failed to open file: {}": "No se pudo abrir el archivo: {}",
+  "No app is set to open this file. Choose one.": "No hay ninguna aplicación para abrir este archivo. Elige una.",
   "Cut {}": "Cortado: {}",
   "Copied {}": "Copiado: {}",
   "to “{}”": "a «{}»",

@@ -179,6 +179,12 @@ pub fn apps_for<'a>(apps: &'a [AppEntry], mime: &str, default_id: Option<&str>) 
     list.into_iter().map(|(_, a)| a).collect()
 }
 
+/// Whether something is set up to open `mime`: a default app, or any installed app that lists the type
+/// (or one it derives from). Without either, `xdg-open` would fail without a word.
+pub fn has_handler(apps: &[AppEntry], mime: &str, default_id: Option<&str>) -> bool {
+    default_id.is_some() || !apps_for(apps, mime, None).is_empty()
+}
+
 /// Locate the image file of a desktop entry's `Icon=` value.
 pub fn resolve_icon(icon: &str) -> Option<PathBuf> {
     let direct = Path::new(icon);

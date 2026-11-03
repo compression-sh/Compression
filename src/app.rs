@@ -339,6 +339,12 @@ fn by_file_name(a: &Path, b: &Path) -> std::cmp::Ordering {
     natural_cmp(&name(a), &name(b))
 }
 
+/// What the thread that opens a file reports back.
+enum OpenReport {
+    Failed(String),
+    NoApp(PathBuf),
+}
+
 pub struct CompressionApp {
     current_path: PathBuf,
     items: Vec<FileItem>,
@@ -355,6 +361,9 @@ pub struct CompressionApp {
     history_job: Option<u64>,
     /// A folder read in the background after a job finished, for the folder it was started in.
     pending_reload: Option<(PathBuf, mpsc::Receiver<std::io::Result<Vec<FileItem>>>)>,
+    /// Where the thread that opens a file reports a type nothing is set up for, or a failure.
+    open_tx: mpsc::Sender<OpenReport>,
+    open_rx: mpsc::Receiver<OpenReport>,
     /// The folder is still being read, so there is nothing to show yet.
     loading: bool,
     /// What to select once the listing in the making arrives: the selected files, the focused one, and whether to scroll to it.
@@ -553,6 +562,7 @@ impl CompressionApp {
         crate::fs::file_item::set_format_options(settings.decimal_units, settings.relative_dates);
         crate::fs::file_item::set_show_extensions(settings.show_extensions);
         network::set_remote_previews(settings.remote_previews);
+        let (open_tx, open_rx) = mpsc::channel();
         let view_mode = if settings.remember_view_per_folder {
             settings.folder_views.get(&canonical_path).copied().unwrap_or(settings.view_mode)
         } else {
@@ -572,6 +582,8 @@ impl CompressionApp {
             history: History::default(),
             history_job: None,
             pending_reload: None,
+            open_tx,
+            open_rx,
             loading: false,
             restore_selection: None,
             watching: watching::Watching::new(ctx),
@@ -1069,8 +1081,33 @@ impl CompressionApp {
                 }
             }
         }
-        if let Err(err) = open::that_detached(path) {
-            self.set_toast(trf("Failed to open file: {}", &[&crate::fs::describe::io_error(&err)]));
+        // Asking `xdg-mime` is slow, so the thread decides: a type nothing is set up for goes to the
+        // "Open with" dialog, because `xdg-open` would fail without a word
+        let (path, tx, ctx) = (path.to_path_buf(), self.open_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let mime = apps::mime_of(&path);
+            let report = if apps::has_handler(&apps::installed(), &mime, apps::default_for(&mime).as_deref()) {
+                open::that_detached(&path).err().map(|err| OpenReport::Failed(crate::fs::describe::io_error(&err)))
+            } else {
+                Some(OpenReport::NoApp(path))
+            };
+            if let Some(report) = report {
+                let _ = tx.send(report);
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Once per frame: take in what the thread opening a file has to say.
+    fn poll_opened(&mut self) {
+        while let Ok(report) = self.open_rx.try_recv() {
+            match report {
+                OpenReport::Failed(why) => self.set_toast(trf("Failed to open file: {}", &[&why])),
+                OpenReport::NoApp(path) => {
+                    self.set_toast(tr("No app is set to open this file. Choose one."));
+                    self.open_open_with(path);
+                }
+            }
         }
     }
 
@@ -2382,6 +2419,7 @@ impl eframe::App for CompressionApp {
         self.chooser_escape(&ctx, escape_is_taken);
         self.sync_selection(false);
         self.poll_jobs();
+        self.poll_opened();
         if self.poll_reload() {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
         }

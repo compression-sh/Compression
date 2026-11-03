@@ -284,6 +284,7 @@
   "Copied to clipboard": "Đã sao chép vào bộ nhớ tạm",
   "Failed to start {}: {}": "Không thể khởi động {}: {}",
   "Failed to open file: {}": "Không thể mở tệp: {}",
+  "No app is set to open this file. Choose one.": "Chưa có ứng dụng nào để mở tệp này. Hãy chọn một ứng dụng.",
   "Cut {}": "Đã cắt: {}",
   "Copied {}": "Đã sao chép: {}",
   "to “{}”": "đến “{}”",
