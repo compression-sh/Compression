@@ -6391,6 +6391,8 @@ fn name_field(ui: &mut egui::Ui, theme: &SerpantinumTheme, text: &mut String, fi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     /// "Always" measures the folders of the listing, the selection's status line adds them up, and
     /// changing a folder from inside Compression makes its total (and its parents') stale.
@@ -7007,4 +7009,246 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    // --- Whole-window tests: the real `ui` runs headless with synthetic input, so what is checked is
+    // what the window would draw and do, though not how it looks.
+
+    struct Window {
+        app: CompressionApp,
+        ctx: egui::Context,
+        frame: eframe::Frame,
+        time: f64,
+        last: Vec<String>,
+        shapes: Vec<(String, egui::Rect)>,
+    }
+
+    impl Window {
+        fn new(folder: PathBuf) -> Self {
+            let ctx = egui::Context::default();
+            let app = CompressionApp::new(folder, SerpantinumTheme::default(), Settings::default(), &ctx);
+            let mut window = Self { app, ctx, frame: eframe::Frame::_new_kittest(), time: 0.0, last: Vec::new(), shapes: Vec::new() };
+            window.run(Vec::new(), 12);
+            window
+        }
+
+        fn run(&mut self, events: Vec<egui::Event>, frames: usize) {
+            for n in 0..frames {
+                self.time += 0.05;
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 700.0))),
+                    time: Some(self.time),
+                    events: if n == 0 { events.clone() } else { Vec::new() },
+                    ..Default::default()
+                };
+                let (app, frame) = (&mut self.app, &mut self.frame);
+                let mut out = self.ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, frame));
+                out.textures_delta.clear();
+                self.shapes.clear();
+                for clipped in &out.shapes {
+                    collect_text(&clipped.shape, &mut self.shapes);
+                }
+                self.last = self.shapes.iter().map(|(t, _)| t.clone()).collect();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        fn click(&mut self, pos: egui::Pos2, button: egui::PointerButton) {
+            let m = egui::Modifiers::NONE;
+            self.run(vec![egui::Event::PointerMoved(pos)], 3);
+            self.run(vec![egui::Event::PointerButton { pos, button, pressed: true, modifiers: m }], 2);
+            self.run(vec![egui::Event::PointerButton { pos, button, pressed: false, modifiers: m }], 8);
+        }
+
+        fn key(&mut self, key: egui::Key) {
+            let m = egui::Modifiers::NONE;
+            self.run(vec![egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers: m }], 1);
+            self.run(vec![egui::Event::Key { key, physical_key: Some(key), pressed: false, repeat: false, modifiers: m }], 10);
+        }
+
+        fn shows(&self, text: &str) -> bool {
+            self.last.iter().any(|t| t == text)
+        }
+
+        /// Where the text `text` is drawn.
+        fn at(&self, text: &str) -> egui::Pos2 {
+            self.shapes.iter().find(|(t, _)| t == text).unwrap_or_else(|| panic!("{text:?} is not on screen: {:?}", self.last)).1.center()
+        }
+
+        fn until(&mut self, what: &str, mut done: impl FnMut(&mut Self) -> bool) {
+            for _ in 0..300 {
+                self.run(Vec::new(), 1);
+                if done(self) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("{what}: not reached");
+        }
+    }
+
+    fn collect_text(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let rect = text.galley.rect.translate(text.pos.to_vec2());
+                out.push((text.galley.text().to_owned(), rect));
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_text(s, out)),
+            _ => {}
+        }
+    }
+
+    fn window_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression_window_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn a_right_click_on_a_tab_opens_the_menu_and_its_entries_work() {
+        let root = window_dir("tabmenu");
+        let folders: Vec<PathBuf> = (0..3).map(|i| {
+            std::fs::create_dir_all(root.join(format!("t{i}"))).unwrap();
+            root.join(format!("t{i}"))
+        }).collect();
+        let mut w = Window::new(folders[0].clone());
+        for f in &folders[1..] {
+            w.app.new_tab(f.clone());
+        }
+        w.run(Vec::new(), 20);
+        assert_eq!(w.app.tabs.len(), 3);
+        assert!(w.shows("t0") && w.shows("t1") && w.shows("t2"), "{:?}", w.last);
+
+        // Right-click the first tab (its title is drawn in the tab bar)
+        let first = w.app.tabs[0].id;
+        w.click(w.at("t0"), egui::PointerButton::Secondary);
+        assert!(matches!(w.app.menu.as_ref().map(|m| &m.target), Some(MenuTarget::Tab(id)) if *id == first), "the menu did not open");
+        for entry in ["Duplicate tab", "Close other tabs", "Close tabs to the right", "Close tab"] {
+            assert!(w.shows(entry), "{entry:?} missing: {:?}", w.last);
+        }
+
+        // "Duplicate tab": a fourth tab right of the first, on the same folder, shown
+        w.click(w.at("Duplicate tab"), egui::PointerButton::Primary);
+        assert!(w.app.menu.is_none(), "the menu stays open");
+        assert_eq!(w.app.tabs.len(), 4);
+        assert_eq!(w.app.active_tab, 1);
+        assert_eq!(w.app.session().0, vec![folders[0].clone(), folders[0].clone(), folders[1].clone(), folders[2].clone()]);
+
+        // The last tab has nothing to its right: that entry is not offered
+        let last = w.at("t2");
+        w.click(last, egui::PointerButton::Secondary);
+        assert!(w.shows("Close other tabs") && !w.shows("Close tabs to the right"), "{:?}", w.last);
+        w.key(egui::Key::Escape);
+        assert!(w.app.menu.is_none());
+
+        // "Close tabs to the right" on the second tab leaves two. The tab titles share one row: the one
+        // of the last tab gives it, and the second "t0" on that row is the duplicate
+        let ids: Vec<u64> = w.app.tabs.iter().map(|t| t.id).collect();
+        let row = w.at("t2").y;
+        let mut titles: Vec<egui::Pos2> = w.shapes.iter().filter(|(t, r)| t == "t0" && (r.center().y - row).abs() < 3.0).map(|(_, r)| r.center()).collect();
+        titles.sort_by(|a, b| a.x.total_cmp(&b.x));
+        assert_eq!(titles.len(), 2, "{:?}", w.shapes);
+        w.click(titles[1], egui::PointerButton::Secondary);
+        assert!(matches!(w.app.menu.as_ref().map(|m| &m.target), Some(MenuTarget::Tab(id)) if *id == ids[1]));
+        w.click(w.at("Close tabs to the right"), egui::PointerButton::Primary);
+        assert_eq!(w.app.tabs.iter().map(|t| t.id).collect::<Vec<_>>(), ids[..2].to_vec());
+        assert_eq!(w.app.active_tab, 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The real thing, with the real `statvfs`: a sparse file whose size is a little above the room left
+    /// on /dev/shm is copied there by a paste. Nothing is ever written: the answer is "Cancel".
+    #[test]
+    fn a_real_copy_that_cannot_fit_asks_with_the_real_free_space() {
+        let shm = PathBuf::from("/dev/shm").join(format!("compression_window_real_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&shm);
+        if std::fs::create_dir_all(&shm).is_err() {
+            return;
+        }
+        let Some(free) = crate::fs::engine::free_space(&shm) else {
+            let _ = std::fs::remove_dir_all(&shm);
+            return;
+        };
+        let root = window_dir("real");
+        let source = root.join("huge.bin");
+        // Sparse: it takes no room here, but the copy would need `free` + 1 MiB there
+        let made = std::fs::File::create(&source).and_then(|f| f.set_len(free + (1 << 20)));
+        if made.is_err() {
+            let _ = std::fs::remove_dir_all(&shm);
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        let mut w = Window::new(shm.clone());
+        w.app.transfer(TransferOp::Copy, vec![source.clone()], shm.clone());
+        w.until("the question", |w| matches!(w.app.dialog, Some(Dialog::LowSpace { .. })) && w.shows("Not enough free space"));
+        let figures = |b: u64| crate::fs::file_item::format_bytes(b);
+        let shown = w.last.iter().find(|t| t.starts_with("Needed: ")).cloned().unwrap_or_default();
+        assert!(shown.starts_with(&format!("Needed: {} · Available: ", figures(free + (1 << 20)))), "{shown:?}");
+        w.click(w.at("Cancel"), egui::PointerButton::Primary);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert_eq!(std::fs::read_dir(&shm).unwrap().count(), 0, "nothing was written");
+        assert!(source.exists());
+        let _ = std::fs::remove_dir_all(&shm);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Opens the window on `root`, starts a job that finds 10 bytes free where 100 are needed, and
+    /// returns once the window shows the question.
+    fn window_with_the_space_question(name: &str) -> (Window, PathBuf, Arc<AtomicBool>) {
+        let root = window_dir(name);
+        let mut w = Window::new(root.clone());
+        let finished = Arc::new(AtomicBool::new(false));
+        let ok = Arc::new(AtomicBool::new(false));
+        let (flag, result) = (finished.clone(), ok.clone());
+        let dest = root.clone();
+        w.app.engine.spawn(JobKind::Copy, "Copying".into(), String::new(), move |worker| {
+            let outcome = match worker.ensure_space(&dest, 100, |_| Some(10)) {
+                Ok(()) => {
+                    result.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Outcome::done("done".into())
+                }
+                Err(_) => Outcome::stopped(),
+            };
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            outcome
+        });
+        w.until("the question", |w| matches!(w.app.dialog, Some(Dialog::LowSpace { .. })) && w.shows("Not enough free space"));
+        (w, root, ok)
+    }
+
+    #[test]
+    fn the_space_question_shows_the_figures_and_each_answer_works() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let figures = |b: u64| crate::fs::file_item::format_bytes(b);
+        let expected = format!("Needed: {} · Available: {} · Missing: {}", figures(100), figures(10), figures(90));
+
+        // "Continue anyway" lets the job go on
+        let (mut w, root, ok) = window_with_the_space_question("space_go");
+        assert!(w.shows(&expected), "{expected:?} not in {:?}", w.last);
+        assert!(w.shows("Cancel") && w.shows("Continue anyway"));
+        w.click(w.at("Continue anyway"), egui::PointerButton::Primary);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert!(ok.load(SeqCst) && w.app.dialog.is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // "Cancel" stops it
+        let (mut w, root, ok) = window_with_the_space_question("space_cancel");
+        w.click(w.at("Cancel"), egui::PointerButton::Primary);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert!(!ok.load(SeqCst));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // Enter is "Cancel": the safe answer is the default one
+        let (mut w, root, ok) = window_with_the_space_question("space_enter");
+        w.key(egui::Key::Enter);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert!(!ok.load(SeqCst));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // So is Escape, which closes the dialog
+        let (mut w, root, ok) = window_with_the_space_question("space_escape");
+        w.key(egui::Key::Escape);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert!(!ok.load(SeqCst));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
