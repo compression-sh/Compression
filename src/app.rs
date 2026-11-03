@@ -3841,6 +3841,11 @@ impl CompressionApp {
         if t > 0.001 {
             pill("selection_pill_area", area.left_bottom() + egui::vec2(14.0, -12.0), egui::Align2::LEFT_BOTTOM, t, None, &self.pill_text);
         }
+        // A search that stopped at its limit says so, whether or not the status bar is shown
+        if !self.search_query.trim().is_empty() && self.search.limit_reached() {
+            let text = trf("{} results. Narrow down the search.", &[&crate::fs::search::MAX_RESULTS]);
+            pill("search_limit_area", area.center_bottom() + egui::vec2(0.0, -12.0), egui::Align2::CENTER_BOTTOM, 1.0, Some(icons::INFO), &text);
+        }
         // Plugin status (the git branch) sits in the corner; the clipboard pill stacks above it
         let statuses = if self.settings.show_status_bar { self.plugins.statuses() } else { Vec::new() };
         for (i, status) in statuses.iter().enumerate() {

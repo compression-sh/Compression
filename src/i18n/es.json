@@ -816,5 +816,6 @@
   "Wheel scroll speed": "Velocidad de desplazamiento de la rueda",
   "Slow": "Lenta",
   "Fast": "Rápida",
-  "Faster": "Más rápida"
+  "Faster": "Más rápida",
+  "{} results. Narrow down the search.": "{} resultados. Acota la búsqueda."
 }

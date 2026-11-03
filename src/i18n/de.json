@@ -816,5 +816,6 @@
   "Wheel scroll speed": "Scrollgeschwindigkeit des Mausrads",
   "Slow": "Langsam",
   "Fast": "Schnell",
-  "Faster": "Schneller"
+  "Faster": "Schneller",
+  "{} results. Narrow down the search.": "{} Treffer. Schränke die Suche ein."
 }

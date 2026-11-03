@@ -1,7 +1,7 @@
 //! Recursive filename search running on a background thread, streaming results in batches.
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
 use eframe::egui;
@@ -59,11 +59,13 @@ pub struct Search {
     generation: Arc<AtomicU64>,
     rx: Option<mpsc::Receiver<Vec<FileItem>>>,
     finished: bool,
+    /// The search stopped because it had `MAX_RESULTS` results; a new one starts with a flag of its own.
+    limit_hit: Arc<AtomicBool>,
 }
 
 impl Search {
     pub fn new() -> Self {
-        Self { generation: Arc::new(AtomicU64::new(0)), rx: None, finished: true }
+        Self { generation: Arc::new(AtomicU64::new(0)), rx: None, finished: true, limit_hit: Arc::new(AtomicBool::new(false)) }
     }
 
     /// Cancel any running search.
@@ -71,6 +73,12 @@ impl Search {
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.rx = None;
         self.finished = true;
+        self.limit_hit = Arc::new(AtomicBool::new(false));
+    }
+
+    /// The results stop at `MAX_RESULTS` because the search did, not because there were no more to find.
+    pub fn limit_reached(&self) -> bool {
+        self.limit_hit.load(Ordering::Relaxed)
     }
 
     /// A search is still walking folders.
@@ -84,6 +92,8 @@ impl Search {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         self.finished = false;
+        self.limit_hit = Arc::new(AtomicBool::new(false));
+        let limit_hit = self.limit_hit.clone();
         let ctx = ctx.clone();
 
         std::thread::spawn(move || {
@@ -152,6 +162,7 @@ impl Search {
                             ctx.request_repaint();
                         }
                         if found >= MAX_RESULTS {
+                            limit_hit.store(true, Ordering::Relaxed);
                             let _ = tx.send(batch);
                             ctx.request_repaint();
                             return;

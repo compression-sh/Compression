@@ -816,5 +816,6 @@
   "Wheel scroll speed": "Vitesse de défilement de la molette",
   "Slow": "Lente",
   "Fast": "Rapide",
-  "Faster": "Plus rapide"
+  "Faster": "Plus rapide",
+  "{} results. Narrow down the search.": "{} résultats. Affinez la recherche."
 }

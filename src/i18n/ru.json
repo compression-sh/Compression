@@ -816,5 +816,6 @@
   "Wheel scroll speed": "Скорость прокрутки колесом",
   "Slow": "Медленно",
   "Fast": "Быстро",
-  "Faster": "Быстрее"
+  "Faster": "Быстрее",
+  "{} results. Narrow down the search.": "{} результатов. Сузьте поиск."
 }
