@@ -443,6 +443,8 @@ pub struct CompressionApp {
     pub(crate) system_theme: SerpantinumTheme,
     /// Follows the files a theme comes from; `None` when none could be watched.
     theme_watch: Option<crate::theme_watch::ThemeWatch>,
+    /// Follows `settings.json`, so an edit by hand applies at once; `None` when it could not be watched.
+    settings_watch: Option<crate::settings_watch::SettingsWatch>,
     from_theme: SerpantinumTheme,
     target_theme: SerpantinumTheme,
     from_popup_theme: SerpantinumTheme,
@@ -615,6 +617,7 @@ impl CompressionApp {
             settings,
             system_theme: SerpantinumTheme::load(),
             theme_watch: crate::theme_watch::ThemeWatch::new(ctx),
+            settings_watch: crate::settings_watch::SettingsWatch::new(ctx),
             from_theme: faded,
             target_theme: faded,
             from_popup_theme: theme,
@@ -1354,6 +1357,77 @@ impl CompressionApp {
         self.rebuild_theme();
     }
 
+    /// Takes up what `settings.json` says after it was written from outside (an edit by hand or
+    /// another window), as if each changed setting had been switched in the Settings window.
+    fn reload_settings_file(&mut self) {
+        match Settings::read() {
+            Some(Ok(new)) => {
+                self.apply_settings_file(new);
+            }
+            Some(Err(err)) => self.set_toast(trf("Settings file has an error: {}", &[&err])),
+            None => {}
+        }
+    }
+
+    /// Makes `new`, the settings as the file has them, the current ones. False when nothing differs.
+    pub(crate) fn apply_settings_file(&mut self, mut new: Settings) -> bool {
+        // The tabs are this window's own: taking another window's would make the two save each other's for good
+        new.session_tabs = self.settings.session_tabs.clone();
+        new.session_active = self.settings.session_active;
+        // Compression's own saves come back here too; `saved_settings` is what the file held after the last one
+        if new == self.saved_settings {
+            return false;
+        }
+        let old = std::mem::replace(&mut self.saved_settings, new.clone());
+        self.settings = new;
+        let s = &self.settings;
+
+        // The file dialog keeps its own view, apart from the main window's
+        self.view_mode = if self.chooser.is_some() { s.chooser_view_mode } else { s.view_mode };
+        self.sort_by = s.sort_by;
+        self.sort_order = s.sort_order;
+        self.show_hidden = s.show_hidden;
+        self.folders_first = s.folders_first;
+        self.columns = s.columns.clone();
+        if let Some(win) = self.settings_win.as_mut() {
+            win.hex = s.accent.clone().unwrap_or_default();
+        }
+        if s.font != old.font {
+            self.fonts_dirty = true;
+        }
+        network::set_remote_previews(s.remote_previews);
+        if s.plugins != old.plugins {
+            self.plugins.set_enabled_map(&s.plugins);
+        }
+        let reread = s.show_hidden != old.show_hidden || s.plugins != old.plugins || s.remote_previews != old.remote_previews;
+        let resort = s.sort_by != old.sort_by || s.sort_order != old.sort_order || s.folders_first != old.folders_first || s.size_on_disk != old.size_on_disk;
+        self.rebuild_theme();
+        if reread {
+            self.reread_items();
+        } else if resort {
+            self.apply_sort();
+        }
+        // Language first, so the toast below is already in the new one
+        crate::i18n::set_language(crate::i18n::resolve(&self.settings.language));
+        self.set_toast(tr("Settings reloaded"));
+        self.repaint_side_windows();
+        true
+    }
+
+    /// The windows besides the main one (Settings, the icon gallery, Copy to / Move to) draw in
+    /// their own redraws, which a change made elsewhere has to ask for. Only open ones are asked:
+    /// a redraw asked of a closed window brings it back empty (see `chrome::reap_closed_viewport`).
+    fn repaint_side_windows(&self) {
+        let open = [
+            ("compression_settings", self.settings_win.is_some()),
+            ("compression_icon_gallery", self.icon_gallery.is_some()),
+            ("compression_folder_picker", self.picker.is_some()),
+        ];
+        for (id, _) in open.into_iter().filter(|(_, open)| *open) {
+            self.ctx.request_repaint_of(egui::ViewportId::from_hash_of(id));
+        }
+    }
+
     pub(crate) fn rebuild_theme(&mut self) {
         let mut theme = SerpantinumTheme::from_settings(&self.settings);
         if self.settings.theme == "system" {
@@ -1420,6 +1494,7 @@ impl CompressionApp {
             } else {
                 ctx.request_repaint();
             }
+            self.repaint_side_windows();
         }
         if self.fonts_dirty {
             crate::ui::fonts::install(ctx, self.settings.font.as_deref());
@@ -2219,6 +2294,9 @@ impl eframe::App for CompressionApp {
         self.drop_zones.clear();
         if self.theme_watch.as_mut().is_some_and(|w| w.changed(&ctx)) {
             self.reload_external_theme();
+        }
+        if self.settings_watch.as_ref().is_some_and(|w| w.changed()) {
+            self.reload_settings_file();
         }
         self.sync_settings(&ctx);
         let shown_px = match self.view_mode {
@@ -6549,6 +6627,35 @@ mod tests {
         std::fs::remove_dir_all(&c).unwrap();
         again.reopen_tab();
         assert_eq!(again.tabs.len(), 1, "a folder that is gone is not reopened");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_settings_file_written_elsewhere_is_taken_up_once_and_keeps_this_windows_tabs() {
+        let base = std::env::temp_dir().join(format!("compression_settings_file_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        // As after a save: the settings and what the file holds agree
+        app.settings.session_tabs = vec![base.clone()];
+        app.saved_settings = app.settings.clone();
+        let before = app.saved_settings.clone();
+
+        // What the file already says changes nothing
+        assert!(!app.apply_settings_file(before.clone()));
+        // Another window's tabs alone are not a change either, or the two would save each other's for good
+        let other_tabs = Settings { session_tabs: vec![PathBuf::from("/tmp")], session_active: 3, ..before.clone() };
+        assert!(!app.apply_settings_file(other_tabs));
+        assert_eq!(app.settings.session_tabs, vec![base.clone()]);
+
+        // An edit by hand takes effect, and applying the same file again does not
+        let hidden = !before.show_hidden;
+        let edited = Settings { show_hidden: hidden, sort_order: SortOrder::Descending, ..before.clone() };
+        assert!(app.apply_settings_file(edited.clone()));
+        assert_eq!((app.show_hidden, app.sort_order), (hidden, SortOrder::Descending));
+        assert_eq!(app.settings.session_tabs, vec![base.clone()]);
+        assert!(!app.apply_settings_file(edited));
         std::fs::remove_dir_all(&base).unwrap();
     }
 

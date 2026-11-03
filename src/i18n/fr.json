@@ -800,5 +800,7 @@
   "Preview": "Aperçu",
   "Pick a theme to start with": "Choisir un thème de départ",
   "New theme": "Nouveau thème",
-  "Theme name": "Nom du thème"
+  "Theme name": "Nom du thème",
+  "Settings reloaded": "Paramètres rechargés",
+  "Settings file has an error: {}": "Erreur dans settings.json : {}"
 }

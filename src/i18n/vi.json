@@ -800,5 +800,7 @@
   "Preview": "Xem trước",
   "Pick a theme to start with": "Chọn một chủ đề để bắt đầu",
   "New theme": "Chủ đề mới",
-  "Theme name": "Tên chủ đề"
+  "Theme name": "Tên chủ đề",
+  "Settings reloaded": "Đã tải lại cài đặt",
+  "Settings file has an error: {}": "Lỗi trong settings.json: {}"
 }

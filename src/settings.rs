@@ -290,17 +290,25 @@ impl Default for Settings {
     }
 }
 
-fn file() -> Option<PathBuf> {
+pub(crate) fn file() -> Option<PathBuf> {
     crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("compression").join("settings.json"))
 }
 
 impl Settings {
     pub fn load() -> Self {
-        file()
-            .and_then(|f| std::fs::read_to_string(f).ok())
-            .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
-            .map_or_else(Self::default, Self::with_current_view_names)
-            .for_session(crate::fs::admin::is_admin())
+        Self::read().and_then(Result::ok).unwrap_or_default().for_session(crate::fs::admin::is_admin())
+    }
+
+    /// The settings as the file has them now: `None` when there is no file to read, an error when
+    /// it is not valid JSON (say, half way through an edit by hand).
+    pub fn read() -> Option<Result<Self, serde_json::Error>> {
+        let text = std::fs::read_to_string(file()?).ok()?;
+        Some(Self::parse(&text))
+    }
+
+    /// Settings from the text of a file, with the names and the rights of this session applied.
+    fn parse(text: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str::<Settings>(text).map(|s| s.with_current_view_names().for_session(crate::fs::admin::is_admin()))
     }
 
     /// The administrator's window reads the settings of the person who started it, but runs as
@@ -367,5 +375,15 @@ mod tests {
         assert_eq!(settings.last_dir, Some(PathBuf::from("compression:bookmarks")));
         assert_eq!(settings.session_tabs, [PathBuf::from("compression:recent"), PathBuf::from("/tmp")]);
         assert!(settings.folder_views.contains_key(&PathBuf::from("compression:bookmarks")));
+    }
+
+    #[test]
+    fn a_settings_file_is_read_with_the_current_names_and_a_broken_one_is_an_error() {
+        let read = Settings::parse(r#"{"start_path":"ski:recent","session_tabs":["ski:bookmarks"]}"#).unwrap();
+        assert_eq!(read.start_path, Some(PathBuf::from("compression:recent")));
+        assert_eq!(read.session_tabs, [PathBuf::from("compression:bookmarks")]);
+        // Half way through an edit by hand
+        assert!(Settings::parse(r#"{"show_hidden": tr"#).is_err());
+        assert!(Settings::parse("").is_err());
     }
 }

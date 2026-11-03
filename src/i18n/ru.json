@@ -800,5 +800,7 @@
   "Preview": "Предпросмотр",
   "Pick a theme to start with": "Выберите тему для начала",
   "New theme": "Новая тема",
-  "Theme name": "Название темы"
+  "Theme name": "Название темы",
+  "Settings reloaded": "Настройки перезагружены",
+  "Settings file has an error: {}": "Ошибка в settings.json: {}"
 }
