@@ -23,7 +23,42 @@ use std::path::PathBuf;
 use app::CompressionApp;
 use ui::theme::SerpantinumTheme;
 
+/// What `--version` / `-V` and `--help` / `-h` print, when `first` (the first argument) asks for it.
+/// Only that exact first argument counts, so every other argument stays a folder (`./--version` is one).
+fn info_for(first: Option<&str>) -> Option<String> {
+    match first? {
+        "--version" | "-V" => Some(format!("compression {}\n", env!("CARGO_PKG_VERSION"))),
+        "--help" | "-h" => Some(format!(
+            "\
+compression {} - a small, fast, keyboard-friendly file manager
+
+Usage:
+  compression [FOLDER | ADDRESS]   open a folder (default: the current one) or a server address
+                                   such as sftp://me@example.com/srv
+  compression --chooser --mode open|folder|save|save-files
+                                   the file dialog for one request: prints the chosen file:// URIs
+                                   and exits with 0 (chosen), 1 (cancelled) or 2 (failed)
+  compression --portal             the xdg-desktop-portal service (FileChooser, FileManager1)
+  compression --resident           keep a background instance, so new windows open at once
+  compression -V, --version        print the version and exit
+  compression -h, --help           print this help and exit
+
+A folder whose name starts with a dash is given as ./-name.
+",
+            env!("CARGO_PKG_VERSION")
+        )),
+        _ => None,
+    }
+}
+
 fn main() -> eframe::Result {
+    // Answered before anything else is touched: no migration, no instance, no display, no socket
+    if let Some(text) = info_for(env::args().nth(1).as_deref()) {
+        use std::io::Write;
+        // A closed pipe (`compression --help | head -1`) is no reason to panic
+        let _ = std::io::stdout().write_all(text.as_bytes());
+        return Ok(());
+    }
     // An elevated start carries its environment in the arguments (see fs::admin); first of all
     let args = fs::admin::take_environment(env::args().skip(1).collect());
     compat::migrate_user_data();
@@ -204,4 +239,26 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::info_for;
+
+    #[test]
+    fn version_and_help_are_answered_only_for_the_exact_first_argument() {
+        let version = format!("compression {}\n", env!("CARGO_PKG_VERSION"));
+        assert_eq!(info_for(Some("--version")), Some(version.clone()));
+        assert_eq!(info_for(Some("-V")), Some(version));
+        let help = info_for(Some("--help")).unwrap();
+        assert_eq!(info_for(Some("-h")), Some(help.clone()));
+        for mode in ["--chooser", "--portal", "--resident", "--version", "--help"] {
+            assert!(help.contains(mode), "the help does not mention {mode}");
+        }
+        // Folders and everything else are not information requests
+        for other in ["./--version", "./--help", "--versions", "-v", "-H", "--Version", "", "/tmp", "--chooser", "sftp://h/"] {
+            assert_eq!(info_for(Some(other)), None, "{other:?}");
+        }
+        assert_eq!(info_for(None), None);
+    }
 }
