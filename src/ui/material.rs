@@ -1809,6 +1809,7 @@ pub fn marked_slider_row(
     reset: Option<f32>,
 ) -> bool {
     const MARK_ROOM: f32 = 16.0;
+    const MARK_NAME_GAP: f32 = 4.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), SETTING_HEIGHT + MARK_ROOM), egui::Sense::hover());
     let id = ui.make_persistent_id(id_source);
     let (lo, hi) = (*range.start(), *range.end());
@@ -1862,13 +1863,20 @@ pub fn marked_slider_row(
     let bar = |l: f32, r: f32| Rect::from_min_max(Pos2::new(l, y - 2.0), Pos2::new(r, y + 2.0));
     painter.rect_filled(bar(track_left, track_right), CornerRadius::same(2), theme.surface2);
     painter.rect_filled(bar(track_left, x), CornerRadius::same(2), theme.mauve);
+    // Marks are in ascending order; a name that would touch the one before it is left out (the dot stays)
+    let mut names_end = f32::NEG_INFINITY;
     for (mark, name) in marks {
         let mx = at(*mark);
         let on = (*mark - *value).abs() < 0.01;
         painter.circle_filled(Pos2::new(mx, y), 2.5, if mx <= x { on_color(theme, theme.mauve) } else { theme.subtext1 });
         let color = if on { theme.text } else { theme.subtext1 };
         let galley = painter.layout_no_wrap((*name).to_owned(), egui::FontId::proportional(FONT_CAPTION - 1.0), color);
-        painter.galley(Pos2::new(mx - galley.size().x / 2.0, y + 12.0), galley, color);
+        let left = mx - galley.size().x / 2.0;
+        if left < names_end + MARK_NAME_GAP {
+            continue;
+        }
+        names_end = left + galley.size().x;
+        painter.galley(Pos2::new(left, y + 12.0), galley, color);
     }
     if hover > 0.01 {
         painter.circle_filled(Pos2::new(x, y), handle_r + 6.0, theme.with_alpha(theme.mauve, (hover * if active { 52.0 } else { 34.0 }) as u8));
