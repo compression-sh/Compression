@@ -126,7 +126,7 @@ Compression can answer `org.freedesktop.FileManager1` (browsers' "Show in folder
 org.freedesktop.impl.portal.FileChooser=compression
 ```
 
-`compression --portal` is the service itself; D-Bus starts it when needed. Each dialog is `compression --chooser --mode open|folder|save|save-files` in a window of its own, which prints the chosen `file://` URIs and exits with 0 (or 1 if cancelled).
+`compression --portal` is the service itself; D-Bus starts it when needed. Each dialog is `compression --chooser --mode open|folder|save|save-files` in a window of its own, which prints the chosen `file://` URIs and exits with 0 (1 if cancelled, 2 if the dialog could not be shown).
 
 ## Usage
 
@@ -134,6 +134,8 @@ org.freedesktop.impl.portal.FileChooser=compression
 compression              # open the current folder
 compression ~/Downloads  # open a specific folder
 compression sftp://me@example.com/srv  # connect to a server and open a folder on it
+compression --version        # print the version
+compression --help           # print the usage
 ```
 
 | To | Do this |
@@ -259,6 +261,8 @@ Compression bundles a few optional features as plugins. Switch them on or off in
   ```
 
   The command runs in the open folder with the selected files as arguments, and `COMPRESSION_SELECTED_FILES` and `COMPRESSION_CURRENT_DIR` are set. Filters: `extensions`, `dirs_only`, `files_only`, `single`.
+
+  An action is stopped after 30 seconds, or as soon as it prints more than 1 MiB to one stream (output or errors), and a message says why.
 
 Folder sizes: the Size column shows how many items a folder holds. Right-click a folder → Calculate size (Settings → Files & View → Details → Folder sizes: Off, On demand, Always) measures it; sizes appear in the column, in the status line for a selection and in sorting. Two folders are measured at a time, hard-linked files count once, links are not followed and other mounted disks are skipped. A folder Compression could not fully read shows `≥`. Sizes are remembered for the session and dropped when Compression changes something inside, or on refresh (`F5`); changes made by other programs show after a refresh. "Size on disk" counts allocated blocks instead of file lengths.
 
