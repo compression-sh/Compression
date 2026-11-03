@@ -12,7 +12,7 @@
 | **Appearance** | The theme and the accent colour, interface size, font, how round the corners are, how transparent the window is, the icon style and animations. The theme editor lives here. |
 | **Files & View** | List or grid, row height and icon size, the columns of the list, folders first, hidden files, whether each folder keeps its own view, thumbnails and previews on servers, file name extensions, relative dates, decimal or binary sizes, folder sizes (off, on demand, always), size on disk, and whether the sidebar and the status bar are shown. |
 | **Sidebar** | Which places the sidebar lists, and whether it shows every internal disk and partition or only Computer and the drives you plug in. |
-| **Behavior** | Opening with a single click, vim-style navigation keys, typing to jump to a name (or to filter, without pressing `/` first), swiping to go back and forward on a touchpad, the terminal command and the folder of file templates. |
+| **Behavior** | Opening with a single click, vim-style navigation keys, typing to jump to a name (or to filter, without pressing `/` first), how fast the mouse wheel scrolls (the "Wheel scroll speed" slider under "Mouse and touchpad"), swiping to go back and forward on a touchpad, the terminal command and the folder of file templates. |
 | **Keybindings** | Every shortcut, searchable; click one to record a new key. |
 | **Applications** | Which program opens each kind of file by default. |
 | **Plugins** | Which [plugins](plugins.md) are on, and the options of each (the problems of custom actions, the colours of tags). |
