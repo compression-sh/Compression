@@ -933,6 +933,14 @@ impl CompressionApp {
         }
     }
 
+    /// Tell the previews what to make first: the rows on screen, then the next two screenfuls below and
+    /// the one above, so scrolling finds them ready; the rest of the folder follows.
+    fn prioritize_previews(&self) {
+        let shown = self.visible_rows.clone();
+        let page = shown.len().max(1);
+        self.thumbs.set_visible(preview_order(shown, page).filter_map(|row| self.items.get(row)).map(|item| item.path.as_path()));
+    }
+
     fn show_listing(&mut self, listing: std::io::Result<Vec<FileItem>>) {
         self.loading = false;
         match listing {
@@ -2261,6 +2269,14 @@ impl CompressionApp {
     }
 }
 
+/// The rows whose previews come first, in that order: those `shown`, then the two `page`s below them, then
+/// the `page` above them, nearest first. Rows past the ends of the list are named too; the caller leaves them out.
+fn preview_order(shown: std::ops::Range<usize>, page: usize) -> impl Iterator<Item = usize> {
+    let below = shown.end..shown.end.saturating_add(2 * page);
+    let above = shown.start.saturating_sub(page)..shown.start;
+    shown.chain(below).chain(above.rev())
+}
+
 /// The printable text typed this frame, if any.
 fn typed_text(ctx: &egui::Context) -> Option<String> {
     ctx.input(|i| {
@@ -3493,7 +3509,7 @@ impl CompressionApp {
         });
 
         self.visible_rows = folder_sizes::visible_rows(&item_rects, scroll_out.inner_rect);
-        self.thumbs.set_visible(self.items.get(self.visible_rows.clone()).unwrap_or_default().iter().map(|i| i.path.as_path()));
+        self.prioritize_previews();
         let drag_consumed = self.handle_drag_select(ui, scroll_out.inner_rect, scroll_out.state.clamped_offset().y, scroll_delta, &item_rects);
         self.last_item_rects = item_rects;
 
@@ -3597,7 +3613,7 @@ impl CompressionApp {
         });
 
         self.visible_rows = folder_sizes::visible_rows(&item_rects, scroll_out.inner_rect);
-        self.thumbs.set_visible(self.items.get(self.visible_rows.clone()).unwrap_or_default().iter().map(|i| i.path.as_path()));
+        self.prioritize_previews();
         let drag_consumed = self.handle_drag_select(ui, scroll_out.inner_rect, scroll_out.state.clamped_offset().y, scroll_delta, &item_rects);
         self.last_item_rects = item_rects;
 
