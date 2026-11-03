@@ -52,8 +52,8 @@ opt-level = 3
 # .deb and .rpm are built by .github/workflows/release.yml after packaging/stage.sh has laid out target/stage.
 # The graphics libraries are loaded at run time, so the dependency lists are written out by hand.
 [package.metadata.deb]
-maintainer = "ilyamiro"
-copyright = "ilyamiro"
+maintainer = "compression-sh"
+copyright = "ilyamiro, compression-sh"
 license-file = ["LICENSE", "0"]
 section = "utils"
 priority = "optional"
