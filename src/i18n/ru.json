@@ -804,5 +804,10 @@
   "Settings reloaded": "Настройки перезагружены",
   "Settings file has an error: {}": "Ошибка в settings.json: {}",
   "It took longer than {} minutes and was stopped": "Заняло больше {} мин., остановлено",
-  "The archive program printed too much": "Программа архивации вывела слишком много"
+  "The archive program printed too much": "Программа архивации вывела слишком много",
+  "Not enough free space": "Недостаточно свободного места",
+  "There may not be enough room in “{}”.": "В папке «{}» может не хватить места.",
+  "Needed: {} · Available: {} · Missing: {}": "Нужно: {} · Доступно: {} · Не хватает: {}",
+  "Replaced files are not counted, so the job may still fit. Continue anyway?": "Заменяемые файлы не вычитаются, поэтому места всё же может хватить. Продолжить?",
+  "Continue anyway": "Всё равно продолжить"
 }

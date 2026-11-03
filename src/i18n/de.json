@@ -804,5 +804,10 @@
   "Settings reloaded": "Einstellungen neu geladen",
   "Settings file has an error: {}": "Fehler in settings.json: {}",
   "It took longer than {} minutes and was stopped": "Es dauerte länger als {} Minuten und wurde beendet",
-  "The archive program printed too much": "Das Archivprogramm hat zu viel ausgegeben"
+  "The archive program printed too much": "Das Archivprogramm hat zu viel ausgegeben",
+  "Not enough free space": "Nicht genug freier Platz",
+  "There may not be enough room in “{}”.": "Im Ordner „{}“ ist möglicherweise nicht genug Platz.",
+  "Needed: {} · Available: {} · Missing: {}": "Benötigt: {} · Verfügbar: {} · Es fehlen: {}",
+  "Replaced files are not counted, so the job may still fit. Continue anyway?": "Ersetzte Dateien werden nicht abgezogen, es kann also trotzdem reichen. Trotzdem fortfahren?",
+  "Continue anyway": "Trotzdem fortfahren"
 }

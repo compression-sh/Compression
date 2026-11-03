@@ -41,7 +41,7 @@ use crate::fs::{
     trash,
 };
 use crate::fs::batch_rename::{self, Entry as RenameEntry, Mode as RenameMode, Rules as RenameRules};
-use crate::fs::engine::{self, ConflictRequest, Effect, Engine, JobKind, Op, Outcome};
+use crate::fs::engine::{self, ConflictRequest, Effect, Engine, JobKind, Op, Outcome, SpaceRequest};
 use crate::fs::history::{Edit, History, UndoEntry};
 use crate::fs::templates::{self, Template};
 use crate::fs::ops::{self, ArchiveFormat};
@@ -243,6 +243,8 @@ pub(crate) enum Dialog {
     Shortcuts,
     /// A copy or move found its target name taken and waits for the answer.
     Conflict { request: Option<ConflictRequest>, all: bool },
+    /// A job found less room than it needs and waits for the answer.
+    LowSpace { request: Option<SpaceRequest> },
     SelectPattern { pattern: String, case: bool, first_frame: bool },
     /// A dialog a plugin draws itself: the plugin's id.
     Plugin(&'static str),
@@ -356,6 +358,7 @@ pub struct CompressionApp {
     /// The folder size mode the View options switch went on from, which turning it off restores.
     sizes_before_always: crate::settings::FolderSizeMode,
     pending_conflicts: VecDeque<ConflictRequest>,
+    pending_space: VecDeque<SpaceRequest>,
     jobs_popover: bool,
     jobs_button_rect: egui::Rect,
     /// Where each listed item was drawn last frame (for the menu key).
@@ -564,6 +567,7 @@ impl CompressionApp {
             job_removals: HashMap::new(),
             sizes_before_always: crate::settings::FolderSizeMode::OnDemand,
             pending_conflicts: VecDeque::new(),
+            pending_space: VecDeque::new(),
             jobs_popover: false,
             jobs_button_rect: egui::Rect::NOTHING,
             last_item_rects: Vec::new(),
@@ -1219,6 +1223,10 @@ impl CompressionApp {
                     let sizes: Vec<u64> = items.iter().map(|p| p.metadata().map_or(0, |m| m.len())).collect();
                     w.shared.files_total.store(items.len() as u64, Relaxed);
                     w.shared.bytes_total.store(sizes.iter().sum(), Relaxed);
+                    let pairs: Vec<(PathBuf, PathBuf)> = items.iter().map(|item| (item.clone(), dest.clone())).collect();
+                    if w.ensure_space_for_archives(&pairs, engine::free_space).is_err() {
+                        return Outcome::stopped();
+                    }
                     let mut failures = Vec::new();
                     let mut done = 0;
                     for (item, size) in items.iter().zip(&sizes) {
@@ -1262,6 +1270,10 @@ impl CompressionApp {
             let sizes: Vec<u64> = archives.iter().map(|p| p.metadata().map_or(0, |m| m.len())).collect();
             w.shared.files_total.store(archives.len() as u64, Relaxed);
             w.shared.bytes_total.store(sizes.iter().sum(), Relaxed);
+            let pairs: Vec<(PathBuf, PathBuf)> = archives.iter().filter_map(|a| a.parent().map(|dir| (a.clone(), dir.to_path_buf()))).collect();
+            if w.ensure_space_for_archives(&pairs, engine::free_space).is_err() {
+                return Outcome::stopped();
+            }
             let mut failures = Vec::new();
             let mut made = Vec::new();
             let mut done = 0;
@@ -5177,6 +5189,7 @@ impl CompressionApp {
                             Dialog::Compress { .. } => self.compress_contents(ui, &mut dialog),
                             Dialog::Shortcuts => self.shortcuts_contents(ui),
                             Dialog::Conflict { .. } => self.conflict_dialog_contents(ui, &mut dialog),
+                            Dialog::LowSpace { .. } => self.low_space_dialog_contents(ui, &mut dialog),
                             Dialog::SelectPattern { .. } => self.select_pattern_contents(ui, &mut dialog),
                             Dialog::QuickLook { .. } => self.quick_look_contents(ui, &mut dialog),
                             Dialog::Plugin(_) => self.plugin_dialog_contents(ui, &mut dialog),

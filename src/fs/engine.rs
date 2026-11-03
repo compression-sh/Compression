@@ -175,8 +175,43 @@ impl Outcome {
     }
 }
 
+/// The target has less room than the job needs. The job waits until the window sends an answer.
+pub struct SpaceRequest {
+    pub job: u64,
+    pub folder: PathBuf,
+    pub needed: u64,
+    pub free: u64,
+    reply: mpsc::Sender<bool>,
+}
+
+impl SpaceRequest {
+    /// `go_on` is the choice to carry on anyway; `false` cancels the job.
+    pub fn answer(self, go_on: bool) {
+        let _ = self.reply.send(go_on);
+    }
+
+    pub fn missing(&self) -> u64 {
+        self.needed.saturating_sub(self.free)
+    }
+}
+
+/// How much is missing when `needed` bytes are to go where `free` bytes are left; `None` if it fits.
+pub fn shortfall(needed: u64, free: u64) -> Option<u64> {
+    needed.checked_sub(free).filter(|missing| *missing > 0)
+}
+
+/// The room an ordinary user has left where `dir` is. `None` when that cannot be told reliably: the
+/// folder is on a server or `statvfs` has no sizes for it, and then nothing is warned about.
+pub fn free_space(dir: &Path) -> Option<u64> {
+    if super::network::is_remote(dir) {
+        return None;
+    }
+    super::drives::Space::of(dir).map(|space| space.free)
+}
+
 pub enum Event {
     Conflict(ConflictRequest),
+    LowSpace(SpaceRequest),
     Done { job: u64, outcome: Outcome },
 }
 
@@ -246,6 +281,20 @@ impl Worker {
         let (reply, answer) = mpsc::channel();
         let request = ConflictRequest { job: self.job, target: target.to_path_buf(), source_info, target_info, reply };
         self.events.send(Event::Conflict(request)).map_err(|_| cancelled())?;
+        let result = self.wait_for(answer);
+        match result {
+            Some((Decision::Cancel, _)) | None => Err(cancelled()),
+            Some((decision, all)) => {
+                if all {
+                    self.remembered = Some(decision);
+                }
+                Ok(decision)
+            }
+        }
+    }
+
+    /// Waits for the window to answer a question; `None` once the job is cancelled or the window dropped it.
+    fn wait_for<T>(&self, answer: mpsc::Receiver<T>) -> Option<T> {
         self.ctx.request_repaint();
         self.shared.waiting.store(true, Relaxed);
         let result = loop {
@@ -260,15 +309,47 @@ impl Worker {
             }
         };
         self.shared.waiting.store(false, Relaxed);
-        match result {
-            Some((Decision::Cancel, _)) | None => Err(cancelled()),
-            Some((decision, all)) => {
-                if all {
-                    self.remembered = Some(decision);
-                }
-                Ok(decision)
+        result
+    }
+
+    /// Before a job writes `needed` bytes into `dest`: if `free(dest)` says they do not fit, ask the
+    /// window whether to go on. Cancelled by the answer or by the job being cancelled; a job that fits, or
+    /// where the room is unknown, is not asked.
+    pub fn ensure_space(&self, dest: &Path, needed: u64, free: impl Fn(&Path) -> Option<u64>) -> io::Result<()> {
+        let Some(free) = free(dest) else { return Ok(()) };
+        if shortfall(needed, free).is_none() {
+            return Ok(());
+        }
+        let (reply, answer) = mpsc::channel();
+        let request = SpaceRequest { job: self.job, folder: dest.to_path_buf(), needed, free, reply };
+        self.events.send(Event::LowSpace(request)).map_err(|_| cancelled())?;
+        match self.wait_for(answer) {
+            Some(true) => Ok(()),
+            _ => Err(cancelled()),
+        }
+    }
+
+    /// `ensure_space` for unpacking `(archive, folder)` pairs: the need of a folder is what its archives hold
+    /// unpacked. A folder whose archives cannot all be listed (or are listed only in part) is not warned about.
+    pub fn ensure_space_for_archives(&self, pairs: &[(PathBuf, PathBuf)], free: impl Fn(&Path) -> Option<u64> + Copy) -> io::Result<()> {
+        let mut folders: Vec<(&Path, Option<u64>)> = Vec::new();
+        for (archive, dest) in pairs {
+            self.shared.checkpoint()?;
+            let size = match super::archive_list::list(archive, &self.shared.cancel) {
+                Ok(listing) if listing.cut.is_none() => Some(listing.unpacked),
+                _ => None,
+            };
+            match folders.iter_mut().find(|(d, _)| *d == dest.as_path()) {
+                Some((_, total)) => *total = total.zip(size).map(|(a, b)| a.saturating_add(b)),
+                None => folders.push((dest, size)),
             }
         }
+        for (dest, needed) in folders {
+            if let Some(needed) = needed {
+                self.ensure_space(dest, needed, free)?;
+            }
+        }
+        Ok(())
     }
 
     /// Runs archive work (`ops::compress`, `ops::extract`) under this job's control: it stops when
@@ -751,6 +832,11 @@ pub fn queue_key(op: Op, sources: &[PathBuf], dest_dir: &Path) -> Option<u64> {
 
 /// Copy or move every `(source, target)` pair. A taken target name is a question for the window.
 pub fn transfer(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>) -> Outcome {
+    transfer_with(w, op, pairs, free_space)
+}
+
+/// `transfer` with the source of the free room given, so a test can say how much there is.
+fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: impl Fn(&Path) -> Option<u64>) -> Outcome {
     let sizes: Vec<(u64, u64)> = pairs
         .iter()
         .map(|(src, _)| {
@@ -761,6 +847,19 @@ pub fn transfer(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>) -> Outco
         .collect();
     w.shared.files_total.store(sizes.iter().map(|s| s.0).sum(), Relaxed);
     w.shared.bytes_total.store(sizes.iter().map(|s| s.1).sum(), Relaxed);
+
+    // Replaced files are not counted back, so a replace may warn a little early; a move inside one file
+    // system is a rename and needs no room
+    if let Some(dest) = pairs.first().and_then(|(_, target)| target.parent()) {
+        let needed = pairs
+            .iter()
+            .zip(&sizes)
+            .filter(|((src, target), _)| op == Op::Copy || target.parent().is_none_or(|parent| !same_device(src, parent)))
+            .fold(0u64, |sum, (_, size)| sum.saturating_add(size.1));
+        if let Err(err) = w.ensure_space(dest, needed, free) {
+            return if is_cancel(&err) { Outcome::stopped() } else { Outcome::failed(err.to_string()) };
+        }
+    }
 
     let mut rec = Record::default();
     let mut failures = Vec::new();
@@ -946,6 +1045,189 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("dst/a")).unwrap(), "old a");
         assert_eq!(std::fs::read_to_string(dir.join("dst/a (copy)")).unwrap(), "new a");
         assert_eq!(std::fs::read_to_string(dir.join("dst/b (copy)")).unwrap(), "new b");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs `e` until its jobs end, handing every low-space question to `reply` (which may answer it or
+    /// keep it); gives back what was asked as (needed, free).
+    fn run_asking(e: &mut Engine, mut reply: impl FnMut(&mut Engine, SpaceRequest)) -> (Vec<(u64, u64)>, Vec<Event>) {
+        let (mut asked, mut done) = (Vec::new(), Vec::new());
+        for _ in 0..600 {
+            for event in e.poll() {
+                match event {
+                    Event::LowSpace(request) => {
+                        asked.push((request.needed, request.free));
+                        reply(e, request);
+                    }
+                    other => done.push(other),
+                }
+            }
+            if !e.running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (asked, done)
+    }
+
+    /// Whether the two folders are on different file systems.
+    fn same_device_not(a: &Path, b: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        matches!((a.metadata(), b.metadata()), (Ok(x), Ok(y)) if x.dev() != y.dev())
+    }
+
+    fn outcome_of(events: &[Event]) -> &Outcome {
+        events.iter().find_map(|ev| if let Event::Done { outcome, .. } = ev { Some(outcome) } else { None }).expect("the job ended")
+    }
+
+    /// A folder with a 100-byte file and an empty target, and the pair a copy or move would work on.
+    fn space_case(name: &str) -> (PathBuf, Vec<(PathBuf, PathBuf)>) {
+        let dir = sandbox(name);
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("a"), vec![1u8; 100]).unwrap();
+        let pairs = vec![(dir.join("a"), dir.join("dst/a"))];
+        (dir, pairs)
+    }
+
+    #[test]
+    fn a_shortfall_is_what_is_missing_and_only_when_something_is() {
+        assert_eq!(shortfall(100, 10), Some(90));
+        assert_eq!(shortfall(11, 10), Some(1));
+        assert_eq!(shortfall(10, 10), None);
+        assert_eq!(shortfall(0, 0), None);
+        assert_eq!(shortfall(0, 10), None);
+        assert_eq!(shortfall(u64::MAX, 0), Some(u64::MAX));
+        assert_eq!(shortfall(5, u64::MAX), None);
+    }
+
+    #[test]
+    fn a_copy_that_does_not_fit_asks_and_cancel_writes_nothing() {
+        let (dir, pairs) = space_case("space_cancel");
+        let mut e = engine();
+        e.spawn(JobKind::Copy, "Copy".into(), String::new(), move |w| transfer_with(w, Op::Copy, pairs, |_| Some(10)));
+        let (asked, events) = run_asking(&mut e, |_, request| request.answer(false));
+        assert_eq!(asked, vec![(100, 10)]);
+        let outcome = outcome_of(&events);
+        assert!(outcome.cancelled && !outcome.ok);
+        assert!(dir.join("dst/a").symlink_metadata().is_err(), "nothing was written");
+        assert!(matches!(outcome.effect, Effect::None));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn going_on_anyway_copies() {
+        let (dir, pairs) = space_case("space_go");
+        let mut e = engine();
+        e.spawn(JobKind::Copy, "Copy".into(), String::new(), move |w| transfer_with(w, Op::Copy, pairs, |_| Some(10)));
+        let (asked, events) = run_asking(&mut e, |_, request| {
+            assert_eq!(request.missing(), 90);
+            request.answer(true);
+        });
+        assert_eq!(asked.len(), 1);
+        assert!(outcome_of(&events).ok);
+        assert_eq!(std::fs::read(dir.join("dst/a")).unwrap().len(), 100);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn enough_room_or_unknown_room_asks_nothing() {
+        for (name, free) in [("space_fits", Some(100)), ("space_unknown", None)] {
+            let (dir, pairs) = space_case(name);
+            let mut e = engine();
+            e.spawn(JobKind::Copy, "Copy".into(), String::new(), move |w| transfer_with(w, Op::Copy, pairs, move |_| free));
+            let (asked, events) = run_asking(&mut e, |_, request| request.answer(false));
+            assert!(asked.is_empty(), "{name}");
+            assert!(outcome_of(&events).ok, "{name}");
+            assert!(dir.join("dst/a").exists(), "{name}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_move_within_one_file_system_never_asks_but_one_across_does() {
+        let (dir, pairs) = space_case("space_move");
+        let mut e = engine();
+        e.spawn(JobKind::Move, "Move".into(), String::new(), move |w| transfer_with(w, Op::Move, pairs, |_| Some(0)));
+        let (asked, events) = run_asking(&mut e, |_, request| request.answer(false));
+        assert!(asked.is_empty());
+        assert!(outcome_of(&events).ok);
+        assert!(dir.join("dst/a").exists() && !dir.join("a").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Across file systems the bytes are written again (/dev/shm is the second file system here)
+        let shm = PathBuf::from("/dev/shm").join(format!("compression_space_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&shm);
+        let (dir, _) = space_case("space_across");
+        if std::fs::create_dir_all(&shm).is_err() || !same_device_not(&dir, &shm) {
+            let _ = std::fs::remove_dir_all(&shm);
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        let pairs = vec![(dir.join("a"), shm.join("a"))];
+        let mut e = engine();
+        e.spawn(JobKind::Move, "Move".into(), String::new(), move |w| transfer_with(w, Op::Move, pairs, |_| Some(10)));
+        let (asked, events) = run_asking(&mut e, |_, request| request.answer(false));
+        assert_eq!(asked, vec![(100, 10)]);
+        assert!(outcome_of(&events).cancelled);
+        assert!(dir.join("a").exists(), "the source is untouched");
+        let _ = std::fs::remove_dir_all(&shm);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cancelling_the_job_while_the_question_is_open_ends_it() {
+        let (dir, pairs) = space_case("space_midway");
+        let mut e = engine();
+        let id = e.spawn(JobKind::Copy, "Copy".into(), String::new(), move |w| transfer_with(w, Op::Copy, pairs, |_| Some(10)));
+        let mut held = Vec::new();
+        let (asked, events) = run_asking(&mut e, |e, request| {
+            // The question stays unanswered (and alive) while the job is cancelled
+            e.cancel(id);
+            held.push(request);
+        });
+        assert_eq!(asked.len(), 1);
+        assert!(outcome_of(&events).cancelled);
+        assert!(dir.join("dst/a").symlink_metadata().is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unpacking_needs_what_the_archives_hold_unpacked_per_folder() {
+        use std::io::Write as _;
+        let dir = sandbox("space_unpack");
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        let mut archives = Vec::new();
+        for (name, sizes) in [("one.zip", vec![300usize, 200]), ("two.zip", vec![50])] {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(dir.join(name)).unwrap());
+            for (i, size) in sizes.iter().enumerate() {
+                zip.start_file(format!("f{i}"), zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored)).unwrap();
+                zip.write_all(&vec![0u8; *size]).unwrap();
+            }
+            zip.finish().unwrap();
+            archives.push(dir.join(name));
+        }
+        let pairs: Vec<(PathBuf, PathBuf)> = archives.iter().map(|a| (a.clone(), dir.join("out"))).collect();
+        let mut e = engine();
+        e.spawn(JobKind::Extract, "Extract".into(), String::new(), move |w| match w.ensure_space_for_archives(&pairs, |_| Some(10)) {
+            Ok(()) => Outcome::done(String::new()),
+            Err(_) => Outcome::stopped(),
+        });
+        let (asked, events) = run_asking(&mut e, |_, request| request.answer(false));
+        // One question for the folder, for both archives together: 300 + 200 + 50
+        assert_eq!(asked, vec![(550, 10)]);
+        assert!(outcome_of(&events).cancelled);
+
+        // An archive that cannot be listed leaves its folder unwarned
+        std::fs::write(dir.join("bad.zip"), b"not a zip").unwrap();
+        let pairs = vec![(dir.join("bad.zip"), dir.join("out")), (dir.join("one.zip"), dir.join("out"))];
+        let mut e = engine();
+        e.spawn(JobKind::Extract, "Extract".into(), String::new(), move |w| match w.ensure_space_for_archives(&pairs, |_| Some(10)) {
+            Ok(()) => Outcome::done(String::new()),
+            Err(_) => Outcome::stopped(),
+        });
+        let (asked, events) = run_asking(&mut e, |_, request| request.answer(false));
+        assert!(asked.is_empty());
+        assert!(outcome_of(&events).ok);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

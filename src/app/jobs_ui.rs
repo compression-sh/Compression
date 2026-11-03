@@ -62,6 +62,7 @@ impl CompressionApp {
         for event in self.engine.poll() {
             match event {
                 Event::Conflict(request) => self.pending_conflicts.push_back(request),
+                Event::LowSpace(request) => self.pending_space.push_back(request),
                 Event::Done { job, outcome } => {
                     changed = true;
                     if self.history_job == Some(job) {
@@ -79,6 +80,14 @@ impl CompressionApp {
             let alive = self.engine.jobs.iter().any(|j| j.id == request.job && j.state == JobState::Running);
             if alive {
                 self.dialog = Some(Dialog::Conflict { request: Some(request), all: false });
+            }
+        }
+        // A request of a job that was cancelled meanwhile is dropped, and its answer with it
+        while self.dialog.is_none()
+            && let Some(request) = self.pending_space.pop_front()
+        {
+            if self.engine.jobs.iter().any(|j| j.id == request.job && j.state == JobState::Running) {
+                self.dialog = Some(Dialog::LowSpace { request: Some(request) });
             }
         }
         if !self.engine.running() {
@@ -375,6 +384,41 @@ impl CompressionApp {
             });
         }
         action
+    }
+
+    /// "Not enough room" — the question a copy, move or extraction asks before it starts writing.
+    /// Cancel is the default: Enter and closing the dialog both stop the job.
+    pub(super) fn low_space_dialog_contents(&mut self, ui: &mut egui::Ui, dialog: &mut Dialog) -> bool {
+        let Dialog::LowSpace { request } = dialog else { return false };
+        let theme = self.theme;
+        let Some(req) = request.as_ref() else { return true };
+        let folder = req.folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| req.folder.display().to_string());
+        let mut go_on = None;
+        if material::dialog_header(ui, tr("Not enough free space"), Some(&trf("There may not be enough room in “{}”.", &[&folder])), &theme, "ls_close") {
+            go_on = Some(false);
+        }
+        let text = trf("Needed: {} · Available: {} · Missing: {}", &[&format_bytes(req.needed), &format_bytes(req.free), &format_bytes(req.missing())]);
+        ui.label(egui::RichText::new(text).size(material::FONT_BODY).color(theme.text));
+        ui.label(egui::RichText::new(tr("Replaced files are not counted, so the job may still fit. Continue anyway?")).size(material::FONT_CAPTION).color(theme.subtext0));
+        ui.add_space(4.0);
+        ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), material::BUTTON_HEIGHT), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if material::button(ui, "ls_cancel", Some(icons::CLOSE), tr("Cancel"), &theme, ButtonKind::Filled, true).clicked() {
+                go_on = Some(false);
+            }
+            if material::button(ui, "ls_go", None, tr("Continue anyway"), &theme, ButtonKind::Tonal, true).clicked() {
+                go_on = Some(true);
+            }
+        });
+        if go_on.is_none() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            go_on = Some(false);
+        }
+        if let Some(go_on) = go_on {
+            if let Some(req) = request.take() {
+                req.answer(go_on);
+            }
+            return true;
+        }
+        false
     }
 
     /// "Replace or skip?" — the question a copy or move asks when a name is already taken.

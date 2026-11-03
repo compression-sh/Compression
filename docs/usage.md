@@ -48,6 +48,8 @@ Click, or move with the arrow keys (or `j` and `k` with the vim keys on). `Shift
 
 Copying, moving, deleting, packing and unpacking run as jobs in the background. `Ctrl+J` shows them: each has a progress bar with the speed and the time left, and a cancel button. Copies and cross-disk moves have a pause button too. When a name is taken, a job asks whether to replace, skip, keep both or (for folders) merge, and offers to do the same for all following conflicts. A cancelled copy removes the half-made copy; a failed or cancelled job never leaves a file that looks finished but is not.
 
+Before a copy, a move to another disk or an unpacking starts writing, Compression compares what it needs with the free space of the target. If it may not fit, the job stops and asks whether to continue anyway ("Cancel" is the default). The check is skipped on servers and where the system gives no sizes, and replaced files are not subtracted, so it can warn a little early.
+
 Copies that write to the same disk run one after the other, because several at once slow each other down on a spinning disk (Settings → General, "Run copies to the same disk one at a time"). A queued job shows "Waiting for the disk"; in the list you can cancel it, start it now or move it up or down. Moves inside one file system and deletes are never queued.
 
 Compression refuses to copy pipes, sockets and device files, and a move across file systems that fails halfway removes the target it had made, so the original stays whole.
