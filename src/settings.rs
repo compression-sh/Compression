@@ -294,6 +294,13 @@ pub(crate) fn file() -> Option<PathBuf> {
     crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("compression").join("settings.json"))
 }
 
+thread_local! {
+    /// Set by a test that runs a whole window on its thread: its tabs and layout are not kept in the
+    /// settings file, which other windows of the test run watch.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) static NO_SAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Settings {
     pub fn load() -> Self {
         Self::read().and_then(Result::ok).unwrap_or_default().for_session(crate::fs::admin::is_admin())
@@ -354,7 +361,7 @@ impl Settings {
 
     pub fn save(&self) {
         // As administrator the settings belong to someone else's home
-        if crate::fs::admin::is_admin() {
+        if crate::fs::admin::is_admin() || NO_SAVE.with(std::cell::Cell::get) {
             return;
         }
         let Some(file) = file() else { return };

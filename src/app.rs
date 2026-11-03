@@ -7024,6 +7024,7 @@ mod tests {
     impl Window {
         fn new(folder: PathBuf) -> Self {
             let ctx = egui::Context::default();
+            crate::settings::NO_SAVE.with(|no_save| no_save.set(true));
             let app = CompressionApp::new(folder, SerpantinumTheme::default(), Settings::default(), &ctx);
             let mut window = Self { app, ctx, frame: eframe::Frame::_new_kittest(), time: 0.0, last: Vec::new(), shapes: Vec::new() };
             window.run(Vec::new(), 12);
