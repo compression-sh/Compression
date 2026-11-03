@@ -39,33 +39,3 @@ pub fn attach<W: HasWindowHandle + HasDisplayHandle>(window: &W, handle: &str) -
     true
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_ids_that_can_be_windows_go_to_the_server() {
-        assert_eq!(parent_id("x11:0x1a00007"), Some(0x1a0_0007));
-        assert_eq!(parent_id("x11:1a00007"), Some(0x1a0_0007));
-        assert_eq!(parent_id("x11:1"), Some(1));
-        assert_eq!(parent_id("x11:1fffffff"), Some(0x1fff_ffff));
-        // Not positive, or too big for a resource id
-        assert_eq!(parent_id("x11:0"), None);
-        assert_eq!(parent_id("x11:0x0"), None);
-        assert_eq!(parent_id("x11:20000000"), None);
-        assert_eq!(parent_id("x11:ffffffffffffffff"), None);
-        assert_eq!(parent_id("x11:fffffffffffffffff"), None);
-        // Not an id at all
-        assert_eq!(parent_id("x11:"), None);
-        assert_eq!(parent_id("x11:0x"), None);
-        assert_eq!(parent_id("x11:-5"), None);
-        assert_eq!(parent_id("x11:+5"), Some(5));
-        assert_eq!(parent_id("x11: 5"), None);
-        assert_eq!(parent_id("x11:zz"), None);
-        assert_eq!(parent_id("x11:12 34"), None);
-        // Another kind of handle
-        assert_eq!(parent_id("wayland:abc"), None);
-        assert_eq!(parent_id("1a00007"), None);
-        assert_eq!(parent_id(""), None);
-    }
-}

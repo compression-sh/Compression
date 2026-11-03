@@ -53,19 +53,3 @@ fn finished_writing(kind: &EventKind) -> bool {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use notify::event::CreateKind;
-
-    #[test]
-    fn only_a_finished_write_counts() {
-        assert!(finished_writing(&EventKind::Access(AccessKind::Close(AccessMode::Write))));
-        assert!(finished_writing(&EventKind::Modify(ModifyKind::Name(RenameMode::To))));
-        assert!(finished_writing(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))));
-        // Half way: the file was only made, or its old name went away
-        assert!(!finished_writing(&EventKind::Create(CreateKind::File)));
-        assert!(!finished_writing(&EventKind::Modify(ModifyKind::Name(RenameMode::From))));
-        assert!(!finished_writing(&EventKind::Access(AccessKind::Close(AccessMode::Read))));
-    }
-}

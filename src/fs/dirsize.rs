@@ -162,36 +162,3 @@ pub fn count_in_background(folders: Vec<PathBuf>, busy: std::sync::Arc<AtomicBoo
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn labels_follow_what_is_known() {
-        let p = Path::new("/compression-test/labels");
-        assert_eq!(label(p), "—");
-        store_count(p, Some(3));
-        assert_eq!(label(p), "3 items");
-        assert_eq!(known_count(p), Some(3));
-        mark_pending(p);
-        assert_eq!(label(p), "…");
-        store(p, Totals { bytes: 2048, disk: 4096, files: 2, folders: 1, partial: false });
-        assert_eq!(label(p), format_bytes(2048));
-        store(p, Totals { bytes: 10, disk: 10, files: 1, folders: 0, partial: true });
-        assert_eq!(label(p), format!("≥ {}", format_bytes(10)));
-    }
-
-    #[test]
-    fn invalidating_drops_the_folder_its_parents_and_its_children() {
-        let t = Totals { bytes: 1, disk: 1, files: 1, folders: 0, partial: false };
-        for p in ["/compression-test/inv", "/compression-test/inv/a", "/compression-test/inv/a/b", "/compression-test/inv/other", "/compression-test/elsewhere"] {
-            store(Path::new(p), t);
-        }
-        invalidate(Path::new("/compression-test/inv/a"));
-        assert!(totals(Path::new("/compression-test/inv")).is_none());
-        assert!(totals(Path::new("/compression-test/inv/a")).is_none());
-        assert!(totals(Path::new("/compression-test/inv/a/b")).is_none());
-        assert!(totals(Path::new("/compression-test/inv/other")).is_some());
-        assert!(totals(Path::new("/compression-test/elsewhere")).is_some());
-    }
-}

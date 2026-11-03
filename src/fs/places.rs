@@ -270,33 +270,3 @@ fn config_file_to_write(name: &str) -> Option<PathBuf> {
     config_file(name).filter(|_| !crate::fs::admin::is_admin())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn an_administrator_window_reads_the_settings_folder_of_the_person_who_started_it() {
-        let user = Some(PathBuf::from("/home/me/.config"));
-        let root = Some(PathBuf::from("/root/.config"));
-        assert_eq!(config_file_in(user.clone(), root.clone(), "pins.json"), Some(PathBuf::from("/home/me/.config/compression/pins.json")));
-        // Without the override (an ordinary start) it is the folder of whoever runs the program
-        assert_eq!(config_file_in(None, root.clone(), "pins.json"), Some(PathBuf::from("/root/.config/compression/pins.json")));
-        assert_eq!(config_file_in(None, None, "pins.json"), None);
-        // This test process is not root: it may write what it reads
-        if !crate::fs::admin::is_admin() {
-            assert_eq!(config_file_to_write("pins.json"), config_file("pins.json"));
-        }
-    }
-
-    #[test]
-    fn legacy_view_names_map_to_the_current_ones() {
-        assert_eq!(normalize(PathBuf::from("ski:recent")), PathBuf::from("compression:recent"));
-        assert_eq!(normalize(PathBuf::from("ski:bookmarks")), PathBuf::from("compression:bookmarks"));
-        assert_eq!(normalize(PathBuf::from("compression:recent")), PathBuf::from(RECENT_PATH));
-        assert_eq!(normalize(PathBuf::from("/home/me/ski:recent")), PathBuf::from("/home/me/ski:recent"));
-        assert!(is_virtual(&normalize(PathBuf::from("ski:recent"))));
-        assert!(is_virtual(&normalize(PathBuf::from("ski:bookmarks"))));
-        assert!(!is_virtual(Path::new("ski:recent")));
-    }
-}

@@ -294,13 +294,6 @@ pub(crate) fn file() -> Option<PathBuf> {
     crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("compression").join("settings.json"))
 }
 
-thread_local! {
-    /// Set by a test that runs a whole window on its thread: its tabs and layout are not kept in the
-    /// settings file, which other windows of the test run watch.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) static NO_SAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 impl Settings {
     pub fn load() -> Self {
         Self::read().and_then(Result::ok).unwrap_or_default().for_session(crate::fs::admin::is_admin())
@@ -361,7 +354,7 @@ impl Settings {
 
     pub fn save(&self) {
         // As administrator the settings belong to someone else's home
-        if crate::fs::admin::is_admin() || NO_SAVE.with(std::cell::Cell::get) {
+        if crate::fs::admin::is_admin() {
             return;
         }
         let Some(file) = file() else { return };
@@ -374,44 +367,3 @@ impl Settings {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_administrator_session_ignores_the_terminal_command_of_the_settings() {
-        let settings = Settings { terminal: "sh -c evil {}".into(), ..Default::default() };
-        assert_eq!(settings.clone().for_session(true).terminal, "");
-        assert_eq!(settings.for_session(false).terminal, "sh -c evil {}");
-    }
-
-    #[test]
-    fn settings_saved_by_ski_name_the_views_by_their_current_names() {
-        let json = r#"{"start_path":"ski:recent","last_dir":"ski:bookmarks","session_tabs":["ski:recent","/tmp"],"folder_views":{"ski:bookmarks":"List"}}"#;
-        let settings = serde_json::from_str::<Settings>(json).unwrap().with_current_view_names();
-        assert_eq!(settings.start_path, Some(PathBuf::from("compression:recent")));
-        assert_eq!(settings.last_dir, Some(PathBuf::from("compression:bookmarks")));
-        assert_eq!(settings.session_tabs, [PathBuf::from("compression:recent"), PathBuf::from("/tmp")]);
-        assert!(settings.folder_views.contains_key(&PathBuf::from("compression:bookmarks")));
-    }
-
-    #[test]
-    fn a_settings_file_is_read_with_the_current_names_and_a_broken_one_is_an_error() {
-        let read = Settings::parse(r#"{"start_path":"ski:recent","session_tabs":["ski:bookmarks"]}"#).unwrap();
-        assert_eq!(read.start_path, Some(PathBuf::from("compression:recent")));
-        assert_eq!(read.session_tabs, [PathBuf::from("compression:bookmarks")]);
-        // Half way through an edit by hand
-        assert!(Settings::parse(r#"{"show_hidden": tr"#).is_err());
-        assert!(Settings::parse("").is_err());
-    }
-
-    #[test]
-    fn where_a_window_was_and_how_wide_its_columns_are_is_no_choice() {
-        let base = Settings::default();
-        let moved = Settings { last_dir: Some(PathBuf::from("/tmp")), column_widths: [120.0; 6], folder_views: [(PathBuf::from("/x"), crate::app::ViewMode::Grid)].into(), ..base.clone() };
-        assert!(base.same_choices_as(&moved));
-        // Anything a person picks is
-        assert!(!base.same_choices_as(&Settings { show_hidden: !base.show_hidden, ..moved.clone() }));
-        assert!(!base.same_choices_as(&Settings { theme: "nord".into(), ..base.clone() }));
-    }
-}

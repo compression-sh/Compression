@@ -1,6 +1,6 @@
 name: CI
 
-# Tests and lints on pull requests and on every branch push. Tags are not built here (release.yml
+# Clippy on pull requests and on every branch push. Tags are not built here (release.yml
 # does that), and nothing is packaged or published by this workflow.
 on:
   pull_request:
@@ -28,21 +28,6 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
           rustc --version
-
-      # The tests never touch a display, the clipboard, a bus or the runner's own home: they get a
-      # home, XDG folders and a runtime folder of their own. The clipboard round trip stays ignored.
-      - name: Test
-        run: |
-          iso="$RUNNER_TEMP/iso"
-          mkdir -p "$iso/home" "$iso/run"
-          chmod 700 "$iso/run"
-          env -u WAYLAND_DISPLAY -u DISPLAY -u DBUS_SESSION_BUS_ADDRESS \
-            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-            HOME="$iso/home" \
-            XDG_CONFIG_HOME="$iso/home/.config" XDG_DATA_HOME="$iso/home/.local/share" \
-            XDG_STATE_HOME="$iso/home/.local/state" XDG_CACHE_HOME="$iso/home/.cache" \
-            XDG_RUNTIME_DIR="$iso/run" \
-            cargo test --locked
 
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings

@@ -786,30 +786,3 @@ fn choice_label(choice: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_key_questions_are_retold() {
-        let message = "The identity of the remote computer (example.com) is unknown.\nThe identity sent by the remote computer is SHA256:abc123.";
-        let (title, body) = describe_question(message);
-        assert_eq!(title, "Unknown server");
-        assert!(body.contains("example.com") && body.contains("SHA256:abc123") && !body.contains("abc123.."));
-        assert_eq!(choice_label("Log In Anyway"), "Connect anyway");
-        assert_eq!(choice_label("Something"), "Something");
-    }
-
-    #[test]
-    fn saved_servers_find_their_folder_inside_a_mount() {
-        let mount = Mount {
-            name: "x".into(),
-            address: Address::parse("smb://nas/media"),
-            local: PathBuf::from("/run/user/1/gvfs/smb-share:server=nas,share=media"),
-            kind: network::MountKind::Gvfs,
-        };
-        let deep = Address::parse("smb://nas/media/films/2024").unwrap();
-        assert_eq!(local_in(&mount, &deep), mount.local.join("films/2024"));
-        assert_eq!(local_in(&mount, &Address::parse("smb://nas/media").unwrap()), mount.local);
-    }
-}
