@@ -342,7 +342,8 @@ impl CompressionApp {
                 action = Some(JobAction::Cancel(row.id));
             }
             right -= 32.0;
-            if row.kind != JobKind::Delete {
+            // Packing and unpacking can be cancelled, not paused: a program they run cannot be held
+            if matches!(row.kind, JobKind::Copy | JobKind::Move) {
                 let pause_rect = egui::Rect::from_center_size(egui::pos2(right - 13.0, rect.top() + 24.0), egui::vec2(26.0, 26.0));
                 let (glyph, tip) = if row.paused { (icons::PLAY, tr("Resume")) } else { (icons::PAUSE, tr("Pause")) };
                 if ui.put(pause_rect, |ui: &mut egui::Ui| material::filled_icon_button(ui, ("job_pause", row.id), glyph, theme, 26.0, tip, None)).clicked() {

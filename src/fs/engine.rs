@@ -164,6 +164,11 @@ impl Outcome {
         Self { ok: false, cancelled: false, message, effect: Effect::None }
     }
 
+    /// The job was cancelled and took back what it had begun.
+    pub fn stopped() -> Self {
+        Self { ok: false, cancelled: true, message: tr("Cancelled").to_owned(), effect: Effect::None }
+    }
+
     pub fn with(mut self, effect: Effect) -> Self {
         self.effect = effect;
         self
@@ -204,7 +209,7 @@ pub struct Job {
 impl Job {
     /// Pausing and cancelling make sense where the work moves through files one at a time.
     pub fn controllable(&self) -> bool {
-        matches!(self.kind, JobKind::Copy | JobKind::Move | JobKind::Delete)
+        matches!(self.kind, JobKind::Copy | JobKind::Move | JobKind::Delete | JobKind::Extract | JobKind::Compress)
     }
 
     pub fn paused(&self) -> bool {
@@ -264,6 +269,16 @@ impl Worker {
                 Ok(decision)
             }
         }
+    }
+
+    /// Runs archive work (`ops::compress`, `ops::extract`) under this job's control: it stops when
+    /// the job is cancelled or after `ops::ARCHIVE_TIME_LIMIT`, and reports into `bytes_done`.
+    /// `base` is what the job's earlier archives already added; `size` is what this one adds.
+    pub fn archive_control<R>(&self, base: u64, size: u64, work: impl FnOnce(&ops::Control) -> R) -> R {
+        let shared = &self.shared;
+        let cancelled = || shared.cancel.load(Relaxed);
+        let progress = |done: u64| shared.bytes_done.store(base + done.min(size), Relaxed);
+        work(&ops::Control::new(&cancelled, &progress, ops::ARCHIVE_TIME_LIMIT))
     }
 
     pub fn add_bytes(&self, n: u64) {
@@ -1222,5 +1237,40 @@ mod tests {
         assert_eq!(queue_key(Op::Move, &[dir.join("f")], &dir), None);
         assert_eq!(queue_key(Op::Copy, &[], &dir.join("missing")), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn archive_work_reports_into_the_job_and_is_cut_short_by_a_cancel() {
+        let mut engine = engine();
+        let id = engine.spawn(JobKind::Extract, "unpacking".into(), String::new(), |w| {
+            // The second archive of a job: the first one added 100 bytes, this one is 50
+            let reported = w.archive_control(100, 50, |control| {
+                control.report(30);
+                let first = w.shared.bytes_done.load(Relaxed);
+                control.report(80);
+                // Never more than the archive's own size
+                (first, w.shared.bytes_done.load(Relaxed))
+            });
+            assert_eq!(reported, (130, 150));
+            // Then the long part: only a cancel ends it
+            let ended = w.archive_control(0, 1, |control| loop {
+                if let Err(err) = control.check() {
+                    break err;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            });
+            assert!(is_cancel(&ended));
+            Outcome::stopped()
+        });
+        assert!(engine.jobs[0].controllable(), "an archive job can be cancelled from the window");
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(engine.running(), "it is still working");
+        engine.cancel(id);
+        let events = wait(&mut engine);
+        assert!(!engine.running(), "the cancel ended the job");
+        let Some(Event::Done { outcome, .. }) = events.into_iter().find(|e| matches!(e, Event::Done { .. })) else { panic!("no result") };
+        assert!(outcome.cancelled && !outcome.ok);
+        assert_eq!(outcome.message, tr("Cancelled"));
+        assert_eq!(engine.jobs[0].state, JobState::Cancelled);
     }
 }

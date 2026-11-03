@@ -1215,16 +1215,24 @@ impl CompressionApp {
             TransferOp::Extract => {
                 let title = trf("Extracting {}…", &[&label]);
                 self.engine.spawn(JobKind::Extract, title, detail, move |w| {
-                    w.shared.files_total.store(items.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let sizes: Vec<u64> = items.iter().map(|p| p.metadata().map_or(0, |m| m.len())).collect();
+                    w.shared.files_total.store(items.len() as u64, Relaxed);
+                    w.shared.bytes_total.store(sizes.iter().sum(), Relaxed);
                     let mut failures = Vec::new();
-                    for item in &items {
+                    let mut done = 0;
+                    for (item, size) in items.iter().zip(&sizes) {
                         if w.shared.checkpoint().is_err() {
-                            break;
+                            return Outcome::stopped();
                         }
-                        if let Err(err) = ops::extract(item, &dest) {
-                            failures.push(format!("{}: {err}", item.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+                        match w.archive_control(done, *size, |control| ops::extract(item, &dest, control)) {
+                            Err(err) if engine::is_cancel(&err) => return Outcome::stopped(),
+                            Err(err) => failures.push(format!("{}: {err}", item.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+                            Ok(()) => {}
                         }
-                        w.shared.files_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        done += size;
+                        w.shared.bytes_done.store(done, Relaxed);
+                        w.shared.files_done.fetch_add(1, Relaxed);
                     }
                     if failures.is_empty() { Outcome::done(trf("Extracted {} to “{}”", &[&label, &target])) } else { Outcome::failed(failures.join(" · ")) }
                 });
@@ -1251,24 +1259,39 @@ impl CompressionApp {
         let title = trf("Extracting {}…", &[&label]);
         self.engine.spawn(JobKind::Extract, title, String::new(), move |w| {
             use std::sync::atomic::Ordering::Relaxed;
+            let sizes: Vec<u64> = archives.iter().map(|p| p.metadata().map_or(0, |m| m.len())).collect();
             w.shared.files_total.store(archives.len() as u64, Relaxed);
+            w.shared.bytes_total.store(sizes.iter().sum(), Relaxed);
             let mut failures = Vec::new();
             let mut made = Vec::new();
-            for archive in &archives {
+            let mut done = 0;
+            let mut stopped = false;
+            for (archive, size) in archives.iter().zip(&sizes) {
                 if w.shared.checkpoint().is_err() {
+                    stopped = true;
                     break;
                 }
-                match ops::extract_beside(archive) {
+                match w.archive_control(done, *size, |control| ops::extract_beside(archive, control)) {
                     Ok(dir) => made.push(dir),
+                    Err(err) if engine::is_cancel(&err) => {
+                        stopped = true;
+                        break;
+                    }
                     Err(err) => failures.push(format!("{}: {err}", archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
                 }
+                done += size;
+                w.shared.bytes_done.store(done, Relaxed);
                 w.shared.files_done.fetch_add(1, Relaxed);
             }
+            // What earlier archives of this job made stays, and can be undone
             let effect = if made.is_empty() {
                 Effect::None
             } else {
                 Effect::Record(UndoEntry::new(trf("Extraction of {}", &[&label]), made.iter().cloned().map(Edit::Trash).collect()))
             };
+            if stopped {
+                return Outcome::stopped().with(effect);
+            }
             if failures.is_empty() {
                 let folder = made.last().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
                 Outcome::done(if archives.len() == 1 { trf("Extracted to “{}”", &[&folder]) } else { trf("Extracted {}", &[&label]) }).with(effect)
@@ -5819,9 +5842,16 @@ impl CompressionApp {
             let (sources, format) = (sources.clone(), *format);
             let shown = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let title = trf("Compressing into {}", &[&shown]);
-            self.engine.spawn(JobKind::Compress, title, String::new(), move |_| match ops::compress(&sources, &out, format) {
-                Ok(()) => Outcome::done(trf("Created “{}”", &[&shown])).with(Effect::Record(UndoEntry::new(trf("Compression into {}", &[&shown]), vec![Edit::Trash(out)]))),
-                Err(err) => Outcome::failed(err.to_string()),
+            self.engine.spawn(JobKind::Compress, title, String::new(), move |w| {
+                use std::sync::atomic::Ordering::Relaxed;
+                let size = ops::tree_bytes(&sources);
+                w.shared.bytes_total.store(size, Relaxed);
+                match w.archive_control(0, size, |control| ops::compress(&sources, &out, format, control)) {
+                    Ok(()) => Outcome::done(trf("Created “{}”", &[&shown])).with(Effect::Record(UndoEntry::new(trf("Compression into {}", &[&shown]), vec![Edit::Trash(out)]))),
+                    // The unfinished archive is already gone
+                    Err(err) if engine::is_cancel(&err) => Outcome::stopped(),
+                    Err(err) => Outcome::failed(err.to_string()),
+                }
             });
             close = true;
         }

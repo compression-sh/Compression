@@ -367,7 +367,7 @@ mod tests {
         }
         let dir = scratch(format.extension().trim_start_matches('.'));
         let out = dir.join(format!("pack{}", format.extension()));
-        compress(&[dir.join("src/a.txt"), dir.join("src/d")], &out, format).unwrap();
+        compress(&[dir.join("src/a.txt"), dir.join("src/d")], &out, format, &crate::fs::ops::Control::unlimited()).unwrap();
         let listing = list(&out, &AtomicBool::new(false)).unwrap();
         assert!(names(&listing).contains(&"a.txt") && names(&listing).contains(&"d/e/b.txt"), "{format:?}: {:?}", names(&listing));
         assert_eq!(listing.unpacked, 12, "{format:?}");
@@ -390,7 +390,7 @@ mod tests {
         }
         for format in [ArchiveFormat::Zip, ArchiveFormat::TarGz] {
             let out = dir.join(format!("many{}", format.extension()));
-            compress(&[dir.join("src")], &out, format).unwrap();
+            compress(&[dir.join("src")], &out, format, &crate::fs::ops::Control::unlimited()).unwrap();
             let listing = list_capped(&out, 10, TIME_LIMIT, &AtomicBool::new(false)).unwrap();
             assert_eq!((listing.entries.len(), listing.cut), (10, Some(Cut::Entries)), "{format:?}");
         }

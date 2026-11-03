@@ -341,7 +341,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("src/inner")).unwrap();
         std::fs::write(dir.join("src/inner/a.txt"), "hello").unwrap();
         let zip = dir.join("pack.zip");
-        crate::fs::ops::compress(&[dir.join("src")], &zip, crate::fs::ops::ArchiveFormat::Zip).unwrap();
+        crate::fs::ops::compress(&[dir.join("src")], &zip, crate::fs::ops::ArchiveFormat::Zip, &crate::fs::ops::Control::unlimited()).unwrap();
         let item = FileItem::from_path(&zip).unwrap();
         let Body::Archive(mut view) = Preview::load(&item).body else { panic!("not an archive preview") };
         for _ in 0..200 {

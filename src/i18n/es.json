@@ -802,5 +802,7 @@
   "New theme": "Nuevo tema",
   "Theme name": "Nombre del tema",
   "Settings reloaded": "Ajustes recargados",
-  "Settings file has an error: {}": "Error en settings.json: {}"
+  "Settings file has an error: {}": "Error en settings.json: {}",
+  "It took longer than {} minutes and was stopped": "Tardó más de {} minutos y se detuvo",
+  "The archive program printed too much": "El programa de archivos escribió demasiado"
 }

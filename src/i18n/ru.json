@@ -802,5 +802,7 @@
   "New theme": "Новая тема",
   "Theme name": "Название темы",
   "Settings reloaded": "Настройки перезагружены",
-  "Settings file has an error: {}": "Ошибка в settings.json: {}"
+  "Settings file has an error: {}": "Ошибка в settings.json: {}",
+  "It took longer than {} minutes and was stopped": "Заняло больше {} мин., остановлено",
+  "The archive program printed too much": "Программа архивации вывела слишком много"
 }

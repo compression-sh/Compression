@@ -802,5 +802,7 @@
   "New theme": "Chủ đề mới",
   "Theme name": "Tên chủ đề",
   "Settings reloaded": "Đã tải lại cài đặt",
-  "Settings file has an error: {}": "Lỗi trong settings.json: {}"
+  "Settings file has an error: {}": "Lỗi trong settings.json: {}",
+  "It took longer than {} minutes and was stopped": "Mất hơn {} phút nên đã bị dừng",
+  "The archive program printed too much": "Chương trình nén in ra quá nhiều"
 }
