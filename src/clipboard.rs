@@ -7,6 +7,7 @@
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// The most that is read from another program's clipboard offer; more than this is refused.
@@ -45,6 +46,23 @@ fn read_limited<R: Read + AsRawFd>(reader: &mut R, limit: usize, timeout: Durati
             Err(_) => return None,
         }
     }
+}
+
+/// Text that this process holds on the clipboard through its own data device (`wayland_dnd`).
+/// Reading the clipboard through the compositor asks its owner to write the text into a pipe;
+/// when the owner is this process, the thread that would answer may be the one waiting, so the
+/// text is taken from here instead.
+static OWN_TEXT: Mutex<Option<String>> = Mutex::new(None);
+
+/// Called by `wayland_dnd` when its own selection is set (`Some`) or taken by another program (`None`).
+pub(crate) fn set_own_text(text: Option<String>) {
+    if let Ok(mut own) = OWN_TEXT.lock() {
+        *own = text;
+    }
+}
+
+fn own_text() -> Option<String> {
+    OWN_TEXT.lock().ok()?.clone()
 }
 
 const URI_LIST: &str = "text/uri-list";
@@ -106,6 +124,7 @@ pub fn set_files(paths: &[PathBuf], cut: bool) -> bool {
     if paths.is_empty() {
         return false;
     }
+    set_own_text(None);
     if on_wayland() { set_wayland(paths, cut) } else { set_x11(paths) }
 }
 
@@ -125,7 +144,6 @@ fn set_wayland(paths: &[PathBuf], cut: bool) -> bool {
 }
 
 fn set_x11(paths: &[PathBuf]) -> bool {
-    use std::sync::Mutex;
     // The selection is served by this owner, so it has to outlive the call
     static OWNER: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
     let Ok(mut owner) = OWNER.lock() else { return false };
@@ -137,17 +155,21 @@ fn set_x11(paths: &[PathBuf]) -> bool {
 
 /// The files on the system clipboard, and whether they were cut, if any application put them there.
 pub fn get_files() -> Option<(Vec<PathBuf>, bool)> {
+    // What this process holds is text, never files
+    if own_text().is_some() {
+        return None;
+    }
     if on_wayland() { get_wayland() } else { get_x11() }
 }
 
 /// Puts plain text on the system clipboard, for windows that have no data device of their own
 /// (X11, or a Wayland compositor without one for this window).
 pub fn set_text(text: String) -> bool {
+    set_own_text(None);
     if on_wayland() {
         use wl_clipboard_rs::copy::{MimeType, Options, Source};
         return Options::new().copy(Source::Bytes(text.into_bytes().into_boxed_slice()), MimeType::Text).is_ok();
     }
-    use std::sync::Mutex;
     // The selection is served by this owner, so it has to outlive the call
     static OWNER: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
     let Ok(mut owner) = OWNER.lock() else { return false };
@@ -159,6 +181,9 @@ pub fn set_text(text: String) -> bool {
 
 /// Plain text on the system clipboard, if any.
 pub fn get_text() -> Option<String> {
+    if let Some(text) = own_text() {
+        return Some(text);
+    }
     if on_wayland() {
         use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents};
         let (mut pipe, _) = get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Text).ok()?;
@@ -170,6 +195,9 @@ pub fn get_text() -> Option<String> {
 
 /// An image on the system clipboard (a screenshot, "copy image" in a browser), as PNG bytes.
 pub fn get_image_png() -> Option<Vec<u8>> {
+    if own_text().is_some() {
+        return None;
+    }
     if on_wayland() {
         use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents, get_mime_types};
         let offered = get_mime_types(ClipboardType::Regular, Seat::Unspecified).ok()?;
@@ -239,6 +267,38 @@ mod tests {
         // SAFETY: pipe2 fills two descriptors that the files then own
         assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) }
+    }
+
+    /// The text this process holds is one global, so the tests about it take turns.
+    static OWN_TEXT_TESTS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn text_held_by_this_process_is_read_back_without_asking_the_compositor() {
+        let _turn = OWN_TEXT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        set_own_text(Some("/home/me/a file".to_owned()));
+        // Even with no display at all there is nobody to ask, and the answer is still there
+        assert_eq!(get_text().as_deref(), Some("/home/me/a file"));
+        // It is text, never files or a picture
+        assert_eq!(get_files(), None);
+        assert_eq!(get_image_png(), None);
+        // Another program took the clipboard
+        set_own_text(None);
+        assert_eq!(own_text(), None);
+    }
+
+    #[test]
+    fn setting_files_forgets_the_text_this_process_held() {
+        let _turn = OWN_TEXT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // set_files would reach the real clipboard where there is a display
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some() {
+            return;
+        }
+        set_own_text(Some("old".to_owned()));
+        let _ = set_files(&[PathBuf::from("/tmp/a")], false);
+        assert_eq!(own_text(), None);
+        set_own_text(Some("old".to_owned()));
+        let _ = set_text("new".to_owned());
+        assert_eq!(own_text(), None);
     }
 
     #[test]
