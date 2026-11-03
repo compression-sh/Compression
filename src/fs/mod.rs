@@ -24,4 +24,5 @@ pub mod dirsize;
 pub mod archive_list;
 pub mod complete;
 pub mod network;
+pub mod mount_health;
 pub mod secrets;

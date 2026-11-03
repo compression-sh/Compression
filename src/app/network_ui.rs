@@ -1,6 +1,7 @@
 //! Servers in the window: the Network section of the sidebar, the Connect to server, login and
 //! question dialogs, and connections that run in the background until their folder can be shown.
 use super::*;
+use crate::fs::mount_health::{self, Health, Probes};
 use crate::fs::network::{self, Address, Mount, Progress, Prompt, Reply, Server, Servers};
 use std::time::{Duration, Instant};
 
@@ -47,12 +48,14 @@ pub(super) struct NetState {
     last: Instant,
     /// Mount folders being disconnected.
     leaving: HashSet<PathBuf>,
+    /// Whether the connected servers still answer.
+    probes: Probes,
 }
 
 impl NetState {
     pub(super) fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        Self { tx, rx, servers: Servers::load(), mounts: Vec::new(), pending: Vec::new(), next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new() }
+        Self { tx, rx, servers: Servers::load(), mounts: Vec::new(), pending: Vec::new(), next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new() }
     }
 }
 
@@ -131,7 +134,32 @@ impl CompressionApp {
         if !self.net.pending.is_empty() || !self.net.leaving.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+        self.probe_servers(ctx);
         self.request_network_listing(ctx, false);
+    }
+
+    /// Ask the connected servers whether they still answer (see `mount_health`).
+    fn probe_servers(&mut self, ctx: &egui::Context) {
+        let servers: Vec<PathBuf> = self.net.mounts.iter().filter(|m| m.address.is_some() && !self.net.leaving.contains(&m.local)).map(|m| m.local.clone()).collect();
+        let ctx_asked = ctx.clone();
+        self.net.probes.tick(&servers, Instant::now(), move |local, tx| {
+            let ctx = ctx_asked.clone();
+            std::thread::spawn(move || {
+                let ok = mount_health::answers(&local);
+                let _ = tx.send((local, ok));
+                ctx.request_repaint();
+            });
+        });
+        // A question in flight may turn "slow" with no other reason to draw a frame
+        if self.net.probes.asking() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    /// How the server mounted at `mount` is doing.
+    #[expect(dead_code, reason = "the sidebar draws it in the next change")]
+    pub(super) fn mount_health(&self, mount: &Mount) -> Health {
+        self.net.probes.health(&mount.local, Instant::now())
     }
 
     pub(super) fn request_network_listing(&mut self, ctx: &egui::Context, now: bool) {
