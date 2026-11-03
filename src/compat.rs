@@ -66,7 +66,7 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// `rename`, but an existing `to` (even an empty folder) is an error instead of being replaced.
-fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     let path = |p: &Path| CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other);
     let (a, b) = (path(from)?, path(to)?);
     // SAFETY: both are NUL-terminated paths that outlive the call.

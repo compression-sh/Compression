@@ -4239,7 +4239,11 @@ impl CompressionApp {
         if target.symlink_metadata().is_ok() {
             return Err(trf("“{}” already exists", &[&new_name]));
         }
-        std::fs::rename(path, &target).map_err(|err| err.to_string())?;
+        // A name taken since the check above must not be replaced
+        crate::compat::rename_noreplace(path, &target).map_err(|err| match err.kind() {
+            std::io::ErrorKind::AlreadyExists => trf("“{}” already exists", &[&new_name]),
+            _ => err.to_string(),
+        })?;
 
         self.retarget_path(path, &target);
 
