@@ -1132,10 +1132,29 @@ mod cache {
         }
     }
 
+    /// Deletes the caches of older versions (`v1`, `v2`, ...) next to the current one `current`: their
+    /// pictures are never read again. Only real folders named `v` and digits go; the current one, links
+    /// and everything else stay.
+    fn remove_old_versions(dir: &Path, current: &str) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let numbered = name.strip_prefix('v').is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+            // `DirEntry::file_type` does not follow a link, so a link named like a version is not a folder here
+            if numbered && *name != *current && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
     /// Deletes the least recently used entries when the cache is over its limit.
     pub fn trim_in_background() {
         std::thread::spawn(|| {
             let Some(root) = root() else { return };
+            if let (Some(parent), Some(current)) = (root.parent(), root.file_name()) {
+                remove_old_versions(parent, &current.to_string_lossy());
+            }
             let mut entries = Vec::new();
             let mut total = 0u64;
             let mut stack = vec![root.to_path_buf()];
