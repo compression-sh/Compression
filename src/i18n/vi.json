@@ -436,6 +436,7 @@
   "The trash has no record of where this came from": "Thùng rác không lưu vị trí ban đầu của mục này",
   "{} Volume": "Ổ đĩa {}",
   "{} free of {}": "Còn trống {} trên {}",
+  "{} free": "Còn trống {}",
   "Calculating the size of “{}”…": "Đang tính kích thước của “{}”…",
   "Calculating the size of the selected folders…": "Đang tính kích thước các thư mục đã chọn…",
   "“{}” takes {}": "“{}” chiếm {}",

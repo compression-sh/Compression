@@ -339,6 +339,14 @@ fn by_file_name(a: &Path, b: &Path) -> std::cmp::Ordering {
     natural_cmp(&name(a), &name(b))
 }
 
+/// How long the free room shown in the status bar may be old before it is asked again.
+const FREE_SPACE_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether the free room of `folder` is to be asked now: never asked for it, or the answer is old.
+fn free_space_due(asked: Option<&(PathBuf, std::time::Instant)>, folder: &Path, now: std::time::Instant) -> bool {
+    !asked.is_some_and(|(was, at)| was == folder && now.saturating_duration_since(*at) < FREE_SPACE_EVERY)
+}
+
 /// What the thread that opens a file reports back.
 enum OpenReport {
     Failed(String),
@@ -501,6 +509,12 @@ pub struct CompressionApp {
     theme_draft: Option<theme_editor::ThemeDraft>,
     /// The selection summary the pill still shows while it fades out.
     pill_text: String,
+    /// Free room where the open folder is, as last asked in the background: the folder and the bytes.
+    free_space: Option<(PathBuf, u64)>,
+    /// The folder and the time of the last such question, so it is asked again after a while, not every frame.
+    free_space_asked: Option<(PathBuf, std::time::Instant)>,
+    free_space_tx: mpsc::Sender<(PathBuf, Option<u64>)>,
+    free_space_rx: mpsc::Receiver<(PathBuf, Option<u64>)>,
     sizes: folder_sizes::SizeScheduler,
     /// Rows of `items` on screen after the last frame, so their folders are measured first.
     visible_rows: std::ops::Range<usize>,
@@ -563,6 +577,7 @@ impl CompressionApp {
         crate::fs::file_item::set_show_extensions(settings.show_extensions);
         network::set_remote_previews(settings.remote_previews);
         let (open_tx, open_rx) = mpsc::channel();
+        let (free_space_tx, free_space_rx) = mpsc::channel();
         let view_mode = if settings.remember_view_per_folder {
             settings.folder_views.get(&canonical_path).copied().unwrap_or(settings.view_mode)
         } else {
@@ -670,6 +685,10 @@ impl CompressionApp {
             theme_picker: None,
             theme_draft: None,
             pill_text: String::new(),
+            free_space: None,
+            free_space_asked: None,
+            free_space_tx,
+            free_space_rx,
             sizes: Default::default(),
             visible_rows: 0..0,
             grid_cols: 1,
@@ -2420,6 +2439,7 @@ impl eframe::App for CompressionApp {
         self.sync_selection(false);
         self.poll_jobs();
         self.poll_opened();
+        self.poll_free_space();
         if self.poll_reload() {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
         }
@@ -3859,11 +3879,38 @@ impl CompressionApp {
         Some(text)
     }
 
-    /// Floating pill over the lower left of the listing, there only while something is selected;
+    /// Once per frame: take in the free room found for the open folder, and ask again when the folder
+    /// changed or the answer is old. `statvfs` runs on a thread: a mount that has stopped answering
+    /// would hold the window.
+    fn poll_free_space(&mut self) {
+        while let Ok((folder, free)) = self.free_space_rx.try_recv() {
+            if folder == self.current_path {
+                self.free_space = free.map(|bytes| (folder, bytes));
+            }
+        }
+        if !self.settings.show_status_bar || !free_space_due(self.free_space_asked.as_ref(), &self.current_path, std::time::Instant::now()) {
+            return;
+        }
+        self.free_space_asked = Some((self.current_path.clone(), std::time::Instant::now()));
+        let (folder, tx, ctx) = (self.current_path.clone(), self.free_space_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((folder.clone(), engine::free_space(&folder)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// "123 GB free" for the open folder, shown while nothing is selected.
+    fn free_space_text(&self) -> Option<String> {
+        let (folder, bytes) = self.free_space.as_ref()?;
+        (*folder == self.current_path).then(|| trf("{} free", &[&crate::fs::file_item::format_bytes(*bytes)]))
+    }
+
+    /// Floating pill over the lower left of the listing, with the selection while something is selected
+    /// and the free room otherwise;
     /// a second one on the right while files wait to be pasted. Clicks pass through both.
     fn render_selection_pill(&mut self, ctx: &egui::Context, area: egui::Rect) {
         let theme = self.theme;
-        let summary = self.selection_summary().filter(|_| self.settings.show_status_bar);
+        let summary = self.selection_summary().or_else(|| self.free_space_text()).filter(|_| self.settings.show_status_bar);
         if let Some(text) = &summary {
             self.pill_text.clone_from(text);
         }

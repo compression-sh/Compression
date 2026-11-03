@@ -436,6 +436,7 @@
   "The trash has no record of where this came from": "La papelera no tiene registro de su origen",
   "{} Volume": "Volumen de {}",
   "{} free of {}": "{} libres de {}",
+  "{} free": "{} libres",
   "Calculating the size of “{}”…": "Calculando el tamaño de «{}»…",
   "Calculating the size of the selected folders…": "Calculando el tamaño de las carpetas seleccionadas…",
   "“{}” takes {}": "«{}» ocupa {}",

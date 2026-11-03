@@ -436,6 +436,7 @@
   "The trash has no record of where this came from": "La corbeille n’a aucune trace de la provenance",
   "{} Volume": "Volume de {}",
   "{} free of {}": "{} libres sur {}",
+  "{} free": "{} libres",
   "Calculating the size of “{}”…": "Calcul de la taille de « {} »…",
   "Calculating the size of the selected folders…": "Calcul de la taille des dossiers sélectionnés…",
   "“{}” takes {}": "« {} » occupe {}",
