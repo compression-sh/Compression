@@ -565,6 +565,8 @@ struct Record {
     /// Items replaced by newer ones, now in the trash.
     replaced: Vec<PathBuf>,
     skipped: usize,
+    /// Files inside a copied folder that could not be copied, and why; the rest of the folder was copied.
+    unreadable: Vec<(PathBuf, String)>,
     /// An item could only be deleted for good, so the undo cannot bring it back.
     lossy: bool,
 }
@@ -668,12 +670,27 @@ fn special_file_error(path: &Path) -> io::Error {
 
 /// Refuse a tree with a named pipe, socket or device file in it before anything is created: opening
 /// a pipe to copy it waits for a writer that may never come, and the job would hang for good.
-fn refuse_special_files(w: &Worker, path: &Path) -> io::Result<()> {
+fn refuse_special_files(w: &Worker, path: &Path, lenient: bool) -> io::Result<()> {
     w.shared.checkpoint()?;
-    let meta = path.symlink_metadata()?;
+    // A copy leaves out what it cannot read (and says so), so this look at the tree does not stop at it;
+    // a move across file systems must not start with anything that would fail
+    let meta = match path.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(_) if lenient => return Ok(()),
+        Err(err) => return Err(err),
+    };
     if meta.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            refuse_special_files(w, &entry?.path())?;
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(_) if lenient => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            match entry {
+                Ok(entry) => refuse_special_files(w, &entry.path(), lenient)?,
+                Err(_) if lenient => {}
+                Err(err) => return Err(err),
+            }
         }
         Ok(())
     } else if meta.is_file() || meta.file_type().is_symlink() {
@@ -691,16 +708,25 @@ fn same_device(src: &Path, parent: &Path) -> bool {
 
 /// `copy_tree` for a job that is making `dst`: when the copy fails or is cancelled, everything it made
 /// there is removed again, so no half-copied folder is left. A `dst` that was already there is never touched.
-fn copy_new(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
+/// With `skipped`, a file inside a folder that cannot be copied is left out and noted there instead of
+/// ending the copy; without it (a move across file systems, which removes the original afterwards) the
+/// first failure ends it.
+fn copy_new(w: &Worker, src: &Path, dst: &Path, skipped: Option<&mut Vec<(PathBuf, String)>>) -> io::Result<()> {
     let existed = dst.symlink_metadata().is_ok();
-    let result = copy_tree(w, src, dst);
+    let result = copy_tree(w, src, dst, skipped);
     if result.is_err() && !existed {
         let _ = ops::remove_tree(dst);
     }
     result
 }
 
-fn copy_tree(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
+/// Whether an error would meet every file that follows as well, so skipping the file helps no one:
+/// a cancel, or a target that is full or cannot be written to.
+fn ends_the_copy(err: &io::Error) -> bool {
+    is_cancel(err) || matches!(err.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT | libc::EROFS))
+}
+
+fn copy_tree(w: &Worker, src: &Path, dst: &Path, mut skipped: Option<&mut Vec<(PathBuf, String)>>) -> io::Result<()> {
     w.shared.checkpoint()?;
     let meta = src.symlink_metadata()?;
     if meta.file_type().is_symlink() {
@@ -711,7 +737,19 @@ fn copy_tree(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
         std::fs::create_dir(dst)?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
-            copy_tree(w, &entry.path(), &dst.join(entry.file_name()))?;
+            let (from, to) = (entry.path(), dst.join(entry.file_name()));
+            match copy_tree(w, &from, &to, skipped.as_deref_mut()) {
+                Err(err) if !ends_the_copy(&err) && skipped.is_some() => {
+                    if let Some(list) = skipped.as_deref_mut() {
+                        list.push((from.clone(), super::describe::io_error(&err)));
+                    }
+                    // A folder that could not be entered was made empty on the way: not worth keeping
+                    if from.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                        let _ = std::fs::remove_dir(&to);
+                    }
+                }
+                other => other?,
+            }
         }
         super::xattr::copy_user(src, dst);
         ops::keep_mode(std::fs::set_permissions(dst, meta.permissions()))
@@ -747,7 +785,7 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
     }
     // Before a conflict is answered, so a refused item does not first send the old target to the trash
     if op == Op::Copy || !same_device(src, parent) {
-        refuse_special_files(w, src)?;
+        refuse_special_files(w, src, op == Op::Copy)?;
     }
     let mut target = target.to_path_buf();
     let mut merge = false;
@@ -793,7 +831,7 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
 
     match op {
         Op::Copy => {
-            copy_new(w, src, &target)?;
+            copy_new(w, src, &target, Some(&mut rec.unreadable))?;
             rec.created.push(target);
         }
         Op::Move => match std::fs::rename(src, &target) {
@@ -809,7 +847,7 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
             }
             // Another filesystem: copy, then remove the original once the copy is whole
             Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                copy_new(w, src, &target)?;
+                copy_new(w, src, &target, None)?;
                 ops::remove_tree(src)?;
                 rec.moved.push((src.to_path_buf(), target));
             }
@@ -904,14 +942,45 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
     if rec.skipped > 0 {
         message.push_str(&format!(" · {}", trf("{} skipped", &[&rec.skipped])));
     }
+    // The rest of a folder was copied; what was left out is said, and the job still counts as done
+    let left_out = (!rec.unreadable.is_empty()).then(|| unreadable_note(&rec.unreadable));
+    if let Some(note) = &left_out {
+        message.push_str(&format!(" · {note}"));
+    }
     if !failures.is_empty() {
-        let mut outcome = Outcome::failed(failures.join(" · ")).with(effect);
+        let mut text = failures.join(" · ");
+        if let Some(note) = &left_out {
+            text.push_str(&format!(" · {note}"));
+        }
+        let mut outcome = Outcome::failed(text).with(effect);
         outcome.cancelled = was_cancelled;
         return outcome;
     }
     let mut outcome = Outcome::done(message).with(effect);
     outcome.cancelled = was_cancelled;
     outcome
+}
+
+/// "3 items could not be copied: a/b.txt (Permission denied), …" for the files a copy left out.
+fn unreadable_note(list: &[(PathBuf, String)]) -> String {
+    const SHOWN: usize = 3;
+    let named: Vec<String> = list
+        .iter()
+        .take(SHOWN)
+        .map(|(path, why)| {
+            let folder = path.parent().map(name_of).filter(|f| !f.is_empty());
+            let name = match folder {
+                Some(folder) => format!("{folder}/{}", name_of(path)),
+                None => name_of(path),
+            };
+            format!("{name} ({why})")
+        })
+        .collect();
+    let mut text = format!("{}: {}", trn(list.len(), "{} item could not be copied", "{} items could not be copied"), named.join(", "));
+    if list.len() > SHOWN {
+        text.push_str(&format!(", {}", trf("and {} more", &[&(list.len() - SHOWN)])));
+    }
+    text
 }
 
 /// Delete for good, one item at a time.

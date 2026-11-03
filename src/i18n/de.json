@@ -825,5 +825,7 @@
   "Not enough space on the disk": "Nicht genug Platz auf dem Datenträger",
   "The file system is read-only": "Das Dateisystem ist schreibgeschützt",
   "The name is too long": "Der Name ist zu lang",
-  "It is in use": "Wird gerade verwendet"
+  "It is in use": "Wird gerade verwendet",
+  "{} items could not be copied": "{} Element konnte nicht kopiert werden|{} Elemente konnten nicht kopiert werden",
+  "and {} more": "und {} weitere"
 }

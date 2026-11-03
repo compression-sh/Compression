@@ -825,5 +825,7 @@
   "Not enough space on the disk": "Không đủ dung lượng trên ổ đĩa",
   "The file system is read-only": "Hệ thống tệp ở chế độ chỉ đọc",
   "The name is too long": "Tên quá dài",
-  "It is in use": "Đang được sử dụng"
+  "It is in use": "Đang được sử dụng",
+  "{} items could not be copied": "Không thể sao chép {} mục",
+  "and {} more": "và {} mục nữa"
 }
