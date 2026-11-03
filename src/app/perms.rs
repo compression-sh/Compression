@@ -116,34 +116,83 @@ impl CompressionApp {
     pub(super) fn apply_mode_to_contents(&mut self, root: PathBuf, mode: u32) {
         let title = trf("Changing permissions in {}", &[&root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()]);
         self.engine.spawn(JobKind::Other, title, String::new(), move |w| {
-            fn walk(w: &engine::Worker, dir: &Path, mode: u32, edits: &mut Vec<Edit>) -> std::io::Result<()> {
-                for entry in std::fs::read_dir(dir)? {
-                    w.shared.checkpoint()?;
-                    let entry = entry?;
-                    let path = entry.path();
-                    let meta = path.symlink_metadata()?;
-                    if meta.file_type().is_symlink() {
-                        continue;
-                    }
-                    let old = meta.permissions().mode() & 0o7777;
-                    let new = if meta.is_dir() { mode } else { (mode & 0o666) | (old & 0o111) };
-                    if new != old {
-                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(new))?;
-                        edits.push(Edit::Chmod { path: path.clone(), mode: old });
-                    }
-                    if meta.is_dir() {
-                        walk(w, &path, mode, edits)?;
-                    }
-                }
-                Ok(())
-            }
             let mut edits = Vec::new();
-            let result = walk(w, &root, mode, &mut edits);
+            let result = chmod_contents(&w.shared, &root, mode, &mut edits);
+            // Undoing goes through the list from the front: a folder must be given its old bits back before what is in it
+            edits.reverse();
             let effect = if edits.is_empty() { Effect::None } else { Effect::Record(UndoEntry::new(trn(edits.len(), "Permissions of {} item", "Permissions of {} items"), edits.clone())) };
             match result {
                 Ok(()) => Outcome::done(trn(edits.len(), "Changed permissions of {} item", "Changed permissions of {} items")).with(effect),
                 Err(err) => Outcome::failed(err.to_string()).with(effect),
             }
         });
+    }
+}
+
+/// `apply_mode_to_contents` for one folder: what is inside gets the permissions, folders last. A
+/// folder given bits without the execute bit can no longer be entered, so it is changed only after
+/// what is in it. Each change is added to `edits` as it is made, the first one first.
+fn chmod_contents(shared: &engine::Shared, dir: &Path, mode: u32, edits: &mut Vec<Edit>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        shared.checkpoint()?;
+        let path = entry?.path();
+        let meta = path.symlink_metadata()?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            chmod_contents(shared, &path, mode, edits)?;
+        }
+        let old = meta.permissions().mode() & 0o7777;
+        let new = if meta.is_dir() { mode } else { (mode & 0o666) | (old & 0o111) };
+        if new != old {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(new))?;
+            edits.push(Edit::Chmod { path, mode: old });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mode_of(path: &Path) -> u32 {
+        path.symlink_metadata().unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn permissions_without_the_execute_bit_can_be_given_to_a_whole_tree_and_taken_back() {
+        // root may enter any folder, so there is nothing to show
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("compression_perms_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+        std::fs::write(root.join("sub/deeper/f.txt"), "x").unwrap();
+        std::fs::write(root.join("a.sh"), "x").unwrap();
+        std::fs::set_permissions(root.join("a.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Read and write for everyone, no execute: the folders cannot be entered afterwards
+        let mut edits = Vec::new();
+        let result = chmod_contents(&engine::Shared::default(), &root, 0o666, &mut edits);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(mode_of(&root.join("sub")), 0o666);
+        // (Nothing below `sub` can be looked at now, which is the point)
+        assert!(root.join("sub/deeper").symlink_metadata().is_err());
+        // A file keeps its own execute bits
+        assert_eq!(mode_of(&root.join("a.sh")), 0o777);
+        assert_eq!(edits.len(), 4, "{edits:?}");
+
+        // Undo, as the history runs it: the list as the job recorded it
+        edits.reverse();
+        let (inverse, error) = crate::fs::history::apply(UndoEntry::new("x", edits));
+        assert_eq!(error, None);
+        assert!(inverse.is_some());
+        assert_eq!(mode_of(&root.join("sub")), 0o755);
+        assert_eq!(mode_of(&root.join("sub/deeper/f.txt")), 0o644);
+        assert_eq!(mode_of(&root.join("a.sh")), 0o755);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
