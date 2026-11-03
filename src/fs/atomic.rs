@@ -154,10 +154,14 @@ mod tests {
             let (file, stop, versions) = (file.clone(), stop.clone(), versions.clone());
             std::thread::spawn(move || {
                 let mut reads = 0;
-                while !stop.load(Ordering::Relaxed) {
+                // Reads at least once, even when the writers are done before this thread starts
+                loop {
                     let text = std::fs::read_to_string(&file).unwrap();
                     assert!(versions.contains(&text), "a reader saw {} bytes that are no writer's whole content", text.len());
                     reads += 1;
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
                 reads
             })
