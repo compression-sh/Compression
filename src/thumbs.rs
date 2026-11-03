@@ -18,7 +18,15 @@ const TIERS: [u32; 3] = [128, 256, 512];
 /// Document pages and video frames need more pixels than a small tile to stay readable, so they
 /// never render below this.
 const PAGE_MIN: u32 = 256;
-const WORKERS: usize = 2;
+/// Decoding threads for a machine with `cores` cores: all but one, so the window keeps a core to itself,
+/// and between two and six, since more would only hold more pictures in memory at once.
+fn workers_for(cores: usize) -> usize {
+    cores.saturating_sub(1).clamp(2, 6)
+}
+
+fn workers() -> usize {
+    std::thread::available_parallelism().map_or(2, |cores| workers_for(cores.get()))
+}
 /// Textures uploaded per frame; the rest wait for the next one so a big folder never stalls a frame.
 const UPLOADS_PER_FRAME: usize = 6;
 /// Previews kept in memory, in bytes of pixels. Past this, opening a folder lets go of the other
@@ -242,7 +250,7 @@ impl Thumbnails {
         let (result_tx, result_rx) = mpsc::channel();
         let generation = Arc::new(AtomicU64::new(0));
 
-        for _ in 0..WORKERS {
+        for _ in 0..workers() {
             let queue = queue.clone();
             let result_tx = result_tx.clone();
             let generation = generation.clone();
