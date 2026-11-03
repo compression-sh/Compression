@@ -134,7 +134,8 @@ pub fn rename_many(pairs: &[(PathBuf, PathBuf)]) -> io::Result<()> {
     }
     let mut failure = None;
     for (from, temp, to) in staged {
-        if let Err(err) = std::fs::rename(&temp, to) {
+        // A name taken since the staging must not be replaced
+        if let Err(err) = crate::compat::rename_noreplace(&temp, to) {
             let _ = std::fs::rename(&temp, from);
             failure.get_or_insert(err);
         }

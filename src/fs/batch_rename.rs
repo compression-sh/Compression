@@ -305,7 +305,8 @@ pub fn apply(entries: &[Entry], names: &[String]) -> (Vec<(PathBuf, PathBuf)>, O
     }
     let mut failure = None;
     for (old, temp, target) in staged {
-        match std::fs::rename(&temp, &target) {
+        // A name taken since the check must not be replaced
+        match crate::compat::rename_noreplace(&temp, &target) {
             Ok(()) => done.push((old, target)),
             Err(err) => {
                 let _ = std::fs::rename(&temp, &old);
