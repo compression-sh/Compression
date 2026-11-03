@@ -10,6 +10,9 @@
 //! Both kinds also get `COMPRESSION_SELECTED_FILES` (one path per line) and `COMPRESSION_CURRENT_DIR`,
 //! and the same two as `SKI_SELECTED_FILES` and `SKI_CURRENT_DIR`, so scripts written for Ski keep working.
 //! Optional filters: `extensions`, `dirs_only`, `files_only`, `single` (exactly one item).
+//! Optional limits: `timeout` (seconds, 1 to 3600, default 30) after which the action is stopped, and
+//! `max_output_mb` (MiB, 1 to 64, default 1) it may print on each of its two streams. A value outside
+//! these ranges (or not a number that fits) is not used: the default stands.
 //!
 //! The folder is read again whenever a file in it changes, so edits show up without a restart.
 //! Files that can't be used are listed on the plugin's Settings page with the reason.
@@ -45,6 +48,10 @@ pub struct Definition {
     pub dirs_only: bool,
     pub files_only: bool,
     pub single: bool,
+    /// Seconds the action may run; see `Limits`.
+    pub timeout: Option<f64>,
+    /// MiB the action may print on each stream; see `Limits`.
+    pub max_output_mb: Option<f64>,
 }
 
 struct Entry {
@@ -80,13 +87,39 @@ pub struct Actions {
     running: Arc<AtomicUsize>,
 }
 
-/// The most an action may print on each of its two streams before it is stopped.
+/// The most an action may print on each of its two streams before it is stopped, unless it says otherwise.
 const OUTPUT_LIMIT: usize = 1 << 20;
-/// How long an action may run before it is stopped. The window is not kept awake for longer.
+/// How long an action may run before it is stopped, unless it says otherwise.
 const RUN_LIMIT: Duration = Duration::from_secs(30);
+/// What an action may ask for: more than this is not granted.
+const MAX_TIMEOUT_SECS: f64 = 3600.0;
+const MAX_OUTPUT_MIB: f64 = 64.0;
+
+/// How long an action may run and how much it may print on each stream.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Limits {
+    run: Duration,
+    output: usize,
+}
+
+impl Definition {
+    /// The limits this action runs under: its own `timeout` and `max_output_mb` where they are
+    /// sensible, the defaults (30 seconds, 1 MiB) where they are missing or out of range.
+    fn limits(&self) -> Limits {
+        let sensible = |value: Option<f64>, most: f64| value.filter(|v| v.is_finite() && (1.0..=most).contains(v));
+        let run = sensible(self.timeout, MAX_TIMEOUT_SECS).map_or(RUN_LIMIT, Duration::from_secs_f64);
+        let output = sensible(self.max_output_mb, MAX_OUTPUT_MIB).map_or(OUTPUT_LIMIT, |mib| (mib * (1 << 20) as f64) as usize);
+        Limits { run, output }
+    }
+}
+
+/// A limit as shown: `30`, `1.5`.
+fn shown(value: f64) -> String {
+    if value.fract() == 0.0 { format!("{}", value as u64) } else { format!("{value}") }
+}
 
 /// The toast for an action that has ended, or was stopped.
-fn message_for(label: &str, result: Result<Output, process::Failure>) -> String {
+fn message_for(label: &str, result: Result<Output, process::Failure>, limits: Limits) -> String {
     match result {
         Ok(out) if out.success => trf("Finished: {}", &[&label]),
         Ok(out) => {
@@ -94,8 +127,8 @@ fn message_for(label: &str, result: Result<Output, process::Failure>) -> String 
             let error = error.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_owned();
             trf("{} failed: {}", &[&label, &error])
         }
-        Err(process::Failure::TooMuchOutput) => trf("{} failed: {}", &[&label, &tr("it printed more than 1 MiB")]),
-        Err(process::Failure::TimedOut) => trf("{} failed: {}", &[&label, &tr("it took longer than 30 seconds")]),
+        Err(process::Failure::TooMuchOutput) => trf("{} failed: {}", &[&label, &trf("it printed more than {} MiB", &[&shown(limits.output as f64 / (1 << 20) as f64)])]),
+        Err(process::Failure::TimedOut) => trf("{} failed: {}", &[&label, &trf("it took longer than {} s", &[&shown(limits.run.as_secs_f64())])]),
         Err(process::Failure::Io(e)) => trf("{} failed: {}", &[&label, &e]),
         // Actions are never called off while they run
         Err(process::Failure::Cancelled) => trf("{} failed: {}", &[&label, &"cancelled"]),
@@ -343,9 +376,10 @@ impl Plugin for Actions {
         let selected = paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join("\n");
         command.current_dir(dir).env("COMPRESSION_SELECTED_FILES", &selected).env("COMPRESSION_CURRENT_DIR", dir).env("SKI_SELECTED_FILES", &selected).env("SKI_CURRENT_DIR", dir).stdin(std::process::Stdio::null());
         let (tx, label, running, finished) = (self.done_tx.clone(), entry.label, Arc::clone(&self.running), Arc::clone(&self.finished));
+        let limits = entry.def.limits();
         running.fetch_add(1, Ordering::Relaxed);
         std::thread::spawn(move || {
-            let message = message_for(label, run_capped(command, OUTPUT_LIMIT, RUN_LIMIT));
+            let message = message_for(label, run_capped(command, limits.output, limits.run), limits);
             let _ = tx.send(message);
             finished.store(true, Ordering::Relaxed);
             running.fetch_sub(1, Ordering::Relaxed);
@@ -406,7 +440,8 @@ mod tests {
         let started = std::time::Instant::now();
         let result = run_capped(sh("while :; do echo xxxxxxxxxxxxxxxxxxxxxxxx; done"), 64 * 1024, Duration::from_secs(30));
         assert!(started.elapsed() < Duration::from_secs(10), "it was not stopped");
-        assert_eq!(message_for("Loud", result), trf("{} failed: {}", &[&"Loud", &tr("it printed more than 1 MiB")]));
+        let defaults = Definition::default().limits();
+        assert_eq!(message_for("Loud", result, defaults), trf("{} failed: {}", &[&"Loud", &trf("it printed more than {} MiB", &[&"1"])]));
     }
 
     #[test]
@@ -414,15 +449,97 @@ mod tests {
         let started = std::time::Instant::now();
         let result = run_capped(sh("sleep 30"), OUTPUT_LIMIT, Duration::from_millis(200));
         assert!(started.elapsed() < Duration::from_secs(5), "it was not stopped");
-        assert_eq!(message_for("Stuck", result), trf("{} failed: {}", &[&"Stuck", &tr("it took longer than 30 seconds")]));
+        let defaults = Definition::default().limits();
+        assert_eq!(message_for("Stuck", result, defaults), trf("{} failed: {}", &[&"Stuck", &trf("it took longer than {} s", &[&"30"])]));
     }
 
     #[test]
     fn short_actions_still_report_what_happened() {
-        assert_eq!(message_for("Quick", run_capped(sh("echo fine"), OUTPUT_LIMIT, RUN_LIMIT)), trf("Finished: {}", &[&"Quick"]));
-        assert_eq!(message_for("Bad", run_capped(sh("echo first >&2; echo it broke >&2; exit 1"), OUTPUT_LIMIT, RUN_LIMIT)), trf("{} failed: {}", &[&"Bad", &"it broke"]));
-        let missing = message_for("Gone", run_capped(Command::new("/nonexistent/compression-action"), OUTPUT_LIMIT, RUN_LIMIT));
+        let defaults = Definition::default().limits();
+        assert_eq!(message_for("Quick", run_capped(sh("echo fine"), OUTPUT_LIMIT, RUN_LIMIT), defaults), trf("Finished: {}", &[&"Quick"]));
+        assert_eq!(message_for("Bad", run_capped(sh("echo first >&2; echo it broke >&2; exit 1"), OUTPUT_LIMIT, RUN_LIMIT), defaults), trf("{} failed: {}", &[&"Bad", &"it broke"]));
+        let missing = message_for("Gone", run_capped(Command::new("/nonexistent/compression-action"), OUTPUT_LIMIT, RUN_LIMIT), defaults);
         assert!(missing.starts_with("Gone failed: "), "{missing}");
+    }
+
+    /// The definition a JSON file holds, read the way the actions folder reads it.
+    fn defined(json: &str) -> Result<Definition, String> {
+        let dir = std::env::temp_dir().join(format!("compression-actions-limits-{}-{}", std::process::id(), json.len()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), json).unwrap();
+        let read = read_entry(&dir.join("a.json")).map(|entry| entry.expect("an action").def);
+        let _ = std::fs::remove_dir_all(&dir);
+        read
+    }
+
+    const DEFAULT_LIMITS: Limits = Limits { run: Duration::from_secs(30), output: 1 << 20 };
+
+    #[test]
+    fn without_limits_in_the_definition_the_defaults_stand() {
+        assert_eq!(Definition::default().limits(), DEFAULT_LIMITS);
+        assert_eq!(defined(r#"{"command":"true"}"#).unwrap().limits(), DEFAULT_LIMITS);
+        assert_eq!(defined(r#"{"command":"true","timeout":null,"max_output_mb":null}"#).unwrap().limits(), DEFAULT_LIMITS);
+        // A script has no definition to put them in
+        assert_eq!(Entry { def: Definition::default(), label: "s", script: Some(PathBuf::from("/x")) }.def.limits(), DEFAULT_LIMITS);
+    }
+
+    #[test]
+    fn an_action_can_ask_for_its_own_time_and_output_limit() {
+        let def = defined(r#"{"command":"true","timeout":120,"max_output_mb":8}"#).unwrap();
+        assert_eq!(def.limits(), Limits { run: Duration::from_secs(120), output: 8 << 20 });
+        // Either one alone; the other stays at its default
+        assert_eq!(defined(r#"{"command":"true","timeout":600}"#).unwrap().limits(), Limits { run: Duration::from_secs(600), output: 1 << 20 });
+        assert_eq!(defined(r#"{"command":"true","max_output_mb":2}"#).unwrap().limits(), Limits { run: Duration::from_secs(30), output: 2 << 20 });
+        // Fractions are fine inside the range, and the ends of it are in
+        assert_eq!(defined(r#"{"command":"true","timeout":1.5,"max_output_mb":1.5}"#).unwrap().limits(), Limits { run: Duration::from_millis(1500), output: 3 << 19 });
+        assert_eq!(defined(r#"{"command":"true","timeout":3600,"max_output_mb":64}"#).unwrap().limits(), Limits { run: Duration::from_secs(3600), output: 64 << 20 });
+        assert_eq!(defined(r#"{"command":"true","timeout":1,"max_output_mb":1}"#).unwrap().limits(), DEFAULT_LIMITS.with_run(1));
+    }
+
+    impl Limits {
+        fn with_run(self, secs: u64) -> Self {
+            Self { run: Duration::from_secs(secs), ..self }
+        }
+    }
+
+    #[test]
+    fn limits_that_make_no_sense_fall_back_to_the_defaults() {
+        for bad in ["0", "-5", "0.5", "3601", "100000", "1e12"] {
+            let def = defined(&format!(r#"{{"command":"true","timeout":{bad},"max_output_mb":{bad}}}"#)).unwrap();
+            assert_eq!(def.limits(), DEFAULT_LIMITS, "{bad}");
+        }
+        // A good one beside a bad one is still used
+        let def = defined(r#"{"command":"true","timeout":90,"max_output_mb":-1}"#).unwrap();
+        assert_eq!(def.limits(), Limits { run: Duration::from_secs(90), output: 1 << 20 });
+        let def = defined(r#"{"command":"true","timeout":0,"max_output_mb":4}"#).unwrap();
+        assert_eq!(def.limits(), Limits { run: Duration::from_secs(30), output: 4 << 20 });
+        // A number that is no number is not a definition, as with any other field of the wrong kind
+        assert!(defined(r#"{"command":"true","timeout":"soon"}"#).is_err());
+        // Not a finite number at all
+        assert_eq!(Definition { timeout: Some(f64::NAN), max_output_mb: Some(f64::INFINITY), ..Default::default() }.limits(), DEFAULT_LIMITS);
+    }
+
+    #[test]
+    fn the_messages_name_the_limit_that_was_hit() {
+        let limits = Limits { run: Duration::from_secs(90), output: 3 << 19 };
+        assert_eq!(message_for("A", Err(process::Failure::TimedOut), limits), trf("{} failed: {}", &[&"A", &trf("it took longer than {} s", &[&"90"])]));
+        assert_eq!(message_for("A", Err(process::Failure::TooMuchOutput), limits), trf("{} failed: {}", &[&"A", &trf("it printed more than {} MiB", &[&"1.5"])]));
+    }
+
+    #[test]
+    fn a_running_action_is_stopped_at_its_own_time_limit() {
+        let dir = std::env::temp_dir().join(format!("compression-actions-own-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), r#"{"name":"Slow","command":"sleep 30","timeout":1}"#).unwrap();
+        let mut actions = Actions::in_dir_for(Some(dir.clone()), false);
+        let started = Instant::now();
+        actions.run("0", &[PathBuf::from("x")], &dir);
+        let message = actions.done_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(15), "it ran for its 30 seconds");
+        assert_eq!(message, trf("{} failed: {}", &[&"Slow", &trf("it took longer than {} s", &[&"1"])]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

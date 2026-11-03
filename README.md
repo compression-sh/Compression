@@ -262,7 +262,7 @@ Compression bundles a few optional features as plugins. Switch them on or off in
 
   The command runs in the open folder with the selected files as arguments, and `COMPRESSION_SELECTED_FILES` and `COMPRESSION_CURRENT_DIR` are set. Filters: `extensions`, `dirs_only`, `files_only`, `single`.
 
-  An action is stopped after 30 seconds, or as soon as it prints more than 1 MiB to one stream (output or errors), and a message says why.
+  An action is stopped after 30 seconds, or as soon as it prints more than 1 MiB to one stream (output or errors), and a message says why. A `.json` action can ask for more with `"timeout"` (seconds, 1 to 3600) and `"max_output_mb"` (MiB per stream, 1 to 64), for example `{ "name": "Backup", "command": "rsync -a \"$@\" /mnt/backup/", "timeout": 900, "max_output_mb": 8 }`. A value outside those ranges is ignored and the default stands. Scripts always run under the defaults.
 
 Folder sizes: the Size column shows how many items a folder holds. Right-click a folder → Calculate size (Settings → Files & View → Details → Folder sizes: Off, On demand, Always) measures it; sizes appear in the column, in the status line for a selection and in sorting. Two folders are measured at a time, hard-linked files count once, links are not followed and other mounted disks are skipped. A folder Compression could not fully read shows `≥`. Sizes are remembered for the session and dropped when Compression changes something inside, or on refresh (`F5`); changes made by other programs show after a refresh. "Size on disk" counts allocated blocks instead of file lengths.
 
