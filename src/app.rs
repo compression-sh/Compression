@@ -1413,6 +1413,8 @@ impl CompressionApp {
             return false;
         }
         let old = std::mem::replace(&mut self.saved_settings, new.clone());
+        // Another window that only went to another folder or widened a column is no news: no message
+        let quiet = old.same_choices_as(&new);
         self.settings = new;
         let s = &self.settings;
 
@@ -1443,7 +1445,9 @@ impl CompressionApp {
         }
         // Language first, so the toast below is already in the new one
         crate::i18n::set_language(crate::i18n::resolve(&self.settings.language));
-        self.set_toast(tr("Settings reloaded"));
+        if !quiet {
+            self.set_toast(tr("Settings reloaded"));
+        }
         self.repaint_side_windows();
         true
     }
@@ -6705,6 +6709,22 @@ mod tests {
         assert_eq!(app.settings.session_tabs, vec![base.clone()]);
         assert!(!app.apply_settings_file(edited));
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn another_window_moving_on_is_taken_up_without_a_message() {
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(std::env::temp_dir(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.status_toast = None;
+        // Another window went to another folder and widened a column: its file differs, and nothing is announced
+        let moved = Settings { last_dir: Some(PathBuf::from("/tmp")), column_widths: [90.0; 6], ..app.saved_settings.clone() };
+        assert!(app.apply_settings_file(moved));
+        assert_eq!(app.settings.last_dir, Some(PathBuf::from("/tmp")));
+        assert!(app.status_toast.is_none(), "a message for a window moving on");
+        // A real change is announced
+        let chosen = Settings { show_hidden: !app.settings.show_hidden, ..app.saved_settings.clone() };
+        assert!(app.apply_settings_file(chosen));
+        assert!(app.status_toast.is_some());
     }
 
     /// Connect to server is off until turned on; hiding other places does not touch it.

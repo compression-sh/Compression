@@ -311,6 +311,17 @@ impl Settings {
         serde_json::from_str::<Settings>(text).map(|s| s.with_current_view_names().for_session(crate::fs::admin::is_admin()))
     }
 
+    /// The parts of the settings that change as a window is used and not because a person chose
+    /// them: where it was last, how wide its columns are, which view each folder has.
+    fn without_state(&self) -> Self {
+        Self { last_dir: None, column_widths: [0.0; 6], folder_views: Default::default(), ..self.clone() }
+    }
+
+    /// Whether `other` holds the same choices, leaving the state of the window out of it.
+    pub fn same_choices_as(&self, other: &Self) -> bool {
+        self.without_state() == other.without_state()
+    }
+
     /// The administrator's window reads the settings of the person who started it, but runs as
     /// root: a command in them, which that person (or a program of theirs) can write, must not
     /// run with root's rights. The terminal falls back to the one found on this system.
@@ -385,5 +396,15 @@ mod tests {
         // Half way through an edit by hand
         assert!(Settings::parse(r#"{"show_hidden": tr"#).is_err());
         assert!(Settings::parse("").is_err());
+    }
+
+    #[test]
+    fn where_a_window_was_and_how_wide_its_columns_are_is_no_choice() {
+        let base = Settings::default();
+        let moved = Settings { last_dir: Some(PathBuf::from("/tmp")), column_widths: [120.0; 6], folder_views: [(PathBuf::from("/x"), crate::app::ViewMode::Grid)].into(), ..base.clone() };
+        assert!(base.same_choices_as(&moved));
+        // Anything a person picks is
+        assert!(!base.same_choices_as(&Settings { show_hidden: !base.show_hidden, ..moved.clone() }));
+        assert!(!base.same_choices_as(&Settings { theme: "nord".into(), ..base.clone() }));
     }
 }
