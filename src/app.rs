@@ -1153,12 +1153,14 @@ impl CompressionApp {
 
     /// Saves an image from the clipboard into the current folder as `Pasted image.png`.
     fn paste_image(&mut self, png: &[u8]) {
-        let path = ops::unique_path(&self.current_path, std::ffi::OsStr::new("Pasted image.png"), "copy");
+        let path = match ops::write_new(&self.current_path, std::ffi::OsStr::new("Pasted image.png"), "copy", png) {
+            Ok(path) => path,
+            Err(err) => {
+                self.set_toast(err.to_string());
+                return;
+            }
+        };
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        if let Err(err) = std::fs::write(&path, png) {
-            self.set_toast(err.to_string());
-            return;
-        }
         self.add_listed(&path);
         if let Some(idx) = self.items.iter().position(|i| i.name == name) {
             self.selection = std::iter::once(idx).collect();

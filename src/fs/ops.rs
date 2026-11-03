@@ -329,10 +329,24 @@ pub fn compress(sources: &[PathBuf], out: &Path, format: ArchiveFormat, control:
         .ok_or_else(|| io::Error::other(tr("Nothing to compress")))?
         .to_path_buf();
     let names: Vec<_> = sources.iter().filter_map(|p| p.file_name().map(|n| n.to_owned())).collect();
+    // `out` was free when its name was chosen. A file that is there now is not ours to fill, nor to
+    // remove when the job fails, so the job ends before it touches anything
+    if out.symlink_metadata().is_ok() {
+        return Err(taken(out));
+    }
+    // Set when someone else made `out` meanwhile, in which case the clean-up below must leave it alone
+    let foreign = std::cell::Cell::new(false);
+    let create = || {
+        std::fs::OpenOptions::new().write(true).create_new(true).open(out).inspect_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                foreign.set(true);
+            }
+        })
+    };
     let result = match format {
-        ArchiveFormat::Zip => write_zip(&base, &names, out, control),
+        ArchiveFormat::Zip => create().and_then(|file| write_zip(&base, &names, file, control)),
         ArchiveFormat::TarGz => (|| {
-            let file = std::fs::File::create(out)?;
+            let file = create()?;
             // The tar stream is watched where it enters the compressor, so the count is the size of the files
             let encoder = Watched::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()), control);
             let mut builder = tar::Builder::new(encoder);
@@ -365,13 +379,41 @@ pub fn compress(sources: &[PathBuf], out: &Path, format: ArchiveFormat, control:
     };
     // An archive library may report the stop in its own words: a stop that holds now is the reason
     let result = result.map_err(|e| if is_stop(&e) { e } else { control.check().err().unwrap_or(e) });
-    if result.is_err() {
+    if result.is_err() && !foreign.get() {
         let _ = std::fs::remove_file(out);
     }
     result
 }
 
-fn write_zip(base: &Path, names: &[std::ffi::OsString], out: &Path, control: &Control) -> io::Result<()> {
+/// The error for a name that is already taken.
+fn taken(path: &Path) -> io::Error {
+    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    io::Error::new(io::ErrorKind::AlreadyExists, trf("“{}” already exists", &[&name]))
+}
+
+/// Make a new file with `bytes` in it, named like `name` and not like anything already in `dir`. A name
+/// that is taken between choosing and creating it moves on to the next one (up to five times); a file
+/// that was not made here is never written to.
+pub fn write_new(dir: &Path, name: &std::ffi::OsStr, suffix: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    let mut last = None;
+    for _ in 0..5 {
+        let path = unique_path(dir, name, suffix);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(bytes) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(err);
+                }
+                return Ok(path);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => last = Some(taken(&path)),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::other("no free name")))
+}
+
+fn write_zip(base: &Path, names: &[std::ffi::OsString], file: std::fs::File, control: &Control) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     use zip::write::SimpleFileOptions;
 
@@ -408,7 +450,7 @@ fn write_zip(base: &Path, names: &[std::ffi::OsString], out: &Path, control: &Co
         Ok(())
     }
 
-    let mut zip = zip::ZipWriter::new(std::fs::File::create(out)?);
+    let mut zip = zip::ZipWriter::new(file);
     let mut done = 0;
     for name in names {
         add(&mut zip, &base.join(name), &name.to_string_lossy(), control, &mut done)?;
