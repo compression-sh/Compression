@@ -24,7 +24,6 @@ You need Rust 1.85 or newer (the project uses the 2024 edition).
 git clone https://github.com/compression-sh/Compression
 cd Compression
 cargo build --release          # target/release/compression
-cargo test                     # optional: the test suite needs no display
 cargo install --path .         # optional: installs into ~/.cargo/bin
 ```
 

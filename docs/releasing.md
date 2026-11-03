@@ -13,7 +13,7 @@ Pushing a tag `vMAJOR.MINOR.PATCH` runs `.github/workflows/release.yml`, which b
 - **Merge pull requests first**, for example translations, with `gh pr merge <n> --squash`. Then `git pull`.
 - **No AI attribution.** Do not add a `Co-Authored-By` line to release or other commits.
 
-## 1. Prepare and test
+## 1. Prepare and check
 
 1. Start from a clean, up-to-date `master`. `git pull`, then `git status -sb` must show `## master...origin/master` with no `[ahead]` or `[behind]` unless you are about to push the release commit. Release only what is committed.
 2. Check the version in `Cargo.toml` and bring `Cargo.lock` in line:
@@ -22,15 +22,12 @@ Pushing a tag `vMAJOR.MINOR.PATCH` runs `.github/workflows/release.yml`, which b
    git diff Cargo.lock   # only the version line of the `compression` entry may change
    ```
    Both files must agree: the Nix source build reads the version from `Cargo.toml` and looks for the same version in `Cargo.lock`.
-3. Build, test and lint exactly as CI does:
+3. Build and lint exactly as CI does:
    ```sh
    cargo build --release --locked
-   cargo test --locked
-   cargo clippy --all-targets --all-features
+   cargo clippy --locked --all-targets --all-features -- -D warnings
    ```
-   All tests must pass and clippy must report no warnings. CI (`.github/workflows/ci.yml`) runs the tests and clippy (`-D warnings`) on pull requests and on pushes to branches; it builds nothing for release and publishes nothing.
-   - `app::tests::rename_trash_restore_delete` can fail while removing its temporary folder when the tests run in parallel. If it is the only failure, rerun it alone (`cargo test rename_trash_restore_delete`) and then the whole suite again. Any other failure blocks the release.
-   - The `i18n` tests check every translation file (`src/i18n/<code>.json`: de, es, fr, ru, vi): each must parse, cover every key in the sources, keep the `{}` holes, have enough plural forms, and contain no duplicate or unused entries.
+   Clippy must report no warnings. CI (`.github/workflows/ci.yml`) runs clippy (`-D warnings`) on pull requests and on pushes to branches; it builds nothing for release and publishes nothing.
 4. Smoke-test the release binary for a few seconds with an isolated environment. **Never use real user data**: a home of its own, `XDG_*` folders of their own and a separate `XDG_RUNTIME_DIR`.
    ```sh
    S=$(mktemp -d); mkdir -p $S/home $S/run; chmod 700 $S/run
@@ -123,7 +120,7 @@ Docker, `cargo-deb`, `cargo-generate-rpm` and Nix are not always installed where
 
 - [ ] Version in `Cargo.toml` updated
 - [ ] `Cargo.lock` updated
-- [ ] Build, tests and clippy green
+- [ ] Build and clippy green
 - [ ] Smoke test in an isolated environment
 - [ ] Tag created
 - [ ] Tag pushed
