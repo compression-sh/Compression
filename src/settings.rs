@@ -67,6 +67,8 @@ pub struct Settings {
     pub type_ahead: bool,
     /// A sideways two-finger swipe over the listing goes back or forward.
     pub swipe_navigation: bool,
+    /// How far one notch of the mouse wheel scrolls, as a multiple of `SCROLL_STEP` points.
+    pub scroll_speed: f32,
     /// Switches of the bundled plugins by id; a plugin not listed keeps its default.
     pub plugins: std::collections::BTreeMap<String, bool>,
     /// Where searches look, and whether they match case or look inside files.
@@ -263,6 +265,7 @@ impl Default for Settings {
             type_to_filter: false,
             type_ahead: true,
             swipe_navigation: false,
+            scroll_speed: SCROLL_SPEED_DEFAULT,
             plugins: Default::default(),
             search_scope: Default::default(),
             search_case: false,
@@ -289,6 +292,13 @@ impl Default for Settings {
         }
     }
 }
+
+/// Points one wheel notch scrolls at speed 1. egui's own 40 felt slow beside other file managers.
+pub const SCROLL_STEP: f32 = 60.0;
+pub const SCROLL_SPEED_DEFAULT: f32 = 1.0;
+/// What the slider in the settings covers; `settings.json` may hold any value in `SCROLL_SPEED_RANGE`.
+pub const SCROLL_SPEED_SLIDER: std::ops::RangeInclusive<f32> = 0.25..=2.25;
+pub const SCROLL_SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.1..=5.0;
 
 pub(crate) fn file() -> Option<PathBuf> {
     crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("compression").join("settings.json"))

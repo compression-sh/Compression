@@ -651,7 +651,6 @@
   "Restore last tabs": "Restaurar las últimas pestañas",
   "Reopen closed tab": "Reabrir pestaña cerrada",
   "Only items deleted directly can be restored. Restore the folder this is in instead.": "Solo se pueden restaurar los elementos eliminados directamente. Restaura en su lugar la carpeta que lo contiene.",
-  "Touchpad": "Panel táctil",
   "Swipe sideways with two fingers over the files to go back or forward": "Desliza de lado con dos dedos sobre los archivos para ir atrás o adelante",
   "Swipe to go back and forward": "Deslizar para ir atrás y adelante",
   "Comparing the start and end of files": "Comparando el principio y el final de los archivos",
@@ -812,5 +811,10 @@
   "Continue anyway": "Continuar de todos modos",
   "Duplicate tab": "Duplicar pestaña",
   "Close other tabs": "Cerrar las demás pestañas",
-  "Close tabs to the right": "Cerrar las pestañas de la derecha"
+  "Close tabs to the right": "Cerrar las pestañas de la derecha",
+  "Mouse and touchpad": "Ratón y panel táctil",
+  "Wheel scroll speed": "Velocidad de desplazamiento de la rueda",
+  "Slow": "Lenta",
+  "Fast": "Rápida",
+  "Faster": "Más rápida"
 }

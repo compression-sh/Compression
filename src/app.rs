@@ -1537,6 +1537,10 @@ impl CompressionApp {
         material::set_animations(self.settings.animations);
         crate::ui::icon_style::set(self.settings.icon_style);
         ctx.all_styles_mut(|s| s.animation_time = material::dur(material::ANIM));
+        // The step for a wheel notch, times the setting
+        let speed = self.settings.scroll_speed;
+        let speed = if speed.is_finite() { speed.clamp(*crate::settings::SCROLL_SPEED_RANGE.start(), *crate::settings::SCROLL_SPEED_RANGE.end()) } else { crate::settings::SCROLL_SPEED_DEFAULT };
+        ctx.options_mut(|o| o.input_options.line_scroll_speed = crate::settings::SCROLL_STEP * speed);
 
         // Each window keeps its own input clock, so the fade, stepped by whichever window draws, runs on one shared clock
         static CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

@@ -651,7 +651,6 @@
   "Restore last tabs": "Letzte Tabs wiederherstellen",
   "Reopen closed tab": "Geschlossenen Tab wieder öffnen",
   "Only items deleted directly can be restored. Restore the folder this is in instead.": "Nur direkt gelöschte Elemente lassen sich wiederherstellen. Stelle stattdessen den Ordner wieder her, in dem es liegt.",
-  "Touchpad": "Touchpad",
   "Swipe sideways with two fingers over the files to go back or forward": "Mit zwei Fingern seitlich über die Dateien wischen, um zurück oder vor zu gehen",
   "Swipe to go back and forward": "Wischen für Zurück und Vor",
   "Comparing the start and end of files": "Anfang und Ende der Dateien werden verglichen",
@@ -812,5 +811,10 @@
   "Continue anyway": "Trotzdem fortfahren",
   "Duplicate tab": "Tab duplizieren",
   "Close other tabs": "Andere Tabs schließen",
-  "Close tabs to the right": "Tabs rechts schließen"
+  "Close tabs to the right": "Tabs rechts schließen",
+  "Mouse and touchpad": "Maus und Touchpad",
+  "Wheel scroll speed": "Scrollgeschwindigkeit des Mausrads",
+  "Slow": "Langsam",
+  "Fast": "Schnell",
+  "Faster": "Schneller"
 }
