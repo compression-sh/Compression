@@ -38,6 +38,11 @@ jobs:
           cargo generate-rpm -o "dist/compression-${version}-1.x86_64.rpm"
           (cd dist && sha256sum * > SHA256SUMS)
 
+      # Install the packages next to Nautilus in clean containers, so a file clash or an unmet dependency
+      # stops the release before anything is uploaded
+      - name: Smoke-test the packages
+        run: packaging/smoke.sh dist
+
       - uses: softprops/action-gh-release@v3
         if: startsWith(github.ref, 'refs/tags/v')
         with:
