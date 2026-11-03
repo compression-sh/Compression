@@ -28,7 +28,7 @@ Pushing a tag `vMAJOR.MINOR.PATCH` runs `.github/workflows/release.yml`, which b
    cargo test --locked
    cargo clippy --all-targets --all-features
    ```
-   All tests must pass and clippy must report no warnings.
+   All tests must pass and clippy must report no warnings. CI (`.github/workflows/ci.yml`) runs the tests and clippy (`-D warnings`) on pull requests and on pushes to branches; it builds nothing for release and publishes nothing.
    - `app::tests::rename_trash_restore_delete` can fail while removing its temporary folder when the tests run in parallel. If it is the only failure, rerun it alone (`cargo test rename_trash_restore_delete`) and then the whole suite again. Any other failure blocks the release.
    - The `i18n` tests check every translation file (`src/i18n/<code>.json`: de, es, fr, ru, vi): each must parse, cover every key in the sources, keep the `{}` holes, have enough plural forms, and contain no duplicate or unused entries.
 4. Smoke-test the release binary for a few seconds with an isolated environment. **Never use real user data**: a home of its own, `XDG_*` folders of their own and a separate `XDG_RUNTIME_DIR`.
