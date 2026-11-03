@@ -27,6 +27,12 @@ impl Sandbox {
 
     /// Runs the program with `args` in `dir`, waits for it (a hung run is stopped and fails the test).
     fn run(&self, dir: &Path, args: &[&str]) -> Output {
+        let args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
+        self.run_os(dir, &args)
+    }
+
+    /// `run` for arguments that need not be text.
+    fn run_os(&self, dir: &Path, args: &[&std::ffi::OsStr]) -> Output {
         let home = self.home();
         let mut child = Command::new(EXE)
             .args(args)
@@ -137,4 +143,24 @@ fn a_folder_named_like_a_flag_is_still_a_folder() {
     assert!(!text(&out.stdout).contains("Usage:"));
     assert!(!out.status.success(), "no display, so no window");
     assert!(!text(&out.stderr).contains("Usage:"));
+}
+
+#[test]
+fn a_name_that_is_not_utf8_is_no_reason_to_panic() {
+    use std::os::unix::ffi::OsStrExt;
+    let sandbox = Sandbox::new("bytes");
+    let config = sandbox.home().join(".config/compression");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("settings.json"), r#"{"run_in_background":false}"#).unwrap();
+    // A name with bytes that are no UTF-8, as another program may hand over for "open with"
+    let odd = std::ffi::OsStr::from_bytes(b"/tmp/\xff\xfe-compression");
+    for args in [vec![odd], vec![std::ffi::OsStr::new("--chooser"), odd]] {
+        let out = sandbox.run_os(&sandbox.root, &args);
+        let stderr = text(&out.stderr);
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert_ne!(out.status.code(), Some(101), "{stderr}");
+    }
+    // The information requests still work with such a name behind them
+    let out = sandbox.run_os(&sandbox.root, &[std::ffi::OsStr::new("--version"), odd]);
+    assert_eq!(text(&out.stdout), format!("compression {}\n", env!("CARGO_PKG_VERSION")));
 }

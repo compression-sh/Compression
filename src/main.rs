@@ -51,16 +51,23 @@ A folder whose name starts with a dash is given as ./-name.
     }
 }
 
+/// The arguments of this run. A name that is not valid UTF-8 (Linux allows any bytes in one) is read
+/// with replacement characters: `env::args` would panic on it, and a program that is handed such a
+/// file by another program must not end with a panic.
+fn arguments() -> Vec<String> {
+    env::args_os().skip(1).map(|arg| arg.to_string_lossy().into_owned()).collect()
+}
+
 fn main() -> eframe::Result {
     // Answered before anything else is touched: no migration, no instance, no display, no socket
-    if let Some(text) = info_for(env::args().nth(1).as_deref()) {
+    if let Some(text) = info_for(arguments().first().map(String::as_str)) {
         use std::io::Write;
         // A closed pipe (`compression --help | head -1`) is no reason to panic
         let _ = std::io::stdout().write_all(text.as_bytes());
         return Ok(());
     }
     // An elevated start carries its environment in the arguments (see fs::admin); first of all
-    let args = fs::admin::take_environment(env::args().skip(1).collect());
+    let args = fs::admin::take_environment(arguments());
     compat::migrate_user_data();
     if args.first().is_some_and(|a| a == "--portal") {
         if let Err(err) = portal::serve() {
