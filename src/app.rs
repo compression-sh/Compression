@@ -36,6 +36,7 @@ use crate::fs::{
     places::{load_folder_icons, save_folder_icons, Place, PlaceGroup, PlaceKind, SidebarPlace, BOOKMARKS_PATH, RECENT_PATH, is_virtual},
     props::{FolderScan, Properties},
     scanner::{natural_cmp, read_folder, sort_items, starts_with_folded, ListOptions, TypeFilter},
+    glob,
     recent,
     search::{Search, SearchOptions, SearchScope},
     trash,
@@ -428,6 +429,9 @@ pub struct CompressionApp {
 
     thumbs: Thumbnails,
     search: Search,
+    /// Results of the previous query kept on screen while the new search runs; the ones it does
+    /// not find again leave when it ends, so typing narrows the list instead of blanking it.
+    search_unconfirmed: HashSet<PathBuf>,
 
     // Places
     pub(crate) places: Vec<Place>,
@@ -613,6 +617,7 @@ impl CompressionApp {
             path_input: canonical_path.to_string_lossy().to_string(),
             thumbs: Thumbnails::new(ctx),
             search: Search::new(),
+            search_unconfirmed: HashSet::new(),
             places,
             show_search: false,
             focus_search: false,
@@ -1678,6 +1683,7 @@ impl CompressionApp {
             self.search_query.clear();
             self.search_root = None;
             self.search.cancel();
+            self.search_unconfirmed.clear();
             self.reread_items();
         }
     }
@@ -1687,18 +1693,24 @@ impl CompressionApp {
         if self.search_query.trim().is_empty() {
             self.search_root = None;
             self.search.cancel();
+            self.search_unconfirmed.clear();
             self.reread_items();
         } else {
             if self.search_root.is_none() {
                 self.search_root = Some(self.current_path.clone());
             }
-            self.items.clear();
+            // The shown results that still match stay until the new search confirms or drops them
+            let query = self.search_query.trim();
+            let (case, filter) = (self.settings.search_case, self.type_filter);
+            self.items.retain(|i| filter.accepts(i) && glob::matches(query, &i.name, case));
+            self.search_unconfirmed = self.items.iter().map(|i| i.path.clone()).collect();
             self.selected_index = None;
             self.sync_selection(true);
             self.error_message = None;
             // A plugin that understands the query (`tag:work`) answers without a scan
             if let Some(paths) = self.plugins.search_paths(self.search_query.trim()) {
                 self.search.cancel();
+                self.search_unconfirmed.clear();
                 self.items = paths.iter().filter(|p| p.symlink_metadata().is_ok()).filter_map(|p| FileItem::from_path(p)).filter(|i| self.type_filter.accepts(i)).collect();
                 self.resort_items();
                 return;
@@ -2384,10 +2396,26 @@ impl eframe::App for CompressionApp {
         self.open_plugin_dialog();
         self.tick_folder_sizes(&ctx);
 
+        let was_running = self.search.is_running();
         let found = self.search.poll();
-        if !found.is_empty() && !self.search_query.trim().is_empty() {
-            self.items.extend(found);
-            self.resort_items();
+        if !self.search_query.trim().is_empty() {
+            let mut changed = false;
+            if !found.is_empty() {
+                let shown: HashSet<PathBuf> = self.items.iter().map(|i| i.path.clone()).collect();
+                for item in found {
+                    self.search_unconfirmed.remove(&item.path);
+                    if !shown.contains(&item.path) {
+                        self.items.push(item);
+                        changed = true;
+                    }
+                }
+            }
+            if was_running && !self.search.is_running() && !self.search_unconfirmed.is_empty() {
+                let gone = std::mem::take(&mut self.search_unconfirmed);
+                self.edit_listing(|items| items.retain(|i| !gone.contains(&i.path)));
+            } else if changed {
+                self.resort_items();
+            }
         }
 
         let title = format!("{} — Compression", self.location_name());

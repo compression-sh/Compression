@@ -120,6 +120,7 @@ impl CompressionApp {
         self.sort_by = state.sort_by;
         self.sort_order = state.sort_order;
         self.search = Search::new();
+        self.search_unconfirmed.clear();
         self.path_input = Self::path_text(&self.current_path);
         self.is_editing_path = false;
         self.show_search = !self.search_query.trim().is_empty();
