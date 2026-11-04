@@ -22,8 +22,8 @@ docker run --rm -e DEBIAN_FRONTEND=noninteractive -v "$dist:/dist:ro" ubuntu:22.
   $check
 "
 
-echo "== .rpm on Fedora with Nautilus"
-docker run --rm -v "$dist:/dist:ro" fedora:41 sh -ec "
+echo "== .rpm on Fedora 43 with Nautilus"
+docker run --rm -v "$dist:/dist:ro" fedora:43 sh -ec "
   dnf install -y -q nautilus
   dnf install -y -q /dist/compression-${version}-1.x86_64.rpm
   $check
