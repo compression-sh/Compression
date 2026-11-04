@@ -6,7 +6,7 @@
 
 A small, fast Rust file manager. Wayland and X11, list and grid views with thumbnails, tabs, vim keys, archives, plugins, themes, network shares and SSH servers, and a system file dialog.
 
-Compression is an independently developed fork of [Ski](https://github.com/ilyamiro/Ski), originally created by [ilyamiro](https://github.com/ilyamiro). Huge thanks to them for building the foundation this project is based on.
+Compression is an independent project based on [Ski](https://github.com/ilyamiro/Ski), originally created by [ilyamiro](https://github.com/ilyamiro). Huge thanks to them for building the foundation this project is built on.
 
 ![Compression showing a Pictures folder as a grid of thumbnails](docs/screenshots/hero.png)
 
