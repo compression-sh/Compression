@@ -81,7 +81,7 @@ To install it, import the package in `configuration.nix`:
 environment.systemPackages = [ (pkgs.callPackage /path/to/Compression { }) ];
 ```
 
-By default this installs the binary of the latest release, patched for Nix, which takes seconds. To compile your checkout instead, which takes several minutes the first time, pass `fromSource = true`. Other architectures than x86_64 always compile.
+By default this installs the binary of the latest release, patched for Nix, which takes seconds. Right after a release, before `nix/release.json` has been updated to it, the package compiles the checkout instead, so it never installs the binary of an older release. To compile your checkout instead, which takes several minutes the first time, pass `fromSource = true`. Other architectures than x86_64 always compile.
 
 ### The NixOS module
 

@@ -97,7 +97,7 @@ Never edit or re-upload a release's tarball after that commit: its hash would no
 ## 5. NixOS
 
 - `nix/bin.nix` installs the release binary `compression-<version>-x86_64-linux.tar.gz` from the GitHub release named in `nix/release.json`. The release workflow updates `nix/release.json` itself; do not edit it by hand for a normal release.
-- Until the follow-up commit is on `master`, `release.json` still names the previous version, which may not exist as a release. Until then, install from the source build: `pkgs.callPackage /path/to/Compression { fromSource = true; }`, or `programs.compression.package` set to it.
+- Until the follow-up commit is on `master`, `release.json` still names the previous version. `default.nix` notices that it differs from the version in `Cargo.toml` and compiles the checkout instead of installing the old binary, so nothing has to be done by hand; `fromSource = true` still forces a compile at any time.
 - The option names from before the rename keep working through an alias in `nix/module.nix`.
 - Compression is not in nixpkgs, so there is no nixpkgs package or pull request to update.
 
