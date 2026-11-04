@@ -56,17 +56,18 @@ jobs:
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           hash="sha256-$(openssl dgst -sha256 -binary "dist/compression-${version}-x86_64-linux.tar.gz" | base64)"
-          git fetch origin master
-          git checkout -B master origin/master
-          printf '{\n  "version": "%s",\n  "hash": "%s"\n}\n' "$version" "$hash" > nix/release.json
-          git diff --quiet && exit 0
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "chore: Nix package installs the v${version} release binary"
-          # GitHub now and then answers a push with an Internal Server Error for a few seconds: wait and try again
+          # GitHub now and then answers a push with an Internal Server Error for a few seconds: wait and try again.
+          # Every attempt starts from the current master, so a commit that master gained meanwhile (even to
+          # nix/release.json) can never leave a half-done rebase behind.
           for attempt in 1 2 3 4 5; do
+            [ "$attempt" -gt 1 ] && sleep $(((attempt - 1) * 15))
+            git fetch origin master && git checkout -q -B master origin/master || continue
+            printf '{\n  "version": "%s",\n  "hash": "%s"\n}\n' "$version" "$hash" > nix/release.json
+            git diff --quiet && exit 0
+            git commit -qam "chore: Nix package installs the v${version} release binary"
             git push origin master && exit 0
-            sleep $((attempt * 15))
-            git pull --rebase origin master || true
           done
+          echo "::error::could not push the Nix release commit after 5 attempts"
           exit 1

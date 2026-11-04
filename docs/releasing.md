@@ -112,6 +112,16 @@ Never edit or re-upload a release's tarball after that commit: its hash would no
 - Workflows of a fork may not be registered until they have been pushed once: `gh workflow list` shows nothing and `gh workflow run` answers 404. Push a branch that contains them and check `gh workflow list` again.
 - `git push` asks for a password: run `gh auth setup-git`.
 
+## Checks with a real server and with Nix
+
+The unit tests use stand-ins (a folder for a mount, a thread that sleeps for a server that hangs). Before a release that touches the server code, check once by hand with a real SSH server you may use, `sshfs` and the Connect to server dialog:
+
+1. **Loss and Reconnect.** Connect `sftp://user@host`, open two tabs in different folders of the server (`/a`, `/b`), keep a third in your home folder. Cut the server off (stop `sshd`, or block it with `iptables -A OUTPUT -d <host> -j DROP`). Within about 20 seconds the dot in the sidebar must turn yellow or red. Restore the server, open the server's menu and choose **Reconnect**. Expected: the tab you were in returns to its folder and every tab that was in the server returns to its own folder; the tab in your home folder stays where it is. Repeat with `/b` renamed on the server meanwhile: that tab shows the top of the server, the others are unaffected.
+2. **A server that hangs.** With the server cut off but the mount still there, click the server in the sidebar, open the folder menu with two tabs open (one in the server), and use Connect to server on the same address. The window must stay usable all the time; after 3 seconds (`CHECK_TIMEOUT` in `src/app/network_ui.rs`) a click on the server says "Not answering" and opens nothing. Restore the server: within about 15 seconds the dot turns green again, and a click opens the folder.
+3. **A slow server.** Add latency (`tc qdisc add dev <if> root netem delay 800ms`) and click the server: it must open, not say "Not answering". If it does say it on a slow but working link, raise `CHECK_TIMEOUT`.
+4. **Renaming on other file systems.** Rename a file and a folder on an `sshfs`, a CIFS and an NFS mount. The rename must work (`compat::rename_noreplace` falls back to a plain rename where the file system cannot refuse to replace).
+5. **Nix.** On NixOS or with Nix installed: right after a release, before the follow-up commit, `nix-build -E 'with import <nixpkgs> {}; callPackage ./. {}'` in a checkout of the tag must compile the checkout (`release.json` names the previous version); after the follow-up commit the same call must install the release binary. `fromSource = true` must compile at any time. With `nix/release.json` removed or without a `version`, the checkout is compiled.
+
 ## Limits of the local checks
 
 Docker, `cargo-deb`, `cargo-generate-rpm` and Nix are not always installed where you release from. Without them the Docker build, the `.deb` and `.rpm` and the Nix build are not tested locally. The release workflow is then the binding check for the packaging and the artifacts: it builds with `--locked`, installs `cargo-deb` and `cargo-generate-rpm`, runs `packaging/stage.sh` and creates the `.tar.gz`, `.deb`, `.rpm` and `SHA256SUMS`. Before the first install on a real machine, treat the packages as untested.
