@@ -8,7 +8,7 @@ Pushing a tag `vMAJOR.MINOR.PATCH` runs `.github/workflows/release.yml`, which b
 
 - **Authentication.** `origin` is `https://github.com/compression-sh/Compression.git`, and pushes authenticate through the GitHub CLI. Check with `gh auth status`. If git asks for a password, run `gh auth setup-git`.
 - **Pushing `master` publishes the Docker image.** `docker.yml` runs on every push to `master` and on every `v*` tag, and it pushes `ghcr.io/compression-sh/compression:latest`. Only push `master` when `latest` is meant to move.
-- **Build tools.** On NixOS run cargo inside the Nix shell (`nix-shell --run "cargo …"`); outside it the binary has no system libraries and fails with `NoWaylandLib`. On other distributions plain `cargo` is enough, with the graphics libraries from the README installed.
+- **Build tools.** On NixOS run cargo inside the Nix shell (`nix-shell --run "cargo …"`); outside it the binary has no system libraries and fails with `NoWaylandLib`. On other distributions plain `cargo` is enough, with the graphics libraries installed that the [Installation page of the wiki](https://github.com/compression-sh/Compression/wiki/Installation) lists.
 - **Use timeouts.** Give long commands a `timeout`, so a stuck build fails instead of hanging. A clean release build takes about 5 minutes and an incremental one 1–2 minutes. Never wait for a build with `pgrep -f "cargo build"`: the waiting shell's own command line matches the pattern, so the loop waits forever.
 - **Merge pull requests first**, for example translations, with `gh pr merge <n> --squash`. Then `git pull`.
 - **No AI attribution.** Do not add a `Co-Authored-By` line to release or other commits.
@@ -84,7 +84,7 @@ Never edit or re-upload a release's tarball after that commit: its hash would no
 - The tag runs `docker.yml` in addition to `release.yml`. It builds the `Dockerfile` and pushes `ghcr.io/compression-sh/compression:0.5.0` (the semver tag) and moves `latest`. A push to `master` or a manual run of the workflow on `master` moves only `latest`.
 - The package must be **public**, so that users can pull it without logging in. The repository owner is a user account, so check the package settings at <https://github.com/compression-sh?tab=packages>. To test from outside: ask `https://ghcr.io/v2/compression-sh/compression/tags/list` with an anonymous pull token; it must answer with the tags `latest` and `0.5.0`.
 - If the push fails with `denied: permission_denied: read_package`, the workflow token has no write access to the package. Open the package's settings, choose "Manage Actions access" and add the repository Compression with the role Write. Then rerun the workflow.
-- Users run the image with `docker/compression-docker`; see the README.
+- Users run the image with `docker/compression-docker`; see the [Installation page of the wiki](https://github.com/compression-sh/Compression/wiki/Installation).
 
 ## 4. After the release
 
