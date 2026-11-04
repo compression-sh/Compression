@@ -831,12 +831,15 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
         return Ok(());
     }
 
+    #[cfg(test)]
+    tests::race_here(&target);
     match op {
         Op::Copy => {
             copy_new(w, src, &target, Some(&mut rec.unreadable))?;
             rec.created.push(target);
         }
-        Op::Move => match std::fs::rename(src, &target) {
+        // Never replaces: a target that appeared since the conflict was settled is not ours to overwrite
+        Op::Move => match crate::compat::rename_noreplace(src, &target) {
             Ok(()) => {
                 let (files, bytes) = known.unwrap_or_else(|| {
                     let (mut f, mut b) = (0, 0);
@@ -1018,3 +1021,158 @@ pub fn delete_forever(w: &mut Worker, paths: Vec<PathBuf>) -> Outcome {
     outcome
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Targets at which a file appears just before the move is made: the moment between settling a conflict and the rename.
+    static RACES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) fn race_here(target: &Path) {
+        if RACES.lock().unwrap().iter().any(|p| p == target) {
+            let _ = std::fs::write(target, "intruder");
+        }
+    }
+
+    fn engine() -> Engine {
+        Engine::new(&egui::Context::default())
+    }
+
+    fn sandbox(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression_engine_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Runs a job to its end; every conflict is answered with `decision`.
+    fn run(kind: JobKind, op: Op, pairs: Vec<(PathBuf, PathBuf)>, decision: Decision) -> (Outcome, usize) {
+        let mut e = engine();
+        e.spawn(kind, String::new(), String::new(), move |w| transfer(w, op, pairs));
+        let (mut done, mut asked) = (None, 0);
+        for _ in 0..500 {
+            for event in e.poll() {
+                match event {
+                    Event::Conflict(request) => {
+                        asked += 1;
+                        request.answer(decision, false);
+                    }
+                    Event::Done { outcome, .. } => done = Some(outcome),
+                    _ => {}
+                }
+            }
+            if !e.running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (done.expect("the job never finished"), asked)
+    }
+
+    #[test]
+    fn a_move_to_a_free_name_works_and_records_the_way_back() {
+        let dir = sandbox("move_free");
+        std::fs::write(dir.join("a"), "from").unwrap();
+        let (outcome, asked) = run(JobKind::Move, Op::Move, vec![(dir.join("a"), dir.join("b"))], Decision::Skip);
+        assert!(outcome.ok && asked == 0, "{}", outcome.message);
+        assert!(!dir.join("a").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "from");
+        let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "from");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_appears_after_the_conflict_check_is_not_replaced_by_a_move() {
+        let dir = sandbox("move_race");
+        std::fs::write(dir.join("a"), "from").unwrap();
+        // Nothing is at the target when the move starts, so no conflict is asked
+        RACES.lock().unwrap().push(dir.join("b"));
+        let (outcome, asked) = run(JobKind::Move, Op::Move, vec![(dir.join("a"), dir.join("b"))], Decision::Replace);
+        assert_eq!(asked, 0);
+        assert!(!outcome.ok, "the move must fail, not replace");
+        assert!(outcome.message.to_lowercase().contains("already exists"), "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "from", "the source stays");
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "intruder", "and the new file is untouched");
+        assert!(matches!(outcome.effect, Effect::None), "nothing to undo");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_folder_that_appears_after_the_conflict_check_is_not_replaced_by_a_move() {
+        let dir = sandbox("move_race_dir");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::write(dir.join("a/x"), "x").unwrap();
+        // The intruder is a file; a folder move onto a taken name must fail as well
+        RACES.lock().unwrap().push(dir.join("b"));
+        let (outcome, _) = run(JobKind::Move, Op::Move, vec![(dir.join("a"), dir.join("b"))], Decision::Replace);
+        assert!(!outcome.ok);
+        assert!(dir.join("a/x").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "intruder");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_confirmed_replace_still_replaces_and_the_old_file_goes_to_the_trash() {
+        let dir = sandbox("move_replace");
+        std::fs::write(dir.join("a"), "new").unwrap();
+        std::fs::write(dir.join("b"), "old").unwrap();
+        let (outcome, asked) = run(JobKind::Move, Op::Move, vec![(dir.join("a"), dir.join("b"))], Decision::Replace);
+        assert_eq!(asked, 1);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "new");
+        assert!(!dir.join("a").exists());
+        // The way back restores both
+        let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "old");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keeping_both_and_skipping_still_work_for_a_move() {
+        let dir = sandbox("move_keep");
+        for n in ["a", "b"] {
+            std::fs::write(dir.join(n), n).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        std::fs::write(dir.join("d/a"), "taken").unwrap();
+        let (outcome, _) = run(JobKind::Move, Op::Move, vec![(dir.join("a"), dir.join("d/a"))], Decision::KeepBoth);
+        assert!(outcome.ok);
+        assert_eq!(std::fs::read_to_string(dir.join("d/a (copy)")).unwrap(), "a");
+        let (outcome, _) = run(JobKind::Move, Op::Move, vec![(dir.join("b"), dir.join("d/a"))], Decision::Skip);
+        assert!(outcome.ok);
+        assert_eq!(std::fs::read_to_string(dir.join("d/a")).unwrap(), "taken");
+        assert!(dir.join("b").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_noreplace_support_a_move_is_refused_with_its_own_message_and_nothing_changes() {
+        let dir = sandbox("refused_move");
+        crate::compat::tests::without_support_under(&dir);
+        std::fs::create_dir_all(dir.join("src/folder/inner")).unwrap();
+        std::fs::write(dir.join("src/file"), "data").unwrap();
+        std::os::unix::fs::symlink("file", dir.join("src/link")).unwrap();
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        for name in ["file", "link", "folder"] {
+            let (outcome, asked) = run(JobKind::Move, Op::Move, vec![(dir.join("src").join(name), dir.join("dst").join(name))], Decision::Skip);
+            assert_eq!(asked, 0);
+            assert!(!outcome.ok, "{name}");
+            assert!(outcome.message.contains("does not support moving or renaming"), "{}", outcome.message);
+            assert!(!outcome.message.to_lowercase().contains("already exists"), "{}", outcome.message);
+            assert!(matches!(outcome.effect, Effect::None), "nothing to undo");
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("src/file")).unwrap(), "data");
+        assert!(dir.join("src/link").symlink_metadata().is_ok() && dir.join("src/folder/inner").is_dir());
+        let mut left = std::fs::read_dir(dir.join("dst")).unwrap().count();
+        assert_eq!(left, 0, "nothing arrived, and no reserved or private name");
+        left = std::fs::read_dir(dir.join("src")).unwrap().count();
+        assert_eq!(left, 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

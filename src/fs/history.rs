@@ -143,3 +143,43 @@ pub fn rename_many(pairs: &[(PathBuf, PathBuf)]) -> io::Result<()> {
     failure.map_or(Ok(()), Err)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression_history_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::compat::tests::without_support_under(&dir);
+        dir
+    }
+
+    #[test]
+    fn without_noreplace_support_renaming_several_is_refused_and_every_name_is_as_it_was() {
+        let dir = dir("many");
+        std::fs::write(dir.join("a"), "A").unwrap();
+        std::fs::write(dir.join("b"), "B").unwrap();
+        let err = rename_many(&[(dir.join("a"), dir.join("c")), (dir.join("b"), dir.join("d"))]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert_eq!((std::fs::read_to_string(dir.join("a")).unwrap(), std::fs::read_to_string(dir.join("b")).unwrap()), ("A".into(), "B".into()));
+        let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a", "b"], "no staging name is left");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_noreplace_support_undoing_a_move_is_refused_with_the_reason_and_changes_nothing() {
+        let dir = dir("undo");
+        std::fs::write(dir.join("new_name"), "x").unwrap();
+        let entry = UndoEntry::new("Renaming", vec![Edit::Move { from: dir.join("new_name"), to: dir.join("old_name") }]);
+        let (inverse, error) = apply(entry);
+        assert!(inverse.is_none());
+        assert!(error.is_some_and(|e| e.contains("does not support moving or renaming")));
+        assert_eq!(std::fs::read_to_string(dir.join("new_name")).unwrap(), "x");
+        assert!(!dir.join("old_name").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

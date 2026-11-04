@@ -5,6 +5,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+use crate::i18n::tr;
+
 const OLD: &str = "ski";
 const NEW: &str = "compression";
 
@@ -66,7 +68,14 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// `rename`, but an existing `to` (even an empty folder) is an error instead of being replaced.
+///
+/// The kernel does this in one step (`renameat2` with `RENAME_NOREPLACE`). A file system that cannot (the kernel says
+/// ENOSYS, EINVAL or EOPNOTSUPP) is refused, see `without_noreplace`.
 pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if tests::forced(from, to) {
+        return without_noreplace(from, to, io::Error::from_raw_os_error(libc::EINVAL));
+    }
     let path = |p: &Path| CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other);
     let (a, b) = (path(from)?, path(to)?);
     // SAFETY: both are NUL-terminated paths that outlive the call.
@@ -75,11 +84,28 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
         return Ok(());
     }
     let err = io::Error::last_os_error();
-    // shortcut: a file system without RENAME_NOREPLACE gets a check first, which leaves a tiny race; upgrade if one shows up
-    if lacks_noreplace(err.raw_os_error()) && to.symlink_metadata().is_err() {
-        return std::fs::rename(from, to);
+    if lacks_noreplace(err.raw_os_error()) { without_noreplace(from, to, err) } else { Err(err) }
+}
+
+/// The error for a move that cannot be done safely on this file system: nothing is changed.
+fn cannot_move_safely() -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, tr("This file system does not support moving or renaming without the risk of replacing something, so nothing was changed"))
+}
+
+/// What a move does on a file system that cannot do RENAME_NOREPLACE: nothing. Every other way of moving is several steps
+/// with a gap between them, in which something that someone else put there can be replaced or left behind, so none is
+/// taken. The source and the target are not touched. A target that is there is said to be (that is a look, not a
+/// change); otherwise the error says the operation is not supported here, which is not a conflict. Moving a folder
+/// into itself, which the kernel also answers with EINVAL, keeps that error.
+fn without_noreplace(from: &Path, to: &Path, err: io::Error) -> io::Result<()> {
+    let meta = from.symlink_metadata()?;
+    if meta.is_dir() && to.starts_with(from) {
+        return Err(err);
     }
-    Err(err)
+    if to.symlink_metadata().is_ok() {
+        return Err(io::ErrorKind::AlreadyExists.into());
+    }
+    Err(cannot_move_safely())
 }
 
 /// Whether `errno` says the file system cannot do RENAME_NOREPLACE at all (the kernel answers EINVAL, a
@@ -88,3 +114,126 @@ fn lacks_noreplace(errno: Option<i32>) -> bool {
     matches!(errno, Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP))
 }
 
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::Mutex;
+
+    /// Folders in which the tests pretend the file system cannot do RENAME_NOREPLACE: a move from or to a path
+    /// under one takes the way for such file systems (this is how the other modules' tests reach it too).
+    static NO_SUPPORT: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) fn forced(from: &Path, to: &Path) -> bool {
+        NO_SUPPORT.lock().unwrap().iter().any(|p| from.starts_with(p) || to.starts_with(p))
+    }
+
+    /// Makes the file system under `dir` "lack" RENAME_NOREPLACE for the rest of the process.
+    pub(crate) fn without_support_under(dir: &Path) {
+        NO_SUPPORT.lock().unwrap().push(dir.to_path_buf());
+    }
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression_compat_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("taken_dir")).unwrap();
+        std::fs::write(dir.join("a"), "from").unwrap();
+        std::fs::write(dir.join("b"), "keep me").unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_rename_without_replacing_never_touches_a_name_that_is_taken() {
+        let dir = dir("noreplace");
+        let err = rename_noreplace(&dir.join("a"), &dir.join("b")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "from");
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "keep me");
+        let err = rename_noreplace(&dir.join("a"), &dir.join("taken_dir")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert!(dir.join("taken_dir").is_dir() && dir.join("a").exists());
+        std::os::unix::fs::symlink("nowhere", dir.join("dangling")).unwrap();
+        assert_eq!(rename_noreplace(&dir.join("a"), &dir.join("dangling")).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        rename_noreplace(&dir.join("a"), &dir.join("c")).unwrap();
+        assert!(!dir.join("a").exists() && std::fs::read_to_string(dir.join("c")).unwrap() == "from");
+        assert_eq!(rename_noreplace(&dir.join("gone"), &dir.join("d")).unwrap_err().kind(), io::ErrorKind::NotFound);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_system_that_cannot_do_noreplace_is_told_from_a_real_failure() {
+        for errno in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP] {
+            assert!(lacks_noreplace(Some(errno)), "{errno}");
+        }
+        for errno in [libc::EEXIST, libc::EACCES, libc::ENOENT, libc::ENOSPC, libc::EXDEV] {
+            assert!(!lacks_noreplace(Some(errno)), "{errno}");
+        }
+        assert!(!lacks_noreplace(None));
+    }
+
+    /// Everything in `dir`, to see that nothing was made or removed.
+    fn snapshot(dir: &Path) -> Vec<(String, u64, u64)> {
+        let mut found: Vec<(String, u64, u64)> = std::fs::read_dir(dir).unwrap().map(|e| {
+            let e = e.unwrap();
+            let m = e.path().symlink_metadata().unwrap();
+            (e.file_name().to_string_lossy().into_owned(), m.ino(), m.nlink())
+        }).collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn without_noreplace_support_a_move_is_refused_and_nothing_is_touched() {
+        let dir = dir("refused");
+        std::fs::create_dir_all(dir.join("f/inside")).unwrap();
+        std::os::unix::fs::symlink("b", dir.join("l")).unwrap();
+        let before = snapshot(&dir);
+        let inside = snapshot(&dir.join("f"));
+        without_support_under(&dir);
+        // A file, a link and a folder, to a free name
+        for (from, to) in [("a", "free"), ("l", "free"), ("f", "free")] {
+            let err = rename_noreplace(&dir.join(from), &dir.join(to)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{from}");
+            assert!(err.to_string().contains("does not support moving or renaming"), "{err}");
+            assert!(!err.to_string().to_lowercase().contains("exists"), "{err}");
+            assert_eq!(snapshot(&dir), before, "{from} -> free: nothing made, removed or changed");
+        }
+        assert_eq!(snapshot(&dir.join("f")), inside);
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "from");
+        assert_eq!(std::fs::read_link(dir.join("l")).unwrap(), Path::new("b"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_noreplace_support_a_target_that_is_there_is_a_conflict_and_nothing_is_touched() {
+        let dir = dir("refused_taken");
+        std::fs::create_dir_all(dir.join("f/inside")).unwrap();
+        std::os::unix::fs::symlink("nowhere", dir.join("dangling")).unwrap();
+        let before = snapshot(&dir);
+        without_support_under(&dir);
+        for from in ["a", "f"] {
+            for taken in ["b", "taken_dir", "dangling"] {
+                let err = rename_noreplace(&dir.join(from), &dir.join(taken)).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{from} -> {taken}");
+            }
+        }
+        assert_eq!(snapshot(&dir), before);
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "keep me");
+        // A missing source and a folder into itself keep their own errors
+        assert_eq!(rename_noreplace(&dir.join("gone"), &dir.join("z")).unwrap_err().kind(), io::ErrorKind::NotFound);
+        let err = rename_noreplace(&dir.join("f"), &dir.join("f/inside/g")).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL), "{err}");
+        assert_eq!(snapshot(&dir), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_supported_file_system_still_moves_and_refuses_a_taken_name_natively() {
+        let dir = dir("native");
+        let ino = dir.join("a").metadata().unwrap().ino();
+        rename_noreplace(&dir.join("a"), &dir.join("c")).unwrap();
+        assert_eq!(dir.join("c").metadata().unwrap().ino(), ino);
+        assert_eq!(rename_noreplace(&dir.join("c"), &dir.join("b")).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

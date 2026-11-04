@@ -317,3 +317,32 @@ pub fn apply(entries: &[Entry], names: &[String]) -> (Vec<(PathBuf, PathBuf)>, O
     (done, failure)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn without_noreplace_support_a_batch_is_refused_and_every_name_is_put_back() {
+        let dir = std::env::temp_dir().join(format!("compression_batch_fb_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        crate::compat::tests::without_support_under(&dir);
+        for (n, c) in [("one", "1"), ("two", "2")] {
+            std::fs::write(dir.join(n), c).unwrap();
+        }
+        let entry = |n: &str, is_dir| Entry { path: dir.join(n), is_dir, date: String::new() };
+        let entries = [entry("one", false), entry("two", false), entry("folder", true)];
+        let names = ["uno".to_owned(), "dos".to_owned(), "dir".to_owned()];
+        let (done, failure) = apply(&entries, &names);
+        assert!(done.is_empty(), "{done:?}");
+        assert!(failure.is_some_and(|f| f.contains("does not support moving or renaming")));
+        assert_eq!(std::fs::read_to_string(dir.join("one")).unwrap(), "1");
+        assert_eq!(std::fs::read_to_string(dir.join("two")).unwrap(), "2");
+        assert!(dir.join("folder").is_dir());
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, vec!["folder", "one", "two"], "no staging name is left");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

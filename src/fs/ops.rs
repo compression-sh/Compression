@@ -196,15 +196,17 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     } else {
         // Not `std::fs::copy`: it fails the whole copy when the target refuses the permissions
         let mut reader = std::fs::File::open(src)?;
-        let mut writer = std::fs::File::create(dst)?;
+        // Not `File::create`: a file that appeared there meanwhile is not ours to cut short
+        let mut writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
         io::copy(&mut reader, &mut writer)?;
         keep_mode(writer.set_permissions(meta.permissions()))
     }
 }
 
 /// Rename `src` to the exact path `dst`, copying across filesystems when it has to.
+/// Never replaces anything: `dst` is a name the caller has found free, and one taken since is an error.
 pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
-    match std::fs::rename(src, dst) {
+    match crate::compat::rename_noreplace(src, dst) {
         Ok(()) => Ok(()),
         // Different filesystem: copy, then remove the original
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
@@ -527,3 +529,61 @@ pub fn extract_beside(archive: &Path, control: &Control) -> io::Result<PathBuf> 
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression_ops_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn moving_to_a_name_that_is_taken_is_an_error_and_changes_nothing() {
+        let dir = dir("move_path");
+        std::fs::write(dir.join("a"), "from").unwrap();
+        std::fs::write(dir.join("b"), "taken").unwrap();
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        for target in ["b", "empty"] {
+            let err = move_path(&dir.join("a"), &dir.join(target)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{target}: {err}");
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "from");
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "taken");
+        move_path(&dir.join("a"), &dir.join("free")).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("free")).unwrap(), "from");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn copying_a_tree_does_not_cut_short_a_file_that_is_in_the_way() {
+        let dir = dir("copy_tree");
+        std::fs::write(dir.join("a"), "from").unwrap();
+        std::fs::write(dir.join("b"), "taken").unwrap();
+        let err = copy_tree(&dir.join("a"), &dir.join("b")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "taken");
+        copy_tree(&dir.join("a"), &dir.join("c")).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("c")).unwrap(), "from");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_noreplace_support_move_path_refuses_and_leaves_source_and_target_alone() {
+        let dir = dir("move_path_refused");
+        crate::compat::tests::without_support_under(&dir);
+        std::fs::write(dir.join("a"), "from").unwrap();
+        std::fs::write(dir.join("b"), "taken").unwrap();
+        // A free name: not supported, not a conflict
+        let err = move_path(&dir.join("a"), &dir.join("free")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        // A taken one: the conflict
+        assert_eq!(move_path(&dir.join("a"), &dir.join("b")).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "from");
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "taken");
+        assert!(!dir.join("free").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

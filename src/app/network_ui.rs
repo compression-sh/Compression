@@ -1888,4 +1888,27 @@ mod tests {
         assert_eq!(app.other_tab_folders(), vec![there], "no is_dir: it is a folder the tab was in");
         std::fs::remove_dir_all(&base).unwrap();
     }
+
+    #[test]
+    fn without_noreplace_support_renaming_says_so_and_changes_nothing_while_a_taken_name_is_still_a_conflict() {
+        let (mut app, base) = local_app("rename");
+        crate::compat::tests::without_support_under(&base);
+        let (file, folder) = (base.join("a/file.txt"), base.join("a/folder"));
+        std::fs::write(&file, "data").unwrap();
+        std::fs::create_dir_all(folder.join("inner")).unwrap();
+        std::fs::write(base.join("a/taken"), "keep").unwrap();
+        app.navigate_to(base.join("a"));
+        drain(&mut app);
+        app.net.ask = ask_server;
+        assert_eq!(app.rename_entry(&file, "taken").unwrap_err(), "“taken” already exists");
+        for (path, new) in [(&file, "renamed.txt"), (&folder, "dir")] {
+            let err = app.rename_entry(path, new).unwrap_err();
+            assert!(err.contains("does not support moving or renaming"), "{err}");
+            assert!(!err.to_lowercase().contains("already exists"), "{err}");
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "data");
+        assert!(folder.join("inner").is_dir() && !base.join("a/renamed.txt").exists() && !base.join("a/dir").exists());
+        assert!(app.history.pop_undo().is_none(), "nothing happened, so there is nothing to undo");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 }

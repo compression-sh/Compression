@@ -837,5 +837,6 @@
   "{} items could not be copied": "{} Element konnte nicht kopiert werden|{} Elemente konnten nicht kopiert werden",
   "{} items could not be changed": "{} Element konnte nicht geändert werden|{} Elemente konnten nicht geändert werden",
   "and {} more": "und {} weitere",
+  "This file system does not support moving or renaming without the risk of replacing something, so nothing was changed": "Dieses Dateisystem unterstützt kein Verschieben oder Umbenennen ohne das Risiko, etwas zu ersetzen. Es wurde nichts geändert",
   "These items are not in the list any more. Refresh the folder and try again.": "Diese Elemente stehen nicht mehr in der Liste. Ordner aktualisieren und erneut versuchen."
 }
