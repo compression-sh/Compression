@@ -210,9 +210,9 @@ pub(super) enum How {
 
 /// What to do once it is known whether a server's folder is there.
 pub(super) enum Next {
-    /// A folder on a server, from the sidebar or the path: it is shown once the server has said what it is.
-    /// `tab` and `serial` are the tab it was asked for and that tab's navigation number then; with `nearest` the
-    /// nearest folder at or above `target` that is there is wanted instead.
+    /// A folder, from the sidebar, the path or a tab: it is shown once a thread has said what it is. `tab` and `serial`
+    /// are the tab it was asked for and that tab's navigation number then; `how` says what is wanted of it (go there,
+    /// the nearest folder at or above `target` that is there, or the tab shown as what the path resolves to).
     Folder { target: PathBuf, tab: u64, serial: u64, how: How },
     Open { address: Address, password: Option<String>, open: OpenIn },
     Back { address: Address, back: Option<PathBuf>, tabs: Vec<(u64, PathBuf)> },
