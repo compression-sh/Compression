@@ -40,6 +40,10 @@ Connecting gives up after 30 seconds without a sign of life, and the dialog can 
 
 Connected servers appear under the drives, each with a button to disconnect. **Keep in sidebar** leaves a server there after you disconnect, and a click connects again. Right-click a server to rename it, change its address, forget its saved password or remove it. Folders on a server can be pinned too, and opening such a pin reconnects.
 
+A small dot in front of each server tells how it is doing; hover over it for the words. Green: connected. Yellow: it answers slowly. Red: the mount is there but does not answer properly. A ring: a saved server that is not connected, which is normal. Compression asks every connected server about every 15 seconds, in the background, and calls it slow when one question stays unanswered for 3 seconds.
+
+For a yellow or red server the right-click menu has **Reconnect**. It lets go of the mount the gentle way (never forced, with a time limit), then connects the server again with the saved login, or asks for it. It is not offered for mounts that belong to the system, and it waits while a job is running, since the job may be using the mount. If the mount cannot be released, the reason is shown and the server stays as it was.
+
 ## How servers differ from local folders
 
 - **No trash.** "Move to trash" asks and then deletes for good.

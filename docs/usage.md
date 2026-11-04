@@ -8,8 +8,8 @@ Compression can be used with the keyboard alone, and with the mouse as you would
 
 - **The path bar** at the top shows where you are as a row of folders you can click. `Ctrl+L` turns it into a text field: type or paste a path (with completion) or the address of a server, and press `Enter`.
 - **The sidebar** on the left holds the places you use: Home, Recent, Bookmarks, Trash, your own pins, the drives, the servers you are connected to and the tags in use. Pin a folder or a file with `Ctrl+D`, and drag pinned rows to reorder them. What the sidebar shows can be changed in Settings → Sidebar.
-- **The file area** shows the open folder as a list or a grid. `Ctrl+1` and `Ctrl+2` switch between the two; `Ctrl+=` and `Ctrl+-` change the size of the icons.
-- **The status line** at the bottom tells how many items are selected and how large they are.
+- **The file area** shows the open folder as a list or a grid. `Ctrl+1` and `Ctrl+2` switch between the two; `Ctrl+=` and `Ctrl+-` change the size of the icons. Thumbnails are made on several threads, those on screen first and the next screens ahead, so scrolling finds them ready.
+- **The status line** at the bottom tells how many items are selected and how large they are. While nothing is selected it shows the free room on the disk of the open folder (not on servers).
 - **The main menu** (the button in the top corner) has the commands that are not tied to a file, such as a new window, Settings and "Open as administrator".
 
 ## Moving around
@@ -50,7 +50,7 @@ Click, or move with the arrow keys (or `j` and `k` with the vim keys on). `Shift
 | Delete for good | `Shift+Delete`. Asks first unless you turned that off in Settings → General. |
 | Undo and redo | `Ctrl+Z` and `Ctrl+Shift+Z` (or `Ctrl+Y`) |
 
-Copying, moving, deleting, packing and unpacking run as jobs in the background. `Ctrl+J` shows them: each has a progress bar with the speed and the time left, and a cancel button. Copies and cross-disk moves have a pause button too. When a name is taken, a job asks whether to replace, skip, keep both or (for folders) merge, and offers to do the same for all following conflicts. A cancelled copy removes the half-made copy; a failed or cancelled job never leaves a file that looks finished but is not.
+Copying, moving, deleting, packing and unpacking run as jobs in the background. `Ctrl+J` shows them: each has a progress bar with the speed and the time left, and a cancel button. Copies and cross-disk moves have a pause button too. When a name is taken, a job asks whether to replace, skip, keep both or (for folders) merge, and offers to do the same for all following conflicts. When a copy of a folder meets files it cannot read, it leaves them out, finishes the rest and names what it skipped; the job still counts as done and can be undone. (A move to another disk stops instead, so the source stays whole.) A cancelled copy removes the half-made copy; a failed or cancelled job never leaves a file that looks finished but is not.
 
 Before a copy, a move to another disk or an unpacking starts writing, Compression compares what it needs with the free space of the target. If it may not fit, the job stops and asks whether to continue anyway ("Cancel" is the default). The check is skipped on servers and where the system gives no sizes, and replaced files are not subtracted, so it can warn a little early.
 
@@ -64,7 +64,7 @@ Deleted items go to the trash of your home folder (`~/.local/share/Trash`); the 
 
 ## Search
 
-`/` opens the search bar. The search runs in the background, shows results as they are found, looks in recently used files first and never goes into folders on servers unless you started in one (or turned on "Previews on servers" in Settings → Files & View). The chips on the bar choose where it looks ("This folder" or "Everywhere", which is your home folder), narrow it to folders, documents, images, audio, video, archives or code, and set two options: "Match case" and "File contents" (text files up to 1 MiB are searched inside, too). `tag:work` finds the files carrying a tag.
+`/` opens the search bar. The search runs in the background, shows results as they are found, looks in recently used files first and never goes into folders on servers unless you started in one (or turned on "Previews on servers" in Settings → Files & View). The chips on the bar choose where it looks ("This folder" or "Everywhere", which is your home folder), narrow it to folders, documents, images, audio, video, archives or code, and set two options: "Match case" and "File contents" (text files up to 1 MiB are searched inside, too). `tag:work` finds the files carrying a tag. A search stops at 400 results and says so at the bottom; type more to narrow it down.
 
 In the search field `↓` moves on to the first result (`Shift+↓` does the same). From there the arrow keys walk through the results as they do in a folder, and `Enter` opens the one you reached. Typing more letters narrows the results on screen instead of emptying the list first.
 
@@ -76,7 +76,7 @@ Patterns understand `*` and `?`, so `*.png` or `report-??` work as you would exp
 
 ## Opening files
 
-Files open with the default application of their type. "Open with…" in the context menu lists the other programs that can open them and can set a new default. `F4` opens a terminal in the open folder; Settings → Behavior chooses which one. On a folder of an SSH server it logs in with `ssh` and opens the same folder there.
+Files open with the default application of their type. "Open with…" in the context menu lists the other programs that can open them and can set a new default. If nothing is set up for a file's type, Compression says so and opens the "Open with…" list instead of failing quietly. `F4` opens a terminal in the open folder; Settings → Behavior chooses which one. On a folder of an SSH server it logs in with `ssh` and opens the same folder there.
 
 ## Open as administrator
 

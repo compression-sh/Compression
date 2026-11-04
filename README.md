@@ -20,6 +20,7 @@ Compression is a fork of [Ski](https://github.com/ilyamiro/Ski) by ilyamiro, dev
 - Copy, move, trash and delete run as background jobs with progress, pause, cancel and conflict questions, and every change can be undone.
 - Rename one file or many at once, by template or by find and replace. Search by name or inside files, filter by type.
 - Drag and drop between windows, tabs and other programs, on Wayland and X11.
+- A copy leaves out files it cannot read and tells you which; the free room of the disk shows at the bottom; a file with no app set for its type opens the "Open with" list.
 
 **Archives**
 - Pack to `.zip`, `.tar.gz` and, with the usual tools installed, `.tar.xz`, `.tar.bz2`, `.tar.zst` and `.7z`; unpack all of those and `.rar`, `.iso`, `.deb` and `.rpm`.
@@ -31,7 +32,7 @@ Compression is a fork of [Ski](https://github.com/ilyamiro/Ski) by ilyamiro, dev
 - Custom actions: your own commands in the context menu, written as a small JSON file or a script, with a time and an output limit you can set per action.
 
 **Servers and the desktop**
-- Open folders on SMB and NFS shares, SSH (sftp), FTP, WebDAV and AFP servers with `Ctrl+K`; passwords can go to your keyring.
+- Open folders on SMB and NFS shares, SSH (sftp), FTP, WebDAV and AFP servers with `Ctrl+K`; passwords can go to your keyring. A dot in the sidebar shows whether each server still answers, and a slow or stuck one can be reconnected from its menu.
 - Serves as the system file dialog (xdg-desktop-portal `FileChooser`) and answers "Show in folder" (`FileManager1`).
 - Settings live in one JSON file. Edit it by hand and every open window follows at once. Open as administrator through polkit when you need to.
 
