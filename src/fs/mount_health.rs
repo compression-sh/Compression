@@ -1,6 +1,6 @@
 //! Whether a connected server still answers. Each mount folder is asked from time to time with a plain
-//! `metadata` call on a thread of its own: that call is what blocks on a mount that has stopped
-//! answering, and a blocked thread must not hold the window.
+//! `statvfs` call (see `answers`) on a thread of its own: that call is what blocks on a mount that has
+//! stopped answering, and a blocked thread must not hold the window.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -84,7 +84,28 @@ impl Probes {
     }
 }
 
-/// Whether the mount folder answers.
+/// Whether the mount folder answers. The question is `statvfs`, not `stat`: the kernel keeps what it
+/// last learned about the mount's top folder for a while (about 20 seconds with sshfs) and answers from
+/// that, so a server that is gone would look well until it ran out. `statvfs` is never kept: it goes to the
+/// program that serves the mount each time, which asks the server (sshfs does when the server knows the
+/// request, as OpenSSH's does) or fails at once when the connection is gone. A mount that cannot answer
+/// `statvfs` at all is asked with `stat` as before.
 pub fn answers(local: &Path) -> bool {
-    std::fs::metadata(local).is_ok()
+    answers_with(local, statvfs)
+}
+
+fn answers_with(local: &Path, statvfs: impl Fn(&Path) -> std::io::Result<()>) -> bool {
+    match statvfs(local) {
+        Ok(()) => true,
+        Err(err) if matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP)) => std::fs::metadata(local).is_ok(),
+        Err(_) => false,
+    }
+}
+
+fn statvfs(local: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(local.as_os_str().as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: a zeroed statvfs is a valid out-parameter, and the path is a terminated string that lives through the call.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
