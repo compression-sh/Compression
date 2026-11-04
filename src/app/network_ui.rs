@@ -2,7 +2,7 @@
 //! question dialogs, and connections that run in the background until their folder can be shown.
 use super::*;
 use crate::fs::mount_health::{self, Health, Probes};
-use crate::fs::network::{self, Address, Mount, Progress, Prompt, Reply, Server, Servers};
+use crate::fs::network::{self, Address, Mount, MountKind, Progress, Prompt, Reply, Server, Servers};
 use std::time::{Duration, Instant};
 
 const REFRESH: Duration = Duration::from_secs(4);
@@ -21,6 +21,8 @@ pub(super) enum NetMsg {
     Done { id: u64, result: Result<PathBuf, Option<String>> },
     Gone { local: PathBuf, name: String, result: Result<(), String> },
     Forgot { name: String, result: Result<(), String> },
+    /// A mount that was let go of to be connected again.
+    Reconnect { local: PathBuf, name: String, address: Address, result: Result<(), String> },
 }
 
 /// A connection on its way.
@@ -117,6 +119,12 @@ impl LinkState {
     }
 }
 
+/// Whether a server's menu offers to connect it again: only one that is slow or broken, and only one that
+/// Compression can let go of itself (not a mount of the system's, which takes more rights).
+pub(super) fn offers_reconnect(mount: &Mount, state: Option<LinkState>) -> bool {
+    mount.address.is_some() && mount.kind != MountKind::System && matches!(state, Some(LinkState::Slow | LinkState::Broken))
+}
+
 /// A row of the Network section: a saved server, a connected one, or both.
 #[derive(Clone)]
 pub(super) struct NetRow {
@@ -175,6 +183,14 @@ impl CompressionApp {
                         Err(err) => self.set_toast(trf("Could not disconnect “{}”: {}", &[&name, &err])),
                     }
                     self.request_network_listing(ctx, true);
+                }
+                NetMsg::Reconnect { local, name, address, result } => {
+                    self.net.leaving.remove(&local);
+                    self.request_network_listing(ctx, true);
+                    match result {
+                        Ok(()) => self.open_address(address, None, OpenIn::Here),
+                        Err(err) => self.set_toast(trf("Could not disconnect “{}”: {}", &[&name, &err])),
+                    }
                 }
                 NetMsg::Forgot { name, result } => match result {
                     Ok(()) => self.set_toast(trf("Forgot the password of “{}”", &[&name])),
@@ -380,6 +396,28 @@ impl CompressionApp {
         });
     }
 
+    /// Let go of a server that is slow or broken and connect it again. Nothing is forced: a mount that
+    /// is in use stays, and the reason comes as a message. Not while a job runs, which may be using it.
+    pub(super) fn reconnect(&mut self, ctx: &egui::Context, mount: Mount) {
+        let Some(address) = mount.address.clone().filter(|_| mount.kind != MountKind::System) else { return };
+        if self.engine.running() {
+            self.set_toast(tr("Wait for the running jobs to finish, then reconnect"));
+            return;
+        }
+        if !self.net.leaving.insert(mount.local.clone()) {
+            return;
+        }
+        if self.current_path.starts_with(&mount.local) {
+            self.navigate_to(dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
+        }
+        let (tx, ctx) = (self.net.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = network::disconnect(&mount);
+            let _ = tx.send(NetMsg::Reconnect { local: mount.local.clone(), name: mount.name.clone(), address, result });
+            ctx.request_repaint();
+        });
+    }
+
     pub(super) fn forget_password(&mut self, address: Address) {
         let (tx, ctx) = (self.net.tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
@@ -576,6 +614,11 @@ impl CompressionApp {
         }
         if let Some(mount) = &row.mount {
             groups.push(vec![(icons::UNMOUNT, tr("Disconnect"), MenuAction::Disconnect(mount.local.clone()))]);
+        }
+        if let Some(mount) = &row.mount
+            && offers_reconnect(mount, row.state)
+        {
+            groups.push(vec![(icons::REFRESH, tr("Reconnect"), MenuAction::Reconnect(mount.local.clone()))]);
         }
         match (row.saved, &row.address) {
             (Some(index), _) => groups.push(vec![

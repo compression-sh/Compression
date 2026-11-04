@@ -730,6 +730,8 @@
   "Answering slowly": "Phản hồi chậm",
   "Not answering": "Không phản hồi",
   "Not connected": "Chưa kết nối",
+  "Reconnect": "Kết nối lại",
+  "Wait for the running jobs to finish, then reconnect": "Hãy đợi các tác vụ đang chạy xong rồi kết nối lại",
   "Connect": "Kết nối",
   "Edit…": "Sửa…",
   "Remove from sidebar": "Xóa khỏi thanh bên",

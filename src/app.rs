@@ -176,6 +176,8 @@ enum MenuAction {
     Connect(Address, OpenIn),
     /// Disconnect the server mounted at this folder.
     Disconnect(PathBuf),
+    /// Disconnect the server mounted at this folder and connect it again.
+    Reconnect(PathBuf),
     SaveServer(Address),
     EditServer(usize),
     RemoveServer(usize),
@@ -4570,6 +4572,11 @@ impl CompressionApp {
                     self.disconnect(ctx, mount);
                 }
             }
+            MenuAction::Reconnect(local) => {
+                if let Some(mount) = self.net.mounts.iter().find(|m| m.local == local).cloned() {
+                    self.reconnect(ctx, mount);
+                }
+            }
             MenuAction::SaveServer(address) => self.save_server(address),
             MenuAction::EditServer(index) => self.open_edit_server(index),
             MenuAction::RemoveServer(index) => self.remove_server(index),
@@ -4639,6 +4646,7 @@ impl CompressionApp {
                     | MenuAction::ConnectToServer
                     | MenuAction::Connect(..)
                     | MenuAction::Disconnect(_)
+                    | MenuAction::Reconnect(_)
                     | MenuAction::SaveServer(_)
                     | MenuAction::EditServer(_)
                     | MenuAction::RemoveServer(_)

@@ -730,6 +730,8 @@
   "Answering slowly": "Отвечает медленно",
   "Not answering": "Не отвечает",
   "Not connected": "Не подключено",
+  "Reconnect": "Подключить заново",
+  "Wait for the running jobs to finish, then reconnect": "Дождитесь завершения текущих задач и подключитесь заново",
   "Connect": "Подключиться",
   "Edit…": "Изменить…",
   "Remove from sidebar": "Убрать с боковой панели",

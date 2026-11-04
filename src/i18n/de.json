@@ -730,6 +730,8 @@
   "Answering slowly": "Antwortet langsam",
   "Not answering": "Antwortet nicht",
   "Not connected": "Nicht verbunden",
+  "Reconnect": "Neu verbinden",
+  "Wait for the running jobs to finish, then reconnect": "Warte, bis die laufenden Aufträge fertig sind, und verbinde dann neu",
   "Connect": "Verbinden",
   "Edit…": "Bearbeiten …",
   "Remove from sidebar": "Aus der Seitenleiste entfernen",
