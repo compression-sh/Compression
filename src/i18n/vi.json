@@ -835,5 +835,6 @@
   "The name is too long": "Tên quá dài",
   "It is in use": "Đang được sử dụng",
   "{} items could not be copied": "Không thể sao chép {} mục",
+  "{} items could not be changed": "Không thể thay đổi {} mục",
   "and {} more": "và {} mục nữa"
 }

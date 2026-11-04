@@ -835,5 +835,6 @@
   "The name is too long": "Der Name ist zu lang",
   "It is in use": "Wird gerade verwendet",
   "{} items could not be copied": "{} Element konnte nicht kopiert werden|{} Elemente konnten nicht kopiert werden",
+  "{} items could not be changed": "{} Element konnte nicht geändert werden|{} Elemente konnten nicht geändert werden",
   "and {} more": "und {} weitere"
 }

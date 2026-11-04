@@ -965,6 +965,11 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
 
 /// "3 items could not be copied: a/b.txt (Permission denied), …" for the files a copy left out.
 fn unreadable_note(list: &[(PathBuf, String)]) -> String {
+    left_out_note(list, trn(list.len(), "{} item could not be copied", "{} items could not be copied"))
+}
+
+/// `head`, then the first few of `list` with the reason each was left out, and how many more there are.
+pub(crate) fn left_out_note(list: &[(PathBuf, String)], head: String) -> String {
     const SHOWN: usize = 3;
     let named: Vec<String> = list
         .iter()
@@ -978,7 +983,7 @@ fn unreadable_note(list: &[(PathBuf, String)]) -> String {
             format!("{name} ({why})")
         })
         .collect();
-    let mut text = format!("{}: {}", trn(list.len(), "{} item could not be copied", "{} items could not be copied"), named.join(", "));
+    let mut text = format!("{head}: {}", named.join(", "));
     if list.len() > SHOWN {
         text.push_str(&format!(", {}", trf("and {} more", &[&(list.len() - SHOWN)])));
     }

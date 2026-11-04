@@ -117,46 +117,91 @@ impl CompressionApp {
         let title = trf("Changing permissions in {}", &[&root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()]);
         self.engine.spawn(JobKind::Permissions, title, String::new(), move |w| {
             let mut edits = Vec::new();
-            let result = chmod_contents(&w.shared, &root, mode, &mut edits);
-            // Undoing goes through the list from the front: a folder must be given its old bits back before what is in it
+            let mut skipped = Vec::new();
+            let result = chmod_contents(&w.shared, &root, mode, &mut edits, &mut skipped);
+            // Undoing goes through the list from the front, so it is the changes in reverse: the last one is undone first
             edits.reverse();
-            chmod_outcome(result, edits)
+            chmod_outcome(result, edits, &skipped)
         });
     }
 }
 
 /// How the job ended. What was changed before a failure or a cancel stays changed, so it keeps its way back.
-fn chmod_outcome(result: std::io::Result<()>, edits: Vec<Edit>) -> Outcome {
+/// `skipped` are the items that were left alone (gone meanwhile, not ours to change, or a folder that cannot be read), and why.
+fn chmod_outcome(result: std::io::Result<()>, edits: Vec<Edit>, skipped: &[(PathBuf, String)]) -> Outcome {
     let count = edits.len();
     let effect = if edits.is_empty() { Effect::None } else { Effect::Record(UndoEntry::new(trn(count, "Permissions of {} item", "Permissions of {} items"), edits)) };
     match result {
-        Ok(()) => Outcome::done(trn(count, "Changed permissions of {} item", "Changed permissions of {} items")).with(effect),
+        Ok(()) => {
+            let mut text = trn(count, "Changed permissions of {} item", "Changed permissions of {} items");
+            if !skipped.is_empty() {
+                text.push_str(" · ");
+                text.push_str(&engine::left_out_note(skipped, trn(skipped.len(), "{} item could not be changed", "{} items could not be changed")));
+            }
+            Outcome::done(text).with(effect)
+        }
         Err(err) if engine::is_cancel(&err) => Outcome::stopped().with(effect),
         Err(err) => Outcome::failed(crate::fs::describe::io_error(&err)).with(effect),
     }
 }
 
-/// `apply_mode_to_contents` for one folder: what is inside gets the permissions, folders last. A
-/// folder given bits without the execute bit can no longer be entered, so it is changed only after
-/// what is in it. Each change is added to `edits` as it is made, the first one first.
-fn chmod_contents(shared: &engine::Shared, dir: &Path, mode: u32, edits: &mut Vec<Edit>) -> std::io::Result<()> {
+/// `apply_mode_to_contents` for one folder: what is inside gets the permissions. A folder that keeps the
+/// owner's read, write and execute bits is changed before what is in it, so that one nobody could enter
+/// (mode 000) can be reached; any other is changed after, since it could no longer be entered. Each change is
+/// added to `edits` as it is made, the first one first. An item that is gone by now, or a folder that still
+/// cannot be read, is left alone and goes to `skipped`; the rest carries on.
+fn chmod_contents(shared: &engine::Shared, dir: &Path, mode: u32, edits: &mut Vec<Edit>, skipped: &mut Vec<(PathBuf, String)>) -> std::io::Result<()> {
+    use std::io::ErrorKind::{NotFound, PermissionDenied};
     for entry in std::fs::read_dir(dir)? {
         shared.checkpoint()?;
-        let path = entry?.path();
-        let meta = path.symlink_metadata()?;
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(err) if err.kind() == NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        let meta = match path.symlink_metadata() {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == NotFound => continue,
+            Err(err) => return Err(err),
+        };
         if meta.file_type().is_symlink() {
             continue;
         }
-        if meta.is_dir() {
-            chmod_contents(shared, &path, mode, edits)?;
-        }
         let old = meta.permissions().mode() & 0o7777;
         let new = if meta.is_dir() { mode } else { (mode & 0o666) | (old & 0o111) };
-        if new != old {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(new))?;
-            edits.push(Edit::Chmod { path, mode: old });
+        let first = meta.is_dir() && new & 0o700 == 0o700;
+        let change = |edits: &mut Vec<Edit>| -> std::io::Result<()> {
+            if new != old {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(new))?;
+                edits.push(Edit::Chmod { path: path.clone(), mode: old });
+            }
+            Ok(())
+        };
+        if first {
+            match change(edits) {
+                Err(err) if err.kind() == NotFound => continue,
+                // Not ours to change: left alone, and so is what is in it
+                Err(err) if err.kind() == PermissionDenied => {
+                    skipped.push((path.clone(), crate::fs::describe::io_error(&err)));
+                    continue;
+                }
+                other => other?,
+            }
+        }
+        if meta.is_dir() {
+            match chmod_contents(shared, &path, mode, edits, skipped) {
+                Err(err) if matches!(err.kind(), NotFound | PermissionDenied) => skipped.push((path.clone(), crate::fs::describe::io_error(&err))),
+                other => other?,
+            }
+        }
+        if !first {
+            match change(edits) {
+                Err(err) if err.kind() == NotFound => {}
+                // A file of somebody else's, say: left alone, the rest carries on
+                Err(err) if err.kind() == PermissionDenied => skipped.push((path.clone(), crate::fs::describe::io_error(&err))),
+                other => other?,
+            }
         }
     }
     Ok(())
 }
-
