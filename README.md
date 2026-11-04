@@ -48,7 +48,7 @@ sudo tar -xzf compression-*-x86_64-linux.tar.gz -C /    # any other distribution
 
 The packages install the program, the desktop entry, the icon and the portal files, so Compression shows up in your launcher.
 
-**From source.** You need Rust 1.85 or newer. Compression loads its graphics libraries at run time; the [installation guide](docs/installation.md) lists the packages to install for your distribution.
+**From source.** You need Rust 1.88 or newer. Compression loads its graphics libraries at run time; the [installation guide](docs/installation.md) lists the packages to install for your distribution.
 
 ```sh
 git clone https://github.com/compression-sh/Compression

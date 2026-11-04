@@ -18,7 +18,7 @@ Every package puts the program, the desktop entry, the icon and the files for th
 
 ## Building from source
 
-You need Rust 1.85 or newer (the project uses the 2024 edition).
+You need Rust 1.88 or newer (the project uses the 2024 edition).
 
 ```sh
 git clone https://github.com/compression-sh/Compression
