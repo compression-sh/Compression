@@ -33,6 +33,8 @@ Right-click an archive and choose:
 
 "Extract here" can be undone like any other change: undo moves the new folder to the trash.
 
+Before anything is written, Compression lists what the archives hold, adds it up per target folder and compares it with the free space there. If it may not fit, the job stops and asks whether to continue anyway ("Cancel" is the default). An archive that cannot be listed in full (a damaged one, or one whose list is cut short because it is very large or slow to read) is not counted, so it brings no warning, and on servers the check is skipped.
+
 ## Looking inside
 
 Select an archive and press `Space` for Quick Look (see [Plugins](plugins.md)). It shows the contents as a folder tree with sizes, the unpacked size, the compression ratio and a lock on encrypted entries, and extracts nothing. A `.zip` is read from its index; tar archives are read as a stream, and listing stops after 2,000 entries or 10 seconds.
