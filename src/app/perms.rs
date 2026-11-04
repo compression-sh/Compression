@@ -205,3 +205,92 @@ fn chmod_contents(shared: &engine::Shared, dir: &Path, mode: u32, edits: &mut Ve
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mode_of(path: &Path) -> u32 {
+        path.symlink_metadata().unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Gives a folder its mode back when the test ends, so a failed one leaves nothing that cannot be removed.
+    struct Unlock(PathBuf);
+    impl Drop for Unlock {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(self.0.parent().unwrap().parent().unwrap());
+        }
+    }
+
+    fn tree(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("compression_perm_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("tree");
+        std::fs::create_dir_all(root.join("locked")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(root.join("other/f.txt"), "x").unwrap();
+        std::fs::set_permissions(root.join("other/f.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_folder_nobody_can_enter_is_fixed_with_the_rest_and_undone_with_it() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = tree("locked");
+        std::fs::write(root.join("locked/in.txt"), "x").unwrap();
+        std::fs::set_permissions(root.join("locked/in.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _unlock = Unlock(root.join("locked"));
+        let (mut edits, mut skipped) = (Vec::new(), Vec::new());
+        let result = chmod_contents(&engine::Shared::default(), &root, 0o755, &mut edits, &mut skipped);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(mode_of(&root.join("locked")), 0o755);
+        assert_eq!(mode_of(&root.join("locked/in.txt")), 0o644);
+        assert_eq!(mode_of(&root.join("other/f.txt")), 0o644);
+        edits.reverse();
+        let (inverse, error) = crate::fs::history::apply(UndoEntry::new("x", edits));
+        assert_eq!(error, None);
+        assert!(inverse.is_some());
+        assert_eq!(mode_of(&root.join("other/f.txt")), 0o600);
+        assert_eq!(mode_of(&root.join("locked")), 0o000);
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(mode_of(&root.join("locked/in.txt")), 0o600);
+    }
+
+    #[test]
+    fn a_folder_that_stays_unreadable_is_named_and_the_rest_is_still_done() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = tree("skip");
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _unlock = Unlock(root.join("locked"));
+        let (mut edits, mut skipped) = (Vec::new(), Vec::new());
+        let result = chmod_contents(&engine::Shared::default(), &root, 0o544, &mut edits, &mut skipped);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].0.ends_with("locked"));
+        assert_eq!(mode_of(&root.join("other/f.txt")), 0o444);
+        assert_eq!(mode_of(&root.join("other")), 0o544);
+        std::fs::set_permissions(root.join("other"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let outcome = chmod_outcome(result, edits, &skipped);
+        assert!(outcome.ok && matches!(outcome.effect, Effect::Record(_)));
+        assert!(outcome.message.contains("1 item could not be changed") && outcome.message.contains("locked"), "{}", outcome.message);
+    }
+
+    #[test]
+    fn a_file_that_is_a_dangling_link_is_left_alone_and_the_rest_is_done() {
+        let root = tree("link");
+        std::os::unix::fs::symlink("nowhere", root.join("other/dangling")).unwrap();
+        let _unlock = Unlock(root.join("locked"));
+        let (mut edits, mut skipped) = (Vec::new(), Vec::new());
+        let result = chmod_contents(&engine::Shared::default(), &root, 0o755, &mut edits, &mut skipped);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(mode_of(&root.join("other/f.txt")), 0o644);
+        assert!(root.join("other/dangling").symlink_metadata().unwrap().file_type().is_symlink(), "the link itself is kept");
+    }
+}
