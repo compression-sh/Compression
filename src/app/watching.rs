@@ -163,7 +163,7 @@ impl CompressionApp {
         self.apply_disk_changes(changed, overflow, gone);
     }
 
-    fn apply_disk_changes(&mut self, changed: BTreeMap<PathBuf, bool>, overflow: bool, gone: Vec<PathBuf>) {
+    pub(super) fn apply_disk_changes(&mut self, changed: BTreeMap<PathBuf, bool>, overflow: bool, gone: Vec<PathBuf>) {
         self.patch_parked_tabs(&changed, overflow, &gone);
         let inside: Vec<&PathBuf> = changed.keys().filter(|p| watch::is_inside(p, &self.watching.active)).collect();
         self.forget_sizes(inside);
@@ -171,13 +171,12 @@ impl CompressionApp {
             self.patch_mixed(&changed);
             return;
         }
-        if gone.contains(&self.current_path) && !self.current_path.is_dir() {
-            // The open folder was deleted, moved or unmounted: go to the nearest one that is left
-            let mut up = self.current_path.clone();
-            while !up.is_dir() && let Some(parent) = up.parent() {
-                up = parent.to_path_buf();
-            }
-            self.navigate_to(up);
+        if gone.contains(&self.current_path) {
+            // The open folder was deleted, moved or unmounted, or so the monitor says: a thread finds out whether it is
+            // there (asking from here could hold the window up, it may be on a mount that hangs) and moves to the
+            // nearest folder that is left if not. Meanwhile the listing is read again.
+            self.reload_items_later();
+            self.check_folder(self.current_path.clone(), network_ui::How::Nearest);
             return;
         }
         let ours = changed.keys().filter(|p| watch::is_inside(p, &self.watching.active)).count();
@@ -237,6 +236,10 @@ impl CompressionApp {
         let mut fresh = Vec::new();
         let mut gone = Vec::new();
         for path in mine {
+            // Not asked: a server may hang, and its entries are read again with the listing
+            if network::is_remote(path) {
+                continue;
+            }
             match path.symlink_metadata() {
                 Ok(_) => fresh.extend(FileItem::from_path(path)),
                 Err(_) => gone.push(path.clone()),
@@ -273,15 +276,14 @@ impl CompressionApp {
             else {
                 continue;
             };
-            if gone.contains(&dir) && !dir.is_dir() {
-                // Its folder is gone: it will show the nearest one that is left
-                let mut up = dir;
-                while !up.is_dir() && let Some(parent) = up.parent() {
-                    up = parent.to_path_buf();
-                }
+            if gone.contains(&dir) {
+                // Its folder may be gone: a thread finds out and moves the tab to the nearest one that is left. Until
+                // then the tab is marked to be read again when it is shown.
                 if let Some(state) = self.tabs[idx].saved.as_mut() {
-                    state.set_folder(up);
+                    state.stale = true;
                 }
+                let tab = self.tabs[idx].id;
+                self.check_folder_in(tab, dir, network_ui::How::Nearest);
                 continue;
             }
             let mine: Vec<&PathBuf> = changed.keys().filter(|p| p.parent() == Some(dir.as_path())).collect();

@@ -3,12 +3,6 @@
 use super::*;
 use crate::fs::search::Search;
 
-/// Whether `path` is a folder, without asking a server: a path on one is taken to be. A server that hangs
-/// would hold up the window, and this is asked on every frame the folder menu is open.
-fn is_folder(path: &Path) -> bool {
-    crate::fs::network::is_remote(path) || path.is_dir()
-}
-
 /// Everything that belongs to one tab: where it is, what is selected, its history and its search.
 pub(super) struct TabState {
     current_path: PathBuf,
@@ -181,13 +175,15 @@ impl CompressionApp {
         }
     }
 
-    /// The folder of the other tab when exactly two tabs are open.
+    /// The folder of the other tab when exactly two tabs are open. Whether it is still there is not asked (this is
+    /// called while a menu is drawn): a tab's folder is one the window went to, and a parked tab whose folder
+    /// disappears is moved to the nearest one that is left by a thread, see `patch_parked_tabs`.
     pub(super) fn other_tab_folders(&self) -> Vec<PathBuf> {
         if self.tabs.len() != 2 {
             return Vec::new();
         }
         let other = &self.tabs[1 - self.active_tab];
-        other.saved.as_ref().map(|s| s.current_path.clone()).filter(|p| !is_virtual(p) && is_folder(p)).into_iter().collect()
+        other.saved.as_ref().map(|s| s.current_path.clone()).filter(|p| !is_virtual(p)).into_iter().collect()
     }
 
     /// The folder of every tab in order, and the index of the one on screen. Places that are not
@@ -280,10 +276,7 @@ impl CompressionApp {
 
     /// Bring back the tab that was closed last.
     pub(super) fn reopen_tab(&mut self) {
-        while let Some((index, state)) = self.closed_tabs.pop() {
-            if !is_folder(&state.current_path) {
-                continue;
-            }
+        if let Some((index, state)) = self.closed_tabs.pop() {
             let parked = self.take_tab_state();
             self.tabs[self.active_tab].saved = Some(parked);
             let id = self.next_tab_id;
@@ -292,8 +285,11 @@ impl CompressionApp {
             self.tabs.insert(at, TabSlot::live(id));
             self.active_tab = at;
             recent::record(&state.current_path);
+            let folder = state.current_path.clone();
             self.put_tab_state(state);
             self.tab_enter = Some(id);
+            // A folder that is gone by now is not asked about here: a thread finds the nearest one that is left
+            self.check_folder(folder, super::network_ui::How::Nearest);
             return;
         }
         self.set_toast(tr("No closed tab to reopen"));
@@ -311,7 +307,10 @@ impl CompressionApp {
     /// `new_tab`, with the choice of listing the folder in Recent; a restored session is not a visit.
     fn open_tab(&mut self, path: PathBuf, record: bool) {
         let path = crate::fs::places::normalize(path);
-        let path = if is_virtual(&path) { path } else { path.canonicalize().unwrap_or(path) };
+        // The path is not resolved here: a link in it may lead onto a server, and the window waits for no server.
+        // The tab opens at the path as given and is moved to what it resolves to when a thread has found out.
+        let resolve = !is_virtual(&path);
+        let asked = path.clone();
         let state = self.take_tab_state();
         self.tabs[self.active_tab].saved = Some(state);
         let id = self.next_tab_id;
@@ -324,6 +323,9 @@ impl CompressionApp {
         }
         self.put_tab_state(TabState::fresh(path, self.sort_by, self.sort_order));
         self.tab_enter = Some(id);
+        if resolve {
+            self.check_folder(asked, super::network_ui::How::Replace);
+        }
     }
 
     /// Close a tab; closing the last one closes the window.

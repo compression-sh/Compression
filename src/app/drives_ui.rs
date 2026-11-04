@@ -46,7 +46,7 @@ impl CompressionApp {
                         Ok(path) => {
                             if open {
                                 self.close_search();
-                                self.navigate_to(path.canonicalize().unwrap_or(path));
+                                self.navigate_to(path);
                             }
                             self.request_drive_listing(ctx, true);
                         }
@@ -58,7 +58,7 @@ impl CompressionApp {
                     match result {
                         Ok(()) => {
                             if self.current_path.starts_with(&mount) {
-                                self.navigate_to(dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
+                                self.navigate_known(dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
                             }
                             self.set_toast(if eject { trf("“{}” can be removed safely", &[&name]) } else { trf("Unmounted “{}”", &[&name]) });
                             self.request_drive_listing(ctx, true);

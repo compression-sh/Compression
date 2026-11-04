@@ -836,5 +836,6 @@
   "It is in use": "Đang được sử dụng",
   "{} items could not be copied": "Không thể sao chép {} mục",
   "{} items could not be changed": "Không thể thay đổi {} mục",
-  "and {} more": "và {} mục nữa"
+  "and {} more": "và {} mục nữa",
+  "These items are not in the list any more. Refresh the folder and try again.": "Các mục này không còn trong danh sách. Hãy làm mới thư mục và thử lại."
 }

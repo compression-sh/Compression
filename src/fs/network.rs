@@ -423,7 +423,15 @@ pub fn is_remote(path: &Path) -> bool {
     if path.starts_with(gvfs_root()) {
         return path != gvfs_root();
     }
-    REMOTE_ROOTS.read().is_ok_and(|roots| roots.iter().any(|r| path.starts_with(r)))
+    remote_root(path).is_some()
+}
+
+/// The mount folder of a server that `path` lies on, found by its name alone (no file system access).
+pub fn remote_root(path: &Path) -> Option<PathBuf> {
+    if let Some(root) = declared_root(path) {
+        return Some(root);
+    }
+    REMOTE_ROOTS.read().ok()?.iter().filter(|r| path.starts_with(r)).max_by_key(|r| r.as_os_str().len()).cloned()
 }
 
 /// Every connected server and GVfs device. Reads `/proc/self/mounts` and a folder listing, so it
@@ -1576,4 +1584,23 @@ impl Servers {
     pub fn find(&self, address: &Address) -> Option<usize> {
         self.saved.iter().position(|s| s.address.same_mount(address) && address.path.starts_with(&s.address.path))
     }
+}
+
+/// Folders the tests declare to be on a server, kept apart from the real mounts, which `list_mounts` rewrites.
+#[cfg(not(test))]
+fn declared_root(_: &Path) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(test)]
+static TEST_REMOTE: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
+
+#[cfg(test)]
+fn declared_root(path: &Path) -> Option<PathBuf> {
+    TEST_REMOTE.read().ok()?.iter().find(|r| path.starts_with(r)).cloned()
+}
+
+#[cfg(test)]
+pub(crate) fn declare_remote_for_tests(path: &Path) {
+    TEST_REMOTE.write().unwrap().push(path.to_path_buf());
 }

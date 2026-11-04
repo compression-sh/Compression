@@ -836,5 +836,6 @@
   "It is in use": "Wird gerade verwendet",
   "{} items could not be copied": "{} Element konnte nicht kopiert werden|{} Elemente konnten nicht kopiert werden",
   "{} items could not be changed": "{} Element konnte nicht geändert werden|{} Elemente konnten nicht geändert werden",
-  "and {} more": "und {} weitere"
+  "and {} more": "und {} weitere",
+  "These items are not in the list any more. Refresh the folder and try again.": "Diese Elemente stehen nicht mehr in der Liste. Ordner aktualisieren und erneut versuchen."
 }

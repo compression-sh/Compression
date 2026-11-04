@@ -225,7 +225,7 @@ struct MenuGhost {
 
 pub(crate) enum Dialog {
     Create { is_dir: bool, name: String, error: Option<String>, first_frame: bool, templates: Vec<Template>, template: usize, edited: bool },
-    Rename { path: PathBuf, name: String, error: Option<String>, first_frame: bool },
+    Rename { path: PathBuf, is_dir: Option<bool>, name: String, error: Option<String>, first_frame: bool },
     Confirm { title: String, body: String, confirm: String, action: ConfirmAction },
     Alert { title: String, body: String },
     Properties { props: Box<Properties>, scan: Option<FolderScan>, tab: usize },
@@ -723,7 +723,23 @@ impl CompressionApp {
         app
     }
 
+    /// Go to `target`, which may be anything a person typed or a link: what it is gets worked out on a thread of its
+    /// own (links followed, whether it is a folder), so that a path that leads onto a server that has stopped
+    /// answering cannot hold the window up. The window moves when the thread has answered.
     pub fn navigate_to(&mut self, target: PathBuf) {
+        self.navigate(target, false);
+    }
+
+    /// Go to a folder the window already knows of and that has no links in its path: the parent or an ancestor of
+    /// where it is, a folder its listing shows that is not a link, the home folder. Nothing is asked of the file
+    /// system, and that is not a promise that it is still there: it may have gone since the listing or the window
+    /// came to rest there. Then the listing of the new place reports it, and the monitor's "gone" (see
+    /// `apply_disk_changes`) moves to the nearest folder that is left.
+    pub(crate) fn navigate_known(&mut self, folder: PathBuf) {
+        self.navigate(folder, true);
+    }
+
+    fn navigate(&mut self, target: PathBuf, known: bool) {
         let target = crate::fs::places::normalize(target);
         if target == self.current_path {
             return;
@@ -732,9 +748,16 @@ impl CompressionApp {
             self.open_address(address, password, OpenIn::Here);
             return;
         }
+        if known || is_virtual(&target) {
+            self.go_to(target, true);
+        } else {
+            self.check_folder(target, network_ui::How::Go);
+        }
+    }
 
-        let canonical = if is_virtual(&target) { target } else { target.canonicalize().unwrap_or(target) };
-        if is_virtual(&canonical) || canonical.is_dir() {
+    /// Show `canonical` once it is known what it is: a folder is entered, anything else is opened.
+    fn go_to(&mut self, canonical: PathBuf, is_dir: bool) {
+        if is_dir {
             self.back_history.push(self.current_path.clone());
             self.forward_history.clear();
             if !is_virtual(&canonical) {
@@ -762,6 +785,7 @@ impl CompressionApp {
 
     /// Switch to `path` after the history was updated: reset everything that belonged to the old place.
     fn arrive(&mut self, path: PathBuf) {
+        self.note_navigation();
         self.sizes.cancel_all();
         self.restore_selection = None;
         self.current_path = path;
@@ -839,10 +863,10 @@ impl CompressionApp {
             self.go_back();
         } else if trash::is_trash_folder(&self.current_path) {
             if let Some(home) = dirs::home_dir() {
-                self.navigate_to(home);
+                self.navigate_known(home);
             }
         } else if let Some(parent) = self.current_path.parent() {
-            self.navigate_to(parent.to_path_buf());
+            self.navigate_known(parent.to_path_buf());
         }
     }
 
@@ -2139,7 +2163,7 @@ impl CompressionApp {
 
         if self.is_act_pressed(ctx, crate::keymap::Action::GoHome) {
             if let Some(home) = dirs::home_dir() {
-                self.navigate_to(home);
+                self.navigate_known(home);
             }
             handled = true;
         }
@@ -3098,7 +3122,7 @@ impl CompressionApp {
 
         self.drop_zones.extend(crumb_zones);
         if let Some(path) = go {
-            self.navigate_to(path);
+            self.navigate_known(path);
         } else if edit || field.clicked() {
             self.is_editing_path = true;
             self.path_input = Self::path_text(&self.current_path);
@@ -3464,7 +3488,8 @@ impl CompressionApp {
                     self.set_toast(trf("Could not open a new window: {}", &[&err]));
                 }
             } else {
-                self.navigate_to(item.path);
+                // A link is followed on a thread; a folder that is not one is known to be what the listing says
+                if item.is_symlink { self.navigate_to(item.path) } else { self.navigate_known(item.path) }
             }
         } else {
             self.open_file(&item.path);
@@ -4331,9 +4356,16 @@ impl CompressionApp {
         Ok(())
     }
 
+    /// Whether `path` is a folder, as the listing says: no file system (maybe a server) is asked. `None` when it is
+    /// not in the listing.
+    fn item_is_dir(&self, path: &Path) -> Option<bool> {
+        self.items.iter().find(|i| i.path == path).map(|i| i.is_dir)
+    }
+
     fn open_rename(&mut self, path: PathBuf) {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        self.dialog = Some(Dialog::Rename { path, name, error: None, first_frame: true });
+        let is_dir = self.item_is_dir(&path);
+        self.dialog = Some(Dialog::Rename { path, is_dir, name, error: None, first_frame: true });
     }
 
     /// Rename `path` inside its folder and keep the renamed item selected.
@@ -5467,11 +5499,11 @@ impl CompressionApp {
     }
 
     fn rename_dialog_contents(&mut self, ui: &mut egui::Ui, dialog: &mut Dialog) -> bool {
-        let Dialog::Rename { path, name, error, first_frame } = dialog else { return false };
+        let Dialog::Rename { path, is_dir, name, error, first_frame } = dialog else { return false };
         let theme = self.theme;
         let mut close = material::dialog_header(ui, tr("Rename"), None, &theme, "rename_close");
 
-        let (changed, mut submit) = name_field(ui, &theme, name, first_frame, !path.is_dir());
+        let (changed, mut submit) = name_field(ui, &theme, name, first_frame, *is_dir == Some(false));
         if changed {
             *error = None;
         }
@@ -5541,13 +5573,19 @@ impl CompressionApp {
     }
 
     fn open_batch_rename(&mut self, paths: Vec<PathBuf>) {
+        // Whether a name belongs to a folder decides how it is split into name and ending, so it must be known; it is
+        // not guessed (and not asked of the file system from here): what the list does not show is not renamed.
+        if paths.iter().any(|p| self.item_is_dir(p).is_none()) {
+            self.set_toast(tr("These items are not in the list any more. Refresh the folder and try again."));
+            return;
+        }
         let entries = paths
             .into_iter()
             .map(|path| {
-                let modified = path.symlink_metadata().ok().and_then(|m| m.modified().ok());
+                let modified = self.items.iter().find(|i| i.path == path).and_then(|i| i.modified);
                 let stamp = crate::fs::props::format_datetime(modified);
                 let date = stamp.get(..10).filter(|d| d.as_bytes().get(4) == Some(&b'-')).unwrap_or("").to_owned();
-                RenameEntry { is_dir: path.is_dir(), path, date }
+                RenameEntry { is_dir: self.item_is_dir(&path).unwrap_or(false), path, date }
             })
             .collect();
         self.dialog = Some(Dialog::BatchRename { entries, rules: RenameRules::new(), first_frame: true });
