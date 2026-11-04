@@ -1808,38 +1808,45 @@ pub fn marked_slider_row(
     suffix: &str,
     reset: Option<f32>,
 ) -> bool {
-    const MARK_ROOM: f32 = 16.0;
     const MARK_NAME_GAP: f32 = 4.0;
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), SETTING_HEIGHT + MARK_ROOM), egui::Sense::hover());
+    // Two lines: the name, with the reset button and the value at its right, and below it the slider
+    // across the whole width, its marks under it, and some air before the next setting.
+    const SLIDER_LINE: f32 = 40.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), SETTING_HEIGHT + SLIDER_LINE), egui::Sense::hover());
     let id = ui.make_persistent_id(id_source);
     let (lo, hi) = (*range.start(), *range.end());
-    let y = rect.top() + SETTING_HEIGHT / 2.0;
+    let label_y = rect.top() + SETTING_HEIGHT / 2.0;
+    let y = rect.top() + SETTING_HEIGHT + 2.0;
 
-    paint_icon(ui.painter(), Pos2::new(rect.left() + INSET_ICON + 2.0, y), icon, ICON_MD, theme.subtext0);
+    paint_icon(ui.painter(), Pos2::new(rect.left() + INSET_ICON + 2.0, label_y), icon, ICON_MD, theme.subtext0);
     let text_x = rect.left() + INSET_LABEL + 2.0;
-    paint_label(ui, text_x, y, label, FONT_BODY, theme.text, 120.0);
 
     let value_w = 52.0;
     let handle_r = 10.0;
-    // The button's room is kept even while it is dimmed, so the track never moves under the pointer
+    // The button's room is kept even while it is dimmed, so nothing moves under the pointer
     let reset_w = if reset.is_some() { CONTROL_HEIGHT + 4.0 } else { 0.0 };
-    let track_right = rect.right() - 16.0 - value_w - 8.0 - reset_w - handle_r;
-    let track_left = (text_x + 120.0 + handle_r).min(track_right - 80.0).max(text_x + 60.0);
+    // The whole name is shown, on a second line when the room is short (a long translation, a narrow window)
+    let label_w = (rect.right() - 16.0 - value_w - 8.0 - reset_w - text_x).max(40.0);
+    let galley = ui.painter().layout(label.to_owned(), egui::FontId::proportional(FONT_BODY), theme.text, label_w);
+    ui.painter().galley(Pos2::new(text_x, label_y - galley.size().y / 2.0), galley, theme.text);
+
+    let track_right = rect.right() - 16.0 - handle_r;
+    let track_left = text_x + handle_r;
     let mut changed = false;
     if let Some(default) = reset {
         let at_default = (*value - default).abs() < 0.001;
-        let spot = Rect::from_center_size(Pos2::new(rect.right() - 16.0 - value_w - 4.0 - CONTROL_HEIGHT / 2.0, y), Vec2::splat(CONTROL_HEIGHT));
-        let clicked = ui
-            .scope_builder(egui::UiBuilder::new().max_rect(spot), |ui| icon_button(ui, id.with("reset"), icons::RESTORE, theme, !at_default, tr("Reset to default")))
-            .inner
-            .clicked();
+        let spot = Rect::from_center_size(Pos2::new(rect.right() - 16.0 - value_w - 4.0 - CONTROL_HEIGHT / 2.0, label_y), Vec2::splat(CONTROL_HEIGHT));
+        // A child of its own: a scope would move the cursor of this ui back up to the button, and the next setting
+        // would start in the middle of the row
+        let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(spot));
+        let clicked = icon_button(&mut button_ui, id.with("reset"), icons::RESTORE, theme, !at_default, tr("Reset to default")).clicked();
         if clicked && !at_default {
             *value = default;
             changed = true;
         }
     }
     let at = |v: f32| lerp(track_left, track_right, ((v - lo) / (hi - lo).max(f32::EPSILON)).clamp(0.0, 1.0));
-    let hit = Rect::from_min_max(Pos2::new(track_left - handle_r, y - 16.0), Pos2::new(track_right + handle_r, rect.bottom()));
+    let hit = Rect::from_min_max(Pos2::new(track_left - handle_r, y - 14.0), Pos2::new(track_right + handle_r, y + 28.0));
     let response = ui.interact(hit, id, egui::Sense::click_and_drag());
 
     if (response.dragged() || response.clicked() || response.drag_started())
@@ -1886,7 +1893,7 @@ pub fn marked_slider_row(
     let shown = format!("{:.2}", *value);
     let shown = shown.trim_end_matches('0').trim_end_matches('.');
     let galley = painter.layout_no_wrap(format!("{shown}{suffix}"), egui::FontId::proportional(FONT_BODY), theme.text);
-    painter.galley(Pos2::new(rect.right() - 16.0 - galley.size().x, y - galley.size().y / 2.0), galley, theme.text);
+    painter.galley(Pos2::new(rect.right() - 16.0 - galley.size().x, label_y - galley.size().y / 2.0), galley, theme.text);
     changed
 }
 
@@ -2576,3 +2583,95 @@ pub fn progress_ring(painter: &egui::Painter, center: Pos2, radius: f32, fractio
     painter.add(egui::Shape::line(points, egui::Stroke::new(stroke_w, color)));
 }
 
+#[cfg(test)]
+mod slider_layout_tests {
+    //! The scroll speed row, drawn headless in every language at the widths a settings window can have.
+    use super::*;
+    use std::collections::HashMap;
+
+    const CATALOGS: [(&str, &str); 5] = [
+        ("de", include_str!("../i18n/de.json")),
+        ("es", include_str!("../i18n/es.json")),
+        ("fr", include_str!("../i18n/fr.json")),
+        ("ru", include_str!("../i18n/ru.json")),
+        ("vi", include_str!("../i18n/vi.json")),
+    ];
+
+    fn texts(out: &egui::FullOutput) -> Vec<(String, Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut found));
+        found
+    }
+
+    /// The row in a window `width` wide: what was drawn, and how much room the row took in the layout.
+    fn draw(width: f32, label: &str, marks: &[(f32, &str)]) -> (Vec<(String, Rect)>, f32) {
+        let theme = SerpantinumTheme::default();
+        let ctx = egui::Context::default();
+        let (mut shown, mut taken, mut value) = (Vec::new(), 0.0, 1.0f32);
+        for n in 0..8 {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 600.0))), time: Some(f64::from(n) * 0.05), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let top = ui.cursor().top();
+                marked_slider_row(ui, "row", icons::MOUSE, label, &theme, &mut value, 0.25..=2.25, marks, "×", Some(1.0));
+                taken = ui.cursor().top() - top;
+            });
+            out.textures_delta.clear();
+            shown = texts(&out);
+        }
+        (shown, taken)
+    }
+
+    fn check(language: &str, width: f32, label: &str, marks: &[(f32, &str)]) {
+        let (shown, taken) = draw(width, label, marks);
+        let at = format!("{language}, width {width}");
+        let find = |t: &str| shown.iter().find(|(s, _)| s == t).unwrap_or_else(|| panic!("{at}: {t:?} was not drawn: {:?}", shown.iter().map(|s| &s.0).collect::<Vec<_>>())).1;
+        // The whole name, and it ends before the reset button, which sits left of the value
+        let name = find(label);
+        let value = find("1×");
+        let reset_left = value.right() - 52.0 - 4.0 - CONTROL_HEIGHT;
+        assert!(name.right() <= reset_left + 0.5, "{at}: the name runs into the button ({} > {reset_left})", name.right());
+        assert!(name.height() <= SETTING_HEIGHT - 4.0, "{at}: the name is taller than its line");
+        assert!(value.right() <= width && value.center().y > 0.0, "{at}");
+        // Every mark is named, none touches another, and they all lie under the name
+        let mut names: Vec<Rect> = marks.iter().map(|(_, n)| find(n)).collect();
+        names.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        for pair in names.windows(2) {
+            assert!(pair[1].left() - pair[0].right() >= 3.9, "{at}: two mark names touch");
+        }
+        assert!(names.iter().all(|r| r.left() >= 0.0 && r.right() <= width && r.top() > name.bottom() + 6.0), "{at}: a mark name is outside or too close to the name");
+        // What follows the row starts below the marks, not in the middle of the row
+        let marks_bottom = names.iter().map(|r| r.bottom()).fold(0.0f32, f32::max);
+        assert!(taken >= marks_bottom + 8.0, "{at}: the row took {taken} px, the marks end at {marks_bottom}");
+    }
+
+    #[test]
+    fn the_scroll_speed_row_fits_in_every_language_at_every_width() {
+        let english = [("Wheel scroll speed", 0.0), ("Slow", 0.5), ("Default", 1.0), ("Fast", 1.5), ("Faster", 2.0)];
+        for width in [420.0, 520.0, 900.0] {
+            let marks: Vec<(f32, &str)> = english[1..].iter().map(|(n, v)| (*v, *n)).collect();
+            check("en", width, english[0].0, &marks);
+            for (code, source) in CATALOGS {
+                let table: HashMap<String, String> = serde_json::from_str(source).unwrap_or_else(|e| panic!("{code}.json: {e}"));
+                let say = |key: &str| table.get(key).unwrap_or_else(|| panic!("{code}: no translation of {key:?}")).as_str();
+                let marks: Vec<(f32, &str)> = english[1..].iter().map(|(n, v)| (*v, say(n))).collect();
+                check(code, width, say(english[0].0), &marks);
+            }
+        }
+    }
+
+    #[test]
+    fn a_name_too_long_for_its_line_wraps_and_the_row_still_fits() {
+        let marks = [(0.5, "Slow"), (1.0, "Default"), (1.5, "Fast"), (2.0, "Faster")];
+        let long = "A longer name for this setting in another language, wrapping";
+        for width in [420.0, 520.0, 900.0] {
+            check("long", width, long, &marks);
+        }
+    }
+}
