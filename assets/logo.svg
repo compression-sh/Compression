@@ -1,19 +1,38 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <title>Compression</title>
+
   <defs>
-    <g id="compression">
-      <path d="M104 248L130 212H176L150 248Z"/>
-      <path d="M200 212H300L384 184L360 248H174Z"/>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1626"/>
+      <stop offset="1" stop-color="#122A3F"/>
+    </linearGradient>
+
+    <!-- Two converging compression blocks -->
+    <g id="compressMark">
+      <path d="M148 208 L228 208 L196 252 L116 252 Z"/>
+      <path d="M284 208 L364 208 L396 252 L316 252 Z"/>
+      <path d="M228 208 L284 208 L256 252 Z" opacity=".55"/>
     </g>
   </defs>
-  <rect width="512" height="512" fill="#0B1626"/>
-  <g fill="#E6F2FB" stroke="#E6F2FB" stroke-width="8" stroke-linejoin="round" transform="translate(-8 0)">
-    <use href="#compression"/>
-    <use href="#compression" x="40" y="80"/>
+
+  <rect width="512" height="512" fill="url(#bg)"/>
+
+  <!-- Main mark -->
+  <g fill="#E6F2FB" stroke="#E6F2FB" stroke-width="8"
+     stroke-linejoin="round" transform="translate(-4 -22)">
+    <use href="#compressMark"/>
+    <use href="#compressMark" x="34" y="92"/>
   </g>
-  <g stroke="#E6F2FB" stroke-width="8" stroke-linecap="round" opacity=".4">
-    <path d="M48 230H70"/>
-    <path d="M60 302H112"/>
-    <path d="M84 318H112"/>
+
+  <!-- Subtle motion / data lines -->
+  <g stroke="#E6F2FB" stroke-width="8" stroke-linecap="round" opacity=".35">
+    <path d="M58 218H92"/>
+    <path d="M74 292H118"/>
+    <path d="M96 322H132"/>
+    <path d="M396 218H430"/>
+    <path d="M382 292H420"/>
   </g>
+
+  <!-- Small archive dot accent -->
+  <circle cx="256" cy="386" r="12" fill="#E6F2FB" opacity=".75"/>
 </svg>
