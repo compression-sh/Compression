@@ -21,6 +21,8 @@ pub enum JobKind {
     Extract,
     Compress,
     Delete,
+    /// New permissions for everything inside a folder.
+    Permissions,
     Other,
 }
 
@@ -244,7 +246,7 @@ pub struct Job {
 impl Job {
     /// Pausing and cancelling make sense where the work moves through files one at a time.
     pub fn controllable(&self) -> bool {
-        matches!(self.kind, JobKind::Copy | JobKind::Move | JobKind::Delete | JobKind::Extract | JobKind::Compress)
+        matches!(self.kind, JobKind::Copy | JobKind::Move | JobKind::Delete | JobKind::Extract | JobKind::Compress | JobKind::Permissions)
     }
 
     pub fn paused(&self) -> bool {

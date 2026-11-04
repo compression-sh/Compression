@@ -115,17 +115,24 @@ impl CompressionApp {
     /// files the same read and write bits while keeping their own execute bits.
     pub(super) fn apply_mode_to_contents(&mut self, root: PathBuf, mode: u32) {
         let title = trf("Changing permissions in {}", &[&root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()]);
-        self.engine.spawn(JobKind::Other, title, String::new(), move |w| {
+        self.engine.spawn(JobKind::Permissions, title, String::new(), move |w| {
             let mut edits = Vec::new();
             let result = chmod_contents(&w.shared, &root, mode, &mut edits);
             // Undoing goes through the list from the front: a folder must be given its old bits back before what is in it
             edits.reverse();
-            let effect = if edits.is_empty() { Effect::None } else { Effect::Record(UndoEntry::new(trn(edits.len(), "Permissions of {} item", "Permissions of {} items"), edits.clone())) };
-            match result {
-                Ok(()) => Outcome::done(trn(edits.len(), "Changed permissions of {} item", "Changed permissions of {} items")).with(effect),
-                Err(err) => Outcome::failed(crate::fs::describe::io_error(&err)).with(effect),
-            }
+            chmod_outcome(result, edits)
         });
+    }
+}
+
+/// How the job ended. What was changed before a failure or a cancel stays changed, so it keeps its way back.
+fn chmod_outcome(result: std::io::Result<()>, edits: Vec<Edit>) -> Outcome {
+    let count = edits.len();
+    let effect = if edits.is_empty() { Effect::None } else { Effect::Record(UndoEntry::new(trn(count, "Permissions of {} item", "Permissions of {} items"), edits)) };
+    match result {
+        Ok(()) => Outcome::done(trn(count, "Changed permissions of {} item", "Changed permissions of {} items")).with(effect),
+        Err(err) if engine::is_cancel(&err) => Outcome::stopped().with(effect),
+        Err(err) => Outcome::failed(crate::fs::describe::io_error(&err)).with(effect),
     }
 }
 
