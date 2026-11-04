@@ -51,6 +51,11 @@ impl TabState {
         self.focus = None;
     }
 
+    /// The tab is in `folder` or below it.
+    pub(super) fn is_inside(&self, folder: &Path) -> bool {
+        self.current_path.starts_with(folder)
+    }
+
     /// The folder this parked tab keeps an up-to-date listing of, if it does.
     pub(super) fn watched(&self) -> Option<&Path> {
         self.items.as_ref().map(|_| self.current_path.as_path())

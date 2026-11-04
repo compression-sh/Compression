@@ -406,9 +406,7 @@ impl CompressionApp {
             return;
         }
         // Nothing may hold the folder open: leave it first
-        if self.current_path.starts_with(&mount.local) {
-            self.navigate_to(dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
-        }
+        self.leave_mount(&mount.local);
         let (tx, ctx) = (self.net.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let result = network::disconnect(&mount);
@@ -430,15 +428,27 @@ impl CompressionApp {
         }
         // Come back to the folder the window is in, not to the top of the server
         let back = self.current_path.strip_prefix(&mount.local).ok().filter(|inside| !inside.as_os_str().is_empty()).map(Path::to_path_buf);
-        if self.current_path.starts_with(&mount.local) {
-            self.navigate_to(dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
-        }
+        self.leave_mount(&mount.local);
         let (tx, ctx) = (self.net.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let result = network::disconnect(&mount);
             let _ = tx.send(NetMsg::Reconnect { local: mount.local.clone(), name: mount.name.clone(), address, back, result });
             ctx.request_repaint();
         });
+    }
+
+    /// Take every tab out of the folders of the mount, which is about to be let go of: the one on screen
+    /// and the parked ones all go to the home folder.
+    pub(super) fn leave_mount(&mut self, local: &Path) {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        if self.current_path.starts_with(local) {
+            self.navigate_to(home.clone());
+        }
+        for slot in &mut self.tabs {
+            if let Some(state) = slot.saved.as_mut().filter(|state| state.is_inside(local)) {
+                state.set_folder(home.clone());
+            }
+        }
     }
 
     pub(super) fn forget_password(&mut self, address: Address) {
