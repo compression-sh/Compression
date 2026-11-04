@@ -31,6 +31,9 @@ Compression is a fork of [Ski](https://github.com/ilyamiro/Ski) by ilyamiro, dev
 - Git status, checksums, tags, a duplicate finder, folder comparison and Quick Look, each one switched on or off in Settings.
 - Custom actions: your own commands in the context menu, written as a small JSON file or a script, with a time and an output limit you can set per action.
 
+**Look**
+- Dozens of colour themes, light and dark, a theme editor for your own, a window you can make transparent, and an interface in English, German, Spanish, French, Russian and Vietnamese.
+
 **Servers and the desktop**
 - Open folders on SMB and NFS shares, SSH (sftp), FTP, WebDAV and AFP servers with `Ctrl+K`; passwords can go to your keyring. A dot in the sidebar shows whether each server still answers, and a slow or stuck one can be reconnected from its menu.
 - Serves as the system file dialog (xdg-desktop-portal `FileChooser`) and answers "Show in folder" (`FileManager1`).
