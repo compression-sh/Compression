@@ -29,7 +29,7 @@ Files that are neither JSON nor executable (notes, for example) are ignored. In 
 | `timeout` | Seconds the action may run before it is stopped. 1 to 3600, default 30. |
 | `max_output_mb` | MiB the action may print on each of its two streams before it is stopped. 1 to 64, default 1. |
 
-A script is run by its own path with the selected files as arguments. It has no filters and no limits to set: it runs under the defaults.
+A script is run by its own path with the selected files as arguments. It has no filters and no limits to set: it runs under the defaults. A script that needs longer than 30 seconds can be started from a JSON action instead, which has a `timeout`: `"command": "~/bin/backup.sh \"$@\""` with `"timeout": 900`.
 
 ## How an action runs
 
