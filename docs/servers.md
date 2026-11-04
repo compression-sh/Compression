@@ -40,9 +40,13 @@ Connecting gives up after 30 seconds without a sign of life, and the dialog can 
 
 Connected servers appear under the drives, each with a button to disconnect. **Keep in sidebar** leaves a server there after you disconnect, and a click connects again. Right-click a server to rename it, change its address, forget its saved password or remove it. Folders on a server can be pinned too, and opening such a pin reconnects.
 
-A small dot in front of each server tells how it is doing; hover over it for the words. Green: connected. Yellow: it answers slowly. Red: the mount is there but does not answer properly. A ring: a saved server that is not connected, which is normal. Compression asks every connected server about every 15 seconds, in the background, and calls it slow when one question stays unanswered for 3 seconds.
+A small dot in front of each server tells how it is doing; hover over it for the words. Green: connected. Yellow: it answers slowly. Red: the mount is there but does not answer properly. A ring: a saved server that is not connected, which is normal. Compression asks every connected server about every 15 seconds, in the background, and calls it slow when one question stays unanswered for 3 seconds. The question is one the system has to pass on to the server rather than answer from memory, so the dot does not stay green after the server has gone away.
 
-For a yellow or red server the right-click menu has **Reconnect**. It lets go of the mount the gentle way (never forced, with a time limit), then connects the server again with the saved login, or asks for it, and returns to the folder you were in. Tabs that were inside the server are taken to your home folder first, so nothing holds the mount. It is not offered for mounts that belong to the system, and it waits while a job is running, since the job may be using the mount. If the mount cannot be released, the reason is shown and the server stays as it was.
+For a yellow or red server the right-click menu has **Reconnect**. It lets go of the mount the gentle way (never forced, with a time limit), then connects the server again with the saved login, or asks for it, and returns to the folder you were in, or to the top of the server if that folder is no longer there. It is not offered for mounts that belong to the system, and it waits while a job is running, since the job may be using the mount. If the mount cannot be released, the reason is shown and the server stays as it was.
+
+Disconnecting and reconnecting both take every tab that is inside the server to your home folder first, so nothing holds the mount. After a reconnect only the tab you were in goes back to its folder; the other tabs stay in your home folder.
+
+Phones and cameras that your desktop has mounted over USB (MTP) are listed in the same part of the sidebar and open like folders. They have no dot and no Reconnect.
 
 ## How servers differ from local folders
 
