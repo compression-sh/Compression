@@ -839,5 +839,7 @@
   "and {} more": "y {} más",
   "This file system does not support moving or renaming without the risk of replacing something, so nothing was changed": "Este sistema de archivos no admite mover ni renombrar sin el riesgo de reemplazar algo, así que no se cambió nada",
   "These items are not in the list any more. Refresh the folder and try again.": "Estos elementos ya no están en la lista. Actualiza la carpeta e inténtalo de nuevo.",
-  "{} items were copied without their tags and other attributes: the target does not keep them": "{} elemento se copió sin sus etiquetas y otros atributos: el destino no los conserva|{} elementos se copiaron sin sus etiquetas y otros atributos: el destino no los conserva"
+  "{} items were copied without their tags and other attributes: the target does not keep them": "{} elemento se copió sin sus etiquetas y otros atributos: el destino no los conserva|{} elementos se copiaron sin sus etiquetas y otros atributos: el destino no los conserva",
+  "{} items were copied without their access control lists (ACLs): the target does not keep ACLs": "{} elemento se copió sin su lista de control de acceso (ACL): el destino no conserva ACL|{} elementos se copiaron sin sus listas de control de acceso (ACL): el destino no conserva ACL",
+  "The group permissions of {} items were not copied, because their ACLs could not be: they have none for the group": "No se copiaron los permisos de grupo de {} elemento, porque no se pudo copiar su ACL: no tiene ninguno para el grupo|No se copiaron los permisos de grupo de {} elementos, porque no se pudieron copiar sus ACL: no tienen ninguno para el grupo"
 }

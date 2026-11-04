@@ -140,16 +140,25 @@ pub fn keep_mode(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-/// The tags and ACLs of `src` onto its copy `dst`, and the permissions the copy is to get from `original`. Call it before
-/// setting them. Whether everything arrived is the second value. If the source has an access ACL and the copy could not
-/// be given it, the group bits of the mode are not the owning group's permission but the ACL's mask, so they are not
-/// taken over: the copy gets no group permissions, which is never more than the source gave anyone.
-pub(crate) fn keep_attributes(src: &Path, dst: &Path, original: &std::fs::Metadata) -> (std::fs::Permissions, bool) {
+/// What copying the tags and ACLs of one item came to.
+pub(crate) struct Kept {
+    /// The permissions the copy is to get. If the source has an access ACL and the copy could not be given it, the group
+    /// bits of the mode are not the owning group's permission but the ACL's mask, so they are not taken over: the copy
+    /// gets no group permissions, which is never more than the source gave anyone.
+    pub permissions: std::fs::Permissions,
+    /// Every `user.*` attribute arrived.
+    pub tags: bool,
+    pub acl: super::xattr::AclCopy,
+}
+
+/// The tags and ACLs of `src` onto its copy `dst`, and the permissions the copy is to get from `original`. Call it
+/// before setting them.
+pub(crate) fn keep_attributes(src: &Path, dst: &Path, original: &std::fs::Metadata) -> Kept {
     use std::os::unix::fs::PermissionsExt;
     let tags = super::xattr::copy_user(src, dst);
     let acl = super::xattr::copy_acl(src, dst, original.is_dir());
     let permissions = if acl.access_lost { std::fs::Permissions::from_mode(original.permissions().mode() & !0o070) } else { original.permissions() };
-    (permissions, tags && !acl.any_lost)
+    Kept { permissions, tags, acl }
 }
 
 /// Gives a copy the access and modification times of what it was copied from, through its open file. Not being able
@@ -234,9 +243,9 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
             let entry = entry?;
             copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
         }
-        let (permissions, _) = keep_attributes(src, dst, &meta);
+        let kept = keep_attributes(src, dst, &meta);
         keep_folder_times(dst, &meta);
-        keep_mode(std::fs::set_permissions(dst, permissions))
+        keep_mode(std::fs::set_permissions(dst, kept.permissions))
     } else if !meta.is_file() {
         // Opening a named pipe waits for a writer that may never come
         let name = src.file_name().map_or_else(|| src.display().to_string(), |n| n.to_string_lossy().into_owned());
@@ -247,9 +256,9 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
         // Not `File::create`: a file that appeared there meanwhile is not ours to cut short
         let mut writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
         io::copy(&mut reader, &mut writer)?;
-        let (permissions, _) = keep_attributes(src, dst, &meta);
+        let kept = keep_attributes(src, dst, &meta);
         keep_times(&writer, &meta);
-        keep_mode(writer.set_permissions(permissions))
+        keep_mode(writer.set_permissions(kept.permissions))
     }
 }
 

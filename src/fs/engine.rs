@@ -273,6 +273,10 @@ pub struct Worker {
     links: Mutex<std::collections::HashMap<(u64, u64), (PathBuf, u64)>>,
     /// Items copied without some of their tags and other attributes, which the target did not take.
     attrs_lost: AtomicU64,
+    /// Items copied without an ACL they had (access or default), which the target did not take.
+    acl_lost: AtomicU64,
+    /// Of those, the ones whose access ACL did not arrive, so that their group permissions were not copied.
+    group_lost: AtomicU64,
 }
 
 impl Worker {
@@ -380,11 +384,17 @@ impl Worker {
     /// The tags, other `user.*` attributes and ACLs of `src` onto its copy, and the permissions the copy is to get (see
     /// `ops::keep_attributes`); if the target does not take everything, that is counted so the result can say so.
     fn keep_attributes(&self, src: &Path, dst: &Path, original: &std::fs::Metadata) -> std::fs::Permissions {
-        let (permissions, all) = ops::keep_attributes(src, dst, original);
-        if !all {
+        let kept = ops::keep_attributes(src, dst, original);
+        if !kept.tags {
             self.attrs_lost.fetch_add(1, Relaxed);
         }
-        permissions
+        if kept.acl.any_lost {
+            self.acl_lost.fetch_add(1, Relaxed);
+        }
+        if kept.acl.access_lost {
+            self.group_lost.fetch_add(1, Relaxed);
+        }
+        kept.permissions
     }
 
     /// Makes `dst` another name of the copy that was made of the file `meta` describes, if this job copied it before.
@@ -461,7 +471,7 @@ impl Engine {
     fn launch(&mut self, id: u64, work: Work) {
         let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) else { return };
         job.state = JobState::Running;
-        let mut worker = Worker { shared: job.shared.clone(), events: self.tx.clone(), ctx: self.ctx.clone(), job: id, remembered: None, links: Mutex::default(), attrs_lost: AtomicU64::new(0) };
+        let mut worker = Worker { shared: job.shared.clone(), events: self.tx.clone(), ctx: self.ctx.clone(), job: id, remembered: None, links: Mutex::default(), attrs_lost: AtomicU64::new(0), acl_lost: AtomicU64::new(0), group_lost: AtomicU64::new(0) };
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
@@ -998,6 +1008,16 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
         let note = trn(lost as usize, "{} item was copied without its tags and other attributes: the target does not keep them", "{} items were copied without their tags and other attributes: the target does not keep them");
         message.push_str(&format!(" · {note}"));
     }
+    let acls = w.acl_lost.load(Relaxed);
+    if acls > 0 {
+        let note = trn(acls as usize, "{} item was copied without its access control list (ACL): the target does not keep ACLs", "{} items were copied without their access control lists (ACLs): the target does not keep ACLs");
+        message.push_str(&format!(" · {note}"));
+    }
+    let groups = w.group_lost.load(Relaxed);
+    if groups > 0 {
+        let note = trn(groups as usize, "The group permissions of {} item were not copied, because its ACL could not be: it has none for the group", "The group permissions of {} items were not copied, because their ACLs could not be: they have none for the group");
+        message.push_str(&format!(" · {note}"));
+    }
     // The rest of a folder was copied; what was left out is said, and the job still counts as done
     let left_out = (!rec.unreadable.is_empty()).then(|| unreadable_note(&rec.unreadable));
     if let Some(note) = &left_out {
@@ -1410,7 +1430,7 @@ mod tests {
         let before = getfacl(&dir.join("f"));
         assert!(before.contains("user:0:rw-") && before.contains("group:0:r--") && before.contains("mask::rw-"), "{before}");
         let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("f"), dir.join("dst/f"))], Decision::Skip);
-        assert!(outcome.ok && !outcome.message.contains("without their tags"), "{}", outcome.message);
+        assert!(outcome.ok && !outcome.message.contains("without") && !outcome.message.contains("not copied"), "{}", outcome.message);
         assert_eq!(getfacl(&dir.join("dst/f")).replace("dst/f", "f"), before.replace("dst/f", "f"));
         assert!(getfacl(&dir.join("dst/f")).contains("group::r--"), "the owning group did not get the mask's permission");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1452,7 +1472,10 @@ mod tests {
         assert_ne!(mode, 0o664);
         assert_eq!(mode & 0o070, 0, "no group permission rather than a wider one: {mode:o}");
         assert_eq!(mode & 0o707, 0o604, "owner and others as in the source");
-        assert!(outcome.message.contains("1 item was copied without their tags and other attributes") || outcome.message.contains("without its tags and other attributes"), "{}", outcome.message);
+        // Said as what it is: the ACL is missing, and with it the group permissions; the tags are not blamed
+        assert!(outcome.message.contains("1 item was copied without its access control list (ACL): the target does not keep ACLs"), "{}", outcome.message);
+        assert!(outcome.message.contains("The group permissions of 1 item were not copied, because its ACL could not be"), "{}", outcome.message);
+        assert!(!outcome.message.contains("tags"), "{}", outcome.message);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
