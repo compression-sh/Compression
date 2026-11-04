@@ -22,7 +22,7 @@ pub(super) enum NetMsg {
     Gone { local: PathBuf, name: String, result: Result<(), String> },
     Forgot { name: String, result: Result<(), String> },
     /// A mount that was let go of to be connected again.
-    Reconnect { local: PathBuf, name: String, address: Address, result: Result<(), String> },
+    Reconnect { local: PathBuf, name: String, address: Address, back: Option<PathBuf>, result: Result<(), String> },
 }
 
 /// A connection on its way.
@@ -37,6 +37,9 @@ struct Pending {
     from_dialog: bool,
     /// Add the server to the sidebar once connected.
     save: bool,
+    /// A folder below the top of the mount to show instead of the top, if it is there: where the window
+    /// was before the server was connected again.
+    then: Option<PathBuf>,
 }
 
 pub(super) struct NetState {
@@ -125,6 +128,12 @@ pub(super) fn offers_reconnect(mount: &Mount, state: Option<LinkState>) -> bool 
     mount.address.is_some() && mount.kind != MountKind::System && matches!(state, Some(LinkState::Slow | LinkState::Broken))
 }
 
+/// Where to show a server that was connected again: the folder the window was in (`inside`, below the top of
+/// the mount), if it is still there, else the top of the mount.
+fn folder_or_top(top: PathBuf, inside: Option<&Path>) -> PathBuf {
+    inside.map(|inside| top.join(inside)).filter(|folder| folder.is_dir()).unwrap_or(top)
+}
+
 /// A row of the Network section: a saved server, a connected one, or both.
 #[derive(Clone)]
 pub(super) struct NetRow {
@@ -184,11 +193,11 @@ impl CompressionApp {
                     }
                     self.request_network_listing(ctx, true);
                 }
-                NetMsg::Reconnect { local, name, address, result } => {
+                NetMsg::Reconnect { local, name, address, back, result } => {
                     self.net.leaving.remove(&local);
                     self.request_network_listing(ctx, true);
                     match result {
-                        Ok(()) => self.open_address(address, None, OpenIn::Here),
+                        Ok(()) => self.open_address_back(address, back),
                         Err(err) => self.set_toast(trf("Could not disconnect “{}”: {}", &[&name, &err])),
                     }
                 }
@@ -260,6 +269,18 @@ impl CompressionApp {
         self.start_connecting(address, password, open, false, false);
     }
 
+    /// `open_address` for a server that was connected again: shows `back` (a folder below its top) when it is there.
+    fn open_address_back(&mut self, address: Address, back: Option<PathBuf>) {
+        if let Some(local) = network::local_path(&address).filter(|p| p.exists()) {
+            self.show_connected(folder_or_top(local, back.as_deref()), OpenIn::Here);
+            return;
+        }
+        let id = self.start_connecting(address, None, OpenIn::Here, false, false);
+        if let Some(pending) = self.net.pending.iter_mut().find(|p| p.id == id) {
+            pending.then = back;
+        }
+    }
+
     fn start_connecting(&mut self, address: Address, password: Option<String>, open: OpenIn, from_dialog: bool, save: bool) -> u64 {
         // A second click on a server that is still connecting waits for the first
         if let Some(p) = self.net.pending.iter().find(|p| p.address == address) {
@@ -276,7 +297,7 @@ impl CompressionApp {
             let _ = tx.send(msg);
             ctx.request_repaint();
         });
-        self.net.pending.push(Pending { id, address, open, replies, asking: false, from_dialog, save });
+        self.net.pending.push(Pending { id, address, open, replies, asking: false, from_dialog, save, then: None });
         id
     }
 
@@ -302,7 +323,7 @@ impl CompressionApp {
                     self.dialog = None;
                 }
                 self.request_network_listing(ctx, true);
-                self.show_connected(local, pending.open);
+                self.show_connected(folder_or_top(local, pending.then.as_deref()), pending.open);
             }
             Err(None) => {
                 if let Some(Dialog::Connect { busy, .. }) = &mut self.dialog {
@@ -407,13 +428,15 @@ impl CompressionApp {
         if !self.net.leaving.insert(mount.local.clone()) {
             return;
         }
+        // Come back to the folder the window is in, not to the top of the server
+        let back = self.current_path.strip_prefix(&mount.local).ok().filter(|inside| !inside.as_os_str().is_empty()).map(Path::to_path_buf);
         if self.current_path.starts_with(&mount.local) {
             self.navigate_to(dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
         }
         let (tx, ctx) = (self.net.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let result = network::disconnect(&mount);
-            let _ = tx.send(NetMsg::Reconnect { local: mount.local.clone(), name: mount.name.clone(), address, result });
+            let _ = tx.send(NetMsg::Reconnect { local: mount.local.clone(), name: mount.name.clone(), address, back, result });
             ctx.request_repaint();
         });
     }
