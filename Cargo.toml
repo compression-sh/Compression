@@ -1,6 +1,6 @@
 [package]
 name = "compression"
-version = "0.5.7"
+version = "0.5.8"
 edition = "2024"
 description = "A small, fast, keyboard-friendly file manager"
 license = "MIT"
