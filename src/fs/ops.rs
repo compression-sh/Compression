@@ -140,6 +140,38 @@ pub fn keep_mode(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
+/// Gives a copy the access and modification times of what it was copied from, through its open file. Not being able
+/// to is no reason to fail the copy (some file systems and mounts refuse), so it is best effort.
+pub(crate) fn keep_times(copy: &std::fs::File, original: &std::fs::Metadata) {
+    let mut times = std::fs::FileTimes::new();
+    if let Ok(accessed) = original.accessed() {
+        times = times.set_accessed(accessed);
+    }
+    if let Ok(modified) = original.modified() {
+        times = times.set_modified(modified);
+    }
+    let _ = copy.set_times(times);
+}
+
+/// The same for a folder, which has to be done after what is in it was made (that changes its time).
+pub(crate) fn keep_folder_times(copy: &Path, original: &std::fs::Metadata) {
+    if let Ok(folder) = std::fs::File::open(copy) {
+        keep_times(&folder, original);
+    }
+}
+
+/// The same for a symbolic link itself, not what it points to.
+pub(crate) fn keep_link_times(copy: &Path, original: &std::fs::Metadata) {
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    let Ok(path) = std::ffi::CString::new(copy.as_os_str().as_bytes()) else { return };
+    let times = [
+        libc::timespec { tv_sec: original.atime(), tv_nsec: original.atime_nsec() },
+        libc::timespec { tv_sec: original.mtime(), tv_nsec: original.mtime_nsec() },
+    ];
+    // SAFETY: `path` is NUL-terminated and `times` holds the two timespecs the call reads.
+    unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+}
+
 /// A name for `name` inside `dir` that does not exist yet: `a.txt`, `a (copy).txt`, `a (copy 2).txt`, ...
 pub fn unique_path(dir: &Path, name: &std::ffi::OsStr, suffix: &str) -> PathBuf {
     unique_path_where(dir, name, suffix, |_| false)
@@ -181,13 +213,17 @@ fn split_name(name: &str) -> (&str, &str) {
 fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = src.symlink_metadata()?;
     if meta.file_type().is_symlink() {
-        std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)
+        std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)?;
+        keep_link_times(dst, &meta);
+        Ok(())
     } else if meta.is_dir() {
         std::fs::create_dir(dst)?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
             copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
         }
+        super::xattr::copy_user(src, dst);
+        keep_folder_times(dst, &meta);
         keep_mode(std::fs::set_permissions(dst, meta.permissions()))
     } else if !meta.is_file() {
         // Opening a named pipe waits for a writer that may never come
@@ -199,6 +235,8 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
         // Not `File::create`: a file that appeared there meanwhile is not ours to cut short
         let mut writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
         io::copy(&mut reader, &mut writer)?;
+        super::xattr::copy_user(src, dst);
+        keep_times(&writer, &meta);
         keep_mode(writer.set_permissions(meta.permissions()))
     }
 }
@@ -584,6 +622,35 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "from");
         assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "taken");
         assert!(!dir.join("free").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_copy_used_across_file_systems_by_trash_and_undo_keeps_times_and_attributes_too() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = dir("copy_tree_meta");
+        std::fs::create_dir_all(dir.join("t/inner")).unwrap();
+        std::fs::write(dir.join("t/inner/f"), "f").unwrap();
+        std::os::unix::fs::symlink("inner/f", dir.join("t/l")).unwrap();
+        let tagged = crate::fs::xattr::set(&dir.join("t/inner/f"), "user.xdg.tags", b"tag").is_ok();
+        let age = |p: &Path, secs: i64| {
+            let c = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(p.as_os_str())).unwrap();
+            let t = [libc::timespec { tv_sec: secs, tv_nsec: 5 }, libc::timespec { tv_sec: secs + 1, tv_nsec: 6 }];
+            // SAFETY: NUL-terminated path, two timespecs.
+            assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), t.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) }, 0);
+        };
+        for (p, s) in [("t/inner/f", 1_000_000_000), ("t/l", 1_000_000_100), ("t/inner", 1_000_000_200), ("t", 1_000_000_300)] {
+            age(&dir.join(p), s);
+        }
+        copy_tree(&dir.join("t"), &dir.join("c")).unwrap();
+        for (p, s) in [("inner/f", 1_000_000_000), ("l", 1_000_000_100), ("inner", 1_000_000_200), ("", 1_000_000_300)] {
+            let m = dir.join("c").join(p).symlink_metadata().unwrap();
+            assert_eq!((m.atime(), m.mtime(), m.mtime_nsec()), (s, s + 1, 6), "{p:?}");
+        }
+        assert_eq!(std::fs::read_link(dir.join("c/l")).unwrap(), Path::new("inner/f"));
+        if tagged {
+            assert_eq!(crate::fs::xattr::get(&dir.join("c/inner/f"), "user.xdg.tags").unwrap().as_deref(), Some(&b"tag"[..]));
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

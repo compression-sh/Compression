@@ -838,5 +838,6 @@
   "{} items could not be changed": "No se pudo cambiar {} elemento|No se pudieron cambiar {} elementos",
   "and {} more": "y {} más",
   "This file system does not support moving or renaming without the risk of replacing something, so nothing was changed": "Este sistema de archivos no admite mover ni renombrar sin el riesgo de reemplazar algo, así que no se cambió nada",
-  "These items are not in the list any more. Refresh the folder and try again.": "Estos elementos ya no están en la lista. Actualiza la carpeta e inténtalo de nuevo."
+  "These items are not in the list any more. Refresh the folder and try again.": "Estos elementos ya no están en la lista. Actualiza la carpeta e inténtalo de nuevo.",
+  "{} items were copied without their tags and other attributes: the target does not keep them": "{} elemento se copió sin sus etiquetas y otros atributos: el destino no los conserva|{} elementos se copiaron sin sus etiquetas y otros atributos: el destino no los conserva"
 }

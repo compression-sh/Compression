@@ -46,6 +46,10 @@ pub fn get(path: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
 }
 
 pub fn set(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    if tests::refused(path) {
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+    }
     let (path, name) = (c_path(path)?, c_name(name)?);
     // SAFETY: the value pointer and length describe `value`.
     let result = unsafe { libc::lsetxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
@@ -87,14 +91,36 @@ pub fn list(path: &Path) -> io::Result<Vec<String>> {
     }
 }
 
-/// Copies the `user.*` attributes (tags, comments, ratings) from `src` to `dst`. Failures are
-/// skipped: a copy onto a disk without attributes is still a good copy.
-pub fn copy_user(src: &Path, dst: &Path) {
-    let Ok(names) = list(src) else { return };
+/// Copies the `user.*` attributes (tags, comments, ratings) from `src` to `dst`. A refusal does not stop the copy:
+/// a copy onto a disk without attributes is still a good copy. Whether every attribute that `src` has arrived
+/// is the result, so that the caller can say when it did not.
+pub fn copy_user(src: &Path, dst: &Path) -> bool {
+    let Ok(names) = list(src) else { return true };
+    let mut all = true;
     for name in names.iter().filter(|n| n.starts_with("user.")) {
-        if let Ok(Some(value)) = get(src, name) {
-            let _ = set(dst, name, &value);
+        match get(src, name) {
+            Ok(Some(value)) => all &= set(dst, name, &value).is_ok(),
+            Ok(None) => {}
+            Err(_) => all = false,
         }
     }
+    all
 }
 
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Folders in which the tests pretend the file system keeps no attributes.
+    static REFUSING: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) fn refused(path: &Path) -> bool {
+        REFUSING.lock().unwrap().iter().any(|p| path.starts_with(p))
+    }
+
+    pub(crate) fn refuse_attributes_under(dir: &Path) {
+        REFUSING.lock().unwrap().push(dir.to_path_buf());
+    }
+}

@@ -268,6 +268,11 @@ pub struct Worker {
     job: u64,
     /// The answer given with "apply to all".
     remembered: Option<Decision>,
+    /// Files with more than one name that this job has copied: `(device, inode)` of the original, and the copy made
+    /// (with its own inode), so that another name of the same file becomes another name of that copy.
+    links: Mutex<std::collections::HashMap<(u64, u64), (PathBuf, u64)>>,
+    /// Items copied without some of their tags and other attributes, which the target did not take.
+    attrs_lost: AtomicU64,
 }
 
 impl Worker {
@@ -371,6 +376,37 @@ impl Worker {
     pub fn file_done(&self) {
         self.shared.files_done.fetch_add(1, Relaxed);
     }
+
+    /// The tags and other `user.*` attributes of `src` onto its copy; if the target does not take them, that is counted
+    /// so the result can say so.
+    fn keep_attributes(&self, src: &Path, dst: &Path) {
+        if !super::xattr::copy_user(src, dst) {
+            self.attrs_lost.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Makes `dst` another name of the copy that was made of the file `meta` describes, if this job copied it before.
+    /// Never replaces anything (`hard_link` fails if `dst` is there), and a copy that is not the one remembered any more
+    /// is not used: then the file is copied in full.
+    fn link_to_earlier_copy(&self, meta: &std::fs::Metadata, dst: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Some((first, inode)) = self.links.lock().ok().and_then(|links| links.get(&(meta.dev(), meta.ino())).cloned()) else { return false };
+        if std::fs::hard_link(&first, dst).is_err() {
+            return false;
+        }
+        if dst.symlink_metadata().is_ok_and(|now| now.ino() == inode) {
+            return true;
+        }
+        let _ = std::fs::remove_file(dst);
+        false
+    }
+
+    fn remember_copy(&self, meta: &std::fs::Metadata, dst: &Path) {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(mut links), Ok(copy)) = (self.links.lock(), dst.symlink_metadata()) {
+            links.insert((meta.dev(), meta.ino()), (dst.to_path_buf(), copy.ino()));
+        }
+    }
 }
 
 type Work = Box<dyn FnOnce(&mut Worker) -> Outcome + Send>;
@@ -423,7 +459,7 @@ impl Engine {
     fn launch(&mut self, id: u64, work: Work) {
         let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) else { return };
         job.state = JobState::Running;
-        let mut worker = Worker { shared: job.shared.clone(), events: self.tx.clone(), ctx: self.ctx.clone(), job: id, remembered: None };
+        let mut worker = Worker { shared: job.shared.clone(), events: self.tx.clone(), ctx: self.ctx.clone(), job: id, remembered: None, links: Mutex::default(), attrs_lost: AtomicU64::new(0) };
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
@@ -652,11 +688,9 @@ fn copy_file(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
             w.add_bytes(n as u64);
         }
         // Tags, comments and ratings live in extended attributes; set them while the copy is still writable
-        super::xattr::copy_user(src, dst);
+        w.keep_attributes(src, dst);
+        ops::keep_times(&writer, &meta);
         ops::keep_mode(writer.set_permissions(meta.permissions()))?;
-        if let Ok(modified) = meta.modified() {
-            let _ = writer.set_modified(modified);
-        }
         Ok(())
     })();
     if result.is_err() {
@@ -733,6 +767,7 @@ fn copy_tree(w: &Worker, src: &Path, dst: &Path, mut skipped: Option<&mut Vec<(P
     let meta = src.symlink_metadata()?;
     if meta.file_type().is_symlink() {
         std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)?;
+        ops::keep_link_times(dst, &meta);
         w.file_done();
         Ok(())
     } else if meta.is_dir() {
@@ -753,11 +788,20 @@ fn copy_tree(w: &Worker, src: &Path, dst: &Path, mut skipped: Option<&mut Vec<(P
                 other => other?,
             }
         }
-        super::xattr::copy_user(src, dst);
+        w.keep_attributes(src, dst);
+        ops::keep_folder_times(dst, &meta);
         ops::keep_mode(std::fs::set_permissions(dst, meta.permissions()))
     } else if meta.is_file() {
+        use std::os::unix::fs::MetadataExt;
         w.shared.set_current(&name_of(src));
-        copy_file(w, src, dst)?;
+        if meta.nlink() > 1 && w.link_to_earlier_copy(&meta, dst) {
+            w.add_bytes(meta.len());
+        } else {
+            copy_file(w, src, dst)?;
+            if meta.nlink() > 1 {
+                w.remember_copy(&meta, dst);
+            }
+        }
         w.file_done();
         Ok(())
     } else {
@@ -946,6 +990,11 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
     };
     if rec.skipped > 0 {
         message.push_str(&format!(" · {}", trf("{} skipped", &[&rec.skipped])));
+    }
+    let lost = w.attrs_lost.load(Relaxed);
+    if lost > 0 {
+        let note = trn(lost as usize, "{} item was copied without its tags and other attributes: the target does not keep them", "{} items were copied without their tags and other attributes: the target does not keep them");
+        message.push_str(&format!(" · {note}"));
     }
     // The rest of a folder was copied; what was left out is said, and the job still counts as done
     let left_out = (!rec.unreadable.is_empty()).then(|| unreadable_note(&rec.unreadable));
@@ -1173,6 +1222,166 @@ mod tests {
         assert_eq!(left, 0, "nothing arrived, and no reserved or private name");
         left = std::fs::read_dir(dir.join("src")).unwrap().count();
         assert_eq!(left, 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    use std::os::unix::fs::MetadataExt;
+
+    /// Sets the access and modification time of `path` itself (not what a link points to).
+    fn age(path: &Path, atime: i64, mtime: i64) {
+        let c = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())).unwrap();
+        let times = [libc::timespec { tv_sec: atime, tv_nsec: 111_222_333 }, libc::timespec { tv_sec: mtime, tv_nsec: 123_456_789 }];
+        // SAFETY: `c` is NUL-terminated and `times` holds two timespecs.
+        assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) }, 0);
+    }
+
+    fn times_of(path: &Path) -> ((i64, i64), (i64, i64)) {
+        let m = path.symlink_metadata().unwrap();
+        ((m.atime(), m.atime_nsec()), (m.mtime(), m.mtime_nsec()))
+    }
+
+    const ATIME: i64 = 1_000_000_000;
+    const MTIME: i64 = 1_100_000_000;
+
+    #[test]
+    fn a_copied_file_keeps_name_content_times_mode_and_user_attributes() {
+        let dir = sandbox("copy_meta_file");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("photo.txt"), "content").unwrap();
+        std::fs::set_permissions(dir.join("photo.txt"), std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
+        let tagged = crate::fs::xattr::set(&dir.join("photo.txt"), "user.xdg.tags", b"holiday").is_ok();
+        age(&dir.join("photo.txt"), ATIME, MTIME);
+        let (outcome, asked) = run(JobKind::Copy, Op::Copy, vec![(dir.join("photo.txt"), dir.join("dst/photo.txt"))], Decision::Skip);
+        assert!(outcome.ok && asked == 0, "{}", outcome.message);
+        let copy = dir.join("dst/photo.txt");
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "content");
+        assert_eq!(times_of(&copy), ((ATIME, 111_222_333), (MTIME, 123_456_789)), "access and modification time, to the nanosecond");
+        assert_eq!(copy.metadata().unwrap().mode() & 0o7777, 0o640);
+        assert_ne!(copy.metadata().unwrap().ino(), dir.join("photo.txt").metadata().unwrap().ino());
+        if tagged {
+            assert_eq!(crate::fs::xattr::get(&copy, "user.xdg.tags").unwrap().as_deref(), Some(&b"holiday"[..]));
+        }
+        assert!(!outcome.message.contains("without their tags"), "{}", outcome.message);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_copied_folder_keeps_its_own_times_mode_and_attributes_and_links_stay_links() {
+        let dir = sandbox("copy_meta_tree");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::create_dir_all(dir.join("tree/inner")).unwrap();
+        std::fs::write(dir.join("tree/inner/f"), "f").unwrap();
+        std::os::unix::fs::symlink("inner/f", dir.join("tree/relative")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/for/compression", dir.join("tree/dangling")).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", dir.join("tree/outside")).unwrap();
+        std::fs::set_permissions(dir.join("tree/inner"), std::os::unix::fs::PermissionsExt::from_mode(0o750)).unwrap();
+        let tagged = crate::fs::xattr::set(&dir.join("tree/inner"), "user.xdg.tags", b"x").is_ok();
+        // Times last, since making things in a folder changes its time
+        for (name, a, m) in [("tree/inner/f", ATIME + 1, MTIME + 1), ("tree/inner", ATIME + 2, MTIME + 2), ("tree/relative", ATIME + 3, MTIME + 3), ("tree/dangling", ATIME + 4, MTIME + 4), ("tree", ATIME + 5, MTIME + 5)] {
+            age(&dir.join(name), a, m);
+        }
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("tree"), dir.join("dst/tree"))], Decision::Skip);
+        assert!(outcome.ok, "{}", outcome.message);
+        let t = dir.join("dst/tree");
+        for (name, a, m) in [("inner/f", ATIME + 1, MTIME + 1), ("inner", ATIME + 2, MTIME + 2), ("relative", ATIME + 3, MTIME + 3), ("dangling", ATIME + 4, MTIME + 4), ("", ATIME + 5, MTIME + 5)] {
+            let ((ta, _), (tm, tn)) = times_of(&t.join(name));
+            assert_eq!((ta, tm, tn), (a, m, 123_456_789), "{name:?}");
+        }
+        assert_eq!(t.join("inner").metadata().unwrap().mode() & 0o7777, 0o750);
+        if tagged {
+            assert_eq!(crate::fs::xattr::get(&t.join("inner"), "user.xdg.tags").unwrap().as_deref(), Some(&b"x"[..]));
+        }
+        // The links are links, with the same text: nothing behind them was copied or followed
+        for (name, to) in [("relative", "inner/f"), ("dangling", "/nonexistent/for/compression"), ("outside", "/etc/hostname")] {
+            assert!(t.join(name).symlink_metadata().unwrap().file_type().is_symlink(), "{name}");
+            assert_eq!(std::fs::read_link(t.join(name)).unwrap(), Path::new(to));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn names_of_one_file_inside_a_copy_stay_names_of_one_file() {
+        let dir = sandbox("copy_hardlinks");
+        std::fs::create_dir_all(dir.join("tree")).unwrap();
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("tree/a"), "shared").unwrap();
+        std::fs::hard_link(dir.join("tree/a"), dir.join("tree/b")).unwrap();
+        std::fs::write(dir.join("tree/c"), "shared").unwrap();
+        age(dir.join("tree/a").as_path(), ATIME, MTIME);
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("tree"), dir.join("dst/tree"))], Decision::Skip);
+        assert!(outcome.ok, "{}", outcome.message);
+        let t = dir.join("dst/tree");
+        let (a, b, c) = (t.join("a").metadata().unwrap(), t.join("b").metadata().unwrap(), t.join("c").metadata().unwrap());
+        assert_eq!((a.ino(), a.nlink()), (b.ino(), 2), "a and b are two names of one file");
+        assert_ne!(a.ino(), c.ino(), "a different file with the same content stays a different file");
+        assert_ne!(a.ino(), dir.join("tree/a").metadata().unwrap().ino(), "and none of it is the original");
+        assert_eq!(std::fs::read_to_string(t.join("b")).unwrap(), "shared");
+        assert_eq!(dir.join("tree/a").metadata().unwrap().nlink(), 2, "the original is as it was");
+        // Progress still adds up
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn names_of_one_file_in_separate_items_of_one_job_are_linked_but_a_lone_name_is_not() {
+        let dir = sandbox("copy_hardlinks_items");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("a"), "x").unwrap();
+        std::fs::hard_link(dir.join("a"), dir.join("b")).unwrap();
+        // Both names in one job
+        let pairs = vec![(dir.join("a"), dir.join("dst/a")), (dir.join("b"), dir.join("dst/b"))];
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, pairs, Decision::Skip);
+        assert!(outcome.ok);
+        assert_eq!(dir.join("dst/a").metadata().unwrap().ino(), dir.join("dst/b").metadata().unwrap().ino());
+        // Only one of them: an independent file
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("a"), dir.join("dst/lone"))], Decision::Skip);
+        assert!(outcome.ok);
+        let lone = dir.join("dst/lone").metadata().unwrap();
+        assert_eq!(lone.nlink(), 1);
+        assert_ne!(lone.ino(), dir.join("a").metadata().unwrap().ino());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_name_that_is_taken_is_never_replaced_by_a_link_or_a_copy() {
+        let dir = sandbox("copy_hardlinks_taken");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("a"), "x").unwrap();
+        std::fs::hard_link(dir.join("a"), dir.join("b")).unwrap();
+        std::fs::write(dir.join("dst/b"), "keep me").unwrap();
+        let pairs = vec![(dir.join("a"), dir.join("dst/a")), (dir.join("b"), dir.join("dst/b"))];
+        let (outcome, asked) = run(JobKind::Copy, Op::Copy, pairs, Decision::Skip);
+        assert_eq!(asked, 1);
+        assert!(outcome.ok);
+        assert_eq!(std::fs::read_to_string(dir.join("dst/b")).unwrap(), "keep me");
+        assert_eq!(dir.join("dst/b").metadata().unwrap().nlink(), 1, "not made a name of the copy");
+        // A name that appears after the conflict check: the copy fails and leaves the new file alone
+        RACES.lock().unwrap().push(dir.join("dst/late"));
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("a"), dir.join("dst/late"))], Decision::Replace);
+        assert!(!outcome.ok);
+        assert_eq!(std::fs::read_to_string(dir.join("dst/late")).unwrap(), "intruder");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_target_that_keeps_no_attributes_gets_the_copy_and_the_result_says_what_is_missing() {
+        let dir = sandbox("copy_no_attrs");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("a"), "x").unwrap();
+        std::fs::write(dir.join("b"), "y").unwrap();
+        std::fs::write(dir.join("plain"), "z").unwrap();
+        let tagged = crate::fs::xattr::set(&dir.join("a"), "user.xdg.tags", b"t").is_ok() && crate::fs::xattr::set(&dir.join("b"), "user.xdg.tags", b"t").is_ok();
+        crate::fs::xattr::tests::refuse_attributes_under(&dir.join("dst"));
+        let pairs = vec![(dir.join("a"), dir.join("dst/a")), (dir.join("b"), dir.join("dst/b")), (dir.join("plain"), dir.join("dst/plain"))];
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, pairs, Decision::Skip);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dir.join("dst/a")).unwrap(), "x", "the copy itself is whole");
+        if tagged {
+            assert!(outcome.message.contains("2 items were copied without their tags and other attributes"), "{}", outcome.message);
+            assert_eq!(crate::fs::xattr::get(&dir.join("dst/a"), "user.xdg.tags").unwrap(), None);
+        }
+        // A file without attributes is not reported
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("plain"), dir.join("dst/plain2"))], Decision::Skip);
+        assert!(!outcome.message.contains("without their tags"), "{}", outcome.message);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
