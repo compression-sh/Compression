@@ -63,8 +63,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "chore: Nix package installs the v${version} release binary"
-          for attempt in 1 2 3; do
+          # GitHub now and then answers a push with an Internal Server Error for a few seconds: wait and try again
+          for attempt in 1 2 3 4 5; do
             git push origin master && exit 0
-            git pull --rebase origin master
+            sleep $((attempt * 15))
+            git pull --rebase origin master || true
           done
           exit 1
