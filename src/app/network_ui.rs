@@ -613,12 +613,11 @@ impl CompressionApp {
             (None, None) => {}
         }
         if let Some(mount) = &row.mount {
-            groups.push(vec![(icons::UNMOUNT, tr("Disconnect"), MenuAction::Disconnect(mount.local.clone()))]);
-        }
-        if let Some(mount) = &row.mount
-            && offers_reconnect(mount, row.state)
-        {
-            groups.push(vec![(icons::REFRESH, tr("Reconnect"), MenuAction::Reconnect(mount.local.clone()))]);
+            let mut group = vec![(icons::UNMOUNT, tr("Disconnect"), MenuAction::Disconnect(mount.local.clone()))];
+            if offers_reconnect(mount, row.state) {
+                group.push((icons::REFRESH, tr("Reconnect"), MenuAction::Reconnect(mount.local.clone())));
+            }
+            groups.push(group);
         }
         match (row.saved, &row.address) {
             (Some(index), _) => groups.push(vec![
