@@ -91,6 +91,40 @@ pub fn list(path: &Path) -> io::Result<Vec<String>> {
     }
 }
 
+/// What copying the POSIX access control lists of a file or folder came to.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct AclCopy {
+    /// The source has an access ACL (one that is more than its mode says) and it did not arrive: the group bits of the mode
+    /// are then the ACL's mask, not a permission of the owning group, and must not be taken over.
+    pub access_lost: bool,
+    /// Something the source has, an access or default ACL, did not arrive.
+    pub any_lost: bool,
+}
+
+/// Copies the POSIX ACLs of `src` to `dst` as they are (the bytes the kernel gives, nothing is read out of them): the
+/// access ACL of anything but a link, and the default ACL, which only a folder has. Links have no ACL of their own,
+/// so nothing is asked of them. Nothing else under `system.` is copied, and no `security.` or `trusted.` attribute.
+/// Meant to run before the mode is set, since setting an ACL sets the group bits of the mode to its mask.
+pub fn copy_acl(src: &Path, dst: &Path, folder: bool) -> AclCopy {
+    let mut result = AclCopy::default();
+    let names: &[&str] = if folder { &["system.posix_acl_access", "system.posix_acl_default"] } else { &["system.posix_acl_access"] };
+    for name in names {
+        match get(src, name) {
+            Ok(Some(value)) => {
+                if set(dst, name, &value).is_err() {
+                    result.any_lost = true;
+                    result.access_lost |= *name == "system.posix_acl_access";
+                }
+            }
+            // No ACL: the mode is all there is
+            Ok(None) => {}
+            // The source cannot say (no ACLs on that file system): there is none to lose
+            Err(_) => {}
+        }
+    }
+    result
+}
+
 /// Copies the `user.*` attributes (tags, comments, ratings) from `src` to `dst`. A refusal does not stop the copy:
 /// a copy onto a disk without attributes is still a good copy. Whether every attribute that `src` has arrived
 /// is the result, so that the caller can say when it did not.

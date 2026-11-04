@@ -140,6 +140,18 @@ pub fn keep_mode(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
+/// The tags and ACLs of `src` onto its copy `dst`, and the permissions the copy is to get from `original`. Call it before
+/// setting them. Whether everything arrived is the second value. If the source has an access ACL and the copy could not
+/// be given it, the group bits of the mode are not the owning group's permission but the ACL's mask, so they are not
+/// taken over: the copy gets no group permissions, which is never more than the source gave anyone.
+pub(crate) fn keep_attributes(src: &Path, dst: &Path, original: &std::fs::Metadata) -> (std::fs::Permissions, bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let tags = super::xattr::copy_user(src, dst);
+    let acl = super::xattr::copy_acl(src, dst, original.is_dir());
+    let permissions = if acl.access_lost { std::fs::Permissions::from_mode(original.permissions().mode() & !0o070) } else { original.permissions() };
+    (permissions, tags && !acl.any_lost)
+}
+
 /// Gives a copy the access and modification times of what it was copied from, through its open file. Not being able
 /// to is no reason to fail the copy (some file systems and mounts refuse), so it is best effort.
 pub(crate) fn keep_times(copy: &std::fs::File, original: &std::fs::Metadata) {
@@ -222,9 +234,9 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
             let entry = entry?;
             copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
         }
-        super::xattr::copy_user(src, dst);
+        let (permissions, _) = keep_attributes(src, dst, &meta);
         keep_folder_times(dst, &meta);
-        keep_mode(std::fs::set_permissions(dst, meta.permissions()))
+        keep_mode(std::fs::set_permissions(dst, permissions))
     } else if !meta.is_file() {
         // Opening a named pipe waits for a writer that may never come
         let name = src.file_name().map_or_else(|| src.display().to_string(), |n| n.to_string_lossy().into_owned());
@@ -235,9 +247,9 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
         // Not `File::create`: a file that appeared there meanwhile is not ours to cut short
         let mut writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
         io::copy(&mut reader, &mut writer)?;
-        super::xattr::copy_user(src, dst);
+        let (permissions, _) = keep_attributes(src, dst, &meta);
         keep_times(&writer, &meta);
-        keep_mode(writer.set_permissions(meta.permissions()))
+        keep_mode(writer.set_permissions(permissions))
     }
 }
 
@@ -651,6 +663,31 @@ mod tests {
         if tagged {
             assert_eq!(crate::fs::xattr::get(&dir.join("c/inner/f"), "user.xdg.tags").unwrap().as_deref(), Some(&b"tag"[..]));
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_copy_used_by_trash_and_undo_keeps_acls_and_never_widens_the_groups_permissions() {
+        use std::os::unix::fs::MetadataExt;
+        let acl = |args: &[&str], p: &Path| std::process::Command::new("setfacl").args(args).arg(p).status().is_ok_and(|s| s.success());
+        let facl = |p: &Path| String::from_utf8_lossy(&std::process::Command::new("getfacl").args(["-n", "-c", "-p"]).arg(p).output().unwrap().stdout).into_owned();
+        let dir = dir("copy_tree_acl");
+        std::fs::create_dir_all(dir.join("t/inner")).unwrap();
+        std::fs::write(dir.join("t/f"), "x").unwrap();
+        std::fs::set_permissions(dir.join("t/f"), std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+        if !acl(&["-m", "u:0:rw,g::r,m::rw"], &dir.join("t/f")) || !acl(&["-m", "u:0:rwx"], &dir.join("t/inner")) || !acl(&["-d", "-m", "u:0:rx"], &dir.join("t/inner")) {
+            return;
+        }
+        copy_tree(&dir.join("t"), &dir.join("c")).unwrap();
+        assert_eq!(facl(&dir.join("c/f")).replace("c/f", "t/f"), facl(&dir.join("t/f")).replace("c/f", "t/f"));
+        assert_eq!(facl(&dir.join("c/inner")).replace("c/inner", "t/inner"), facl(&dir.join("t/inner")).replace("c/inner", "t/inner"));
+        assert!(facl(&dir.join("c/f")).contains("group::r--"));
+        // Where the target takes no ACL: whole copy, no group permission, never the mask's
+        crate::fs::xattr::tests::refuse_attributes_under(&dir.join("refusing"));
+        std::fs::create_dir_all(dir.join("refusing")).unwrap();
+        copy_tree(&dir.join("t/f"), &dir.join("refusing/f")).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("refusing/f")).unwrap(), "x");
+        assert_eq!(dir.join("refusing/f").metadata().unwrap().mode() & 0o7777, 0o604);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

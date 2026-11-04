@@ -377,12 +377,14 @@ impl Worker {
         self.shared.files_done.fetch_add(1, Relaxed);
     }
 
-    /// The tags and other `user.*` attributes of `src` onto its copy; if the target does not take them, that is counted
-    /// so the result can say so.
-    fn keep_attributes(&self, src: &Path, dst: &Path) {
-        if !super::xattr::copy_user(src, dst) {
+    /// The tags, other `user.*` attributes and ACLs of `src` onto its copy, and the permissions the copy is to get (see
+    /// `ops::keep_attributes`); if the target does not take everything, that is counted so the result can say so.
+    fn keep_attributes(&self, src: &Path, dst: &Path, original: &std::fs::Metadata) -> std::fs::Permissions {
+        let (permissions, all) = ops::keep_attributes(src, dst, original);
+        if !all {
             self.attrs_lost.fetch_add(1, Relaxed);
         }
+        permissions
     }
 
     /// Makes `dst` another name of the copy that was made of the file `meta` describes, if this job copied it before.
@@ -688,9 +690,9 @@ fn copy_file(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
             w.add_bytes(n as u64);
         }
         // Tags, comments and ratings live in extended attributes; set them while the copy is still writable
-        w.keep_attributes(src, dst);
+        let permissions = w.keep_attributes(src, dst, &meta);
         ops::keep_times(&writer, &meta);
-        ops::keep_mode(writer.set_permissions(meta.permissions()))?;
+        ops::keep_mode(writer.set_permissions(permissions))?;
         Ok(())
     })();
     if result.is_err() {
@@ -788,9 +790,9 @@ fn copy_tree(w: &Worker, src: &Path, dst: &Path, mut skipped: Option<&mut Vec<(P
                 other => other?,
             }
         }
-        w.keep_attributes(src, dst);
+        let permissions = w.keep_attributes(src, dst, &meta);
         ops::keep_folder_times(dst, &meta);
-        ops::keep_mode(std::fs::set_permissions(dst, meta.permissions()))
+        ops::keep_mode(std::fs::set_permissions(dst, permissions))
     } else if meta.is_file() {
         use std::os::unix::fs::MetadataExt;
         w.shared.set_current(&name_of(src));
@@ -1382,6 +1384,114 @@ mod tests {
         // A file without attributes is not reported
         let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("plain"), dir.join("dst/plain2"))], Decision::Skip);
         assert!(!outcome.message.contains("without their tags"), "{}", outcome.message);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `setfacl` with `args` on `path`, or `false` when the tool or the file system cannot (the ACL tests then say nothing).
+    fn setfacl(args: &[&str], path: &Path) -> bool {
+        std::process::Command::new("setfacl").args(args).arg(path).status().is_ok_and(|s| s.success())
+    }
+
+    /// The ACL of `path` as text with numeric ids, including the default ACL of a folder.
+    fn getfacl(path: &Path) -> String {
+        let out = std::process::Command::new("getfacl").args(["-n", "-c", "-p"]).arg(path).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn a_copied_file_keeps_its_access_acl_with_named_entries_and_the_owning_groups_own_permission() {
+        let dir = sandbox("copy_acl_file");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("f"), "x").unwrap();
+        std::fs::set_permissions(dir.join("f"), std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
+        if !setfacl(&["-m", "u:0:rw,g:0:r,g::r,m::rw"], &dir.join("f")) {
+            return;
+        }
+        let before = getfacl(&dir.join("f"));
+        assert!(before.contains("user:0:rw-") && before.contains("group:0:r--") && before.contains("mask::rw-"), "{before}");
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("f"), dir.join("dst/f"))], Decision::Skip);
+        assert!(outcome.ok && !outcome.message.contains("without their tags"), "{}", outcome.message);
+        assert_eq!(getfacl(&dir.join("dst/f")).replace("dst/f", "f"), before.replace("dst/f", "f"));
+        assert!(getfacl(&dir.join("dst/f")).contains("group::r--"), "the owning group did not get the mask's permission");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_copied_folder_keeps_its_access_and_its_default_acl() {
+        let dir = sandbox("copy_acl_folder");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::create_dir_all(dir.join("d/inner")).unwrap();
+        if !setfacl(&["-m", "u:0:rwx"], &dir.join("d")) || !setfacl(&["-d", "-m", "u:0:rx,g:0:r"], &dir.join("d")) {
+            return;
+        }
+        let before = getfacl(&dir.join("d"));
+        assert!(before.contains("default:user:0:r-x"), "{before}");
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("d"), dir.join("dst/d"))], Decision::Skip);
+        assert!(outcome.ok && !outcome.message.contains("without their tags"), "{}", outcome.message);
+        assert_eq!(getfacl(&dir.join("dst/d")).replace("dst/d", "d"), before.replace("dst/d", "d"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_target_that_refuses_the_acl_gets_the_whole_copy_but_no_wider_permissions_than_the_source_gave() {
+        let dir = sandbox("copy_acl_refused");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("f"), "x").unwrap();
+        std::fs::set_permissions(dir.join("f"), std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+        // The owning group may read; a named entry may write, so the mask is rw- and the mode shows rw- for the group
+        if !setfacl(&["-m", "u:0:rw,g::r,m::rw"], &dir.join("f")) {
+            return;
+        }
+        assert_eq!(dir.join("f").metadata().unwrap().mode() & 0o7777, 0o664, "the mode shows the mask");
+        crate::fs::xattr::tests::refuse_attributes_under(&dir.join("dst"));
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("f"), dir.join("dst/f"))], Decision::Skip);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dir.join("dst/f")).unwrap(), "x", "the copy is whole");
+        let mode = dir.join("dst/f").metadata().unwrap().mode() & 0o7777;
+        // The old defect: the copy got 664, so the owning group could write where the source let it only read
+        assert_ne!(mode, 0o664);
+        assert_eq!(mode & 0o070, 0, "no group permission rather than a wider one: {mode:o}");
+        assert_eq!(mode & 0o707, 0o604, "owner and others as in the source");
+        assert!(outcome.message.contains("1 item was copied without their tags and other attributes") || outcome.message.contains("without its tags and other attributes"), "{}", outcome.message);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_name_that_is_taken_keeps_its_own_permissions_when_the_source_has_an_acl() {
+        let dir = sandbox("copy_acl_taken");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("f"), "new").unwrap();
+        std::fs::write(dir.join("dst/f"), "old").unwrap();
+        std::fs::set_permissions(dir.join("dst/f"), std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        if !setfacl(&["-m", "u:0:rw"], &dir.join("f")) {
+            return;
+        }
+        let (outcome, asked) = run(JobKind::Copy, Op::Copy, vec![(dir.join("f"), dir.join("dst/f"))], Decision::Skip);
+        assert!(outcome.ok && asked == 1);
+        assert_eq!(std::fs::read_to_string(dir.join("dst/f")).unwrap(), "old");
+        assert_eq!(dir.join("dst/f").metadata().unwrap().mode() & 0o7777, 0o600);
+        assert!(!getfacl(&dir.join("dst/f")).contains("user:0:"), "no ACL was put on a file that was not replaced");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_link_to_a_file_with_an_acl_is_copied_as_a_link_without_touching_either_acl() {
+        let dir = sandbox("copy_acl_link");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::create_dir_all(dir.join("t")).unwrap();
+        std::fs::write(dir.join("t/f"), "x").unwrap();
+        std::os::unix::fs::symlink("f", dir.join("t/link")).unwrap();
+        if !setfacl(&["-m", "u:0:rw"], &dir.join("t/f")) {
+            return;
+        }
+        let before = getfacl(&dir.join("t/f"));
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("t"), dir.join("dst/t"))], Decision::Skip);
+        assert!(outcome.ok && !outcome.message.contains("without their tags"), "{}", outcome.message);
+        let link = dir.join("dst/t/link");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        // A link has no ACL of its own and none is made for it; the file it points to keeps what it has
+        assert_eq!(crate::fs::xattr::get(&link, "system.posix_acl_access").ok().flatten(), None);
+        assert_eq!(getfacl(&dir.join("t/f")), before);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
