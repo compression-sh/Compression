@@ -10,7 +10,9 @@
 
 let
   checkoutVersion = (pkgs.lib.importTOML ./Cargo.toml).package.version;
-  releaseVersion = (pkgs.lib.importJSON ./nix/release.json).version;
+  releaseFile = ./nix/release.json;
+  # No file, or one without a version, is no release: the checkout is compiled
+  releaseVersion = if builtins.pathExists releaseFile then (pkgs.lib.importJSON releaseFile).version or null else null;
 in
 if fromSource || pkgs.stdenv.hostPlatform.system != "x86_64-linux" || releaseVersion != checkoutVersion
 then import ./nix/package.nix { inherit pkgs; }

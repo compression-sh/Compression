@@ -3,6 +3,12 @@
 use super::*;
 use crate::fs::search::Search;
 
+/// Whether `path` is a folder, without asking a server: a path on one is taken to be. A server that hangs
+/// would hold up the window, and this is asked on every frame the folder menu is open.
+fn is_folder(path: &Path) -> bool {
+    crate::fs::network::is_remote(path) || path.is_dir()
+}
+
 /// Everything that belongs to one tab: where it is, what is selected, its history and its search.
 pub(super) struct TabState {
     current_path: PathBuf,
@@ -49,6 +55,11 @@ impl TabState {
         self.items = None;
         self.selection.clear();
         self.focus = None;
+    }
+
+    /// The folder the tab is in.
+    pub(super) fn folder(&self) -> &Path {
+        &self.current_path
     }
 
     /// The tab is in `folder` or below it.
@@ -176,7 +187,7 @@ impl CompressionApp {
             return Vec::new();
         }
         let other = &self.tabs[1 - self.active_tab];
-        other.saved.as_ref().map(|s| s.current_path.clone()).filter(|p| !is_virtual(p) && p.is_dir()).into_iter().collect()
+        other.saved.as_ref().map(|s| s.current_path.clone()).filter(|p| !is_virtual(p) && is_folder(p)).into_iter().collect()
     }
 
     /// The folder of every tab in order, and the index of the one on screen. Places that are not
@@ -270,7 +281,7 @@ impl CompressionApp {
     /// Bring back the tab that was closed last.
     pub(super) fn reopen_tab(&mut self) {
         while let Some((index, state)) = self.closed_tabs.pop() {
-            if !state.current_path.is_dir() {
+            if !is_folder(&state.current_path) {
                 continue;
             }
             let parked = self.take_tab_state();

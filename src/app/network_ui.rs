@@ -22,7 +22,9 @@ pub(super) enum NetMsg {
     Gone { local: PathBuf, name: String, result: Result<(), String> },
     Forgot { name: String, result: Result<(), String> },
     /// A mount that was let go of to be connected again.
-    Reconnect { local: PathBuf, name: String, address: Address, back: Option<PathBuf>, result: Result<(), String> },
+    /// A server's folder was asked about: `local` is it when it is there.
+    Checked { id: u64, local: Option<PathBuf>, next: Next },
+    Reconnect { local: PathBuf, name: String, address: Address, back: Option<PathBuf>, tabs: Vec<(u64, PathBuf)>, result: Result<(), String> },
 }
 
 /// A connection on its way.
@@ -40,6 +42,8 @@ struct Pending {
     /// A folder below the top of the mount to show instead of the top, if it is there: where the window
     /// was before the server was connected again.
     then: Option<PathBuf>,
+    /// The same for the tabs that were parked in the mount: `(tab id, folder below the top)`.
+    tabs: Vec<(u64, PathBuf)>,
 }
 
 pub(super) struct NetState {
@@ -48,6 +52,7 @@ pub(super) struct NetState {
     pub(super) servers: Servers,
     pub(super) mounts: Vec<Mount>,
     pending: Vec<Pending>,
+    checking: Vec<Check>,
     next_id: u64,
     listing: bool,
     last: Instant,
@@ -60,7 +65,7 @@ pub(super) struct NetState {
 impl NetState {
     pub(super) fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        Self { tx, rx, servers: Servers::load(), mounts: Vec::new(), pending: Vec::new(), next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new() }
+        Self { tx, rx, servers: Servers::load(), mounts: Vec::new(), pending: Vec::new(), checking: Vec::new(), next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new() }
     }
 }
 
@@ -128,10 +133,109 @@ pub(super) fn offers_reconnect(mount: &Mount, state: Option<LinkState>) -> bool 
     mount.address.is_some() && mount.kind != MountKind::System && matches!(state, Some(LinkState::Slow | LinkState::Broken))
 }
 
-/// Where to show a server that was connected again: the folder the window was in (`inside`, below the top of
-/// the mount), if it is still there, else the top of the mount.
-fn folder_or_top(top: PathBuf, inside: Option<&Path>) -> PathBuf {
-    inside.map(|inside| top.join(inside)).filter(|folder| folder.is_dir()).unwrap_or(top)
+/// What a path on a server is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Kind {
+    Dir,
+    Other,
+    Missing,
+}
+
+/// The most the window waits, right after a server connected, for it to say what its paths are.
+const ANSWER_WAIT: Duration = Duration::from_millis(500);
+
+/// How long a click on a server may go without an answer before the window says "Not answering". Nothing waits
+/// for it: the question is asked on a thread of its own and the window carries on; this is only when to tell.
+/// A thread whose server hangs stays in its call until the server answers or the connection breaks, and what
+/// it learns then is used to refresh the sidebar, not to open anything the person has stopped waiting for.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// What each of `paths` is, or `None` where the server did not say within `wait`. The asking runs on a thread of
+/// its own: a server that hangs costs the window at most `wait`, not the whole time it hangs.
+fn kinds(paths: &[PathBuf], wait: Duration) -> Vec<Option<Kind>> {
+    kinds_with(paths, wait, |path| match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => Kind::Dir,
+        Ok(_) => Kind::Other,
+        Err(_) => Kind::Missing,
+    })
+}
+
+fn kinds_with(paths: &[PathBuf], wait: Duration, ask: impl Fn(&Path) -> Kind + Send + 'static) -> Vec<Option<Kind>> {
+    let list = paths.to_vec();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for (i, path) in list.iter().enumerate() {
+            if tx.send((i, ask(path))).is_err() {
+                break;
+            }
+        }
+    });
+    let mut kinds = vec![None; paths.len()];
+    let deadline = Instant::now() + wait;
+    while kinds.iter().any(Option::is_none) {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
+        match rx.recv_timeout(left) {
+            Ok((i, kind)) => kinds[i] = Some(kind),
+            Err(_) => break,
+        }
+    }
+    kinds
+}
+
+/// What to do once it is known whether a server's folder is there.
+pub(super) enum Next {
+    /// A folder of a connected server, from the sidebar or the path: it is shown once the server answers.
+    Folder { local: PathBuf },
+    Open { address: Address, password: Option<String>, open: OpenIn },
+    Back { address: Address, back: Option<PathBuf>, tabs: Vec<(u64, PathBuf)> },
+    Dialog { address: Address, password: Option<String>, save: bool },
+}
+
+impl Next {
+    /// The folder to ask about.
+    fn local(&self) -> Option<PathBuf> {
+        match self {
+            Next::Folder { local } => Some(local.clone()),
+            Next::Open { address, .. } | Next::Back { address, .. } | Next::Dialog { address, .. } => network::local_path(address),
+        }
+    }
+
+    /// What two questions about the same thing have in common.
+    fn key(&self) -> String {
+        match self {
+            Next::Folder { local } => local.to_string_lossy().into_owned(),
+            Next::Open { address, .. } | Next::Back { address, .. } | Next::Dialog { address, .. } => address.display(),
+        }
+    }
+}
+
+/// A question to a server that has not been answered yet.
+struct Check {
+    id: u64,
+    key: String,
+    started: Instant,
+    /// The window said "Not answering" and went on; an answer that comes now opens nothing.
+    late: bool,
+}
+
+/// The checks that have waited longer than `wait` and were not marked yet: they are marked now, and their ids returned.
+fn overdue(checks: &mut [Check], wait: Duration) -> Vec<u64> {
+    checks.iter_mut().filter(|c| !c.late && c.started.elapsed() > wait).map(|c| {
+        c.late = true;
+        c.id
+    }).collect()
+}
+
+/// Where each of `insides` (folders below the top of a mount) is to be shown once the server is connected
+/// again: there if it is still a folder, else at `top`.
+fn folders_or_top(top: &Path, insides: &[PathBuf]) -> Vec<PathBuf> {
+    let wanted: Vec<PathBuf> = insides.iter().map(|inside| top.join(inside)).collect();
+    kinds(&wanted, ANSWER_WAIT).into_iter().zip(wanted).map(|(kind, folder)| if kind == Some(Kind::Dir) { folder } else { top.to_path_buf() }).collect()
+}
+
+/// Where the tabs that were taken out of a mount wait.
+fn home_folder() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// A row of the Network section: a saved server, a connected one, or both.
@@ -180,6 +284,7 @@ impl CompressionApp {
                 }
                 NetMsg::Ask { id, prompt } => self.show_prompt(id, prompt),
                 NetMsg::Done { id, result } => self.connected(ctx, id, result),
+                NetMsg::Checked { id, local, next } => self.checked(ctx, id, local, next),
                 NetMsg::Gone { local, name, result } => {
                     self.net.leaving.remove(&local);
                     match result {
@@ -193,11 +298,11 @@ impl CompressionApp {
                     }
                     self.request_network_listing(ctx, true);
                 }
-                NetMsg::Reconnect { local, name, address, back, result } => {
+                NetMsg::Reconnect { local, name, address, back, tabs, result } => {
                     self.net.leaving.remove(&local);
                     self.request_network_listing(ctx, true);
                     match result {
-                        Ok(()) => self.open_address_back(address, back),
+                        Ok(()) => self.open_address_back(address, back, tabs),
                         Err(err) => self.set_toast(trf("Could not disconnect “{}”: {}", &[&name, &err])),
                     }
                 }
@@ -217,6 +322,21 @@ impl CompressionApp {
             let _ = pending.replies.send(Reply::Cancel);
         }
         if !self.net.pending.is_empty() || !self.net.leaving.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        let late = overdue(&mut self.net.checking, CHECK_TIMEOUT);
+        if !late.is_empty() {
+            for id in &late {
+                if let Some(Dialog::Connect { busy, error, .. }) = &mut self.dialog
+                    && *busy == Some(*id)
+                {
+                    *busy = None;
+                    *error = Some(tr("Not answering").to_owned());
+                }
+            }
+            self.set_toast(tr("Not answering"));
+        }
+        if !self.net.checking.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         self.probe_servers(ctx);
@@ -262,23 +382,82 @@ impl CompressionApp {
 
     /// Show `address`: at once when its server is connected, otherwise once connecting is done.
     pub(crate) fn open_address(&mut self, address: Address, password: Option<String>, open: OpenIn) {
-        if let Some(local) = network::local_path(&address).filter(|p| p.exists()) {
-            self.show_connected(local, open);
+        self.check_then(Next::Open { address, password, open });
+    }
+
+    /// Ask, on a thread of its own, whether the folder of `next`'s server is there, and carry on with `next` when
+    /// it is known. A server that hangs cannot hold the window up: it is the window that stops waiting.
+    /// `None` when an earlier question about the same server is still without an answer: asking again would only
+    /// add a thread that hangs as well, so the window says at once that it is not answering.
+    fn check_then(&mut self, next: Next) -> Option<u64> {
+        let key = next.key();
+        if self.net.checking.iter().any(|c| c.late && c.key == key) {
+            self.set_toast(tr("Not answering"));
+            return None;
+        }
+        let id = self.net.next_id;
+        self.net.next_id += 1;
+        self.net.checking.push(Check { id, key, started: Instant::now(), late: false });
+        let local = next.local();
+        let (tx, ctx) = (self.net.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let local = local.filter(|p| std::fs::metadata(p).is_ok());
+            let _ = tx.send(NetMsg::Checked { id, local, next });
+            ctx.request_repaint();
+        });
+        Some(id)
+    }
+
+    /// The answer to `check_then`: show the server's folder when it is there, else connect it.
+    fn checked(&mut self, ctx: &egui::Context, id: u64, found: Option<PathBuf>, next: Next) {
+        let Some(i) = self.net.checking.iter().position(|c| c.id == id) else { return };
+        let check = self.net.checking.remove(i);
+        // Whatever it was, the sidebar learns that the server answers
+        self.request_network_listing(ctx, true);
+        if check.late {
             return;
         }
-        self.start_connecting(address, password, open, false, false);
+        // The dialog was closed meanwhile: the person gave up on this
+        if matches!(next, Next::Dialog { .. }) && !matches!(&self.dialog, Some(Dialog::Connect { busy: Some(b), .. }) if *b == id) {
+            return;
+        }
+        match (next, found) {
+            (Next::Folder { local }, _) => self.navigate_to(local),
+            (Next::Open { open, .. }, Some(local)) => self.show_connected(local, open),
+            (Next::Open { address, password, open }, None) => {
+                self.start_connecting(address, password, open, false, false);
+            }
+            (Next::Back { back, tabs, .. }, Some(local)) => self.show_back(local, back, tabs, OpenIn::Here),
+            (Next::Back { address, back, tabs }, None) => {
+                let id = self.start_connecting(address, None, OpenIn::Here, false, false);
+                if let Some(pending) = self.net.pending.iter_mut().find(|p| p.id == id) {
+                    pending.then = back;
+                    pending.tabs = tabs;
+                }
+            }
+            (Next::Dialog { address, save, .. }, Some(local)) => {
+                if save {
+                    self.save_server(address);
+                }
+                if matches!(&self.dialog, Some(Dialog::Connect { busy: Some(b), .. }) if *b == id) {
+                    self.dialog = None;
+                }
+                self.show_connected(local, OpenIn::Here);
+            }
+            (Next::Dialog { address, password, save }, None) => {
+                let new = self.start_connecting(address, password, OpenIn::Here, true, save);
+                if let Some(Dialog::Connect { busy, .. }) = &mut self.dialog
+                    && *busy == Some(id)
+                {
+                    *busy = Some(new);
+                }
+            }
+        }
     }
 
     /// `open_address` for a server that was connected again: shows `back` (a folder below its top) when it is there.
-    fn open_address_back(&mut self, address: Address, back: Option<PathBuf>) {
-        if let Some(local) = network::local_path(&address).filter(|p| p.exists()) {
-            self.show_connected(folder_or_top(local, back.as_deref()), OpenIn::Here);
-            return;
-        }
-        let id = self.start_connecting(address, None, OpenIn::Here, false, false);
-        if let Some(pending) = self.net.pending.iter_mut().find(|p| p.id == id) {
-            pending.then = back;
-        }
+    fn open_address_back(&mut self, address: Address, back: Option<PathBuf>, tabs: Vec<(u64, PathBuf)>) {
+        self.check_then(Next::Back { address, back, tabs });
     }
 
     fn start_connecting(&mut self, address: Address, password: Option<String>, open: OpenIn, from_dialog: bool, save: bool) -> u64 {
@@ -297,7 +476,7 @@ impl CompressionApp {
             let _ = tx.send(msg);
             ctx.request_repaint();
         });
-        self.net.pending.push(Pending { id, address, open, replies, asking: false, from_dialog, save, then: None });
+        self.net.pending.push(Pending { id, address, open, replies, asking: false, from_dialog, save, then: None, tabs: Vec::new() });
         id
     }
 
@@ -323,7 +502,7 @@ impl CompressionApp {
                     self.dialog = None;
                 }
                 self.request_network_listing(ctx, true);
-                self.show_connected(folder_or_top(local, pending.then.as_deref()), pending.open);
+                self.show_back(local, pending.then, pending.tabs, pending.open);
             }
             Err(None) => {
                 if let Some(Dialog::Connect { busy, .. }) = &mut self.dialog {
@@ -348,8 +527,28 @@ impl CompressionApp {
         }
     }
 
+
+    /// Show a server that was connected again: the window in the folder it was in, the tabs that were parked in
+    /// it in theirs, where those are still folders, else at the top of the server. A tab that has been moved
+    /// since is left alone.
+    fn show_back(&mut self, top: PathBuf, back: Option<PathBuf>, tabs: Vec<(u64, PathBuf)>, open: OpenIn) {
+        if back.is_none() && tabs.is_empty() {
+            return self.show_connected(top, open);
+        }
+        let insides: Vec<PathBuf> = back.iter().cloned().chain(tabs.iter().map(|(_, inside)| inside.clone())).collect();
+        let mut folders = folders_or_top(&top, &insides).into_iter();
+        self.show_connected(if back.is_some() { folders.next().unwrap_or_else(|| top.clone()) } else { top.clone() }, open);
+        let home = home_folder();
+        for ((id, _), folder) in tabs.iter().zip(folders) {
+            if let Some(state) = self.tabs.iter_mut().find(|slot| slot.id == *id).and_then(|slot| slot.saved.as_mut()).filter(|state| state.folder() == home) {
+                state.set_folder(folder);
+            }
+        }
+    }
+
     /// Show a folder of a connected server; a file is shown selected in its folder.
     fn show_connected(&mut self, local: PathBuf, open: OpenIn) {
+        // The server has just answered (it was checked, or connected): asking again is quick
         let (folder, select) = if local.is_dir() || !local.exists() {
             (local, None)
         } else {
@@ -428,19 +627,26 @@ impl CompressionApp {
         }
         // Come back to the folder the window is in, not to the top of the server
         let back = self.current_path.strip_prefix(&mount.local).ok().filter(|inside| !inside.as_os_str().is_empty()).map(Path::to_path_buf);
+        // ... and the tabs parked in it to theirs
+        let tabs = self.parked_in(&mount.local);
         self.leave_mount(&mount.local);
         let (tx, ctx) = (self.net.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let result = network::disconnect(&mount);
-            let _ = tx.send(NetMsg::Reconnect { local: mount.local.clone(), name: mount.name.clone(), address, back, result });
+            let _ = tx.send(NetMsg::Reconnect { local: mount.local.clone(), name: mount.name.clone(), address, back, tabs, result });
             ctx.request_repaint();
         });
+    }
+
+    /// The parked tabs that are in the mount: `(tab id, folder below its top)`.
+    fn parked_in(&self, local: &Path) -> Vec<(u64, PathBuf)> {
+        self.tabs.iter().filter_map(|slot| Some((slot.id, slot.saved.as_ref()?.folder().strip_prefix(local).ok()?.to_path_buf()))).collect()
     }
 
     /// Take every tab out of the folders of the mount, which is about to be let go of: the one on screen
     /// and the parked ones all go to the home folder.
     pub(super) fn leave_mount(&mut self, local: &Path) {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let home = home_folder();
         if self.current_path.starts_with(local) {
             self.navigate_to(home.clone());
         }
@@ -612,7 +818,12 @@ impl CompressionApp {
             match event {
                 NetEvent::Open(path) => {
                     self.close_search();
-                    self.navigate_to(path);
+                    // A folder on a server is asked about first: a server that hangs must not hold the window up
+                    if network::is_remote(&path) {
+                        self.check_then(Next::Folder { local: path });
+                    } else {
+                        self.navigate_to(path);
+                    }
                 }
                 NetEvent::Connect(address, open) => self.open_address(address, None, open),
                 NetEvent::NewTab(path) => self.new_tab(path),
@@ -766,14 +977,10 @@ impl CompressionApp {
             match parsed {
                 Some((address, password)) => {
                     *error = None;
-                    if let Some(local) = network::local_path(&address).filter(|p| p.exists()) {
-                        if *save {
-                            self.save_server(address);
-                        }
-                        self.show_connected(local, OpenIn::Here);
-                        return true;
+                    match self.check_then(Next::Dialog { address, password, save: *save }) {
+                        Some(id) => *busy = Some(id),
+                        None => *error = Some(tr("Not answering").to_owned()),
                     }
-                    *busy = Some(self.start_connecting(address, password, OpenIn::Here, true, *save));
                 }
                 None => *error = Some(tr("This is not a server address").to_owned()),
             }

@@ -75,10 +75,16 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
         return Ok(());
     }
     let err = io::Error::last_os_error();
-    match err.raw_os_error() {
-        // shortcut: a file system without RENAME_NOREPLACE gets a check first, which leaves a tiny race; upgrade if one shows up
-        Some(libc::ENOSYS | libc::EINVAL) if to.symlink_metadata().is_err() => std::fs::rename(from, to),
-        _ => Err(err),
+    // shortcut: a file system without RENAME_NOREPLACE gets a check first, which leaves a tiny race; upgrade if one shows up
+    if lacks_noreplace(err.raw_os_error()) && to.symlink_metadata().is_err() {
+        return std::fs::rename(from, to);
     }
+    Err(err)
+}
+
+/// Whether `errno` says the file system cannot do RENAME_NOREPLACE at all (the kernel answers EINVAL, a
+/// file system of its own may answer EOPNOTSUPP), as opposed to a real failure such as EEXIST.
+fn lacks_noreplace(errno: Option<i32>) -> bool {
+    matches!(errno, Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP))
 }
 
