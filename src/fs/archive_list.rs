@@ -331,3 +331,108 @@ pub fn tree(entries: &[ArchiveEntry]) -> Vec<Node> {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::ops::{ArchiveFormat, compress};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression-archive-list-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/d/e")).unwrap();
+        std::fs::write(dir.join("src/a.txt"), "hello").unwrap();
+        std::fs::write(dir.join("src/d/e/b.txt"), "world!!").unwrap();
+        dir
+    }
+
+    fn names(l: &Listing) -> Vec<&str> {
+        let mut n: Vec<&str> = l.entries.iter().map(|e| e.path.trim_end_matches('/')).collect();
+        n.sort_unstable();
+        n
+    }
+
+    fn check(format: ArchiveFormat) {
+        if !format.available() {
+            return;
+        }
+        let dir = scratch(format.extension().trim_start_matches('.'));
+        let out = dir.join(format!("pack{}", format.extension()));
+        compress(&[dir.join("src/a.txt"), dir.join("src/d")], &out, format, &crate::fs::ops::Control::unlimited()).unwrap();
+        let listing = list(&out, &AtomicBool::new(false)).unwrap();
+        assert!(names(&listing).contains(&"a.txt") && names(&listing).contains(&"d/e/b.txt"), "{format:?}: {:?}", names(&listing));
+        assert_eq!(listing.unpacked, 12, "{format:?}");
+        assert!(listing.packed > 0 && listing.cut.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lone_compressed_file_has_no_tree() {
+        for name in ["a.zip", "a.tar.gz", "a.tgz", "a.tar.zst", "a.7z"] {
+            assert!(is_listable(Path::new(name)), "{name}");
+        }
+        for name in ["log.gz", "dump.sql.xz", "data.bz2", "backup.zst", "notes.txt"] {
+            assert!(!is_listable(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn lists_zip_tar_gz_and_the_tools_that_exist() {
+        for format in ArchiveFormat::ALL {
+            check(format);
+        }
+    }
+
+    #[test]
+    fn long_listings_are_cut() {
+        let dir = scratch("cap");
+        for n in 0..40 {
+            std::fs::write(dir.join("src").join(format!("f{n}")), "x").unwrap();
+        }
+        for format in [ArchiveFormat::Zip, ArchiveFormat::TarGz] {
+            let out = dir.join(format!("many{}", format.extension()));
+            compress(&[dir.join("src")], &out, format, &crate::fs::ops::Control::unlimited()).unwrap();
+            let listing = list_capped(&out, 10, TIME_LIMIT, &AtomicBool::new(false)).unwrap();
+            assert_eq!((listing.entries.len(), listing.cut), (10, Some(Cut::Entries)), "{format:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_lose_control_characters_and_length() {
+        assert_eq!(sanitize("a\u{1b}[31mb\nc\u{202e}d"), "a[31mbcd");
+        assert_eq!(sanitize(&"x".repeat(400)).chars().count(), MAX_NAME + 1);
+        // A tar with such a name is listed clean
+        let dir = scratch("names");
+        let out = dir.join("odd.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&out).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_cksum();
+        builder.append_data(&mut header, "bad\u{7}name\u{1b}", &b"x"[..]).unwrap();
+        builder.finish().unwrap();
+        let listing = list(&out, &AtomicBool::new(false)).unwrap();
+        assert_eq!(listing.entries[0].path, "badname");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_seven_zip_output() {
+        let text = "7-Zip\n\nListing archive: x.7z\n\n--\nPath = x.7z\nType = 7z\n\n----------\nPath = dir\nFolder = +\nSize = 0\n\nPath = dir/secret.bin\nFolder = -\nSize = 42\nEncrypted = +\n\nPath = top.txt\nSize = 7\nAttributes = A_ -rw-r--r--\n";
+        let mut parser = SevenZip::default();
+        text.lines().for_each(|l| parser.feed(l));
+        parser.flush();
+        let e = &parser.entries;
+        assert_eq!(e.len(), 3);
+        assert!(e[0].is_dir && !e[1].is_dir && e[1].encrypted && e[1].size == 42);
+        assert_eq!((e[2].path.as_str(), e[2].size, e[2].encrypted), ("top.txt", 7, false));
+    }
+
+    #[test]
+    fn the_tree_sums_folders_and_puts_them_first() {
+        let file = |p: &str, size| ArchiveEntry { path: p.into(), is_dir: false, size, encrypted: false };
+        let nodes = tree(&[file("z.txt", 1), file("d/e/b.txt", 7), file("./d/a.txt", 5), file("/abs/x", 2)]);
+        let shown: Vec<(usize, &str, u64, usize)> = nodes.iter().map(|n| (n.depth, n.name.as_str(), n.size, n.files)).collect();
+        assert_eq!(shown, vec![(0, "abs", 2, 1), (1, "x", 2, 1), (0, "d", 12, 2), (1, "e", 7, 1), (2, "b.txt", 7, 1), (1, "a.txt", 5, 1), (0, "z.txt", 1, 1)]);
+        assert_eq!(nodes[2].end, 6, "a folder's subtree ends before the next sibling");
+    }
+}

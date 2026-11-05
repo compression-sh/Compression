@@ -39,6 +39,14 @@ impl<'a> Control<'a> {
     }
 }
 
+#[cfg(test)]
+impl Control<'_> {
+    /// No cancelling, no limit worth speaking of, no one watching the progress.
+    pub fn unlimited() -> Control<'static> {
+        Control::new(&|| false, &|_| {}, Duration::from_secs(24 * 3600))
+    }
+}
+
 fn stopped() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "cancelled")
 }
