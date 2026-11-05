@@ -74,6 +74,9 @@ pub(super) struct NetState {
     leaving: HashSet<PathBuf>,
     /// Whether the connected servers still answer.
     probes: Probes,
+    /// Logins and questions of connections that wait for the window to have room for them: no dialog is shown over
+    /// another one, since the one underneath (a question of a copy, a name being typed) would be lost.
+    waiting_prompts: VecDeque<(u64, Prompt)>,
     /// What the window knows about paths on servers without having to ask in a frame.
     pub(super) known: Known,
     #[cfg(test)]
@@ -91,7 +94,7 @@ impl NetState {
 
     pub(super) fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        Self { tx, rx, servers: Servers::load(), mounts: Vec::new(), pending: Vec::new(), checking: Vec::new(), navs: HashMap::new(), generations: HashMap::new(), ask: ask_server, next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new(), known: Known::default(), #[cfg(test)] rename: Arc::new(crate::compat::rename_noreplace) }
+        Self { tx, rx, servers: Servers::load(), mounts: Vec::new(), pending: Vec::new(), checking: Vec::new(), navs: HashMap::new(), generations: HashMap::new(), ask: ask_server, next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new(), waiting_prompts: VecDeque::new(), known: Known::default(), #[cfg(test)] rename: Arc::new(crate::compat::rename_noreplace) }
     }
 }
 
@@ -527,6 +530,7 @@ impl CompressionApp {
                 },
             }
         }
+        self.show_waiting_prompt();
         // A login or question that was closed some other way (Escape, a click outside) is a cancel
         let shown = match &self.dialog {
             Some(Dialog::Login { id, .. } | Dialog::NetQuestion { id, .. }) => Some(*id),
@@ -850,8 +854,20 @@ impl CompressionApp {
         }
     }
 
-    /// The login or question dialog for a connection that waits for an answer.
+    /// The login or question dialog for a connection that waits for an answer. Another dialog on screen is not
+    /// replaced (a question of a running copy that is dropped ends that copy; a name being typed is lost): the
+    /// prompt waits for its turn (`show_waiting_prompt`), and the connection with it.
     fn show_prompt(&mut self, id: u64, prompt: Prompt) {
+        if !self.net.pending.iter().any(|p| p.id == id) {
+            return;
+        }
+        // The Connect to server dialog that started this very connection is the one place a login belongs in front of
+        // (it only waits for it); any other dialog is somebody else's
+        let theirs = self.net.pending.iter().find(|p| p.id == id).is_some_and(|p| p.from_dialog) && matches!(self.dialog, Some(Dialog::Connect { .. }));
+        if self.dialog.is_some() && !theirs {
+            self.net.waiting_prompts.push_back((id, prompt));
+            return;
+        }
         let Some(pending) = self.net.pending.iter_mut().find(|p| p.id == id) else { return };
         pending.asking = true;
         let address = pending.address.clone();
@@ -874,6 +890,14 @@ impl CompressionApp {
                 Dialog::NetQuestion { id, title, body, choices: choices.iter().map(|c| choice_label(c)).collect() }
             }
         });
+    }
+
+    /// Once nothing else is on screen: the next prompt that waited. One whose connection is over is dropped.
+    fn show_waiting_prompt(&mut self) {
+        while self.dialog.is_none() {
+            let Some((id, prompt)) = self.net.waiting_prompts.pop_front() else { return };
+            self.show_prompt(id, prompt);
+        }
     }
 
     fn reply(&mut self, id: u64, reply: Reply) {
@@ -1926,6 +1950,93 @@ mod tests {
         }
         app.net.ask = slow_resolution;
         (app, base)
+    }
+
+    fn waiting_connection(app: &mut CompressionApp, id: u64) -> mpsc::Receiver<Reply> {
+        let (replies, answers) = mpsc::channel();
+        app.net.pending.push(Pending { id, address: Address::parse("sftp://me@host/").unwrap(), open: OpenIn::Here, replies, asking: false, from_dialog: false, save: false, then: None, tabs: Vec::new() });
+        answers
+    }
+
+    fn login_prompt() -> Prompt {
+        Prompt::Login { user: Some("me".into()), domain: None, fixed_user: false, anonymous: false, retry: false }
+    }
+
+    #[test]
+    fn a_login_waits_for_the_dialog_on_screen_instead_of_replacing_it() {
+        let (mut app, base) = local_app("prompt_waits");
+        let ctx = app.ctx.clone();
+        let answers = waiting_connection(&mut app, 7);
+        // A question of a running copy is on screen: it is not the login's to take over
+        app.dialog = Some(Dialog::Conflict { request: None, all: false });
+        app.show_prompt(7, login_prompt());
+        assert!(matches!(app.dialog, Some(Dialog::Conflict { .. })), "the dialog underneath stays");
+        assert_eq!(app.net.waiting_prompts.len(), 1);
+        // The login waits, and the connection with it: nobody answered "cancel" for it
+        for _ in 0..3 {
+            app.poll_network(&ctx);
+        }
+        assert!(answers.try_recv().is_err(), "a waiting login is not a cancelled one");
+        assert!(matches!(app.dialog, Some(Dialog::Conflict { .. })));
+        // Once the room is free, the login comes
+        app.dialog = None;
+        app.poll_network(&ctx);
+        assert!(matches!(app.dialog, Some(Dialog::Login { id: 7, .. })));
+        assert!(app.net.pending[0].asking);
+        assert!(app.net.waiting_prompts.is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn the_login_of_a_connection_started_in_the_connect_dialog_comes_in_front_of_that_dialog() {
+        let (mut app, base) = local_app("prompt_connect_dialog");
+        let _answers = waiting_connection(&mut app, 4);
+        app.net.pending[0].from_dialog = true;
+        app.dialog = Some(Dialog::Connect { text: "sftp://me@host/".into(), save: true, error: None, first_frame: false, busy: Some(4) });
+        app.show_prompt(4, login_prompt());
+        assert!(matches!(app.dialog, Some(Dialog::Login { id: 4, .. })), "the dialog that waits for it must not hold it back");
+        assert!(app.net.waiting_prompts.is_empty());
+        // A connection that was not started there does not take the dialog over
+        let _other = waiting_connection(&mut app, 8);
+        app.dialog = Some(Dialog::Connect { text: String::new(), save: true, error: None, first_frame: false, busy: None });
+        app.show_prompt(8, login_prompt());
+        assert!(matches!(app.dialog, Some(Dialog::Connect { .. })));
+        assert_eq!(app.net.waiting_prompts.len(), 1);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_login_whose_connection_is_over_is_dropped_and_several_come_one_after_the_other() {
+        let (mut app, base) = local_app("prompts_in_turn");
+        let ctx = app.ctx.clone();
+        let _first = waiting_connection(&mut app, 1);
+        let _second = waiting_connection(&mut app, 2);
+        app.dialog = Some(Dialog::Conflict { request: None, all: false });
+        app.show_prompt(1, login_prompt());
+        app.show_prompt(2, login_prompt());
+        app.show_prompt(3, login_prompt());
+        // 3 has no connection: nothing to wait for
+        assert_eq!(app.net.waiting_prompts.len(), 2);
+        // The first connection ends while its login waits
+        app.net.pending.retain(|p| p.id != 1);
+        app.dialog = None;
+        app.poll_network(&ctx);
+        assert!(matches!(app.dialog, Some(Dialog::Login { id: 2, .. })), "the dead one is skipped, the next is shown");
+        assert!(app.net.waiting_prompts.is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_login_that_is_shown_and_then_closed_by_another_dialog_still_cancels_its_connection() {
+        let (mut app, base) = local_app("prompt_closed");
+        let ctx = app.ctx.clone();
+        let answers = waiting_connection(&mut app, 5);
+        app.show_prompt(5, login_prompt());
+        assert!(matches!(app.dialog, Some(Dialog::Login { id: 5, .. })));
+        app.dialog = None;
+        app.poll_network(&ctx);
+        assert!(matches!(answers.try_recv(), Ok(Reply::Cancel)), "a login that was dismissed is a cancel, as before");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     fn drain(app: &mut CompressionApp) {
