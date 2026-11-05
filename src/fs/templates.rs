@@ -113,3 +113,34 @@ pub fn create(template: &Template, target: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_and_user_templates_create_files() {
+        let dir = std::env::temp_dir().join(format!("compression_tpl_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tpl/sub")).unwrap();
+        std::fs::write(dir.join("tpl/Invoice.odt"), "odt").unwrap();
+        std::fs::write(dir.join("tpl/sub/Letter.txt"), "dear").unwrap();
+        std::fs::write(dir.join("tpl/.hidden"), "x").unwrap();
+
+        let all = load(Some(&dir.join("tpl")));
+        let names: Vec<&str> = all.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"Invoice") && names.contains(&"Letter") && !names.iter().any(|n| n.contains("hidden")));
+        assert_eq!(all[0].file_name, "Untitled");
+
+        let sh = all.iter().find(|t| t.file_name == "script.sh").unwrap();
+        create(sh, &dir.join("a.sh")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(dir.join("a.sh")).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(create(sh, &dir.join("a.sh")).is_err(), "an existing file is never replaced");
+
+        let invoice = all.iter().find(|t| t.name == "Invoice").unwrap();
+        create(invoice, &dir.join("new.odt")).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("new.odt")).unwrap(), "odt");
+        assert_eq!(invoice.extension(), Some("odt"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

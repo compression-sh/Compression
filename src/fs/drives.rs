@@ -205,3 +205,69 @@ fn is_mounted(dev: &str) -> bool {
     run("lsblk", &["-no", "MOUNTPOINT", dev]).is_ok_and(|s| !s.trim().is_empty())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"{"blockdevices":[
+      {"name":"nvme0n1","path":"/dev/nvme0n1","label":null,"size":"500G","mountpoint":null,"rm":false,"hotplug":false,"type":"disk","fstype":null,"children":[
+        {"name":"nvme0n1p1","path":"/dev/nvme0n1p1","label":"boot","size":"1G","mountpoint":"/boot","rm":false,"hotplug":false,"type":"part","fstype":"vfat"},
+        {"name":"nvme0n1p2","path":"/dev/nvme0n1p2","label":null,"size":"499G","mountpoint":"/","rm":false,"hotplug":false,"type":"part","fstype":"ext4"}]},
+      {"name":"sda","path":"/dev/sda","label":null,"size":"16G","mountpoint":null,"rm":"1","hotplug":"1","type":"disk","fstype":null,"children":[
+        {"name":"sda1","path":"/dev/sda1","label":"STICK","size":"8G","mountpoint":"/run/media/me/STICK","rm":"1","hotplug":"1","type":"part","fstype":"vfat"},
+        {"name":"sda2","path":"/dev/sda2","label":null,"size":"8G","mountpoint":null,"rm":"1","hotplug":"1","type":"part","fstype":"ext4"}]},
+      {"name":"sdb","path":"/dev/sdb","label":null,"size":"1T","mountpoint":null,"rm":false,"hotplug":false,"type":"disk","fstype":null,"children":[
+        {"name":"sdb1","path":"/dev/sdb1","label":"data","size":"1T","mountpoint":null,"rm":false,"hotplug":false,"type":"part","fstype":"ext4"}]}]}"#;
+
+    #[test]
+    fn lists_every_partition_but_the_root() {
+        let drives = parse_lsblk(SAMPLE, true);
+        let mut seen: Vec<(&str, bool, bool)> = drives.iter().map(|p| {
+            let d = p.drive.as_ref().unwrap();
+            (d.dev.as_str(), d.mounted, d.system)
+        }).collect();
+        seen.sort();
+        assert_eq!(seen, vec![
+            ("/dev/nvme0n1p1", true, true),
+            ("/dev/sda1", true, false),
+            ("/dev/sda2", false, false),
+            ("/dev/sdb1", false, false),
+        ]);
+        let stick = drives.iter().find(|p| p.name == "STICK").unwrap();
+        assert_eq!(stick.path, PathBuf::from("/run/media/me/STICK"));
+        // Internal disks come before the ones plugged in
+        assert!(!drives[0].drive.as_ref().unwrap().removable);
+    }
+
+    #[test]
+    fn lists_a_windows_partition_but_not_its_boot_ones() {
+        let json = r#"{"blockdevices":[
+          {"name":"nvme1n1","path":"/dev/nvme1n1","label":null,"size":"1T","mountpoint":null,"mountpoints":[null],"rm":false,"hotplug":false,"type":"disk","fstype":null,"parttype":null,"children":[
+            {"name":"nvme1n1p1","path":"/dev/nvme1n1p1","label":"SYSTEM","size":"100M","mountpoint":null,"mountpoints":[null],"rm":false,"hotplug":false,"type":"part","fstype":"vfat","parttype":"c12a7328-f81f-11d2-ba4b-00a0c93ec93b"},
+            {"name":"nvme1n1p2","path":"/dev/nvme1n1p2","label":null,"size":"16M","mountpoint":null,"mountpoints":[null],"rm":false,"hotplug":false,"type":"part","fstype":null,"parttype":"e3c9e316-0b5c-4db8-817d-f92df00215ae"},
+            {"name":"nvme1n1p3","path":"/dev/nvme1n1p3","label":"Windows","size":"900G","mountpoint":null,"mountpoints":[null],"rm":false,"hotplug":false,"type":"part","fstype":"ntfs","parttype":"ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"},
+            {"name":"nvme1n1p4","path":"/dev/nvme1n1p4","label":"Recovery","size":"700M","mountpoint":null,"mountpoints":[null],"rm":false,"hotplug":false,"type":"part","fstype":"ntfs","parttype":"de94bba4-06d1-4d40-a16a-bfd50179d6ac"}]},
+          {"name":"nvme0n1","path":"/dev/nvme0n1","label":null,"size":"500G","mountpoint":null,"mountpoints":[null],"rm":false,"hotplug":false,"type":"disk","fstype":null,"parttype":null,"children":[
+            {"name":"nvme0n1p1","path":"/dev/nvme0n1p1","label":null,"size":"500G","mountpoint":"/home","mountpoints":["/home","/nix","/"],"rm":false,"hotplug":false,"type":"part","fstype":"btrfs","parttype":"0fc63daf-8483-4772-8e79-3d69d8477de4"}]}]}"#;
+        let drives = parse_lsblk(json, true);
+        assert!(parse_lsblk(json, false).is_empty());
+        let names: Vec<&str> = drives.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["Windows"]);
+        let windows = drives[0].drive.as_ref().unwrap();
+        assert!(!windows.mounted && !windows.removable);
+        assert_eq!(drives[0].icon, icons::HARD_DISK);
+    }
+
+    #[test]
+    fn without_all_lists_user_mounts_and_unmounted_removables_only() {
+        let mut seen: Vec<String> = parse_lsblk(SAMPLE, false).iter().map(|p| p.drive.as_ref().unwrap().dev.clone()).collect();
+        seen.sort();
+        assert_eq!(seen, vec!["/dev/sda1", "/dev/sda2"]);
+    }
+
+    #[test]
+    fn space_of_the_root() {
+        let space = Space::of(Path::new("/")).unwrap();
+        assert!(space.total > 0 && space.used <= space.total && space.free <= space.total);
+    }
+}

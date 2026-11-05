@@ -211,3 +211,134 @@ pub fn is_inside(path: &Path, dirs: &[PathBuf]) -> bool {
     path.parent().is_some_and(|p| dirs.iter().any(|d| d == p))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wait_for(watcher: &Watcher, want: impl Fn(&Event) -> bool) -> bool {
+        for _ in 0..100 {
+            if watcher.events().any(|e| want(&e)) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn changes_in_a_watched_folder_arrive_and_a_removed_folder_is_reported() {
+        let dir = std::env::temp_dir().join(format!("compression-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut watcher = Watcher::new(&egui::Context::default()).expect("inotify");
+        watcher.set(std::slice::from_ref(&dir));
+
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert!(wait_for(&watcher, |e| matches!(e, Event::Path { path, settled: true } if *path == file)), "a new file is reported once written");
+        std::fs::remove_file(&file).unwrap();
+        assert!(wait_for(&watcher, |e| matches!(e, Event::Path { path, .. } if *path == file)), "and again when it goes");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(wait_for(&watcher, |e| *e == Event::Gone(dir.clone())));
+    }
+
+    /// Every event that arrives within a while.
+    fn collect(watcher: &Watcher, until: impl Fn(&[Event]) -> bool) -> Vec<Event> {
+        let mut all = Vec::new();
+        for _ in 0..100 {
+            all.extend(watcher.events());
+            if until(&all) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        all
+    }
+
+    #[test]
+    fn a_folder_reached_by_two_paths_reports_to_both() {
+        let dir = std::env::temp_dir().join(format!("compression-watch-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        let (real, alias) = (dir.join("real"), dir.join("alias"));
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let mut watcher = Watcher::new(&egui::Context::default()).expect("inotify");
+        watcher.set(&[real.clone(), alias.clone()]);
+        // One descriptor, two paths
+        assert_eq!(watcher.state.lock().unwrap().watches.len(), 1);
+
+        std::fs::write(real.join("a.txt"), "x").unwrap();
+        let both = |events: &[Event]| [&real, &alias].iter().all(|d| events.iter().any(|e| matches!(e, Event::Path { path, settled: true } if *path == d.join("a.txt"))));
+        let events = collect(&watcher, both);
+        assert!(both(&events), "each path hears of the new file: {events:?}");
+
+        // A folder that is gone is gone under both names
+        std::fs::remove_dir_all(&real).unwrap();
+        let gone = |events: &[Event]| events.contains(&Event::Gone(real.clone())) && events.contains(&Event::Gone(alias.clone()));
+        let events = collect(&watcher, gone);
+        assert!(gone(&events), "{events:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn registering_the_same_path_twice_does_not_report_twice() {
+        let dir = std::env::temp_dir().join(format!("compression-watch-twice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut watcher = Watcher::new(&egui::Context::default()).expect("inotify");
+        watcher.set(&[dir.clone(), dir.clone()]);
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let events = collect(&watcher, |e| e.iter().any(|e| matches!(e, Event::Path { settled: true, .. })));
+        std::thread::sleep(Duration::from_millis(100));
+        let more: Vec<_> = watcher.events().collect();
+        let settled = events.iter().chain(&more).filter(|e| matches!(e, Event::Path { settled: true, .. })).count();
+        assert_eq!(settled, 1, "{events:?} {more:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_descriptor_is_closed_when_the_thread_cannot_be_started() {
+        // A pipe stands in for the inotify descriptor: its read end sees the end of the data
+        // once the write end, which the watcher owns, is closed
+        let mut fds = [0 as std::os::fd::RawFd; 2];
+        // SAFETY: pipe2 fills two descriptors that are owned from here on
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }, 0);
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let started = Watcher::start(write, &egui::Context::default(), |_work| Err(std::io::Error::other("no thread")));
+        assert!(started.is_none());
+        let mut byte = 0u8;
+        // SAFETY: reads one byte into a variable of ours
+        let n = unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+        assert_eq!(n, 0, "the write end was still open (a read would give EAGAIN)");
+    }
+
+    #[test]
+    fn the_descriptor_is_closed_when_the_watcher_stops() {
+        let mut fds = [0 as std::os::fd::RawFd; 2];
+        // SAFETY: as above
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }, 0);
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let watcher = Watcher::start(write, &egui::Context::default(), |work| std::thread::Builder::new().spawn(work).map(|_| ())).expect("started");
+        drop(watcher);
+        // The thread notices the stop within a poll round (half a second)
+        let started = std::time::Instant::now();
+        let mut byte = 0u8;
+        loop {
+            let n = unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+            if n == 0 {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "the descriptor stayed open");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_watched_is_polled() {
+        let mut watcher = Watcher::new(&egui::Context::default()).expect("inotify");
+        let missing = std::env::temp_dir().join(format!("compression-watch-missing-{}", std::process::id()));
+        watcher.set(std::slice::from_ref(&missing));
+        assert!(watcher.state.lock().unwrap().polled.contains_key(&missing));
+    }
+}

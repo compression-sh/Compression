@@ -248,3 +248,24 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::info_for;
+
+    #[test]
+    fn version_and_help_are_answered_only_for_the_exact_first_argument() {
+        let version = format!("compression {}\n", env!("CARGO_PKG_VERSION"));
+        assert_eq!(info_for(Some("--version")), Some(version.clone()));
+        assert_eq!(info_for(Some("-V")), Some(version));
+        let help = info_for(Some("--help")).unwrap();
+        assert_eq!(info_for(Some("-h")), Some(help.clone()));
+        for mode in ["--chooser", "--portal", "--resident", "--version", "--help"] {
+            assert!(help.contains(mode), "the help does not mention {mode}");
+        }
+        // Folders and everything else are not information requests
+        for other in ["./--version", "./--help", "--versions", "-v", "-H", "--Version", "", "/tmp", "--chooser", "sftp://h/"] {
+            assert_eq!(info_for(Some(other)), None, "{other:?}");
+        }
+        assert_eq!(info_for(None), None);
+    }
+}

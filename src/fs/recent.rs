@@ -148,3 +148,32 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stamps_become_epoch_seconds() {
+        assert_eq!(iso_seconds("1970-01-02T00:00:01.5Z"), 86401);
+        assert_eq!(iso_seconds("2024-03-01T00:00:00Z"), 1709251200);
+        assert_eq!(iso_seconds("junk"), 0);
+    }
+
+    #[test]
+    fn a_write_by_compression_counts_as_ours_only_for_a_moment() {
+        *LAST_OWN_WRITE.lock().unwrap() = None;
+        assert!(!written_here_lately());
+        *LAST_OWN_WRITE.lock().unwrap() = Some(std::time::Instant::now());
+        assert!(written_here_lately());
+        *LAST_OWN_WRITE.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        assert!(!written_here_lately());
+        assert!(sources().iter().all(|s| s.is_absolute()));
+    }
+
+    #[test]
+    fn newest_use_wins_across_sources() {
+        let p = |s: &str| PathBuf::from(s);
+        let merged = merge(vec![(100, p("/old-in-compression")), (500, p("/both"))], vec![(900, p("/in-gimp")), (400, p("/both"))]);
+        assert_eq!(merged, [p("/in-gimp"), p("/both"), p("/old-in-compression")]);
+    }
+}

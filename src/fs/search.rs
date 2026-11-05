@@ -196,3 +196,112 @@ impl Search {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folders_on_servers_are_entered_only_when_allowed_or_searched_from_inside() {
+        let remote = |p: &std::path::Path| p.starts_with("/srv/nas");
+        let allowed = |p: &std::path::Path| !remote(p);
+        assert!(may_enter(std::path::Path::new("/home/me/docs"), false, allowed));
+        assert!(!may_enter(std::path::Path::new("/srv/nas/share"), false, allowed));
+        // Previews on servers switched on: everything may be entered
+        assert!(may_enter(std::path::Path::new("/srv/nas/share"), false, |_| true));
+        // A search that begins in a server's folder goes on there
+        assert!(may_enter(std::path::Path::new("/srv/nas/share/sub"), true, allowed));
+    }
+
+    /// The paths a search from `root` finds for "needle" (waits for it to finish).
+    fn found(root: &std::path::Path) -> Vec<PathBuf> {
+        let mut search = Search::new();
+        search.start(&egui::Context::default(), root.to_path_buf(), "needle".into(), true, TypeFilter::All, SearchOptions::default());
+        let mut paths = Vec::new();
+        let started = std::time::Instant::now();
+        loop {
+            paths.extend(search.poll().into_iter().map(|i| i.path));
+            if !search.is_running() || started.elapsed() > std::time::Duration::from_secs(10) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn a_search_skips_folders_on_servers_but_finds_local_files() {
+        let dir = std::env::temp_dir().join(format!("compression_search_remote_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["local", "nas", "nas/deep"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        for file in ["needle-top.txt", "local/needle-a.txt", "nas/needle-b.txt", "nas/deep/needle-c.txt"] {
+            std::fs::write(dir.join(file), "x").unwrap();
+        }
+        super::super::network::declare_remote_for_tests(&dir.join("nas"));
+        // Previews on servers are off by default, and nothing in the tests turns them on
+        let names = |paths: Vec<PathBuf>| paths.iter().map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(names(found(&dir)), ["local/needle-a.txt", "needle-top.txt"]);
+        // Started inside the server's folder, the search is the person's own choice
+        let inside: Vec<_> = found(&dir.join("nas")).into_iter().map(|p| p.strip_prefix(dir.join("nas")).unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(inside, ["deep/needle-c.txt", "needle-b.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn contents_match_text_files_only() {
+        let dir = std::env::temp_dir().join(format!("compression_search_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.txt"), "Remember the Milk").unwrap();
+        std::fs::write(dir.join("blob.bin"), b"milk\0\0\0").unwrap();
+        assert!(file_contains(&dir.join("note.txt"), "milk", false));
+        assert!(!file_contains(&dir.join("note.txt"), "milk", true));
+        assert!(file_contains(&dir.join("note.txt"), "Milk", true));
+        assert!(!file_contains(&dir.join("blob.bin"), "milk", false));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs a search to the end; gives back how many results it sent and whether it hit its limit.
+    fn run_to_the_end(search: &mut Search, root: &std::path::Path) -> (usize, bool) {
+        search.start(&egui::Context::default(), root.to_path_buf(), "needle".into(), true, TypeFilter::All, SearchOptions::default());
+        let mut count = 0;
+        let started = std::time::Instant::now();
+        loop {
+            count += search.poll().len();
+            if !search.is_running() || started.elapsed() > std::time::Duration::from_secs(10) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (count, search.limit_reached())
+    }
+
+    #[test]
+    fn a_search_says_when_it_stopped_at_its_limit() {
+        let many = std::env::temp_dir().join(format!("compression_search_many_{}", std::process::id()));
+        let few = std::env::temp_dir().join(format!("compression_search_few_{}", std::process::id()));
+        for dir in [&many, &few] {
+            let _ = std::fs::remove_dir_all(dir);
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for n in 0..450 {
+            std::fs::write(many.join(format!("needle-{n:03}.txt")), "x").unwrap();
+        }
+        for n in 0..10 {
+            std::fs::write(few.join(format!("needle-{n}.txt")), "x").unwrap();
+        }
+        let mut search = Search::new();
+        assert!(!search.limit_reached(), "nothing was searched yet");
+        assert_eq!(run_to_the_end(&mut search, &many), (MAX_RESULTS, true));
+        // The next search starts without the flag, and a search with few results never sets it
+        assert_eq!(run_to_the_end(&mut search, &few), (10, false));
+        // Cancelling forgets it too
+        assert_eq!(run_to_the_end(&mut search, &many), (MAX_RESULTS, true));
+        search.cancel();
+        assert!(!search.limit_reached());
+        std::fs::remove_dir_all(&many).unwrap();
+        std::fs::remove_dir_all(&few).unwrap();
+    }
+}

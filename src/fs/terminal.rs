@@ -136,3 +136,41 @@ pub fn ssh_command(user: Option<&str>, host: &str, port: Option<u16>, dir: &str)
     command
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_terminal_that_was_closed_is_collected_and_starting_it_does_not_wait() {
+        let started = std::time::Instant::now();
+        // A program that runs for a while stands in for the terminal
+        let id = start(Command::new("sleep").arg("0.4")).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(300), "starting waited for the terminal");
+        assert!(Path::new(&format!("/proc/{id}")).exists(), "still running");
+        let waited = std::time::Instant::now();
+        while Path::new(&format!("/proc/{id}")).exists() && waited.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!Path::new(&format!("/proc/{id}")).exists(), "the terminal was left as a zombie");
+        assert!(start(&mut Command::new("/nonexistent/compression-test-terminal")).is_err());
+    }
+
+    #[test]
+    fn folder_placeholder_is_filled() {
+        assert_eq!(fill("--working-directory={}", Path::new("/a b")), "--working-directory=/a b");
+        assert_eq!(detect("mycterm --flag").as_deref(), Some("mycterm"));
+    }
+
+    #[test]
+    fn root_does_not_use_the_terminal_command_of_the_settings() {
+        assert_eq!(trusted("sh -c evil {}", true), "");
+        assert_eq!(trusted("kitty --directory {}", false), "kitty --directory {}");
+    }
+
+    #[test]
+    fn ssh_opens_the_folder_on_the_server() {
+        let command = ssh_command(Some("me"), "example.com", Some(2222), "/srv/it's here");
+        assert_eq!(command[..5], ["ssh", "-t", "-p", "2222", "me@example.com"]);
+        assert_eq!(command[5], "cd '/srv/it'\\''s here' 2>/dev/null; exec \"$SHELL\" -l");
+    }
+}
