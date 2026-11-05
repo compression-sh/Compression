@@ -227,3 +227,30 @@ pub fn trn(n: usize, one: &'static str, other: &'static str) -> String {
     fill(template, &[&n])
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_language_has_every_key_that_any_language_has() {
+        let languages: Vec<Language> = Language::ALL.into_iter().filter(|l| *l != Language::English).collect();
+        let sets: Vec<(Language, std::collections::BTreeSet<String>)> = languages
+            .iter()
+            .map(|l| (*l, l.catalog().unwrap_or_else(|e| panic!("{}.json: {e}", l.code())).into_iter().map(|(k, _)| k).collect()))
+            .collect();
+        let all: std::collections::BTreeSet<&String> = sets.iter().flat_map(|(_, s)| s).collect();
+        for (lang, keys) in &sets {
+            let missing: Vec<&&String> = all.iter().filter(|k| !keys.contains(**k)).collect();
+            assert!(missing.is_empty(), "{}.json lacks {} entries that other languages have, for example {:?}", lang.code(), missing.len(), missing.iter().take(5).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn no_translation_is_left_empty() {
+        for lang in Language::ALL.into_iter().filter(|l| *l != Language::English) {
+            for (key, text) in lang.catalog().unwrap() {
+                assert!(!text.trim().is_empty(), "{}: {key:?} has no text", lang.code());
+            }
+        }
+    }
+}
