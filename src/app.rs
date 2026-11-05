@@ -473,6 +473,9 @@ pub struct CompressionApp {
     // Persisted preferences, and what the next frame has to re-apply to egui
     pub(crate) settings: Settings,
     pub(crate) saved_settings: Settings,
+    /// After a save that failed: when the next one may be tried, and what was last said about it.
+    pub(crate) settings_retry: Option<std::time::Instant>,
+    settings_error: Option<String>,
     pub(crate) system_theme: SerpantinumTheme,
     /// Follows the files a theme comes from; `None` when none could be watched.
     theme_watch: Option<crate::theme_watch::ThemeWatch>,
@@ -680,6 +683,8 @@ impl CompressionApp {
             app_icons: HashMap::new(),
             admin_launch: None,
             saved_settings: settings.clone(),
+            settings_retry: None,
+            settings_error: None,
             settings,
             system_theme: SerpantinumTheme::load(),
             theme_watch: crate::theme_watch::ThemeWatch::new(ctx),
@@ -1731,8 +1736,34 @@ impl CompressionApp {
             ..self.settings.clone()
         };
         if current != self.saved_settings {
-            current.save();
-            self.saved_settings = current;
+            self.store_settings(current, false);
+        }
+    }
+
+    /// Writes `settings`. They count as saved (`saved_settings`) only when the file was written: after a failure the
+    /// difference stays, the person is told once, and another try is made after `SETTINGS_RETRY` (`forced` ignores the
+    /// wait, for a change the person has just made in the settings).
+    pub(crate) fn store_settings(&mut self, settings: Settings, forced: bool) -> bool {
+        if !forced && self.settings_retry.is_some_and(|at| std::time::Instant::now() < at) {
+            return false;
+        }
+        match settings.save() {
+            Ok(()) => {
+                self.saved_settings = settings;
+                self.settings_retry = None;
+                self.settings_error = None;
+                true
+            }
+            Err(err) => {
+                self.settings_retry = Some(std::time::Instant::now() + SETTINGS_RETRY);
+                self.ctx.request_repaint_after(SETTINGS_RETRY);
+                let why = crate::fs::describe::io_error(&err);
+                if self.settings_error.as_ref() != Some(&why) {
+                    self.set_toast(trf("Settings could not be saved: {}", &[&why]));
+                    self.settings_error = Some(why);
+                }
+                false
+            }
         }
     }
 
@@ -2432,6 +2463,9 @@ const CONTENT_INSET: i8 = 16;
 const TITLE_GAP: f32 = 8.0;
 /// Space between a header button and the menu or popup that hangs from it.
 const POPUP_GAP: f32 = 6.0;
+
+/// How long after a settings file that could not be written the next try waits.
+const SETTINGS_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 /// Breadcrumb buttons sit as far from the pill's left end as from its top and bottom, so the
 /// first icon and label land on the sidebar's icon and label columns.
 const CRUMB_HEIGHT: f32 = 26.0;
@@ -6979,6 +7013,63 @@ mod tests {
         assert_eq!((again.tabs.len(), again.current_path.clone()), (2, canon(&c)));
         // (A tab is reopened without asking the file system; one whose folder has vanished is moved on afterwards,
         // see `reopening_a_closed_tab_does_not_ask_about_its_folder_and_a_vanished_one_is_moved_after`.)
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_written_is_said_once_not_counted_as_saved_and_tried_again_later() {
+        use crate::settings::{FAIL_SAVE, NO_SAVE, SAVES};
+        let base = std::env::temp_dir().join(format!("compression_settings_fail_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        NO_SAVE.with(|n| n.set(true));
+        app.saved_settings = app.settings.clone();
+        let saves = || SAVES.with(|n| n.get());
+        SAVES.with(|n| n.set(0));
+        FAIL_SAVE.with(|f| f.set(true));
+
+        // A change whose file cannot be written: not counted as saved, and the person is told
+        app.show_hidden = !app.show_hidden;
+        let before = app.saved_settings.clone();
+        app.save_changed_settings();
+        assert_eq!(app.saved_settings, before, "an unwritten file is not a saved one");
+        assert_eq!(saves(), 1);
+        let said = app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+        assert!(said.contains("could not be saved"), "{said:?}");
+
+        // Every frame asks again; inside the wait nothing is tried and nothing is said again
+        app.status_toast = None;
+        for _ in 0..5 {
+            app.save_changed_settings();
+        }
+        assert_eq!(saves(), 1);
+        assert!(app.status_toast.is_none());
+
+        // After the wait it is tried again; the same trouble is not said again
+        app.settings_retry = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        app.save_changed_settings();
+        assert_eq!(saves(), 2);
+        assert_eq!(app.saved_settings, before);
+        assert!(app.status_toast.is_none(), "the same words twice in a row would only nag");
+
+        // What the person changes in the settings window is tried at once, wait or not
+        app.settings_retry = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        app.persist_settings();
+        assert_eq!(saves(), 3);
+        assert_eq!(app.saved_settings, before);
+
+        // The disk is fine again: the next try saves, and then nothing is left to save
+        FAIL_SAVE.with(|f| f.set(false));
+        app.settings_retry = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        app.save_changed_settings();
+        assert_eq!(saves(), 4);
+        assert_eq!(app.saved_settings.show_hidden, app.show_hidden);
+        assert!(app.settings_retry.is_none());
+        app.save_changed_settings();
+        assert_eq!(saves(), 4, "nothing changed, nothing written");
+        NO_SAVE.with(|n| n.set(false));
         std::fs::remove_dir_all(&base).unwrap();
     }
 

@@ -844,5 +844,6 @@
   "The group permissions of {} items were not copied, because their ACLs could not be: they have none for the group": "Les droits de groupe de {} élément n’ont pas été copiés, car son ACL n’a pas pu l’être : il n’en a aucun pour le groupe|Les droits de groupe de {} éléments n’ont pas été copiés, car leurs ACL n’ont pas pu l’être : ils n’en ont aucun pour le groupe",
   "A complete copy was made in “{}”, but the original could not be fully removed: {}": "Une copie complète a été créée dans « {} », mais l’original n’a pas pu être entièrement supprimé : {}",
   "Incomplete move of {}": "Déplacement incomplet de {}",
-  "{} replaced items could not go to the trash and were deleted for good: undo cannot bring them back": "{} élément remplacé n'a pas pu aller dans la corbeille et a été supprimé définitivement : annuler ne peut pas le rétablir|{} éléments remplacés n'ont pas pu aller dans la corbeille et ont été supprimés définitivement : annuler ne peut pas les rétablir"
+  "{} replaced items could not go to the trash and were deleted for good: undo cannot bring them back": "{} élément remplacé n'a pas pu aller dans la corbeille et a été supprimé définitivement : annuler ne peut pas le rétablir|{} éléments remplacés n'ont pas pu aller dans la corbeille et ont été supprimés définitivement : annuler ne peut pas les rétablir",
+  "Settings could not be saved: {}": "Les réglages n'ont pas pu être enregistrés : {}"
 }

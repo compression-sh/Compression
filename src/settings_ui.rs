@@ -90,8 +90,8 @@ impl CompressionApp {
         self.settings.show_hidden = self.show_hidden;
         self.settings.folders_first = self.folders_first;
         self.settings.columns = self.columns.clone();
-        self.settings.save();
-        self.saved_settings = self.settings.clone();
+        let settings = self.settings.clone();
+        self.store_settings(settings, true);
     }
 
     /// The name of the category that is open, for the window's header.

@@ -309,6 +309,9 @@ thread_local! {
     /// Set by a test that runs a whole window on its thread: its tabs and layout are not kept in the
     /// settings file.
     pub(crate) static NO_SAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by a test that wants every save to fail, and how many saves were asked for on this thread.
+    pub(crate) static FAIL_SAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static SAVES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 impl Settings {
@@ -369,22 +372,33 @@ impl Settings {
         (kept, shown)
     }
 
-    pub fn save(&self) {
+    /// Writes the settings file. An error means the file was not written (full disk, no rights, a folder in the way);
+    /// the caller must not count the settings as saved then.
+    pub fn save(&self) -> std::io::Result<()> {
         // As administrator the settings belong to someone else's home
         if crate::fs::admin::is_admin() {
-            return;
+            return Ok(());
         }
         #[cfg(test)]
-        if NO_SAVE.with(std::cell::Cell::get) {
-            return;
+        {
+            SAVES.with(|n| n.set(n.get() + 1));
+            if FAIL_SAVE.with(std::cell::Cell::get) {
+                return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+            }
+            if NO_SAVE.with(std::cell::Cell::get) {
+                return Ok(());
+            }
         }
-        let Some(file) = file() else { return };
+        let Some(file) = file() else { return Ok(()) };
+        self.save_to(&file)
+    }
+
+    fn save_to(&self, file: &std::path::Path) -> std::io::Result<()> {
         if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir)?;
         }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = crate::fs::atomic::write(&file, json);
-        }
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        crate::fs::atomic::write(file, json)
     }
 }
 
@@ -448,5 +462,21 @@ mod tests {
         assert_eq!(wild.scroll_speed, 99.0);
         // Not a number at all: the file is refused as a whole, like any other wrong type
         assert!(serde_json::from_str::<Settings>(r#"{ "scroll_speed": "fast" }"#).is_err());
+    }
+
+    #[test]
+    fn saving_to_a_place_that_cannot_hold_the_file_is_an_error_and_saving_to_a_good_one_is_not() {
+        let base = std::env::temp_dir().join(format!("compression_settings_save_to_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let settings = Settings { show_hidden: true, ..Settings::default() };
+        // A file where the folder should be
+        std::fs::write(base.join("blocked"), "x").unwrap();
+        assert!(settings.save_to(&base.join("blocked").join("settings.json")).is_err());
+        // A folder that is made on the way
+        let good = base.join("new").join("compression").join("settings.json");
+        settings.save_to(&good).unwrap();
+        assert!(Settings::parse(&std::fs::read_to_string(&good).unwrap()).unwrap().show_hidden);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

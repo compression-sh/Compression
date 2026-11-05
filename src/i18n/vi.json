@@ -844,5 +844,6 @@
   "The group permissions of {} items were not copied, because their ACLs could not be: they have none for the group": "Quyền nhóm của {} mục không được sao chép vì không thể sao chép ACL của chúng: chúng không có quyền nào cho nhóm",
   "A complete copy was made in “{}”, but the original could not be fully removed: {}": "Đã tạo bản sao đầy đủ trong “{}”, nhưng không thể xóa hết bản gốc: {}",
   "Incomplete move of {}": "Di chuyển chưa hoàn tất {}",
-  "{} replaced items could not go to the trash and were deleted for good: undo cannot bring them back": "{} mục bị thay thế không thể chuyển vào thùng rác và đã bị xóa vĩnh viễn: hoàn tác không thể khôi phục"
+  "{} replaced items could not go to the trash and were deleted for good: undo cannot bring them back": "{} mục bị thay thế không thể chuyển vào thùng rác và đã bị xóa vĩnh viễn: hoàn tác không thể khôi phục",
+  "Settings could not be saved: {}": "Không thể lưu cài đặt: {}"
 }
