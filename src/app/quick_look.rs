@@ -80,7 +80,10 @@ impl Drop for ArchiveView {
 
 impl Preview {
     pub fn load(item: &FileItem) -> Self {
-        let body = if !item.is_dir && archive_list::is_listable(&item.path) {
+        // Only a regular file is opened: a named pipe would hold the window up for good until someone writes to it
+        let body = if !item.is_dir && !is_regular_file(&item.path) {
+            Body::Nothing
+        } else if !item.is_dir && archive_list::is_listable(&item.path) {
             Body::Archive(Box::new(ArchiveView::start(item.path.clone())))
         } else if crate::thumbs::is_image(&item.path) || crate::thumbs::has_preview(&item.path) {
             Body::Picture { dimensions: image::image_dimensions(&item.path).ok() }
@@ -91,9 +94,20 @@ impl Preview {
     }
 }
 
+/// Whether `path` (links followed) is a regular file, not a pipe, a device or a socket.
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
 /// The start of a file that is text; `None` when it holds binary data or cannot be read.
 fn read_text(path: &Path) -> Option<Body> {
-    let mut file = std::fs::File::open(path).ok()?;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Not blocking, so that opening a pipe that appeared since `is_regular_file` returns at once; what was opened is
+    // looked at, not the name
+    let mut file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut bytes = Vec::with_capacity(MAX_BYTES);
     file.by_ref().take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes).ok()?;
     let mut cut = bytes.len() > MAX_BYTES;
@@ -311,6 +325,58 @@ mod tests {
         let path = std::env::temp_dir().join(format!("compression-ql-{}-{name}", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    fn fifo(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("compression-ql-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let c = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())).unwrap();
+        // SAFETY: `c` is a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        path
+    }
+
+    /// Runs `work` on a thread: a call that opens the pipe would never return.
+    fn within_a_few_seconds<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the preview hung on the pipe")
+    }
+
+    #[test]
+    fn a_named_pipe_gets_no_preview_instead_of_holding_the_window_up() {
+        // Whatever the name suggests: text, picture, archive
+        for name in ["pipe.txt", "pipe.png", "pipe.zip", "pipe"] {
+            let path = fifo(name);
+            let item = FileItem::from_path(&path).expect("a pipe is listed");
+            let preview = within_a_few_seconds(move || Preview::load(&item));
+            assert!(matches!(preview.body, Body::Nothing), "{name}");
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn a_pipe_that_appears_after_the_check_is_not_waited_for_either() {
+        let path = fifo("late.txt");
+        assert!(within_a_few_seconds({
+            let path = path.clone();
+            move || read_text(&path).is_none()
+        }));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_link_to_a_regular_file_is_still_previewed() {
+        let file = temp("target.txt", b"hello\n");
+        let link = std::env::temp_dir().join(format!("compression-ql-{}-link.txt", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let item = FileItem::from_path(&link).unwrap();
+        assert!(matches!(Preview::load(&item).body, Body::Text { .. }));
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(file);
     }
 
     #[test]
