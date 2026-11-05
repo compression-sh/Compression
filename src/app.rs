@@ -562,6 +562,27 @@ pub struct CompressionApp {
     type_ahead: (String, std::time::Instant),
 }
 
+/// The items of the Recent and Bookmarks views for `paths`: what is still there, and passes the hidden-files setting and
+/// the type filter. Asks the file system about every path, so it runs on a thread when a server is among them.
+fn recent_listing(paths: Vec<PathBuf>, show_hidden: bool, filter: TypeFilter) -> Vec<FileItem> {
+    const LIMIT: usize = 150;
+    paths
+        .into_iter()
+        .filter(|p| show_hidden || !p.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')))
+        .filter_map(|p| FileItem::from_path(&p).filter(|_| p.symlink_metadata().is_ok()))
+        .filter(|i| filter.accepts(i))
+        .take(LIMIT)
+        .collect()
+}
+
+/// What to tell about a rename that did not work.
+fn rename_error(err: &std::io::Error, new_name: &str) -> String {
+    match err.kind() {
+        std::io::ErrorKind::AlreadyExists => trf("“{}” already exists", &[&new_name]),
+        _ => crate::fs::describe::io_error(err),
+    }
+}
+
 impl CompressionApp {
     pub fn new(initial_path: PathBuf, theme: SerpantinumTheme, settings: Settings, ctx: &egui::Context) -> Self {
         apps::preload();
@@ -933,7 +954,19 @@ impl CompressionApp {
         self.pending_reload = None;
         self.resync_watch();
         let opts = self.list_options();
-        let listing = if self.in_recent() { Ok(self.recent_items()) } else { read_folder(&self.current_path, &opts) };
+        let paths = if self.in_recent() { self.recent_paths() } else { Vec::new() };
+        if paths.iter().any(|p| network::is_remote(p)) {
+            // A server in the list may not answer: its entries are asked about on a thread, and the window keeps the
+            // listing it has until they are in (`poll_reload`)
+            let (show_hidden, filter) = (self.show_hidden, self.type_filter);
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(Ok(recent_listing(paths, show_hidden, filter)));
+            });
+            self.pending_reload = Some((self.current_path.clone(), rx));
+            return;
+        }
+        let listing = if self.in_recent() { Ok(recent_listing(paths, self.show_hidden, self.type_filter)) } else { read_folder(&self.current_path, &opts) };
         self.show_listing(listing);
     }
 
@@ -1083,23 +1116,15 @@ impl CompressionApp {
         self.plugins.directory_changed(&here);
     }
 
-    /// The files and folders used lately, most recent first, or the bookmarked ones in the Bookmarks view.
-    fn recent_items(&self) -> Vec<FileItem> {
-        const LIMIT: usize = 150;
-        let paths = if self.in_bookmarks() { self.bookmarks.clone() } else { recent::load() };
-        paths
-            .into_iter()
-            .filter(|p| self.show_hidden || !p.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')))
-            .filter_map(|p| FileItem::from_path(&p).filter(|_| p.symlink_metadata().is_ok()))
-            .filter(|i| self.type_filter.accepts(i))
-            .take(LIMIT)
-            .collect()
+    /// The paths of the Recent view, or of the Bookmarks view.
+    fn recent_paths(&self) -> Vec<PathBuf> {
+        if self.in_bookmarks() { self.bookmarks.clone() } else { recent::load() }
     }
 
     /// Bring the listing up to date after files changed under it.
     fn refresh_listing(&mut self) {
         if self.is_mixed_listing() {
-            self.items.retain(|i| i.path.symlink_metadata().is_ok());
+            self.items.retain(|i| network::is_remote(&i.path) || i.path.symlink_metadata().is_ok());
             self.selected_index = None;
             self.sync_selection(true);
         } else {
@@ -1263,9 +1288,14 @@ impl CompressionApp {
         self.set_toast_action(trf("Pasted {}", &[&name]), ToastAction::Undo);
     }
 
+    /// `path` with its links resolved; a path on a server is left as it is (resolving would ask the server in the frame).
+    fn resolved(path: &Path) -> PathBuf {
+        if network::is_remote(path) { path.to_path_buf() } else { path.canonicalize().unwrap_or_else(|_| path.to_path_buf()) }
+    }
+
     fn paste(&mut self) {
         // Files copied in another application count too, and win when they are newer than ours
-        let external = crate::clipboard::get_files().filter(|(paths, _)| paths.iter().all(|p| p.exists()));
+        let external = crate::clipboard::get_files().filter(|(paths, _)| paths.iter().all(|p| network::is_remote(p) || p.exists()));
         let Some((paths, cut)) = external.or_else(|| self.clipboard.clone()) else {
             if self.can_modify_here() && let Some(png) = crate::clipboard::get_image_png() {
                 self.paste_image(&png);
@@ -1280,14 +1310,14 @@ impl CompressionApp {
         }
         let dest = self.current_path.clone();
         if cut {
-            let dest_canon = dest.canonicalize().unwrap_or_else(|_| dest.clone());
+            let dest_canon = Self::resolved(&dest);
             let same_folder = paths.iter().any(|p| {
                 p.parent()
-                    .map(|parent| parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf()) == dest_canon)
+                    .map(|parent| Self::resolved(parent) == dest_canon)
                     .unwrap_or(false)
             });
             if same_folder {
-                let any_dir = paths.iter().any(|p| p.is_dir());
+                let any_dir = paths.iter().any(|p| !network::is_remote(p) && p.is_dir());
                 let (title, body) = if paths.len() == 1 && any_dir {
                     (
                         tr("Can't move a folder over itself").to_owned(),
@@ -3179,6 +3209,15 @@ impl CompressionApp {
         }
     }
 
+    /// Whether a pinned path is a folder. A pin on a server is not looked at in the frame (the server may hang): it
+    /// counts as a folder until a thread has said otherwise, and one that is not connected is still a folder.
+    fn pin_is_folder(&self, pin: &Path, ctx: &egui::Context) -> bool {
+        if !network::is_remote(pin) {
+            return pin.is_dir();
+        }
+        network::is_disconnected(pin) || !matches!(self.net.known.get(pin, ctx), Some(network_ui::Kind::Other | network_ui::Kind::Missing))
+    }
+
     /// The folders leading to the current one, starting at Home, the trash or the root.
     fn crumbs(&self) -> Vec<Crumb> {
         let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
@@ -3251,7 +3290,7 @@ impl CompressionApp {
                     let mut rects = Vec::with_capacity(self.pins.len());
                     for (idx, pin) in self.pins.iter().enumerate() {
                         // A pinned folder on a server that is not connected is still a folder: opening it connects
-                        let is_dir = pin.is_dir() || network::is_remote(pin) && network::is_disconnected(pin);
+                        let is_dir = self.pin_is_folder(pin, ui.ctx());
                         let selected = browsing && is_dir && self.current_path == *pin;
                         let name = pin.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| pin.display().to_string());
                         let own = crate::fs::places::folder_glyph(pin).map(String::from);
@@ -4378,15 +4417,19 @@ impl CompressionApp {
             return Ok(());
         }
         let target = path.with_file_name(new_name);
-        if target.symlink_metadata().is_ok() {
-            return Err(trf("“{}” already exists", &[&new_name]));
+        if network::is_remote(path) {
+            // A server may take its time: the name is checked and the item renamed on a thread, and the window goes
+            // on with the result (`NetMsg::Renamed`)
+            self.rename_on_server(path.to_path_buf(), target, new_name.to_owned());
+            return Ok(());
         }
-        // A name taken since the check above must not be replaced
-        crate::compat::rename_noreplace(path, &target).map_err(|err| match err.kind() {
-            std::io::ErrorKind::AlreadyExists => trf("“{}” already exists", &[&new_name]),
-            _ => crate::fs::describe::io_error(&err),
-        })?;
+        crate::compat::rename_noreplace(path, &target).map_err(|err| rename_error(&err, new_name))?;
+        self.renamed(path, target, new_name);
+        Ok(())
+    }
 
+    /// An item was renamed: show it under its new name, selected, and record the way back.
+    fn renamed(&mut self, path: &Path, target: PathBuf, new_name: &str) {
         self.retarget_path(path, &target);
 
         if self.is_mixed_listing() {
@@ -4405,7 +4448,6 @@ impl CompressionApp {
         }
         self.history.record(UndoEntry::new(trf("Renaming of {}", &[&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()]), vec![Edit::Move { from: target.clone(), to: path.to_path_buf() }]));
         self.set_toast_action(trf("Renamed to “{}”", &[&new_name]), ToastAction::Undo);
-        Ok(())
     }
 
     /// Move to the trash, with an Undo in the toast.

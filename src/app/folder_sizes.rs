@@ -153,7 +153,8 @@ impl CompressionApp {
 
     /// "Calculate size" on folders. A toast says it started, and another the total once known.
     pub(super) fn calculate_sizes(&mut self, paths: &[PathBuf]) {
-        let folders: Vec<PathBuf> = paths.iter().filter(|p| p.is_dir()).cloned().collect();
+        // The listing says what is a folder; a path on a server that it does not show is not looked at in the frame
+        let folders: Vec<PathBuf> = paths.iter().filter(|p| self.is_folder(p)).cloned().collect();
         for path in &folders {
             self.sizes.discard(path);
             dirsize::forget(path);

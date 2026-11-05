@@ -434,6 +434,17 @@ pub fn remote_root(path: &Path) -> Option<PathBuf> {
     REMOTE_ROOTS.read().ok()?.iter().filter(|r| path.starts_with(r)).max_by_key(|r| r.as_os_str().len()).cloned()
 }
 
+/// The mount folder `path` lies on (a GVfs one, or a server's by `remote_root`), found by its name alone: what
+/// tells whether two paths are on one server, without asking any.
+pub fn mount_root(path: &Path) -> Option<PathBuf> {
+    if let Ok(rest) = path.strip_prefix(gvfs_root())
+        && let Some(first) = rest.components().next()
+    {
+        return Some(gvfs_root().join(first));
+    }
+    remote_root(path)
+}
+
 /// Every connected server and GVfs device. Reads `/proc/self/mounts` and a folder listing, so it
 /// is quick, but it is still meant for a background thread.
 pub fn list_mounts() -> Vec<Mount> {

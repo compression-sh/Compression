@@ -3,6 +3,7 @@
 use super::*;
 use crate::fs::mount_health::{self, Health, Probes};
 use crate::fs::network::{self, Address, Mount, MountKind, Progress, Prompt, Reply, Server, Servers};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const REFRESH: Duration = Duration::from_secs(4);
@@ -24,6 +25,8 @@ pub(super) enum NetMsg {
     /// A mount that was let go of to be connected again.
     /// A server's folder was asked about: `local` is it when it is there.
     Checked { id: u64, local: Option<PathBuf>, is_dir: bool, next: Next },
+    /// An item on a server was renamed (or not): `path` is the old path.
+    Renamed { path: PathBuf, target: PathBuf, new_name: String, result: Result<(), String> },
     Reconnect { local: PathBuf, name: String, address: Address, back: Option<PathBuf>, tabs: Vec<(u64, PathBuf)>, result: Result<(), String> },
 }
 
@@ -67,6 +70,8 @@ pub(super) struct NetState {
     leaving: HashSet<PathBuf>,
     /// Whether the connected servers still answer.
     probes: Probes,
+    /// What the window knows about paths on servers without having to ask in a frame.
+    pub(super) known: Known,
 }
 
 impl NetState {
@@ -80,7 +85,7 @@ impl NetState {
 
     pub(super) fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        Self { tx, rx, servers: Servers::load(), mounts: Vec::new(), pending: Vec::new(), checking: Vec::new(), navs: HashMap::new(), generations: HashMap::new(), ask: ask_server, next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new() }
+        Self { tx, rx, servers: Servers::load(), mounts: Vec::new(), pending: Vec::new(), checking: Vec::new(), navs: HashMap::new(), generations: HashMap::new(), ask: ask_server, next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new(), known: Known::default() }
     }
 }
 
@@ -164,6 +169,56 @@ const ANSWER_WAIT: Duration = Duration::from_millis(500);
 /// A thread whose server hangs stays in its call until the server answers or the connection breaks, and what
 /// it learns then is used to refresh the sidebar, not to open anything the person has stopped waiting for.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long what a server said about a path is trusted before it is asked again (the old answer is still used meanwhile).
+const KNOWN_FOR: Duration = Duration::from_secs(30);
+
+/// What paths on servers are, for what the window draws every frame (the pinned folders, a drop target): a frame
+/// must not ask a server, which may hang. An answer is looked up here; if there is none, or it is old, one question
+/// goes out on a thread of its own and the window repaints when it comes back. At most one question is on its way
+/// per mount, so a server that hangs holds one thread, not one per frame.
+#[derive(Default)]
+pub(super) struct Known {
+    state: Arc<Mutex<KnownState>>,
+}
+
+#[derive(Default)]
+struct KnownState {
+    kinds: HashMap<PathBuf, (Kind, Instant)>,
+    /// The mounts with a question on their way.
+    asking: HashSet<PathBuf>,
+}
+
+impl Known {
+    /// What `path` was last said to be, if it was; asks again in the background when that is old or missing.
+    pub(super) fn get(&self, path: &Path, ctx: &egui::Context) -> Option<Kind> {
+        let mount = network::mount_root(path).unwrap_or_else(|| path.to_path_buf());
+        let Ok(mut state) = self.state.lock() else { return None };
+        let known = state.kinds.get(path).copied();
+        if known.is_some_and(|(_, at)| at.elapsed() < KNOWN_FOR) || state.asking.contains(&mount) {
+            return known.map(|(kind, _)| kind);
+        }
+        state.asking.insert(mount.clone());
+        let (shared, ctx, path) = (self.state.clone(), ctx.clone(), path.to_path_buf());
+        drop(state);
+        let started = std::thread::Builder::new().name("known-kind".into()).spawn(move || {
+            let kind = match std::fs::metadata(&path) {
+                Ok(meta) if meta.is_dir() => Kind::Dir,
+                Ok(_) => Kind::Other,
+                Err(_) => Kind::Missing,
+            };
+            if let Ok(mut state) = shared.lock() {
+                state.kinds.insert(path, (kind, Instant::now()));
+                state.asking.remove(&mount);
+            }
+            ctx.request_repaint();
+        });
+        if started.is_err() && let Ok(mut state) = self.state.lock() {
+            state.asking.clear();
+        }
+        known.map(|(kind, _)| kind)
+    }
+}
 
 /// What each of `paths` is, or `None` where the server did not say within `wait`. The asking runs on a thread of
 /// its own: a server that hangs costs the window at most `wait`, not the whole time it hangs.
@@ -430,6 +485,10 @@ impl CompressionApp {
                         Err(err) => self.set_toast(trf("Could not disconnect “{}”: {}", &[&name, &err])),
                     }
                 }
+                NetMsg::Renamed { path, target, new_name, result } => match result {
+                    Ok(()) => self.renamed(&path, target, &new_name),
+                    Err(message) => self.set_toast(message),
+                },
                 NetMsg::Forgot { name, result } => match result {
                     Ok(()) => self.set_toast(trf("Forgot the password of “{}”", &[&name])),
                     Err(err) => self.set_toast(trf("Could not forget the password: {}", &[&err])),
@@ -855,6 +914,16 @@ impl CompressionApp {
         std::thread::spawn(move || {
             let result = network::forget_password(&address);
             let _ = tx.send(NetMsg::Forgot { name: address.name(), result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Rename an item on a server on a thread of its own.
+    pub(super) fn rename_on_server(&mut self, path: PathBuf, target: PathBuf, new_name: String) {
+        let (tx, ctx) = (self.net.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let result = crate::compat::rename_noreplace(&path, &target).map_err(|err| rename_error(&err, &new_name));
+            let _ = tx.send(NetMsg::Renamed { path, target, new_name, result });
             ctx.request_repaint();
         });
     }

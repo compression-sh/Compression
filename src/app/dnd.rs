@@ -85,12 +85,25 @@ impl CompressionApp {
         Some((dest, rect))
     }
 
+    /// Whether `dest` is a folder, without asking a server in the frame: what the listing shows is believed, and
+    /// one on a server that it does not show is taken for a folder until a thread has said otherwise (if it is not,
+    /// the job reports it).
+    pub(super) fn is_folder(&self, dest: &Path) -> bool {
+        if let Some(item) = self.items.iter().find(|i| i.path == dest) {
+            return item.is_dir;
+        }
+        if !network::is_remote(dest) {
+            return dest.is_dir();
+        }
+        !matches!(self.net.known.get(dest, &self.ctx), Some(network_ui::Kind::Other | network_ui::Kind::Missing))
+    }
+
     /// Dropping is pointless on the folder the items already sit in, and impossible into themselves.
     fn accepts(&self, dest: &Path, items: &[PathBuf]) -> bool {
         if trash::is_trash_folder(dest) {
             return true;
         }
-        if dest.as_os_str() == RECENT_PATH || !dest.is_dir() || trash::contains(dest) {
+        if dest.as_os_str() == RECENT_PATH || !self.is_folder(dest) || trash::contains(dest) {
             return false;
         }
         !items.iter().all(|i| i.parent() == Some(dest)) && !items.iter().any(|i| dest.starts_with(i))
@@ -103,7 +116,12 @@ impl CompressionApp {
         if modifiers.command || modifiers.shift {
             return modifiers.command;
         }
-        let (Some(first), Ok(dest)) = (items.first(), std::fs::metadata(dest)) else { return false };
+        let Some(first) = items.first() else { return false };
+        // Between servers, or between a server and a drive, nothing is asked: the mounts tell whether it is one drive
+        if network::is_remote(dest) || network::is_remote(first) {
+            return network::mount_root(dest) != network::mount_root(first);
+        }
+        let Ok(dest) = std::fs::metadata(dest) else { return false };
         std::fs::symlink_metadata(first).is_ok_and(|m| m.dev() != dest.dev())
     }
 
