@@ -1558,6 +1558,18 @@ pub struct Servers {
     pub saved: Vec<Server>,
     /// Latest first.
     pub recent: Vec<Address>,
+    /// The file on disk could not be read and could not be put aside: it is not written over.
+    #[serde(skip)]
+    locked: bool,
+}
+
+/// Why the list of servers started empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadProblem {
+    /// The unreadable file was put aside under this name, next to the list.
+    Kept(String),
+    /// It could not be put aside; it stays where it is, and nothing is written over it.
+    NotKept,
 }
 
 const RECENT_KEPT: usize = 8;
@@ -1567,8 +1579,45 @@ impl Servers {
         crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("compression").join("servers.json"))
     }
 
-    pub fn load() -> Servers {
-        Self::file().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    /// The saved servers. A file that is there but cannot be read as a list is not silently replaced by an empty list
+    /// the next save would write over it: it is put aside as `servers.json.broken` (or, if that name is taken,
+    /// `.broken.1`, …) and the problem is returned. If it cannot be put aside, the list is not saved at all.
+    pub fn load() -> (Servers, Option<LoadProblem>) {
+        match Self::file() {
+            Some(file) => Self::load_from(&file),
+            None => (Servers::default(), None),
+        }
+    }
+
+    fn load_from(file: &Path) -> (Servers, Option<LoadProblem>) {
+        let text = match std::fs::read_to_string(file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Servers::default(), None),
+            Err(_) => return Self::set_aside(file),
+        };
+        match serde_json::from_str(&text) {
+            Ok(servers) => (servers, None),
+            Err(_) => Self::set_aside(file),
+        }
+    }
+
+    fn set_aside(file: &Path) -> (Servers, Option<LoadProblem>) {
+        // As administrator the file belongs to someone else's home: it is not touched, and not saved over either
+        if crate::fs::admin::is_admin() {
+            return (Servers { locked: true, ..Servers::default() }, Some(LoadProblem::NotKept));
+        }
+        let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        for n in 0..100 {
+            let kept = file.with_file_name(if n == 0 { format!("{name}.broken") } else { format!("{name}.broken.{n}") });
+            if kept.symlink_metadata().is_ok() {
+                continue;
+            }
+            return match crate::compat::rename_noreplace(file, &kept) {
+                Ok(()) => (Servers::default(), Some(LoadProblem::Kept(kept.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()))),
+                Err(_) => (Servers { locked: true, ..Servers::default() }, Some(LoadProblem::NotKept)),
+            };
+        }
+        (Servers { locked: true, ..Servers::default() }, Some(LoadProblem::NotKept))
     }
 
     pub fn save(&self) {
@@ -1576,12 +1625,19 @@ impl Servers {
             return;
         }
         let Some(file) = Self::file() else { return };
+        let _ = self.save_to(&file);
+    }
+
+    fn save_to(&self, file: &Path) -> std::io::Result<()> {
+        // A list that could not be read and could not be put aside stays as it is on disk
+        if self.locked {
+            return Ok(());
+        }
         if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir)?;
         }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = crate::fs::atomic::write(&file, json);
-        }
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        crate::fs::atomic::write(file, json)
     }
 
     /// Put `address` first among the recent ones.
@@ -1954,4 +2010,76 @@ mod tests {
         assert_eq!(servers.recent[0].host, "h5");
         assert_eq!(servers.recent.iter().filter(|a| a.host == "h5").count(), 1);
     }
+
+    fn servers_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression_servers_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_servers_file_that_cannot_be_read_is_put_aside_and_never_written_over() {
+        let dir = servers_dir("broken");
+        let file = dir.join("servers.json");
+        std::fs::write(&file, "{ \"saved\": [ this was edited by hand").unwrap();
+        let (servers, problem) = Servers::load_from(&file);
+        assert_eq!(problem, Some(LoadProblem::Kept("servers.json.broken".into())));
+        assert!(servers.saved.is_empty() && servers.recent.is_empty(), "the list starts empty");
+        assert!(!file.exists(), "the unreadable file is out of the way");
+        assert_eq!(std::fs::read_to_string(dir.join("servers.json.broken")).unwrap(), "{ \"saved\": [ this was edited by hand");
+        // The next save writes a new list; the old file is still there under its new name
+        servers.save_to(&file).unwrap();
+        assert_eq!(Servers::load_from(&file), (Servers::default(), None));
+        assert!(std::fs::read_to_string(dir.join("servers.json.broken")).unwrap().contains("edited by hand"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_servers_file_of_the_wrong_shape_counts_as_broken_and_a_second_one_does_not_replace_the_first_backup() {
+        let dir = servers_dir("shape");
+        let file = dir.join("servers.json");
+        std::fs::write(dir.join("servers.json.broken"), "first").unwrap();
+        std::fs::write(&file, "[1, 2, 3]").unwrap();
+        let (_, problem) = Servers::load_from(&file);
+        assert_eq!(problem, Some(LoadProblem::Kept("servers.json.broken.1".into())));
+        assert_eq!(std::fs::read_to_string(dir.join("servers.json.broken")).unwrap(), "first", "an earlier backup is not touched");
+        assert_eq!(std::fs::read_to_string(dir.join("servers.json.broken.1")).unwrap(), "[1, 2, 3]");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_good_or_a_missing_servers_file_is_no_problem_and_leaves_no_backup() {
+        let dir = servers_dir("good");
+        let file = dir.join("servers.json");
+        assert_eq!(Servers::load_from(&file), (Servers::default(), None), "no file yet");
+        let mut servers = Servers::default();
+        servers.saved.push(Server { name: "NAS".into(), address: addr("sftp://me@nas/") });
+        servers.save_to(&file).unwrap();
+        let (loaded, problem) = Servers::load_from(&file);
+        assert_eq!((loaded.saved.len(), problem), (1, None));
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("locked"), "the guard is not part of the file");
+        assert!(!dir.join("servers.json.broken").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_servers_file_that_cannot_be_put_aside_stays_as_it_is_and_is_not_saved_over() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = servers_dir("locked");
+        let file = dir.join("servers.json");
+        std::fs::write(&file, "not json").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let (servers, problem) = Servers::load_from(&file);
+        assert_eq!(problem, Some(LoadProblem::NotKept));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        servers.save_to(&file).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "not json", "the list is not written over the file");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
 }

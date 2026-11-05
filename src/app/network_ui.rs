@@ -57,6 +57,8 @@ pub(super) struct NetState {
     tx: mpsc::Sender<NetMsg>,
     rx: mpsc::Receiver<NetMsg>,
     pub(super) servers: Servers,
+    /// Why the saved servers started empty, until the window has said so.
+    pub(super) servers_problem: Option<network::LoadProblem>,
     pub(super) mounts: Vec<Mount>,
     pending: Vec<Pending>,
     checking: Vec<Check>,
@@ -94,7 +96,8 @@ impl NetState {
 
     pub(super) fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        Self { tx, rx, servers: Servers::load(), mounts: Vec::new(), pending: Vec::new(), checking: Vec::new(), navs: HashMap::new(), generations: HashMap::new(), ask: ask_server, next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new(), waiting_prompts: VecDeque::new(), known: Known::default(), #[cfg(test)] rename: Arc::new(crate::compat::rename_noreplace) }
+        let servers = Servers::load();
+        Self { tx, rx, servers: servers.0, servers_problem: servers.1, mounts: Vec::new(), pending: Vec::new(), checking: Vec::new(), navs: HashMap::new(), generations: HashMap::new(), ask: ask_server, next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new(), waiting_prompts: VecDeque::new(), known: Known::default(), #[cfg(test)] rename: Arc::new(crate::compat::rename_noreplace) }
     }
 }
 
@@ -562,6 +565,16 @@ impl CompressionApp {
         }
         self.probe_servers(ctx);
         self.request_network_listing(ctx, false);
+    }
+
+    /// Say, once, that the list of saved servers could not be read (and where the unreadable file is).
+    pub(super) fn announce_servers_problem(&mut self) {
+        let message = match self.net.servers_problem.take() {
+            Some(network::LoadProblem::Kept(name)) => trf("The list of servers could not be read. The file was kept as “{}” and a new list is used.", &[&name]),
+            Some(network::LoadProblem::NotKept) => tr("The list of servers could not be read, and the file could not be put aside. It is left as it is and not written over.").to_owned(),
+            None => return,
+        };
+        self.set_toast(message);
     }
 
     /// Ask the connected servers whether they still answer (see `mount_health`).
@@ -2036,6 +2049,23 @@ mod tests {
         app.dialog = None;
         app.poll_network(&ctx);
         assert!(matches!(answers.try_recv(), Ok(Reply::Cancel)), "a login that was dismissed is a cancel, as before");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_list_of_servers_that_could_not_be_read_is_said_once_with_the_name_it_was_kept_under() {
+        let (mut app, base) = local_app("servers_problem");
+        app.status_toast = None;
+        app.net.servers_problem = Some(network::LoadProblem::Kept("servers.json.broken".into()));
+        app.announce_servers_problem();
+        let said = app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+        assert!(said.contains("could not be read") && said.contains("servers.json.broken"), "{said:?}");
+        app.status_toast = None;
+        app.announce_servers_problem();
+        assert!(app.status_toast.is_none(), "once");
+        app.net.servers_problem = Some(network::LoadProblem::NotKept);
+        app.announce_servers_problem();
+        assert!(app.status_toast.as_ref().is_some_and(|t| t.message.contains("not written over")));
         std::fs::remove_dir_all(&base).unwrap();
     }
 

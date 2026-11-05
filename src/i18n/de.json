@@ -853,5 +853,7 @@
   "Not replaced: the old item cannot go to the trash and would be lost for good ({})": "Nicht ersetzt: Das alte Element lässt sich nicht in den Papierkorb legen und wäre endgültig verloren ({})",
   "Not replaced: {}": "Nicht ersetzt: {}",
   "Not replaced: the old item is in the trash, but the new one could not take its place ({})": "Nicht ersetzt: Das alte Element liegt im Papierkorb, aber das neue konnte seinen Platz nicht einnehmen ({})",
-  "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "Nicht ersetzt: Das neue Element konnte den Platz des alten nicht einnehmen ({}); es bleibt als „{}“ erhalten"
+  "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "Nicht ersetzt: Das neue Element konnte den Platz des alten nicht einnehmen ({}); es bleibt als „{}“ erhalten",
+  "The list of servers could not be read. The file was kept as “{}” and a new list is used.": "Die Serverliste konnte nicht gelesen werden. Die Datei wurde als „{}“ aufbewahrt, und es wird eine neue Liste verwendet.",
+  "The list of servers could not be read, and the file could not be put aside. It is left as it is and not written over.": "Die Serverliste konnte nicht gelesen werden, und die Datei ließ sich nicht beiseitelegen. Sie bleibt unverändert und wird nicht überschrieben."
 }

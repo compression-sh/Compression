@@ -853,5 +853,7 @@
   "Not replaced: the old item cannot go to the trash and would be lost for good ({})": "Không thay thế: không thể chuyển mục cũ vào thùng rác và nó sẽ mất vĩnh viễn ({})",
   "Not replaced: {}": "Không thay thế: {}",
   "Not replaced: the old item is in the trash, but the new one could not take its place ({})": "Không thay thế: mục cũ nằm trong thùng rác nhưng mục mới không thể thế chỗ ({})",
-  "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "Không thay thế: mục mới không thể thế chỗ mục cũ ({}); nó được giữ lại với tên “{}”"
+  "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "Không thay thế: mục mới không thể thế chỗ mục cũ ({}); nó được giữ lại với tên “{}”",
+  "The list of servers could not be read. The file was kept as “{}” and a new list is used.": "Không thể đọc danh sách máy chủ. Tệp được giữ lại với tên “{}” và dùng danh sách mới.",
+  "The list of servers could not be read, and the file could not be put aside. It is left as it is and not written over.": "Không thể đọc danh sách máy chủ và không thể cất tệp đi. Tệp được giữ nguyên và sẽ không bị ghi đè."
 }

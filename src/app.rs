@@ -744,6 +744,7 @@ impl CompressionApp {
         };
 
         app.reload_items();
+        app.announce_servers_problem();
         app.request_drive_listing(ctx, true);
         app.request_network_listing(ctx, true);
         app
