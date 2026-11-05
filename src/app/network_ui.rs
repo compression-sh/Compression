@@ -49,6 +49,10 @@ struct Pending {
     tabs: Vec<(u64, PathBuf)>,
 }
 
+/// How an item on a server is renamed; the tests put a slow one here.
+#[cfg(test)]
+type Renamer = Arc<dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync>;
+
 pub(super) struct NetState {
     tx: mpsc::Sender<NetMsg>,
     rx: mpsc::Receiver<NetMsg>,
@@ -72,6 +76,8 @@ pub(super) struct NetState {
     probes: Probes,
     /// What the window knows about paths on servers without having to ask in a frame.
     pub(super) known: Known,
+    #[cfg(test)]
+    rename: Renamer,
 }
 
 impl NetState {
@@ -85,7 +91,7 @@ impl NetState {
 
     pub(super) fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        Self { tx, rx, servers: Servers::load(), mounts: Vec::new(), pending: Vec::new(), checking: Vec::new(), navs: HashMap::new(), generations: HashMap::new(), ask: ask_server, next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new(), known: Known::default() }
+        Self { tx, rx, servers: Servers::load(), mounts: Vec::new(), pending: Vec::new(), checking: Vec::new(), navs: HashMap::new(), generations: HashMap::new(), ask: ask_server, next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new(), known: Known::default(), #[cfg(test)] rename: Arc::new(crate::compat::rename_noreplace) }
     }
 }
 
@@ -177,9 +183,30 @@ const KNOWN_FOR: Duration = Duration::from_secs(30);
 /// must not ask a server, which may hang. An answer is looked up here; if there is none, or it is old, one question
 /// goes out on a thread of its own and the window repaints when it comes back. At most one question is on its way
 /// per mount, so a server that hangs holds one thread, not one per frame.
-#[derive(Default)]
+#[cfg_attr(not(test), derive(Default))]
 pub(super) struct Known {
     state: Arc<Mutex<KnownState>>,
+    /// What a test puts in place of the question to the file system.
+    #[cfg(test)]
+    ask: Arc<dyn Fn(&Path) -> Kind + Send + Sync>,
+}
+
+#[cfg(test)]
+impl Default for Known {
+    fn default() -> Self {
+        Self::with_ask(|path| match std::fs::metadata(path) {
+            Ok(meta) if meta.is_dir() => Kind::Dir,
+            Ok(_) => Kind::Other,
+            Err(_) => Kind::Missing,
+        })
+    }
+}
+
+#[cfg(test)]
+impl Known {
+    fn with_ask(ask: impl Fn(&Path) -> Kind + Send + Sync + 'static) -> Self {
+        Self { state: Arc::default(), ask: Arc::new(ask) }
+    }
 }
 
 #[derive(Default)]
@@ -200,8 +227,13 @@ impl Known {
         }
         state.asking.insert(mount.clone());
         let (shared, ctx, path) = (self.state.clone(), ctx.clone(), path.to_path_buf());
+        #[cfg(test)]
+        let ask = self.ask.clone();
         drop(state);
         let started = std::thread::Builder::new().name("known-kind".into()).spawn(move || {
+            #[cfg(test)]
+            let kind = ask(&path);
+            #[cfg(not(test))]
             let kind = match std::fs::metadata(&path) {
                 Ok(meta) if meta.is_dir() => Kind::Dir,
                 Ok(_) => Kind::Other,
@@ -921,7 +953,12 @@ impl CompressionApp {
     /// Rename an item on a server on a thread of its own.
     pub(super) fn rename_on_server(&mut self, path: PathBuf, target: PathBuf, new_name: String) {
         let (tx, ctx) = (self.net.tx.clone(), self.ctx.clone());
+        #[cfg(test)]
+        let rename = self.net.rename.clone();
         std::thread::spawn(move || {
+            #[cfg(test)]
+            let result = rename(&path, &target).map_err(|err| rename_error(&err, &new_name));
+            #[cfg(not(test))]
             let result = crate::compat::rename_noreplace(&path, &target).map_err(|err| rename_error(&err, &new_name));
             let _ = tx.send(NetMsg::Renamed { path, target, new_name, result });
             ctx.request_repaint();
@@ -1979,5 +2016,216 @@ mod tests {
         assert!(folder.join("inner").is_dir() && !base.join("a/renamed.txt").exists() && !base.join("a/dir").exists());
         assert!(app.history.pop_undo().is_none(), "nothing happened, so there is nothing to undo");
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A fake server folder that does not exist, so that only a stat could say anything about it.
+    fn fake_server(name: &str) -> PathBuf {
+        let top = PathBuf::from(format!("/nonexistent/compression_known_{name}_{}", std::process::id()));
+        network::declare_remote_for_tests(&top);
+        top
+    }
+
+    fn wait_for<T>(mut look: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(found) = look() {
+                return found;
+            }
+            assert!(Instant::now() < deadline, "no answer in time");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// An app whose server questions wait for `release` and are counted.
+    fn app_with_hanging_server() -> (CompressionApp, mpsc::Sender<()>, Arc<AtomicUsize>) {
+        let (release, hold) = mpsc::channel::<()>();
+        let (hold, calls) = (Mutex::new(hold), Arc::new(AtomicUsize::new(0)));
+        let counted = calls.clone();
+        let mut app = CompressionApp::new(std::env::temp_dir(), SerpantinumTheme::default(), Settings::default(), &egui::Context::default());
+        app.net.known = Known::with_ask(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = hold.lock().unwrap().recv();
+            Kind::Missing
+        });
+        (app, release, calls)
+    }
+
+    #[test]
+    fn a_server_that_hangs_is_asked_once_and_a_frame_never_waits_for_it() {
+        let (release, hold) = mpsc::channel::<()>();
+        let (hold, calls) = (Mutex::new(hold), Arc::new(AtomicUsize::new(0)));
+        let counted = calls.clone();
+        let known = Known::with_ask(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = hold.lock().unwrap().recv();
+            Kind::Dir
+        });
+        let (top, ctx) = (fake_server("hang"), egui::Context::default());
+        let started = Instant::now();
+        for i in 0..200 {
+            assert_eq!(known.get(&top.join(format!("p{}", i % 3)), &ctx), None);
+        }
+        assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+        wait_for(|| (calls.load(Ordering::SeqCst) > 0).then_some(()));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one question per mount, however many frames ask");
+        release.send(()).unwrap();
+        assert_eq!(wait_for(|| known.get(&top.join("p0"), &ctx)), Kind::Dir);
+    }
+
+    #[test]
+    fn an_old_answer_is_used_while_a_new_one_is_asked_for_and_a_fresh_one_is_not_asked_again() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let known = Known::with_ask(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Kind::Missing
+        });
+        let (path, ctx) = (fake_server("old").join("a"), egui::Context::default());
+        known.state.lock().unwrap().kinds.insert(path.clone(), (Kind::Dir, Instant::now() - KNOWN_FOR * 2));
+        assert_eq!(known.get(&path, &ctx), Some(Kind::Dir), "the old answer, at once");
+        assert_eq!(wait_for(|| known.get(&path, &ctx).filter(|k| *k == Kind::Missing)), Kind::Missing);
+        for _ in 0..50 {
+            known.get(&path, &ctx);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a fresh answer is not asked for again");
+    }
+
+    #[test]
+    fn a_pin_on_a_server_is_a_folder_until_told_otherwise_and_is_never_looked_at_in_the_frame() {
+        let (app, release, calls) = app_with_hanging_server();
+        let (pin, ctx) = (fake_server("pin").join("projects"), egui::Context::default());
+        assert!(!pin.is_dir(), "a stat would say it is nothing");
+        let started = Instant::now();
+        for _ in 0..100 {
+            assert!(app.pin_is_folder(&pin, &ctx));
+        }
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(app.is_folder(&pin), "and a drop target on a server is taken for a folder too");
+        release.send(()).unwrap();
+        wait_for(|| (!app.pin_is_folder(&pin, &ctx)).then_some(()));
+        assert!(!app.is_folder(&pin), "once the server has said it is not");
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+        // A local pin is still looked at
+        assert!(app.pin_is_folder(&std::env::temp_dir(), &ctx));
+        assert!(!app.pin_is_folder(&std::env::temp_dir().join("compression_no_such_pin"), &ctx));
+    }
+
+    #[test]
+    fn pasting_does_not_resolve_a_path_on_a_server() {
+        // A link under a server's folder would be resolved only by asking the server
+        let top = std::env::temp_dir().join(format!("compression_resolve_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        std::fs::create_dir_all(top.join("real")).unwrap();
+        std::os::unix::fs::symlink(top.join("real"), top.join("link")).unwrap();
+        network::declare_remote_for_tests(&top);
+        assert_eq!(CompressionApp::resolved(&top.join("link")), top.join("link"));
+        std::fs::remove_dir_all(&top).unwrap();
+        let local = std::env::temp_dir();
+        assert_eq!(CompressionApp::resolved(&local), local.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn bookmarks_and_recent_files_on_a_server_are_asked_about_on_a_thread_and_then_listed() {
+        let top = std::env::temp_dir().join(format!("compression_bookmarks_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        std::fs::create_dir_all(&top).unwrap();
+        std::fs::write(top.join("on_server.txt"), "x").unwrap();
+        let local = std::env::temp_dir().join(format!("compression_bookmarks_local_{}.txt", std::process::id()));
+        std::fs::write(&local, "y").unwrap();
+        network::declare_remote_for_tests(&top);
+        let mut app = CompressionApp::new(std::env::temp_dir(), SerpantinumTheme::default(), Settings::default(), &egui::Context::default());
+        app.bookmarks = vec![top.join("on_server.txt"), local.clone()];
+        app.navigate_known(PathBuf::from(crate::fs::places::BOOKMARKS_PATH));
+        // Nothing was asked of the server in this call: the listing is on its way
+        app.reload_items();
+        assert!(app.pending_reload.is_some(), "a listing with a server in it is read on a thread");
+        wait_for(|| (!app.poll_reload()).then_some(()));
+        let mut names: Vec<String> = app.items.iter().map(|i| i.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec![local.file_name().unwrap().to_string_lossy().into_owned(), "on_server.txt".to_owned()]);
+        // Without a server in it the listing is there at once, as before
+        app.bookmarks = vec![local.clone()];
+        app.reload_items();
+        assert!(app.pending_reload.is_none() && app.items.len() == 1);
+        std::fs::remove_dir_all(&top).unwrap();
+        std::fs::remove_file(&local).unwrap();
+    }
+
+    /// An app showing `dir` (which stands in for a folder on a server).
+    fn app_on_server_folder(name: &str, files: &[&str]) -> (CompressionApp, PathBuf, egui::Context) {
+        let dir = std::env::temp_dir().join(format!("compression_server_rename_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in files {
+            std::fs::write(dir.join(file), file).unwrap();
+        }
+        let dir = dir.canonicalize().unwrap();
+        let ctx = egui::Context::default();
+        let app = CompressionApp::new(dir.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        network::declare_remote_for_tests(&dir);
+        (app, dir, ctx)
+    }
+
+    #[test]
+    fn renaming_on_a_server_does_not_wait_for_it_and_then_shows_the_new_name_with_an_undo() {
+        let (mut app, dir, ctx) = app_on_server_folder("slow", &["a.txt"]);
+        let (release, hold) = mpsc::channel::<()>();
+        let hold = Mutex::new(hold);
+        app.net.rename = Arc::new(move |from, to| {
+            let _ = hold.lock().unwrap().recv();
+            crate::compat::rename_noreplace(from, to)
+        });
+        let started = Instant::now();
+        assert_eq!(app.rename_entry(&dir.join("a.txt"), "b.txt"), Ok(()));
+        assert!(started.elapsed() < Duration::from_millis(500), "the call waited for the server");
+        assert!(dir.join("a.txt").exists() && app.history.undo_label().is_none(), "nothing happened yet");
+        release.send(()).unwrap();
+        wait_for(|| {
+            app.poll_network(&ctx);
+            app.history.undo_label().map(drop)
+        });
+        assert!(dir.join("b.txt").exists() && !dir.join("a.txt").exists());
+        assert!(app.items.iter().any(|i| i.name == "b.txt") && !app.items.iter().any(|i| i.name == "a.txt"));
+        assert!(app.history.undo_label().unwrap().starts_with("Renaming of"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_name_that_is_taken_on_a_server_is_told_and_nothing_is_replaced() {
+        let (mut app, dir, ctx) = app_on_server_folder("taken", &["a.txt", "b.txt"]);
+        assert_eq!(app.rename_entry(&dir.join("a.txt"), "b.txt"), Ok(()), "the answer comes from the server, later");
+        wait_for(|| {
+            app.poll_network(&ctx);
+            app.status_toast.as_ref().map(|t| t.message.clone())
+        });
+        assert_eq!(app.status_toast.as_ref().unwrap().message, "“b.txt” already exists");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b.txt", "not replaced");
+        assert!(dir.join("a.txt").exists() && app.history.undo_label().is_none());
+        // Bad names are still refused on the spot
+        assert!(app.rename_entry(&dir.join("a.txt"), "x/y").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_size_of_a_folder_is_asked_for_without_looking_at_it_when_a_server_has_it() {
+        let (mut app, dir, _ctx) = app_on_server_folder("size", &["file.txt"]);
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        app.reload_items();
+        wait_for(|| (!app.poll_reload()).then_some(()));
+        // In the listing: a folder is asked for, a file is not
+        app.calculate_sizes(&[dir.join("folder"), dir.join("file.txt")]);
+        assert_eq!(app.sizes.asked, vec![dir.join("folder")]);
+        // Not in the listing, on a server: taken for a folder, and not looked at (it does not exist here at all)
+        let elsewhere = dir.join("not_listed_and_not_there");
+        app.calculate_sizes(std::slice::from_ref(&elsewhere));
+        assert_eq!(app.sizes.asked, vec![elsewhere]);
+        // Not in the listing and local: looked at, as before
+        let local = std::env::temp_dir().join(format!("compression_size_local_{}", std::process::id()));
+        std::fs::create_dir_all(&local).unwrap();
+        app.calculate_sizes(&[local.clone(), local.join("missing")]);
+        assert_eq!(app.sizes.asked, vec![local.clone()]);
+        std::fs::remove_dir_all(&local).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

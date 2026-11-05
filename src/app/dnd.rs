@@ -344,3 +344,32 @@ impl CompressionApp {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fake server folder that does not exist, so that only a stat could say anything about it.
+    fn fake_server(name: &str) -> PathBuf {
+        let top = PathBuf::from(format!("/nonexistent/compression_dnd_{name}_{}", std::process::id()));
+        network::declare_remote_for_tests(&top);
+        top
+    }
+
+    #[test]
+    fn dropping_onto_or_from_a_server_decides_copy_or_move_without_asking_it() {
+        let (a, b) = (fake_server("copies_a"), fake_server("copies_b"));
+        let (one, two) = (vec![a.join("x")], b.join("y"));
+        let none = egui::Modifiers::NONE;
+        assert!(!CompressionApp::copies(&one, &a.join("sub"), none), "within one server: a move");
+        assert!(CompressionApp::copies(&one, &two, none), "from one server to another: a copy");
+        assert!(CompressionApp::copies(&one, &std::env::temp_dir(), none), "from a server to a local folder: a copy");
+        assert!(CompressionApp::copies(&[std::env::temp_dir().join("x")], &a, none), "from a local folder to a server: a copy");
+        // GVfs mounts are told apart by their folder name
+        let gvfs = |server: &str, file: &str| network::gvfs_root().join(server).join(file);
+        assert!(!CompressionApp::copies(&[gvfs("sftp:host=a", "x")], &gvfs("sftp:host=a", "dir"), none), "within one GVfs server: a move");
+        assert!(CompressionApp::copies(&[gvfs("sftp:host=a", "x")], &gvfs("sftp:host=b", "dir"), none), "between two GVfs servers: a copy");
+        assert!(CompressionApp::copies(&[gvfs("sftp:host=a", "x")], &a, none), "between a GVfs server and another one: a copy");
+        assert!(CompressionApp::copies(&one, &two, egui::Modifiers::COMMAND) && !CompressionApp::copies(&one, &two, egui::Modifiers::SHIFT));
+    }
+}
