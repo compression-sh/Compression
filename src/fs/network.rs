@@ -458,7 +458,8 @@ pub fn list_mounts() -> Vec<Mount> {
         }
     }
     let helper = helper_root();
-    for (source, point, kind) in proc_mounts() {
+    let system = proc_mounts();
+    for (source, point, kind) in system.iter().cloned() {
         if point.parent() == Some(helper.as_path()) {
             let address = point.file_name().and_then(|id| read_record(&id.to_string_lossy()));
             let name = address.as_ref().map(Address::name).unwrap_or_else(|| point.file_name().unwrap_or_default().to_string_lossy().into_owned());
@@ -469,13 +470,34 @@ pub fn list_mounts() -> Vec<Mount> {
     }
     found.sort_by_key(|m| m.name.to_lowercase());
     if let Ok(mut roots) = REMOTE_ROOTS.write() {
-        *roots = found.iter().filter(|m| m.kind != MountKind::Gvfs).map(|m| m.local.clone()).collect();
+        *roots = remote_roots(&found, &system);
     }
     if let Ok(mut mounts) = MOUNTS.write() {
         mounts.clone_from(&found);
     }
     LISTED.store(true, std::sync::atomic::Ordering::Relaxed);
     found
+}
+
+/// File system types that are other computers' storage and not otherwise known as servers (they have no address to show
+/// or to connect again with): their mount points count as servers, so that nothing in the window waits for them.
+/// This is a list, not a guess: a FUSE file system may as well be local (an encrypted folder, an image).
+const NETWORK_FILE_SYSTEMS: &[&str] = &["fuse.rclone", "fuse.s3fs", "fuse.gcsfuse", "9p", "ceph", "fuse.ceph", "glusterfs", "fuse.glusterfs", "afs", "lustre", "ncpfs"];
+
+fn is_network_fs(kind: &str) -> bool {
+    NETWORK_FILE_SYSTEMS.contains(&kind)
+}
+
+/// Where servers are mounted: the mounts found (GVfs ones are recognised by their folder) and every mount of a type in
+/// `NETWORK_FILE_SYSTEMS`.
+fn remote_roots(found: &[Mount], system: &[(String, PathBuf, String)]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = found.iter().filter(|m| m.kind != MountKind::Gvfs).map(|m| m.local.clone()).collect();
+    for (_, point, kind) in system {
+        if is_network_fs(kind) && !roots.contains(point) {
+            roots.push(point.clone());
+        }
+    }
+    roots
 }
 
 /// Mount points with their source and filesystem type, from `/proc/self/mounts`.
@@ -2082,4 +2104,30 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn mounts_of_network_file_systems_count_as_servers_and_local_ones_do_not() {
+        for kind in ["fuse.rclone", "fuse.s3fs", "9p", "ceph", "glusterfs", "fuse.gcsfuse", "afs", "lustre"] {
+            assert!(is_network_fs(kind), "{kind}");
+        }
+        for kind in ["ext4", "btrfs", "xfs", "tmpfs", "vfat", "exfat", "fuse.gocryptfs", "fuse.ntfs-3g", "fuse.encfs", "fuse.AppImage", "overlay", "nfs", "cifs", "fuse.sshfs"] {
+            assert!(!is_network_fs(kind), "{kind}: known elsewhere, or local");
+        }
+    }
+
+    #[test]
+    fn the_places_servers_are_mounted_are_the_known_ones_plus_the_network_file_systems_once() {
+        let known = Mount { name: "nas".into(), address: None, local: PathBuf::from("/mnt/nas"), kind: MountKind::System };
+        let gvfs = Mount { name: "g".into(), address: None, local: PathBuf::from("/run/user/1000/gvfs/sftp:host=x"), kind: MountKind::Gvfs };
+        let system = vec![
+            ("nas:/export".to_owned(), PathBuf::from("/mnt/nas"), "nfs4".to_owned()),
+            ("remote:".to_owned(), PathBuf::from("/mnt/cloud"), "fuse.rclone".to_owned()),
+            ("bucket".to_owned(), PathBuf::from("/mnt/s3"), "fuse.s3fs".to_owned()),
+            ("host".to_owned(), PathBuf::from("/mnt/share"), "9p".to_owned()),
+            ("/dev/sda1".to_owned(), PathBuf::from("/"), "ext4".to_owned()),
+            ("crypt".to_owned(), PathBuf::from("/mnt/crypt"), "fuse.gocryptfs".to_owned()),
+            ("remote:".to_owned(), PathBuf::from("/mnt/cloud"), "fuse.rclone".to_owned()),
+        ];
+        let roots = remote_roots(&[known, gvfs], &system);
+        assert_eq!(roots, vec![PathBuf::from("/mnt/nas"), PathBuf::from("/mnt/cloud"), PathBuf::from("/mnt/s3"), PathBuf::from("/mnt/share")]);
+    }
 }
