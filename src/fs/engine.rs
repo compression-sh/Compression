@@ -1602,6 +1602,96 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// `(path relative to root, content)` of every file under `root`, sorted: the real state of a folder.
+    fn listing(root: &Path) -> Vec<(String, String)> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    out.push((path.strip_prefix(root).unwrap().display().to_string(), std::fs::read_to_string(&path).unwrap_or_default()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// A second file system and a user who cannot remove what is locked; `None` (with a note) where there is none.
+    fn two_file_systems(name: &str) -> Option<(PathBuf, PathBuf)> {
+        use std::os::unix::fs::MetadataExt;
+        let (from, to) = (sandbox(name), PathBuf::from("/dev/shm").join(format!("compression_engine_{name}_{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&to);
+        std::fs::create_dir_all(&to).unwrap();
+        if from.metadata().unwrap().dev() == to.metadata().unwrap().dev() || unsafe { libc::geteuid() } == 0 {
+            std::fs::remove_dir_all(&from).unwrap();
+            std::fs::remove_dir_all(&to).unwrap();
+            return None;
+        }
+        Some((from, to))
+    }
+
+    fn mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn a_move_to_another_file_system_whose_original_cannot_be_removed_says_so_and_undoes_only_the_copy() {
+        let Some((from, to)) = two_file_systems("move_stays") else { return };
+        std::fs::create_dir_all(from.join("box/tree/sub")).unwrap();
+        std::fs::write(from.join("box/tree/a.txt"), "one").unwrap();
+        std::fs::write(from.join("box/tree/sub/b.txt"), "two").unwrap();
+        std::fs::write(from.join("box/file.txt"), "three").unwrap();
+        // The loose file cannot be unlinked from a locked folder; in the tree one file can go and one cannot
+        mode(&from.join("box/tree/sub"), 0o555);
+        mode(&from.join("box"), 0o555);
+        let before = listing(&from);
+        let pairs = vec![(from.join("box/file.txt"), to.join("file.txt")), (from.join("box/tree"), to.join("tree"))];
+        let (outcome, _) = run(JobKind::Move, Op::Move, pairs, Decision::Skip);
+        // What is there once the job is over, and again a moment later: nothing tries again, nothing is put back
+        let after = listing(&from);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(listing(&from), after, "nothing touches the original after the job");
+        let copies = listing(&to);
+        assert!(!outcome.ok, "no silent partial success: {}", outcome.message);
+        assert!(outcome.message.contains("could not be fully removed") && outcome.message.contains("file.txt") && outcome.message.contains("tree"), "{}", outcome.message);
+        // The copies are whole
+        assert_eq!(copies, vec![("file.txt".into(), "three".into()), ("tree/a.txt".into(), "one".into()), ("tree/sub/b.txt".into(), "two".into())]);
+        // The originals: the loose file is there. Of the tree, the file in the locked folder is certainly there; the other
+        // may or may not be (which goes first is up to the system), so the state is read and not assumed
+        assert!(after.contains(&("box/file.txt".into(), "three".into())));
+        assert!(after.contains(&("box/tree/sub/b.txt".into(), "two".into())));
+        assert!(after.iter().all(|entry| before.contains(entry)), "the original lost files at most, it gained none");
+        // The undo is of the copies, and says so
+        let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
+        assert!(entry.label.starts_with("Incomplete move of"), "{}", entry.label);
+        assert!(entry.edits.iter().all(|e| matches!(e, Edit::Trash(p) if p.starts_with(&to))) && entry.edits.len() == 2, "{:?}", entry.edits);
+        // Doing it takes the copies away and does not touch the originals
+        // The trash of that file system is made in its top folder
+        let trash = PathBuf::from("/dev/shm").join(format!(".Trash-{}", unsafe { libc::geteuid() }));
+        let trash_existed = trash.exists();
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        let gone = !to.join("file.txt").exists() && !to.join("tree").exists();
+        let originals_unchanged = listing(&from) == after;
+        mode(&from.join("box"), 0o755);
+        mode(&from.join("box/tree/sub"), 0o755);
+        assert!(gone, "the copies are in the trash");
+        assert!(originals_unchanged, "and the originals are as they were");
+        std::fs::remove_dir_all(&from).unwrap();
+        if !trash_existed {
+            // What was trashed has the locked folder in it; only a trash this test made is removed
+            let _ = std::process::Command::new("chmod").args(["-R", "u+rwx"]).arg(&trash).status();
+            let _ = std::fs::remove_dir_all(&trash);
+        }
+        let _ = std::fs::remove_dir_all(&to);
+    }
+
     #[test]
     fn the_room_a_copy_needs_counts_holes_only_where_they_stay() {
         use std::os::unix::fs::{FileExt, MetadataExt};
@@ -1699,5 +1789,47 @@ mod tests {
         assert_eq!(dir.join("copy").metadata().unwrap().len(), len);
         assert_eq!(std::fs::read(dir.join("image")).unwrap(), std::fs::read(dir.join("copy")).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_move_tried_again_after_an_incomplete_one_asks_about_the_copy_that_is_there_and_nothing_goes_unasked() {
+        let Some((from, to)) = two_file_systems("move_again") else { return };
+        let trash = PathBuf::from("/dev/shm").join(format!(".Trash-{}", unsafe { libc::geteuid() }));
+        let trash_existed = trash.exists();
+        std::fs::create_dir_all(from.join("box/tree/sub")).unwrap();
+        std::fs::write(from.join("box/tree/a.txt"), "one").unwrap();
+        std::fs::write(from.join("box/tree/sub/b.txt"), "two").unwrap();
+        mode(&from.join("box/tree/sub"), 0o555);
+        mode(&from.join("box"), 0o555);
+        let pair = || vec![(from.join("box/tree"), to.join("tree"))];
+        let (first, _) = run(JobKind::Move, Op::Move, pair(), Decision::Skip);
+        assert!(!first.ok && first.message.contains("could not be fully removed"), "{}", first.message);
+        let copy_after_first = listing(&to);
+        // The person unlocks what was in the way and tries again
+        mode(&from.join("box"), 0o755);
+        mode(&from.join("box/tree/sub"), 0o755);
+        let unlocked = listing(&from);
+
+        // Saying "skip" changes nothing at all
+        let (second, asked) = run(JobKind::Move, Op::Move, pair(), Decision::Skip);
+        assert_eq!(asked, 1, "the copy that is there is a name that is taken, and that is asked");
+        assert!(second.ok, "{}", second.message);
+        assert_eq!((listing(&from), listing(&to)), (unlocked.clone(), copy_after_first.clone()), "nothing was touched");
+
+        // Saying "replace" moves what is left of the original over the copy and the copy goes to the trash
+        let (third, asked) = run(JobKind::Move, Op::Move, pair(), Decision::Replace);
+        assert_eq!(asked, 1);
+        assert!(third.ok, "{}", third.message);
+        assert!(!from.join("box/tree").exists(), "the original is gone now");
+        assert_eq!(listing(&to), unlocked.iter().map(|(p, c)| (p.strip_prefix("box/").unwrap().to_owned(), c.clone())).collect::<Vec<_>>(), "and it is all there");
+        let Effect::Record(entry) = third.effect else { panic!("no undo entry") };
+        assert!(entry.edits.iter().any(|e| matches!(e, Edit::Restore(_))), "the replaced copy can be brought back");
+
+        std::fs::remove_dir_all(&from).unwrap();
+        if !trash_existed {
+            let _ = std::process::Command::new("chmod").args(["-R", "u+rwx"]).arg(&trash).status();
+            let _ = std::fs::remove_dir_all(&trash);
+        }
+        let _ = std::fs::remove_dir_all(&to);
     }
 }
