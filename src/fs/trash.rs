@@ -108,6 +108,10 @@ pub fn is_empty() -> bool {
 /// Move `path` to the trash, returning where it ended up. Items on another drive go to a trash
 /// folder on that drive (as the freedesktop.org spec says), so deleting is a rename, not a copy.
 pub fn trash(path: &Path) -> io::Result<PathBuf> {
+    #[cfg(test)]
+    if tests_refuse::refused(path) {
+        return Err(io::Error::from_raw_os_error(libc::EACCES));
+    }
     let home = root().ok_or_else(|| io::Error::other("no trash folder"))?;
     let original = absolute(path)?;
     match drive_trash(&home, &original) {
@@ -456,5 +460,22 @@ mod tests {
 
         assert_eq!(decode(&encode(Path::new("/a b/ü%x"))), std::ffi::OsString::from("/a b/ü%x"));
         std::fs::remove_dir_all(&base).unwrap();
+    }
+}
+
+/// Paths for which the tests pretend the trash cannot take them (any job's thread asks, so it is not thread-local).
+#[cfg(test)]
+pub(crate) mod tests_refuse {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static REFUSED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(crate) fn refuse(path: &Path) {
+        REFUSED.lock().unwrap().push(path.to_path_buf());
+    }
+
+    pub(crate) fn refused(path: &Path) -> bool {
+        REFUSED.lock().unwrap().iter().any(|p| path.starts_with(p))
     }
 }

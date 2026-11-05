@@ -617,8 +617,8 @@ struct Record {
     skipped: usize,
     /// Files inside a copied folder that could not be copied, and why; the rest of the folder was copied.
     unreadable: Vec<(PathBuf, String)>,
-    /// An item could only be deleted for good, so the undo cannot bring it back.
-    lossy: bool,
+    /// Items that could only be deleted for good (the trash could not take them), so the undo cannot bring them back.
+    deleted_for_good: Vec<PathBuf>,
 }
 
 fn measure(path: &Path, files: &mut u64, bytes: &mut u64) {
@@ -846,7 +846,7 @@ fn clear_target(rec: &mut Record, target: &Path) -> io::Result<()> {
         Ok(trashed) => rec.replaced.push(trashed),
         Err(_) => {
             ops::remove_tree(target)?;
-            rec.lossy = true;
+            rec.deleted_for_good.push(target.to_path_buf());
         }
     }
     Ok(())
@@ -1067,13 +1067,18 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
         message.push_str(&format!(" · {note}"));
     }
     // The rest of a folder was copied; what was left out is said, and the job still counts as done
+    // Said in the message of a job that goes wrong too: it is the one thing an undo cannot make good
+    let gone = deleted_for_good_note(&rec.deleted_for_good);
+    if let Some(note) = &gone {
+        message.push_str(&format!(" · {note}"));
+    }
     let left_out = (!rec.unreadable.is_empty()).then(|| unreadable_note(&rec.unreadable));
     if let Some(note) = &left_out {
         message.push_str(&format!(" · {note}"));
     }
     if !failures.is_empty() {
         let mut text = failures.join(" · ");
-        if let Some(note) = &left_out {
+        for note in [&gone, &left_out].into_iter().flatten() {
             text.push_str(&format!(" · {note}"));
         }
         let mut outcome = Outcome::failed(text).with(effect);
@@ -1083,6 +1088,17 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
     let mut outcome = Outcome::done(message).with(effect);
     outcome.cancelled = was_cancelled;
     outcome
+}
+
+/// What the message says about replaced items that the trash could not take and that were deleted for good.
+fn deleted_for_good_note(list: &[PathBuf]) -> Option<String> {
+    (!list.is_empty()).then(|| {
+        trn(
+            list.len(),
+            "{} replaced item could not go to the trash and was deleted for good: undo cannot bring it back",
+            "{} replaced items could not go to the trash and were deleted for good: undo cannot bring them back",
+        )
+    })
 }
 
 /// "3 items could not be copied: a/b.txt (Permission denied), …" for the files a copy left out.
@@ -1186,6 +1202,41 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         (done.expect("the job never finished"), asked)
+    }
+
+    #[test]
+    fn a_replaced_item_the_trash_cannot_take_is_said_to_be_deleted_for_good() {
+        let dir = sandbox("replace_no_trash");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("a"), "new").unwrap();
+        std::fs::write(dir.join("dst/a"), "old").unwrap();
+        crate::fs::trash::tests_refuse::refuse(&dir.join("dst/a"));
+        let (outcome, asked) = run(JobKind::Copy, Op::Copy, vec![(dir.join("a"), dir.join("dst/a"))], Decision::Replace);
+        assert_eq!(asked, 1);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(outcome.message.contains("deleted for good") && outcome.message.contains("undo cannot bring it back"), "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dir.join("dst/a")).unwrap(), "new");
+        let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
+        assert!(entry.edits.iter().any(|e| matches!(e, Edit::Trash(_))), "the copy can still be taken back");
+        assert!(!entry.edits.iter().any(|e| matches!(e, Edit::Restore(_))), "nothing was put in the trash, so nothing can be brought back");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_replaced_item_that_went_to_the_trash_gets_no_warning_and_can_be_brought_back() {
+        let dir = sandbox("replace_with_trash");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("a"), "new").unwrap();
+        std::fs::write(dir.join("dst/a"), "old").unwrap();
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("a"), dir.join("dst/a"))], Decision::Replace);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(!outcome.message.contains("deleted for good"), "{}", outcome.message);
+        let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
+        assert!(entry.edits.iter().any(|e| matches!(e, Edit::Restore(_))));
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        assert_eq!(std::fs::read_to_string(dir.join("dst/a")).unwrap(), "old", "undo brings the old file back");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

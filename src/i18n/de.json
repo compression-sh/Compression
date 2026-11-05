@@ -843,5 +843,6 @@
   "{} items were copied without their access control lists (ACLs): the target does not keep ACLs": "{} Element wurde ohne seine Zugriffskontrollliste (ACL) kopiert: Das Ziel behält ACLs nicht|{} Elemente wurden ohne ihre Zugriffskontrolllisten (ACLs) kopiert: Das Ziel behält ACLs nicht",
   "The group permissions of {} items were not copied, because their ACLs could not be: they have none for the group": "Die Gruppenrechte von {} Element wurden nicht kopiert, weil dessen ACL nicht übernommen werden konnte: Es hat keine für die Gruppe|Die Gruppenrechte von {} Elementen wurden nicht kopiert, weil deren ACLs nicht übernommen werden konnten: Sie haben keine für die Gruppe",
   "A complete copy was made in “{}”, but the original could not be fully removed: {}": "Eine vollständige Kopie wurde in „{}“ angelegt, aber das Original ließ sich nicht ganz entfernen: {}",
-  "Incomplete move of {}": "Unvollständiges Verschieben von {}"
+  "Incomplete move of {}": "Unvollständiges Verschieben von {}",
+  "{} replaced items could not go to the trash and were deleted for good: undo cannot bring them back": "{} ersetztes Element ließ sich nicht in den Papierkorb legen und wurde endgültig gelöscht: Rückgängig kann es nicht zurückbringen|{} ersetzte Elemente ließen sich nicht in den Papierkorb legen und wurden endgültig gelöscht: Rückgängig kann sie nicht zurückbringen"
 }
