@@ -193,6 +193,87 @@ pub(crate) fn keep_link_times(copy: &Path, original: &std::fs::Metadata) {
     unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
 }
 
+/// Whether a file has holes worth keeping: it uses less room than its size says. (Not a proof: a compressed file
+/// does too; the copy then simply finds one data range as long as the file.)
+pub(crate) fn may_have_holes(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.is_file() && meta.len() > 0 && meta.blocks().saturating_mul(512) < meta.len()
+}
+
+/// What `copy_holey` came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Holey {
+    /// The data ranges were copied and the copy has the length of the original; the holes stayed holes (where the
+    /// target file system has them).
+    Copied,
+    /// The source file system cannot tell data from holes (`SEEK_DATA`): nothing was written, copy it the plain way.
+    Unavailable,
+}
+
+/// The most one `step` is asked to copy.
+const HOLEY_STEP: u64 = 1 << 20;
+
+fn seek_to(file: &std::fs::File, offset: u64, whence: libc::c_int) -> io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    let offset = libc::off_t::try_from(offset).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    // SAFETY: an open descriptor; the call only moves its position
+    let at = unsafe { libc::lseek(file.as_raw_fd(), offset, whence) };
+    if at < 0 { Err(io::Error::last_os_error()) } else { Ok(at as u64) }
+}
+
+/// Copies `reader` (of `len` bytes) into the new, empty file `writer` without writing its holes: only the data
+/// ranges (found with `SEEK_DATA` and `SEEK_HOLE`) are copied, each by `step(most, first)` (which copies up to `most`
+/// bytes at both files' positions and returns how many, 0 at the end), then the length is set. `check` is asked before
+/// each step (to pause or stop), `progress` is told every byte passed, holes included, so a sparse file's progress still
+/// ends at its size.
+pub(crate) fn copy_holey(
+    reader: &std::fs::File,
+    writer: &std::fs::File,
+    len: u64,
+    check: &mut dyn FnMut() -> io::Result<()>,
+    step: &mut dyn FnMut(u64, bool) -> io::Result<usize>,
+    progress: &mut dyn FnMut(u64),
+) -> io::Result<Holey> {
+    let (mut reader_at, mut writer_at) = (reader, writer);
+    let mut pos = 0;
+    let mut asked = false;
+    while pos < len {
+        check()?;
+        let data = match seek_to(reader, pos, libc::SEEK_DATA) {
+            Ok(data) => data,
+            // Nothing but a hole is left
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => break,
+            // Not a file system that can tell (and nothing was written yet)
+            Err(e) if !asked && matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)) => return Ok(Holey::Unavailable),
+            Err(e) => return Err(e),
+        };
+        asked = true;
+        if data >= len {
+            break;
+        }
+        let end = seek_to(reader, data, libc::SEEK_HOLE).unwrap_or(len).min(len).max(data);
+        progress(data - pos);
+        reader_at.seek(SeekFrom::Start(data))?;
+        writer_at.seek(SeekFrom::Start(data))?;
+        let (mut left, mut first) = (end - data, true);
+        while left > 0 {
+            check()?;
+            let n = step(left.min(HOLEY_STEP), first)? as u64;
+            if n == 0 {
+                // The file got shorter while it was copied: the copy ends where the data did
+                return Ok(Holey::Copied);
+            }
+            first = false;
+            left = left.saturating_sub(n);
+            progress(n);
+        }
+        pos = end;
+    }
+    progress(len.saturating_sub(pos));
+    writer.set_len(len)?;
+    Ok(Holey::Copied)
+}
+
 /// A name for `name` inside `dir` that does not exist yet: `a.txt`, `a (copy).txt`, `a (copy 2).txt`, ...
 pub fn unique_path(dir: &Path, name: &std::ffi::OsStr, suffix: &str) -> PathBuf {
     unique_path_where(dir, name, suffix, |_| false)
@@ -252,14 +333,26 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
         Err(io::Error::other(trf("Cannot copy {}: it is a named pipe, socket or device file", &[&name])))
     } else {
         // Not `std::fs::copy`: it fails the whole copy when the target refuses the permissions
-        let mut reader = std::fs::File::open(src)?;
+        let reader = std::fs::File::open(src)?;
         // Not `File::create`: a file that appeared there meanwhile is not ours to cut short
-        let mut writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
-        io::copy(&mut reader, &mut writer)?;
+        let writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
+        copy_contents(&reader, &writer, &meta)?;
         let kept = keep_attributes(src, dst, &meta);
         keep_times(&writer, &meta);
         keep_mode(writer.set_permissions(kept.permissions))
     }
+}
+
+/// The contents of `reader` into the new file `writer`; a file with holes keeps them.
+fn copy_contents(reader: &std::fs::File, writer: &std::fs::File, meta: &std::fs::Metadata) -> io::Result<()> {
+    if may_have_holes(meta) {
+        let (from, mut to) = (reader, writer);
+        let mut step = |most: u64, _first: bool| io::copy(&mut from.take(most), &mut to).map(|n| n as usize);
+        if copy_holey(reader, writer, meta.len(), &mut || Ok(()), &mut step, &mut |_| {})? == Holey::Copied {
+            return Ok(());
+        }
+    }
+    io::copy(&mut &*reader, &mut &*writer).map(drop)
 }
 
 /// Rename `src` to the exact path `dst`, copying across filesystems when it has to.

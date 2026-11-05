@@ -650,54 +650,72 @@ fn name_of(path: &Path) -> String {
 /// Bytes copied between two checks for pause and cancel.
 const CHUNK: usize = 1 << 20;
 
-/// Up to `CHUNK` bytes from `reader` to `writer` inside the kernel, at both files' positions. The data
+/// Up to `most` (at most `CHUNK`) bytes from `reader` to `writer` inside the kernel, at both files' positions. The data
 /// never passes through Compression, and file systems that can (btrfs, XFS, NFS) share the blocks instead of copying them.
-fn copy_range(reader: &std::fs::File, writer: &std::fs::File) -> io::Result<usize> {
+fn copy_range(reader: &std::fs::File, writer: &std::fs::File, most: usize) -> io::Result<usize> {
     use std::os::fd::AsRawFd;
     // SAFETY: two open descriptors; null offsets make the kernel use and advance the files' own positions
-    let n = unsafe { libc::copy_file_range(reader.as_raw_fd(), std::ptr::null_mut(), writer.as_raw_fd(), std::ptr::null_mut(), CHUNK, 0) };
+    let n = unsafe { libc::copy_file_range(reader.as_raw_fd(), std::ptr::null_mut(), writer.as_raw_fd(), std::ptr::null_mut(), most.min(CHUNK), 0) };
     if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
 }
 
-fn copy_file(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
-    let mut reader = std::fs::File::open(src)?;
-    let meta = reader.metadata()?;
-    // `create_new`: a file that is already there is an error, and not ours to remove below
-    let mut writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
-    let result = (|| {
-        let mut in_kernel = true;
-        let mut buffer = Vec::new();
-        let mut copied = 0u64;
+/// How the bytes of a file get from one place to the other: inside the kernel while that works, through a buffer when it
+/// does not.
+struct Mover {
+    in_kernel: bool,
+    buffer: Vec<u8>,
+}
+
+impl Mover {
+    fn new() -> Self {
+        Self { in_kernel: true, buffer: Vec::new() }
+    }
+
+    /// Up to `most` bytes from `reader` to `writer`, at their positions; 0 is the end. `first`: nothing was copied yet.
+    fn step(&mut self, reader: &std::fs::File, writer: &std::fs::File, most: usize, first: bool) -> io::Result<usize> {
         loop {
-            w.shared.checkpoint()?;
-            let n = if in_kernel {
-                match copy_range(&reader, &writer) {
+            if self.in_kernel {
+                match copy_range(reader, writer, most) {
                     // Files such as those in /proc claim to be empty to the kernel copy; read them the plain way
-                    Ok(0) if copied == 0 => {
-                        in_kernel = false;
-                        continue;
-                    }
-                    Ok(n) => n,
+                    Ok(0) if first => self.in_kernel = false,
+                    Ok(n) => return Ok(n),
                     // Not supported between these files: copy through a buffer instead
-                    Err(e) if matches!(e.raw_os_error(), Some(libc::EXDEV | libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM | libc::EBADF)) => {
-                        in_kernel = false;
-                        continue;
-                    }
+                    Err(e) if matches!(e.raw_os_error(), Some(libc::EXDEV | libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM | libc::EBADF)) => self.in_kernel = false,
                     Err(e) => return Err(e),
                 }
             } else {
-                if buffer.is_empty() {
-                    buffer = vec![0u8; CHUNK];
+                if self.buffer.is_empty() {
+                    self.buffer = vec![0u8; CHUNK];
                 }
-                let n = reader.read(&mut buffer)?;
-                writer.write_all(&buffer[..n])?;
-                n
-            };
-            if n == 0 {
-                break;
+                let n = (&*reader).read(&mut self.buffer[..most.min(CHUNK)])?;
+                (&*writer).write_all(&self.buffer[..n])?;
+                return Ok(n);
             }
-            copied += n as u64;
-            w.add_bytes(n as u64);
+        }
+    }
+}
+
+fn copy_file(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
+    let reader = std::fs::File::open(src)?;
+    let meta = reader.metadata()?;
+    // `create_new`: a file that is already there is an error, and not ours to remove below
+    let writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
+    let result = (|| {
+        let mut mover = Mover::new();
+        // A file with holes (a disk image, a database) keeps them instead of becoming as big as it says
+        let holey = ops::may_have_holes(&meta)
+            && ops::copy_holey(&reader, &writer, meta.len(), &mut || w.shared.checkpoint(), &mut |most, first| mover.step(&reader, &writer, most as usize, first), &mut |n| w.add_bytes(n))? == ops::Holey::Copied;
+        let mut copied = 0u64;
+        if !holey {
+            loop {
+                w.shared.checkpoint()?;
+                let n = mover.step(&reader, &writer, CHUNK, copied == 0)?;
+                if n == 0 {
+                    break;
+                }
+                copied += n as u64;
+                w.add_bytes(n as u64);
+            }
         }
         // Tags, comments and ratings live in extended attributes; set them while the copy is still writable
         let permissions = w.keep_attributes(src, dst, &meta);
