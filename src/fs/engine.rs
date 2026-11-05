@@ -927,7 +927,13 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
             // Another filesystem: copy, then remove the original once the copy is whole
             Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
                 copy_new(w, src, &target, None)?;
-                ops::remove_tree(src)?;
+                if let Err(err) = ops::remove_tree(src) {
+                    // The copy is whole and stays; the original is still (at least partly) where it was. That is
+                    // said, and an undo takes the copy away again
+                    let folder = target.parent().map(name_of).unwrap_or_default();
+                    rec.created.push(target);
+                    return Err(io::Error::other(trf("A complete copy was made in “{}”, but the original could not be fully removed: {}", &[&folder, &crate::fs::describe::io_error(&err)])));
+                }
                 rec.moved.push((src.to_path_buf(), target));
             }
             Err(e) => return Err(e),
@@ -1004,7 +1010,9 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
         }
         Op::Move => {
             edits.extend(rec.moved.iter().rev().map(|(from, to)| Edit::Move { from: to.clone(), to: from.clone() }));
-            trf("Move of {}", &[&label])
+            // Copies whose originals could not be removed: an undo takes those copies away, it does not put the originals back
+            edits.extend(rec.created.iter().cloned().map(Edit::Trash));
+            if rec.created.is_empty() { trf("Move of {}", &[&label]) } else { trf("Incomplete move of {}", &[&label]) }
         }
     };
     edits.extend(rec.replaced.iter().cloned().map(Edit::Restore));

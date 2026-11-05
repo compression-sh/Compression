@@ -841,5 +841,7 @@
   "These items are not in the list any more. Refresh the folder and try again.": "Các mục này không còn trong danh sách. Hãy làm mới thư mục và thử lại.",
   "{} items were copied without their tags and other attributes: the target does not keep them": "{} mục được sao chép mà không có thẻ và các thuộc tính khác: đích không lưu giữ chúng",
   "{} items were copied without their access control lists (ACLs): the target does not keep ACLs": "{} mục được sao chép mà không có danh sách kiểm soát truy cập (ACL): đích không lưu giữ ACL",
-  "The group permissions of {} items were not copied, because their ACLs could not be: they have none for the group": "Quyền nhóm của {} mục không được sao chép vì không thể sao chép ACL của chúng: chúng không có quyền nào cho nhóm"
+  "The group permissions of {} items were not copied, because their ACLs could not be: they have none for the group": "Quyền nhóm của {} mục không được sao chép vì không thể sao chép ACL của chúng: chúng không có quyền nào cho nhóm",
+  "A complete copy was made in “{}”, but the original could not be fully removed: {}": "Đã tạo bản sao đầy đủ trong “{}”, nhưng không thể xóa hết bản gốc: {}",
+  "Incomplete move of {}": "Di chuyển chưa hoàn tất {}"
 }
