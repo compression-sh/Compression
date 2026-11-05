@@ -486,3 +486,275 @@ fn split_branch(head: &str) -> (String, String) {
     (branch, tracking)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_branch_and_file_states() {
+        let root = Path::new("/r");
+        let text = "## main...origin/main [ahead 2]\0 M src/a.rs\0A  new.txt\0?? notes/\0R  to.rs\0from.rs\0UU merge.rs\0 D gone.rs\0";
+        let repo = parse_status(root, text);
+        assert_eq!(repo.branch, "main");
+        assert_eq!(repo.tracking, "[ahead 2]");
+        assert_eq!(repo.changed, 6);
+        let letter = |p: &str| repo.files.get(Path::new(p)).map(|b| b.letter);
+        assert_eq!(letter("/r/src/a.rs"), Some('M'));
+        assert_eq!(letter("/r/src"), Some('M'));
+        assert_eq!(letter("/r/new.txt"), Some('A'));
+        assert_eq!(letter("/r/notes"), Some('?'));
+        assert_eq!(letter("/r/to.rs"), Some('R'));
+        assert_eq!(letter("/r/from.rs"), None);
+        assert_eq!(letter("/r/merge.rs"), Some('!'));
+        assert_eq!(letter("/r/gone.rs"), Some('D'));
+        assert_eq!(letter("/r"), None);
+    }
+
+    #[test]
+    fn files_in_an_untracked_folder_can_be_staged() {
+        let repo = parse_status(Path::new("/r"), "## main\0?? notes/\0 M a.rs\0");
+        assert!(repo.in_untracked_folder(Path::new("/r/notes/x.txt")));
+        assert!(!repo.in_untracked_folder(Path::new("/r/notes")));
+        assert!(!repo.in_untracked_folder(Path::new("/r/a.rs")));
+        assert!(repo.applies(&[Path::new("/r/notes/x.txt")]).stage);
+    }
+
+    #[test]
+    fn staged_and_edited_again_counts_as_modified() {
+        let repo = parse_status(Path::new("/r"), "## dev\0MM a\0M  b\0");
+        assert_eq!(repo.files[Path::new("/r/a")].tone, Tone::Warn);
+        assert_eq!(repo.files[Path::new("/r/b")], Badge { letter: 'S', tone: Tone::Good });
+        assert_eq!(repo.branch, "dev");
+    }
+
+    #[test]
+    fn branch_without_upstream_or_commits() {
+        assert_eq!(split_branch("feature/x"), ("feature/x".to_owned(), String::new()));
+        assert_eq!(split_branch("No commits yet on main"), ("main".to_owned(), String::new()));
+    }
+
+    #[test]
+    fn reads_a_real_repository() {
+        let dir = std::env::temp_dir().join(format!("compression-git-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        if git(&dir, &["init", "-q"]).is_none() {
+            return;
+        }
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let repo = read_repo(&dir).expect("repo");
+        let root = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(repo.files.get(&root.join("a.txt")).map(|b| b.letter), Some('?'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_git_command_that_hangs_is_stopped_at_the_time_limit() {
+        let started = std::time::Instant::now();
+        let mut hangs = Command::new("sleep");
+        hangs.arg("30");
+        assert_eq!(run_within(hangs, Duration::from_millis(200)), Err(tr("git took longer than 10 seconds").to_owned()));
+        assert!(started.elapsed() < Duration::from_secs(5), "it was not stopped");
+        // One that prints without end is stopped too, and one that cannot start says why
+        let mut loud = Command::new("sh");
+        loud.arg("-c").arg("while :; do echo xxxxxxxxxxxxxxxx; done");
+        assert_eq!(run_within(loud, Duration::from_secs(60)), Err(tr("git printed more than 64 MiB").to_owned()));
+        assert!(run_within(Command::new("/nonexistent/git"), GIT_TIMEOUT).is_err());
+    }
+
+    #[test]
+    fn a_normal_git_command_still_gives_its_output_and_its_errors() {
+        let Some((dir, root)) = sandbox("timeout") else { return };
+        let status = git(&root, &["status", "--porcelain=v1"]).expect("status");
+        assert!(String::from_utf8_lossy(&status).contains("b.txt"));
+        assert!(run_git(&root, &[os("diff"), os("--no-color"), os("--"), os("a.txt")]).unwrap().windows(7).any(|w| w == b"+changed"[..7].to_vec()));
+        // git's own error is what comes back, not a time-out
+        let err = run_git(&root, &[os("rev-parse"), os("--verify"), os("no-such-ref")]).unwrap_err();
+        assert!(!err.contains("longer than"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_repository_cannot_make_git_run_its_own_commands() {
+        let dir = std::env::temp_dir().join(format!("compression-git-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `git()` is the hardened runner, so the repository is made with plain git
+        if Command::new("git").arg("-C").arg(&dir).args(["init", "-q"]).output().map_or(true, |o| !o.status.success()) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let marker = dir.join("MARKER");
+        let hook = dir.join("hook.sh");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // A downloaded folder can bring this in its own `.git/config`
+        let config = dir.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!("[core]\n\tfsmonitor = {}\n", hook.display()));
+        std::fs::write(&config, text).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let repo = read_repo(&dir).expect("git still reads the repository");
+        assert!(repo.files.values().any(|b| b.letter == '?'));
+        assert!(!marker.exists(), "git ran the program named by the repository's core.fsmonitor");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository in a temp folder with `a.txt` committed, then edited, and `b.txt` untracked.
+    fn sandbox(name: &str) -> Option<(PathBuf, PathBuf)> {
+        let dir = std::env::temp_dir().join(format!("compression-git-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        git(&dir, &["init", "-q"])?;
+        let root = std::fs::canonicalize(&dir).ok()?;
+        std::fs::write(root.join("a.txt"), "one\n").ok()?;
+        let commit = |args: &[&str]| {
+            Command::new("git").arg("-C").arg(&root).args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]).args(args).output().ok().filter(|o| o.status.success())
+        };
+        commit(&["add", "a.txt"])?;
+        commit(&["commit", "-q", "-m", "first"])?;
+        std::fs::write(root.join("a.txt"), "one\nchanged\n").ok()?;
+        std::fs::write(root.join("b.txt"), "new\n").ok()?;
+        Some((dir, root))
+    }
+
+    fn state(root: &Path, name: &str) -> Option<(char, char)> {
+        read_repo(root)?.states.get(&root.join(name)).copied()
+    }
+
+    #[test]
+    fn stage_unstage_and_discard_change_the_repository() {
+        let Some((dir, root)) = sandbox("actions") else { return };
+        assert_eq!(state(&root, "a.txt"), Some((' ', 'M')));
+        assert_eq!(state(&root, "b.txt"), Some(('?', '?')));
+
+        change(&root, Action::Stage, &[root.join("a.txt"), root.join("b.txt")]).unwrap();
+        assert_eq!(state(&root, "a.txt"), Some(('M', ' ')));
+        assert_eq!(state(&root, "b.txt"), Some(('A', ' ')));
+
+        change(&root, Action::Unstage, &[root.join("a.txt"), root.join("b.txt")]).unwrap();
+        assert_eq!(state(&root, "a.txt"), Some((' ', 'M')));
+        assert_eq!(state(&root, "b.txt"), Some(('?', '?')));
+
+        let message = change(&root, Action::Discard, &[root.join("a.txt")]).unwrap();
+        assert!(message.contains('1'), "{message}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one\n");
+        assert_eq!(state(&root, "a.txt"), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn names_that_look_like_options_are_still_paths() {
+        let Some((dir, root)) = sandbox("dash") else { return };
+        std::fs::write(root.join("--force"), "x").unwrap();
+        change(&root, Action::Stage, &[root.join("--force")]).unwrap();
+        assert_eq!(state(&root, "--force"), Some(('A', ' ')));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unstaging_before_the_first_commit_works_and_errors_say_why() {
+        let dir = std::env::temp_dir().join(format!("compression-git-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        if git(&dir, &["init", "-q"]).is_none() {
+            return;
+        }
+        let root = std::fs::canonicalize(&dir).unwrap();
+        std::fs::write(root.join("f"), "x").unwrap();
+        change(&root, Action::Stage, &[root.join("f")]).unwrap();
+        assert_eq!(state(&root, "f"), Some(('A', ' ')));
+        change(&root, Action::Unstage, &[root.join("f")]).unwrap();
+        assert_eq!(state(&root, "f"), Some(('?', '?')));
+        // Outside a repository git's own last line is the message
+        let outside = std::env::temp_dir().join(format!("compression-git-none-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let error = change(&outside, Action::Stage, &[outside.join("x")]).unwrap_err();
+        assert!(!error.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn diff_shows_changes_and_flags_binary_files() {
+        let Some((dir, root)) = sandbox("diff") else { return };
+        let view = diff(&root, &[root.join("a.txt")]).unwrap();
+        assert!(view.lines.iter().any(|l| l == "+changed"), "{:?}", view.lines);
+        assert!(!view.binary && !view.cut);
+        // Staged changes are part of the diff too
+        change(&root, Action::Stage, &[root.join("a.txt")]).unwrap();
+        assert!(diff(&root, &[root.join("a.txt")]).unwrap().lines.iter().any(|l| l == "+changed"));
+
+        std::fs::write(root.join("pic.bin"), [0u8, 159, 146, 150, 0]).unwrap();
+        let commit = Command::new("git").arg("-C").arg(&root).args(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "x"]).output().unwrap();
+        assert!(commit.status.success());
+        change(&root, Action::Stage, &[root.join("pic.bin")]).unwrap();
+        std::fs::write(root.join("pic.bin"), [0u8, 1, 2, 3, 0, 0]).unwrap();
+        assert!(diff(&root, &[root.join("pic.bin")]).unwrap().binary);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn menu_entries_follow_the_state_of_the_selection() {
+        let root = Path::new("/r");
+        let repo = parse_status(root, "## main\0 M edited.rs\0M  staged.rs\0MM both.rs\0?? new.txt\0 D gone.rs\0");
+        let applies = |names: &[&str]| {
+            let paths: Vec<PathBuf> = names.iter().map(|n| root.join(n)).collect();
+            repo.applies(&paths.iter().map(|p| p.as_path()).collect::<Vec<_>>())
+        };
+        assert_eq!(applies(&["edited.rs"]), Applies { stage: true, unstage: false, discard: true, diff: true });
+        assert_eq!(applies(&["staged.rs"]), Applies { stage: false, unstage: true, discard: false, diff: true });
+        assert_eq!(applies(&["both.rs"]), Applies { stage: true, unstage: true, discard: true, diff: true });
+        // Untracked: can be staged, nothing to discard or compare
+        assert_eq!(applies(&["new.txt"]), Applies { stage: true, unstage: false, discard: false, diff: false });
+        assert!(applies(&["gone.rs"]).discard);
+        // Several files: no diff window
+        assert!(!applies(&["edited.rs", "both.rs"]).diff);
+        // Clean files offer nothing
+        assert_eq!(applies(&["clean.rs"]), Applies::default());
+    }
+
+    #[test]
+    fn discard_asks_first_and_menu_actions_refresh_the_badges() {
+        let Some((dir, root)) = sandbox("menu") else { return };
+        let mut plugin = Git::default();
+        plugin.directory_changed(&root);
+        let wait = |plugin: &mut Git, until: &dyn Fn(&Git) -> bool| {
+            for _ in 0..400 {
+                plugin.poll();
+                if until(plugin) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("timed out");
+        };
+        wait(&mut plugin, &|p| p.repo.is_some());
+
+        let a = FileItem::from_path(&root.join("a.txt")).unwrap();
+        let entries = plugin.menu_items(std::slice::from_ref(&a));
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["stage", "diff", "discard"]);
+        let discard = entries.iter().find(|e| e.id == "discard").unwrap();
+        assert!(discard.confirm.is_some_and(|q| q.contains('1')), "{:?}", discard.confirm);
+        assert!(entries.iter().filter(|e| e.id != "discard").all(|e| e.confirm.is_none()));
+        // Files outside the repository get nothing
+        assert!(plugin.menu_items(&[FileItem::from_path(Path::new("/")).unwrap()]).is_empty());
+
+        // Staging runs on a worker, reports, and the badge follows without waiting for the throttle
+        plugin.run("stage", std::slice::from_ref(&a.path), &root);
+        wait(&mut plugin, &|p| p.repo.as_ref().is_some_and(|r| r.states.get(&a.path) == Some(&('M', ' '))));
+        let messages = plugin.messages();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        let ids: Vec<String> = plugin.menu_items(std::slice::from_ref(&a)).into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["unstage", "diff"]);
+
+        // The diff window opens with the changes and closes on request
+        plugin.run("diff", std::slice::from_ref(&a.path), &root);
+        wait(&mut plugin, &|p| p.diff.is_some());
+        assert_eq!(plugin.window_title(), Some(tr("Changes")));
+        plugin.close_window();
+        assert_eq!(plugin.window_title(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
