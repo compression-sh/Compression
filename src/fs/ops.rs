@@ -278,6 +278,80 @@ pub(crate) fn copy_holey(
     Ok(Holey::Copied)
 }
 
+/// What is in a folder, read without setting the folder's access time. Reading a folder sets it on a file system
+/// mounted with relatime (the usual way), and the copy of a folder is to have the access time the original had before
+/// the job looked at it. The folder is opened with `O_NOATIME`, which the system allows for the owner of the folder (and
+/// root); for anyone else the folder is read the usual way and its access time may change, as with any reader.
+pub(crate) struct DirPaths {
+    dir: *mut libc::DIR,
+    base: PathBuf,
+}
+
+pub(crate) fn read_dir_keeping_atime(path: &Path) -> io::Result<DirPaths> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    // SAFETY: `c` is a NUL-terminated path that outlives the call.
+    let mut fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_NOATIME) };
+    if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+        // SAFETY: as above.
+        fd = unsafe { libc::open(c.as_ptr(), flags) };
+    }
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is an open folder; on success the DIR owns it and `closedir` closes it.
+    let dir = unsafe { libc::fdopendir(fd) };
+    if dir.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so `fd` is still ours to close.
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    Ok(DirPaths { dir, base: path.to_path_buf() })
+}
+
+impl Iterator for DirPaths {
+    type Item = io::Result<PathBuf>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use std::os::unix::ffi::OsStrExt;
+        loop {
+            // `readdir` leaves errno alone at the end and sets it on an error
+            // SAFETY: `__errno_location` is the thread's errno; `self.dir` is an open DIR until `drop`.
+            let entry = unsafe {
+                *libc::__errno_location() = 0;
+                libc::readdir(self.dir)
+            };
+            if entry.is_null() {
+                let err = io::Error::last_os_error();
+                return if err.raw_os_error() == Some(0) { None } else { Some(Err(err)) };
+            }
+            // SAFETY: a non-null entry from `readdir` has a NUL-terminated name, valid until the next call.
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name != b"." && name != b".." {
+                return Some(Ok(self.base.join(std::ffi::OsStr::from_bytes(name))));
+            }
+        }
+    }
+}
+
+impl Drop for DirPaths {
+    fn drop(&mut self) {
+        // SAFETY: `self.dir` came from `fdopendir` and is closed only here.
+        unsafe { libc::closedir(self.dir) };
+    }
+}
+
+#[cfg(test)]
+impl DirPaths {
+    /// The descriptor of the open folder, for a test to ask the system how it was opened.
+    pub(crate) fn raw_fd(&self) -> i32 {
+        // SAFETY: `self.dir` is an open DIR.
+        unsafe { libc::dirfd(self.dir) }
+    }
+}
+
 /// A name for `name` inside `dir` that does not exist yet: `a.txt`, `a (copy).txt`, `a (copy 2).txt`, ...
 pub fn unique_path(dir: &Path, name: &std::ffi::OsStr, suffix: &str) -> PathBuf {
     unique_path_where(dir, name, suffix, |_| false)
@@ -968,5 +1042,36 @@ pub(crate) mod tests {
         let err = copy_holey(&reader, &writer, 8 * MIB, &mut || Ok(()), &mut |_, _| Ok(0), &mut |_| {}).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_folder_is_read_without_setting_its_access_time_and_lists_the_same_as_the_usual_way() {
+        let dir = dir("read_dir_atime");
+        std::fs::create_dir_all(dir.join("sub/deeper")).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::write(dir.join(".hidden"), "h").unwrap();
+        let entries = read_dir_keeping_atime(&dir).unwrap();
+        // The system says how the folder was opened: with O_NOATIME, which it allows for our own folder
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", entries.raw_fd())).unwrap();
+        let flags = info.lines().find_map(|l| l.strip_prefix("flags:")).map(|f| i32::from_str_radix(f.trim(), 8).unwrap()).unwrap();
+        assert_ne!(flags & libc::O_NOATIME, 0, "{info}");
+        let mut ours: Vec<PathBuf> = entries.map(Result::unwrap).collect();
+        let mut usual: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        ours.sort();
+        usual.sort();
+        assert_eq!(ours, usual, "the same paths, without . and ..");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_folder_of_someone_else_and_a_folder_that_is_not_there_are_read_or_refused_as_usual() {
+        // The system does not allow O_NOATIME on a folder of another user (unless root): then it is read the usual way
+        let root: Vec<PathBuf> = read_dir_keeping_atime(Path::new("/")).unwrap().map(Result::unwrap).collect();
+        assert!(root.contains(&PathBuf::from("/usr")), "{root:?}");
+        assert_eq!(read_dir_keeping_atime(Path::new("/definitely/not/here")).err().map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+        let file = dir("read_dir_file").join("f");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(read_dir_keeping_atime(&file).err().and_then(|e| e.raw_os_error()), Some(libc::ENOTDIR));
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
 }

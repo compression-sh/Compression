@@ -624,9 +624,9 @@ struct Record {
 fn measure(path: &Path, files: &mut u64, bytes: &mut u64) {
     let Ok(meta) = path.symlink_metadata() else { return };
     if meta.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(path) {
+        if let Ok(entries) = ops::read_dir_keeping_atime(path) {
             for entry in entries.flatten() {
-                measure(&entry.path(), files, bytes);
+                measure(&entry, files, bytes);
             }
         }
     } else {
@@ -746,14 +746,14 @@ fn refuse_special_files(w: &Worker, path: &Path, lenient: bool) -> io::Result<()
         Err(err) => return Err(err),
     };
     if meta.is_dir() {
-        let entries = match std::fs::read_dir(path) {
+        let entries = match ops::read_dir_keeping_atime(path) {
             Ok(entries) => entries,
             Err(_) if lenient => return Ok(()),
             Err(err) => return Err(err),
         };
         for entry in entries {
             match entry {
-                Ok(entry) => refuse_special_files(w, &entry.path(), lenient)?,
+                Ok(entry) => refuse_special_files(w, &entry, lenient)?,
                 Err(_) if lenient => {}
                 Err(err) => return Err(err),
             }
@@ -802,9 +802,9 @@ fn copy_tree(w: &Worker, src: &Path, dst: &Path, mut skipped: Option<&mut Vec<(P
         Ok(())
     } else if meta.is_dir() {
         std::fs::create_dir(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        for from in ops::read_dir_keeping_atime(src)? {
+            let from = from?;
+            let to = dst.join(from.file_name().unwrap_or_default());
             match copy_tree(w, &from, &to, skipped.as_deref_mut()) {
                 Err(err) if !ends_the_copy(&err) && skipped.is_some() => {
                     if let Some(list) = skipped.as_deref_mut() {
@@ -951,7 +951,7 @@ fn room_for(src: &Path, dest: Option<&Path>, size: u64) -> u64 {
     fn used(path: &Path, device: u64) -> u64 {
         let Ok(meta) = path.symlink_metadata() else { return 0 };
         if meta.is_dir() {
-            std::fs::read_dir(path).map_or(0, |entries| entries.flatten().fold(0u64, |sum, entry| sum.saturating_add(used(&entry.path(), device))))
+            ops::read_dir_keeping_atime(path).map_or(0, |entries| entries.flatten().fold(0u64, |sum, entry| sum.saturating_add(used(&entry, device))))
         } else if meta.dev() == device && ops::may_have_holes(&meta) {
             meta.blocks().saturating_mul(512).min(meta.len())
         } else {
@@ -1324,8 +1324,9 @@ mod tests {
         let (outcome, asked) = run(JobKind::Copy, Op::Copy, vec![(dir.join("photo.txt"), dir.join("dst/photo.txt"))], Decision::Skip);
         assert!(outcome.ok && asked == 0, "{}", outcome.message);
         let copy = dir.join("dst/photo.txt");
-        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "content");
+        // The times first: reading the copy sets its access time on a file system mounted with relatime
         assert_eq!(times_of(&copy), ((ATIME, 111_222_333), (MTIME, 123_456_789)), "access and modification time, to the nanosecond");
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "content");
         assert_eq!(copy.metadata().unwrap().mode() & 0o7777, 0o640);
         assert_ne!(copy.metadata().unwrap().ino(), dir.join("photo.txt").metadata().unwrap().ino());
         if tagged {
@@ -1353,9 +1354,14 @@ mod tests {
         let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("tree"), dir.join("dst/tree"))], Decision::Skip);
         assert!(outcome.ok, "{}", outcome.message);
         let t = dir.join("dst/tree");
-        for (name, a, m) in [("inner/f", ATIME + 1, MTIME + 1), ("inner", ATIME + 2, MTIME + 2), ("relative", ATIME + 3, MTIME + 3), ("dangling", ATIME + 4, MTIME + 4), ("", ATIME + 5, MTIME + 5)] {
-            let ((ta, _), (tm, tn)) = times_of(&t.join(name));
+        // All the times before anything is read (reading sets the access time on a file system mounted with relatime)
+        let seen: Vec<_> = ["inner/f", "inner", "relative", "dangling", ""].iter().map(|name| (*name, times_of(&t.join(name)))).collect();
+        for ((name, ((ta, _), (tm, tn))), (a, m)) in seen.into_iter().zip([(ATIME + 1, MTIME + 1), (ATIME + 2, MTIME + 2), (ATIME + 3, MTIME + 3), (ATIME + 4, MTIME + 4), (ATIME + 5, MTIME + 5)]) {
             assert_eq!((ta, tm, tn), (a, m, 123_456_789), "{name:?}");
+        }
+        // The job read the original folders to size its work: that did not set their access time either
+        for (name, a) in [("tree", ATIME + 5), ("tree/inner", ATIME + 2)] {
+            assert_eq!(times_of(&dir.join(name)).0.0, a, "the original {name:?}");
         }
         assert_eq!(t.join("inner").metadata().unwrap().mode() & 0o7777, 0o750);
         if tagged {
