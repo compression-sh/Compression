@@ -240,3 +240,75 @@ impl CompressionApp {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chooser::Spec;
+    use crate::settings::Settings;
+    use crate::ui::theme::SerpantinumTheme;
+
+    fn app_in(dir: &Path, args: &[&str]) -> CompressionApp {
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(dir.to_path_buf(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        app.chooser = Spec::parse(&args).map(Chooser::new);
+        app.reload_items();
+        app
+    }
+
+    #[test]
+    fn answers_follow_the_mode() {
+        let work = std::env::temp_dir().join(format!("compression_chooser_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        std::fs::write(work.join("a.txt"), "a").unwrap();
+        std::fs::write(work.join("b.png"), "b").unwrap();
+
+        // Opening needs a selected file, and the filter hides the rest
+        let mut app = app_in(&work, &["--chooser", "--mode", "open", "--filter", "Text\tg:*.txt"]);
+        assert_eq!(app.items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["sub", "a.txt"]);
+        assert_eq!(app.chooser_answer(), None);
+        app.select_path(&work.join("a.txt"));
+        assert_eq!(app.chooser_answer(), Some(vec![work.join("a.txt")]));
+
+        // A folder dialog answers with the open folder when nothing is selected
+        let app = app_in(&work, &["--chooser", "--mode", "folder"]);
+        assert_eq!(app.items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["sub"]);
+        assert_eq!(app.chooser_answer(), Some(vec![app.current_path.clone()]));
+
+        // Saving needs a name and answers with the open folder joined to it
+        let app = app_in(&work, &["--chooser", "--mode", "save", "--name", "new.txt"]);
+        assert_eq!(app.chooser_answer(), Some(vec![app.current_path.join("new.txt")]));
+        let app = app_in(&work, &["--chooser", "--mode", "save"]);
+        assert_eq!(app.chooser_answer(), None);
+
+        // A typed path decides where the file goes, and a filter never renames it
+        let app = app_in(&work, &["--chooser", "--mode", "save", "--name", "sub/x", "--filter", "PNG\tg:*.png"]);
+        assert_eq!(app.chooser_answer(), Some(vec![app.current_path.join("sub/x")]));
+
+        // A typed folder is gone into, not answered with
+        let app = app_in(&work, &["--chooser", "--mode", "save", "--name", "sub/"]);
+        assert_eq!(app.chooser_answer(), None);
+        assert_eq!(app.chooser_typed_dir(), Some(app.current_path.join("sub")));
+        let app = app_in(&work, &["--chooser", "--mode", "save", "--name", "/tmp/y.txt"]);
+        assert_eq!(app.chooser_answer(), Some(vec![PathBuf::from("/tmp/y.txt")]));
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_mime_filter_keeps_the_images() {
+        let work = std::env::temp_dir().join(format!("compression_chooser_mime_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("Screenshot_2026-10-22-22403.png"), "a").unwrap();
+        std::fs::write(work.join("notes.txt"), "b").unwrap();
+        let app = app_in(&work, &["--chooser", "--mode", "open", "--filter", "All Supported Types\tm:image/png\tm:image/jpeg"]);
+        let names: Vec<&str> = app.items.iter().map(|i| i.name.as_str()).collect();
+        // Without a shared-mime-info database every file is shown, by design
+        if crate::fs::apps::mime_of_name("a.png").is_some() {
+            assert_eq!(names, ["Screenshot_2026-10-22-22403.png"]);
+        }
+        let _ = std::fs::remove_dir_all(&work);
+    }
+}

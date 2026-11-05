@@ -59,3 +59,44 @@ impl SwipeDetector {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(d: &mut SwipeDetector, dx: f32, frames: usize, start: f64) -> Vec<Swipe> {
+        (0..frames).filter_map(|i| d.feed(Vec2::new(dx, 0.0), start + i as f64 * 0.016)).collect()
+    }
+
+    #[test]
+    fn a_long_sideways_swipe_fires_once_and_the_tail_is_ignored() {
+        let mut d = SwipeDetector::default();
+        // 40 frames of 20 points is far past the threshold; the cooldown keeps it to one
+        assert_eq!(run(&mut d, 20.0, 40, 1.0), vec![Swipe::Back]);
+        let mut d = SwipeDetector::default();
+        assert_eq!(run(&mut d, -20.0, 40, 1.0), vec![Swipe::Forward]);
+    }
+
+    #[test]
+    fn short_and_vertical_movement_does_nothing() {
+        let mut d = SwipeDetector::default();
+        assert!(run(&mut d, 10.0, 5, 1.0).is_empty());
+        // The same distance spread over seconds is not a gesture
+        let mut d = SwipeDetector::default();
+        let slow: Vec<_> = (0..30).filter_map(|i| d.feed(Vec2::new(20.0, 0.0), i as f64 * 0.5)).collect();
+        assert!(slow.is_empty());
+        // Diagonal scrolling that is mostly vertical is the list moving
+        let mut d = SwipeDetector::default();
+        let diag: Vec<_> = (0..40).filter_map(|i| d.feed(Vec2::new(20.0, 15.0), 1.0 + i as f64 * 0.016)).collect();
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn a_second_swipe_works_after_a_pause_and_reversing_restarts_the_count() {
+        let mut d = SwipeDetector::default();
+        assert_eq!(run(&mut d, 30.0, 6, 1.0), vec![Swipe::Back]);
+        assert_eq!(run(&mut d, 30.0, 6, 3.0), vec![Swipe::Back]);
+        let mut d = SwipeDetector::default();
+        assert!(run(&mut d, 20.0, 5, 1.0).is_empty());
+        assert!(run(&mut d, -20.0, 5, 1.1).is_empty(), "the other direction starts from zero");
+    }
+}

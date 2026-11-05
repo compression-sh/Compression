@@ -894,3 +894,190 @@ impl Dispatch<WlDataSource, ()> for State {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pipe: the end to read from (not blocking, as the reader of a drop has it) and the end to write to.
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: pipe2 fills two descriptors that are owned from here on
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn a_source_that_sends_nothing_is_given_up_on_after_the_limit() {
+        let (read, _write_kept_open) = pipe();
+        let mut reader = Reader { fd: Some(read), timeout: std::time::Duration::from_millis(60), ..Default::default() };
+        reader.pump();
+        assert!(!reader.done() && !reader.timed_out, "still within the time");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        reader.pump();
+        assert!(reader.done() && reader.timed_out);
+        assert!(reader.data.is_empty());
+        // Restarting the wait gives a source new time
+        let (read, _write) = pipe();
+        let mut reader = Reader { fd: Some(read), timeout: std::time::Duration::from_millis(60), ..Default::default() };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        reader.restart();
+        reader.pump();
+        assert!(!reader.done());
+    }
+
+    #[test]
+    fn a_list_cut_off_at_the_limit_is_not_taken_as_complete() {
+        let cut_off = |extra: usize| {
+            let (read, write) = pipe();
+            let mut reader = Reader { fd: Some(read), limit: 100_000, ..Default::default() };
+            let list = "file:///tmp/a\r\n".repeat((reader.limit + extra) / 15 + 1);
+            let list = list.as_bytes()[..reader.limit + extra].to_vec();
+            let sender = std::thread::spawn(move || write_all_within(write, &list, std::time::Duration::from_secs(5)));
+            let started = std::time::Instant::now();
+            while !reader.done() && started.elapsed() < std::time::Duration::from_secs(5) {
+                reader.pump();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let _ = sender.join();
+            reader
+        };
+        // One byte over the limit is already too long, and nothing of it is kept
+        let reader = cut_off(1);
+        assert!(reader.done() && reader.truncated && reader.unusable() && !reader.timed_out);
+        assert!(reader.data.is_empty());
+        let reader = cut_off(50_000);
+        assert!(reader.truncated && reader.data.is_empty());
+
+        // A list that fits, even exactly, is complete once the source closes the pipe
+        let (read, write) = pipe();
+        let mut reader = Reader { fd: Some(read), limit: 20_000, ..Default::default() };
+        let exact = vec![b'u'; 20_000];
+        let sender = std::thread::spawn({
+            let exact = exact.clone();
+            move || write_all_within(write, &exact, std::time::Duration::from_secs(5))
+        });
+        let started = std::time::Instant::now();
+        while !reader.done() && started.elapsed() < std::time::Duration::from_secs(5) {
+            reader.pump();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        sender.join().unwrap().unwrap();
+        assert!(reader.done() && !reader.unusable());
+        assert_eq!(reader.data, exact);
+    }
+
+    #[test]
+    fn half_a_list_from_a_stalled_source_is_thrown_away() {
+        let (read, write) = pipe();
+        let mut reader = Reader { fd: Some(read), timeout: std::time::Duration::from_millis(60), ..Default::default() };
+        let half = b"file:///tmp/a\r\nfile:///tm";
+        assert_eq!(unsafe { libc::write(write.as_raw_fd(), half.as_ptr().cast(), half.len()) }, half.len() as isize);
+        reader.pump();
+        assert!(!reader.done());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        reader.pump();
+        assert!(reader.done() && reader.timed_out && reader.data.is_empty());
+    }
+
+    /// Reads until the reader is done, waiting on the pipe itself (no sleeping): the closing of a pipe is seen
+    /// only when every holder of its write end has let go, and a program started at that moment by another thread
+    /// holds a copy until it has run `exec`.
+    fn pump_until_done(reader: &mut Reader) {
+        while !reader.done() {
+            if let Some(fd) = &reader.fd {
+                let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                // SAFETY: one valid pollfd; the descriptor is open
+                unsafe { libc::poll(&mut pfd, 1, 5000) };
+            }
+            reader.pump();
+        }
+    }
+
+    #[test]
+    fn a_source_that_sends_everything_and_closes_is_read_whole() {
+        let (read, write) = pipe();
+        let mut reader = Reader { fd: Some(read), ..Default::default() };
+        let list = b"file:///tmp/a\r\n";
+        assert_eq!(unsafe { libc::write(write.as_raw_fd(), list.as_ptr().cast(), list.len()) }, list.len() as isize);
+        drop(write);
+        pump_until_done(&mut reader);
+        assert!(reader.done() && !reader.timed_out && !reader.unusable());
+        assert_eq!(reader.data, b"file:///tmp/a\r\n");
+    }
+
+    #[test]
+    fn the_end_of_a_list_is_the_closing_by_the_last_holder_of_the_pipe() {
+        let (read, write) = pipe();
+        let mut reader = Reader { fd: Some(read), ..Default::default() };
+        let held_elsewhere = write.try_clone().unwrap();
+        let list = b"file:///tmp/a\r\nfile:///tmp/b\r\n";
+        assert_eq!(unsafe { libc::write(write.as_raw_fd(), list.as_ptr().cast(), list.len()) }, list.len() as isize);
+        drop(write);
+        // Everything is there, but another holder keeps the pipe open: that is not the end yet
+        reader.pump();
+        assert!(!reader.done() && reader.data == list);
+        drop(held_elsewhere);
+        pump_until_done(&mut reader);
+        assert!(reader.done() && !reader.timed_out);
+        assert_eq!(reader.data, list);
+    }
+
+    #[test]
+    fn writing_to_a_program_that_never_reads_gives_up_at_the_timeout() {
+        let (read, write) = pipe();
+        // More than a pipe holds, so the write has to wait for the reader, which is not coming
+        let big = vec![b'x'; 4 << 20];
+        let started = std::time::Instant::now();
+        let err = write_all_within(write, &big, std::time::Duration::from_millis(150)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        drop(read);
+    }
+
+    #[test]
+    fn writing_to_a_program_that_reads_slowly_and_one_that_left() {
+        let (read, write) = pipe();
+        let big = vec![b'y'; 1 << 20];
+        let expect = big.clone();
+        let reader = std::thread::spawn(move || {
+            let mut file = std::fs::File::from(read);
+            let mut all = Vec::new();
+            let mut buf = [0u8; 4096];
+            while all.len() < expect.len() {
+                match std::io::Read::read(&mut file, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => all.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    Err(_) => break,
+                }
+            }
+            all == expect
+        });
+        write_all_within(write, &big, std::time::Duration::from_secs(10)).unwrap();
+        assert!(reader.join().unwrap());
+        // A program that closed its end is an error at once, not a wait
+        let (read, write) = pipe();
+        drop(read);
+        let started = std::time::Instant::now();
+        assert_eq!(write_all_within(write, b"data", std::time::Duration::from_secs(10)).unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn icon_stacks_the_files_and_shows_the_count() {
+        let style = IconStyle { card: 0xFF_30_30_40, badge: 0xFF_C0_A0_FF, badge_text: 0xFF_1C_1B_22, icons: vec![(crate::ui::icons::FILE, 0xFF_FF_FF_FF); 3], scale: 2 };
+        let size = (ICON_SIZE * 2) as usize;
+        let alpha = |px: &[u8], x: usize, y: usize| px[(y * size + x) * 4 + 3];
+        let one = render_icon(size, 2.0, 1, &style);
+        let three = render_icon(size, 2.0, 3, &style);
+        assert_eq!(three.len(), size * size * 4);
+        // The front card is covered and its corner rounded off
+        assert!(alpha(&one, 8 + 44, size - 8 - 44) > 200);
+        assert_eq!(alpha(&one, 0, size - 1), 0);
+        // Only several files carry the badge in the top right corner, and a pile behind the front card
+        assert_eq!(alpha(&one, size - 12, 12), 0);
+        assert!(alpha(&three, size - 12, 12) > 200);
+        assert_eq!(alpha(&one, 114, 60), 0);
+        assert!(alpha(&three, 114, 60) > 200);
+    }
+}

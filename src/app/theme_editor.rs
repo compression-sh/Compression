@@ -595,3 +595,15 @@ fn round_off(painter: &egui::Painter, rect: egui::Rect, radius: f32, backdrop: C
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_come_from_names_and_stay_unique() {
+        let taken = |id: &str| CustomTheme { id: id.to_owned(), name: String::new(), colors: ThemeColors::default() };
+        assert_eq!(unique_id("My Theme!", &[]), "my-theme");
+        assert_eq!(unique_id("???", &[]), "theme");
+        assert_eq!(unique_id("Mine", &[taken("mine"), taken("mine-2")]), "mine-3");
+    }
+}

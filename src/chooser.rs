@@ -354,3 +354,116 @@ pub fn cancel() -> ! {
     std::process::exit(EXIT_CANCELLED);
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uri_round_trips() {
+        let p = PathBuf::from("/home/a b/ü#1.txt");
+        assert_eq!(from_uri(&uri(&p)), Some(p));
+        assert_eq!(uri(Path::new("/a b")), "file:///a%20b");
+    }
+
+    #[test]
+    fn filters_match_globs_and_mimes() {
+        let f = Filter { label: "Images".into(), patterns: vec![Pattern::Mime("image/*".into()), Pattern::Glob("*.xyz".into())] };
+        assert!(f.accepts(Path::new("/x/a.xyz")));
+        // Without a shared-mime-info database (a build sandbox) MIME patterns show everything
+        if crate::fs::apps::mime_of_name("a.png").is_some() {
+            assert!(f.accepts(Path::new("/x/a.PNG")));
+            assert!(!f.accepts(Path::new("/x/a.txt")));
+        }
+    }
+
+    #[test]
+    fn mime_filters_follow_the_shared_database() {
+        let mime = |m: &str| Filter { label: String::new(), patterns: vec![Pattern::Mime(m.into())] };
+        // Skipped where no shared-mime-info is installed, which then shows everything by design
+        if crate::fs::apps::mime_of_name("a.png").is_none() {
+            return;
+        }
+        assert!(mime("application/zip").accepts(Path::new("/x/report.docx")));
+        assert!(mime("text/*").accepts(Path::new("/x/main.rs")));
+        assert!(!mime("image/*").accepts(Path::new("/x/a.tar.gz")));
+        assert!(!mime("application/x-foo").accepts(Path::new("/x/a.png")));
+    }
+
+    #[test]
+    fn plain_paths_and_other_schemes_in_from_uri() {
+        assert_eq!(from_uri("file:///home/a%20b"), Some(PathBuf::from("/home/a b")));
+        assert_eq!(from_uri("rel/dir"), Some(PathBuf::from("rel/dir")));
+        assert_eq!(from_uri("https://x/y"), None);
+        // A file on another computer is not opened as a local one
+        assert_eq!(from_uri("file://other-host/pfad"), None);
+        assert_eq!(from_uri("file://nas/"), None);
+        assert_eq!(from_uri("file://localhost/home/a%20b"), Some(PathBuf::from("/home/a b")));
+        assert_eq!(from_uri("file://LOCALHOST/x"), Some(PathBuf::from("/x")));
+        assert_eq!(from_uri("file:///x"), Some(PathBuf::from("/x")));
+        assert_eq!(from_uri("file://"), Some(PathBuf::new()));
+        // One slash is a local path too, and means the same as three
+        assert_eq!(from_uri("file:/tmp/example"), Some(PathBuf::from("/tmp/example")));
+        assert_eq!(from_uri("file:/tmp/a%20b"), from_uri("file:///tmp/a%20b"));
+        assert_eq!(from_uri("file:///tmp/example"), Some(PathBuf::from("/tmp/example")));
+        assert_eq!(from_uri("file://other-host/tmp/example"), None);
+        // `file:` without a slash is not a URI of ours
+        assert_eq!(from_uri("file:relative"), Some(PathBuf::from("file:relative")));
+    }
+
+    #[test]
+    fn file_names_cannot_leave_the_folder() {
+        let args: Vec<String> = ["--chooser", "--mode", "save-files", "--file", "../../etc/passwd", "--file", "/abs/x.txt", "--file", "..", "--file", "ok"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(Spec::parse(&args).unwrap().files, ["passwd", "x.txt", "ok"]);
+    }
+
+    fn parse(args: &[&str]) -> Option<Spec> {
+        Spec::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_choice_that_cannot_be_read_is_skipped_and_the_rest_of_the_request_stands() {
+        let spec = parse(&[
+            "--chooser", "--mode", "save", "--name", "a.txt",
+            "--choice", "encoding\tEncoding\tutf8\tutf8\tUTF-8\tlatin1\tLatin-1",
+            "--choice", "only-an-id",
+            "--choice", "",
+            "--choice", "\tno id\tx",
+            "--choice", "bom\tAdd BOM\tfalse",
+            "--filter", "Text\tg:*.txt",
+        ])
+        .expect("the request is still readable");
+        assert_eq!(spec.mode, Mode::Save);
+        assert_eq!(spec.name.as_deref(), Some("a.txt"));
+        assert_eq!(spec.filters.len(), 1);
+        let ids: Vec<_> = spec.choices.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["encoding", "bom"]);
+        assert_eq!(spec.choices[0].options, [("utf8".to_owned(), "UTF-8".to_owned()), ("latin1".to_owned(), "Latin-1".to_owned())]);
+        assert_eq!(spec.choices[1].initial, "false");
+        // A --choice with nothing after it is one that cannot be read too
+        assert_eq!(parse(&["--chooser", "--choice", "ok\tOK\tx", "--choice"]).unwrap().choices.len(), 1);
+    }
+
+    #[test]
+    fn a_request_whose_choices_are_all_broken_is_refused_and_one_without_choices_is_fine() {
+        assert!(parse(&["--chooser", "--mode", "open", "--choice", "broken"]).is_none());
+        assert!(parse(&["--chooser", "--choice"]).is_none());
+        assert!(parse(&["--chooser", "--choice", "a", "--choice", "b\tonly label"]).is_none());
+        let plain = parse(&["--chooser", "--mode", "open"]).expect("no choices asked for");
+        assert!(plain.choices.is_empty());
+    }
+
+    #[test]
+    fn parses_arguments() {
+        let args: Vec<String> = ["--chooser", "--mode", "save", "--name", "a.txt", "--filter", "Text\tg:*.txt\tm:text/plain"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let spec = Spec::parse(&args).unwrap();
+        assert_eq!(spec.mode, Mode::Save);
+        assert_eq!(spec.name.as_deref(), Some("a.txt"));
+        assert_eq!(spec.filters[0].patterns.len(), 2);
+    }
+}
