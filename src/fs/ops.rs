@@ -45,6 +45,11 @@ impl Control<'_> {
     pub fn unlimited() -> Control<'static> {
         Control::new(&|| false, &|_| {}, Duration::from_secs(24 * 3600))
     }
+
+    /// Tells the progress by hand, as the files being read or written do.
+    pub fn report(&self, done: u64) {
+        (self.progress)(done);
+    }
 }
 
 fn stopped() -> io::Error {
@@ -1110,5 +1115,361 @@ pub(crate) mod tests {
         std::fs::write(&file, "x").unwrap();
         assert_eq!(read_dir_keeping_atime(&file).err().and_then(|e| e.raw_os_error()), Some(libc::ENOTDIR));
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+
+    /// A folder of its own with `src/` holding incompressible files, so archives are about as big as their contents.
+    fn archive_sandbox(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("compression_ops_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut noise = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 24) as u8
+                })
+                .collect()
+        };
+        std::fs::write(root.join("src/one.bin"), noise(1 << 20)).unwrap();
+        std::fs::write(root.join("src/two.bin"), noise(1 << 20)).unwrap();
+        std::fs::write(root.join("src/sub/three.bin"), noise(1 << 20)).unwrap();
+        std::fs::write(root.join("src/sub/four.bin"), noise(1 << 20)).unwrap();
+        root
+    }
+
+    fn sources(root: &Path) -> Vec<PathBuf> {
+        vec![root.join("src/one.bin"), root.join("src/two.bin"), root.join("src/sub")]
+    }
+
+    #[test]
+    fn keep_mode_lets_copies_onto_shares_without_permissions_through() {
+        // GVfs's SMB mount answers a chmod with "Operation not supported (os error 95)"
+        assert!(keep_mode(Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))).is_ok());
+        assert!(keep_mode(Err(io::Error::from_raw_os_error(libc::EPERM))).is_ok());
+        assert!(keep_mode(Err(io::Error::from_raw_os_error(libc::ENOSPC))).is_err());
+    }
+
+    #[test]
+    fn a_failed_move_across_file_systems_leaves_no_half_copied_target() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("compression_ops_move_{}", std::process::id()));
+        let shm = std::path::PathBuf::from("/dev/shm").join(format!("compression_ops_move_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&shm);
+        std::fs::create_dir_all(root.join("tree/sub")).unwrap();
+        // Only a copy between two file systems goes through the code under test; root can read everything
+        if std::fs::create_dir_all(&shm).is_err() || shm.metadata().unwrap().dev() == root.metadata().unwrap().dev() || unsafe { libc::geteuid() } == 0 {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&shm);
+            return;
+        }
+        std::fs::write(root.join("tree/a.txt"), "first").unwrap();
+        std::fs::write(root.join("tree/sub/locked.txt"), "second").unwrap();
+        std::fs::set_permissions(root.join("tree/sub/locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(move_path(&root.join("tree"), &shm.join("tree")).is_err());
+        assert!(!shm.join("tree").exists(), "the half-copied folder was left behind");
+        assert_eq!(std::fs::read_to_string(root.join("tree/a.txt")).unwrap(), "first");
+
+        // A target that was there before is not removed
+        std::fs::create_dir_all(shm.join("there")).unwrap();
+        std::fs::write(shm.join("there/mine.txt"), "mine").unwrap();
+        assert!(move_path(&root.join("tree"), &shm.join("there")).is_err());
+        assert_eq!(std::fs::read_to_string(shm.join("there/mine.txt")).unwrap(), "mine");
+
+        std::fs::set_permissions(root.join("tree/sub/locked.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&shm).unwrap();
+    }
+
+    #[test]
+    fn the_copy_behind_trash_and_undo_refuses_a_named_pipe_instead_of_hanging() {
+        let root = std::env::temp_dir().join(format!("compression_ops_fifo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("tree")).unwrap();
+        std::fs::write(root.join("tree/a.txt"), "a").unwrap();
+        std::os::unix::fs::symlink("a.txt", root.join("tree/link")).unwrap();
+        let pipe = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(root.join("tree/pipe").as_os_str())).unwrap();
+        // SAFETY: `pipe` is a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+
+        // Run on a thread: a copy that opens the pipe would never return
+        let (from, to) = (root.join("tree"), root.join("copy"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(copy_tree(&from, &to)).unwrap());
+        let err = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the copy hung on the pipe").unwrap_err();
+        assert!(err.to_string().contains("named pipe"), "{err}");
+
+        // Regular files and symlinks still copy
+        std::fs::remove_file(root.join("tree/pipe")).unwrap();
+        copy_tree(&root.join("tree"), &root.join("whole")).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("whole/a.txt")).unwrap(), "a");
+        assert_eq!(std::fs::read_link(root.join("whole/link")).unwrap(), Path::new("a.txt"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn roundtrip() {
+        let root = std::env::temp_dir().join(format!("compression_ops_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("d/e")).unwrap();
+        std::fs::write(src.join("a.txt"), "hello").unwrap();
+        std::fs::write(src.join("d/e/b.txt"), "world").unwrap();
+        let srcs = vec![src.join("a.txt"), src.join("d")];
+        for fmt in ArchiveFormat::ALL {
+            if !fmt.available() { println!("skip {:?}", fmt); continue; }
+            let out = src.join(format!("pack{}", fmt.extension()));
+            compress(&srcs, &out, fmt, &Control::unlimited()).unwrap_or_else(|e| panic!("{fmt:?} compress: {e}"));
+            let dest = extract_beside(&out, &Control::unlimited()).unwrap_or_else(|e| panic!("{fmt:?} extract: {e}"));
+            assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "hello", "{fmt:?}");
+            assert_eq!(std::fs::read_to_string(dest.join("d/e/b.txt")).unwrap(), "world", "{fmt:?}");
+            println!("ok {:?} -> {}", fmt, dest.display());
+        }
+        assert!(unique_path(&src, std::ffi::OsStr::new("d"), "copy").ends_with("d (copy)"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_size_of_the_work_of_packing_is_the_bytes_below_the_sources() {
+        let root = archive_sandbox("size");
+        assert_eq!(tree_bytes(&sources(&root)), 4 << 20);
+        assert_eq!(tree_bytes(&[root.join("missing")]), 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn packing_reports_the_bytes_it_has_done() {
+        let root = archive_sandbox("pack_progress");
+        let total = tree_bytes(&sources(&root));
+        for format in [ArchiveFormat::Zip, ArchiveFormat::TarGz] {
+            let (last, calls) = (AtomicU64::new(0), AtomicU64::new(0));
+            let progress = |done: u64| {
+                // Never backwards
+                assert!(done >= last.swap(done, Relaxed));
+                calls.fetch_add(1, Relaxed);
+            };
+            let control = Control::new(&|| false, &progress, Duration::from_secs(60));
+            let out = root.join(format!("pack{}", format.extension()));
+            compress(&sources(&root), &out, format, &control).unwrap();
+            // The zip counts the files' bytes; the tar stream adds its headers and padding
+            let done = last.load(Relaxed);
+            assert!(done >= total && done < total + 64 * 1024, "{format:?}: {done} of {total}");
+            assert!(calls.load(Relaxed) > 4, "{format:?}: progress comes in steps, not once at the end");
+            assert!(out.is_file());
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn unpacking_reports_how_much_of_the_archive_it_has_read() {
+        let root = archive_sandbox("unpack_progress");
+        let out = root.join("pack.zip");
+        compress(&sources(&root), &out, ArchiveFormat::Zip, &Control::unlimited()).unwrap();
+        let (last, calls) = (AtomicU64::new(0), AtomicU64::new(0));
+        let progress = |done: u64| {
+            assert!(done >= last.swap(done, Relaxed));
+            calls.fetch_add(1, Relaxed);
+        };
+        let control = Control::new(&|| false, &progress, Duration::from_secs(60));
+        let dest = extract_beside(&out, &control).unwrap();
+        assert!(dest.join("sub/four.bin").is_file());
+        assert!(last.load(Relaxed) >= out.metadata().unwrap().len() / 2, "it read most of the archive");
+        assert!(calls.load(Relaxed) > 4);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_pack_stops_half_way_and_leaves_no_archive() {
+        let root = archive_sandbox("pack_cancel");
+        for format in [ArchiveFormat::Zip, ArchiveFormat::TarGz] {
+            let cancel = AtomicBool::new(false);
+            // The person presses Cancel once about a megabyte is done
+            let progress = |done: u64| {
+                if done >= 1 << 20 {
+                    cancel.store(true, Relaxed);
+                }
+            };
+            let stop = || cancel.load(Relaxed);
+            let control = Control::new(&stop, &progress, Duration::from_secs(60));
+            let out = root.join(format!("pack{}", format.extension()));
+            let err = compress(&sources(&root), &out, format, &control).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Interrupted, "{format:?}: {err}");
+            assert!(!out.exists(), "{format:?}: an unfinished archive was left behind");
+        }
+        // The sources are untouched
+        assert_eq!(tree_bytes(&sources(&root)), 4 << 20);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_unpack_takes_back_what_it_made_and_keeps_what_was_there() {
+        let root = archive_sandbox("unpack_cancel");
+        for (format, ext) in [(ArchiveFormat::Zip, "zip"), (ArchiveFormat::TarGz, "tar.gz")] {
+            let out = root.join(format!("pack.{ext}"));
+            compress(&sources(&root), &out, format, &Control::unlimited()).unwrap();
+            let dest = root.join(format!("into_{ext}"));
+            std::fs::create_dir_all(dest.join("old")).unwrap();
+            std::fs::write(dest.join("keep.txt"), "mine").unwrap();
+            let cancel = AtomicBool::new(false);
+            let progress = |done: u64| {
+                if done >= 2 << 20 {
+                    cancel.store(true, Relaxed);
+                }
+            };
+            let stop = || cancel.load(Relaxed);
+            let control = Control::new(&stop, &progress, Duration::from_secs(60));
+            let err = extract(&out, &dest, &control).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Interrupted, "{ext}: {err}");
+            let mut left: Vec<String> = std::fs::read_dir(&dest).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            left.sort();
+            assert_eq!(left, ["keep.txt", "old"], "{ext}");
+            assert_eq!(std::fs::read_to_string(dest.join("keep.txt")).unwrap(), "mine");
+        }
+        // Next to the archive, the whole new folder goes
+        let out = root.join("pack.zip");
+        let cancel = AtomicBool::new(true);
+        let stop = || cancel.load(Relaxed);
+        let control = Control::new(&stop, &|_| {}, Duration::from_secs(60));
+        assert!(extract_beside(&out, &control).is_err());
+        assert!(!root.join("pack").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_job_out_of_time_stops_like_a_cancelled_one_but_says_why() {
+        let root = archive_sandbox("timeout");
+        let out = root.join("pack.zip");
+        let none = Control::new(&|| false, &|_| {}, Duration::ZERO);
+        let err = compress(&sources(&root), &out, ArchiveFormat::Zip, &none).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("30"), "{err}");
+        assert!(!out.exists());
+
+        compress(&sources(&root), &out, ArchiveFormat::Zip, &Control::unlimited()).unwrap();
+        let dest = root.join("into");
+        std::fs::create_dir_all(&dest).unwrap();
+        let err = extract(&out, &dest, &none).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+
+        // The same through the libraries that copy by themselves
+        let tgz = root.join("pack.tar.gz");
+        let err = compress(&sources(&root), &tgz, ArchiveFormat::TarGz, &none).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(!tgz.exists());
+        compress(&sources(&root), &tgz, ArchiveFormat::TarGz, &Control::unlimited()).unwrap();
+        let err = extract(&tgz, &dest, &none).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_program_that_packs_is_killed_when_cancelled_or_out_of_time() {
+        let sleeper = || {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg("sleep 30");
+            cmd
+        };
+        // Out of time
+        let started = Instant::now();
+        let control = Control::new(&|| false, &|_| {}, Duration::from_millis(200));
+        let err = run_tool(sleeper(), &control).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // Cancelled while it runs
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let err = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                cancel.store(true, Relaxed);
+            });
+            run_tool(sleeper(), &Control::new(&|| cancel.load(Relaxed), &|_| {}, Duration::from_secs(60))).unwrap_err()
+        });
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // A program that ends normally, and one that complains
+        let ok = Control::unlimited();
+        let mut fine = Command::new("sh");
+        fine.arg("-c").arg("echo packed");
+        assert!(run_tool(fine, &ok).is_ok());
+        let mut bad = Command::new("sh");
+        bad.arg("-c").arg("echo first >&2; echo cannot open >&2; exit 2");
+        assert_eq!(run_tool(bad, &ok).unwrap_err().to_string(), "cannot open");
+    }
+
+    #[test]
+    fn a_new_archive_never_touches_a_file_that_is_in_the_way() {
+        let root = std::env::temp_dir().join(format!("compression_ops_taken_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        let mut tried = 0;
+        for fmt in ArchiveFormat::ALL {
+            if !fmt.available() {
+                continue;
+            }
+            tried += 1;
+            let out = root.join(format!("mine{}", fmt.extension()));
+            std::fs::write(&out, "not an archive, and not the job's").unwrap();
+            let err = compress(&[root.join("a.txt")], &out, fmt, &Control::unlimited()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{fmt:?}: {err}");
+            assert!(err.to_string().contains("already exists"), "{fmt:?}: {err}");
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), "not an archive, and not the job's", "{fmt:?}");
+            // A free name still works afterwards
+            let free = root.join(format!("free{}", fmt.extension()));
+            compress(&[root.join("a.txt")], &free, fmt, &Control::unlimited()).unwrap_or_else(|e| panic!("{fmt:?}: {e}"));
+            assert!(free.is_file(), "{fmt:?}");
+        }
+        assert!(tried >= 2, "zip and tar.gz are always there");
+        // A dangling link counts as taken too
+        std::os::unix::fs::symlink("nowhere", root.join("dangling.zip")).unwrap();
+        let err = compress(&[root.join("a.txt")], &root.join("dangling.zip"), ArchiveFormat::Zip, &Control::unlimited()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(std::fs::symlink_metadata(root.join("dangling.zip")).unwrap().file_type().is_symlink());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_job_still_removes_the_archive_it_made() {
+        let root = std::env::temp_dir().join(format!("compression_ops_madeit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        for fmt in [ArchiveFormat::Zip, ArchiveFormat::TarGz] {
+            let out = root.join(format!("cancelled{}", fmt.extension()));
+            let cancelled = || true;
+            let control = Control::new(&cancelled, &|_| {}, Duration::from_secs(60));
+            assert!(compress(&[root.join("a.txt")], &out, fmt, &control).is_err());
+            assert!(!out.exists(), "{fmt:?}: the half-made archive is gone");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_new_file_takes_the_next_free_name_and_keeps_the_others() {
+        let root = std::env::temp_dir().join(format!("compression_ops_writenew_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let name = std::ffi::OsStr::new("Pasted image.png");
+        let first = write_new(&root, name, "copy", b"one").unwrap();
+        let second = write_new(&root, name, "copy", b"two").unwrap();
+        let third = write_new(&root, name, "copy", b"three").unwrap();
+        assert_eq!(first, root.join("Pasted image.png"));
+        assert_eq!(second, root.join("Pasted image (copy).png"));
+        assert_eq!(third, root.join("Pasted image (copy 2).png"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        assert_eq!(std::fs::read(&second).unwrap(), b"two");
+        assert_eq!(std::fs::read(&third).unwrap(), b"three");
+        // A folder that is not there is an error of its own, and leaves nothing behind
+        assert_eq!(write_new(&root.join("nope"), name, "copy", b"x").unwrap_err().kind(), io::ErrorKind::NotFound);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
