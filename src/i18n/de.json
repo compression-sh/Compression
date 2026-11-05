@@ -845,5 +845,6 @@
   "A complete copy was made in “{}”, but the original could not be fully removed: {}": "Eine vollständige Kopie wurde in „{}“ angelegt, aber das Original ließ sich nicht ganz entfernen: {}",
   "Incomplete move of {}": "Unvollständiges Verschieben von {}",
   "{} replaced items could not go to the trash and were deleted for good: undo cannot bring them back": "{} ersetztes Element ließ sich nicht in den Papierkorb legen und wurde endgültig gelöscht: Rückgängig kann es nicht zurückbringen|{} ersetzte Elemente ließen sich nicht in den Papierkorb legen und wurden endgültig gelöscht: Rückgängig kann sie nicht zurückbringen",
-  "Settings could not be saved: {}": "Die Einstellungen konnten nicht gespeichert werden: {}"
+  "Settings could not be saved: {}": "Die Einstellungen konnten nicht gespeichert werden: {}",
+  "The copy is complete, but the original could not be fully removed: {}": "Die Kopie ist vollständig, aber das Original ließ sich nicht ganz entfernen: {}"
 }

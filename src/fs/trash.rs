@@ -4,7 +4,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::ops::{move_path, remove_tree, unique_path, unique_path_where};
+use super::ops::{is_copied_not_removed, move_path, remove_tree, unique_path, unique_path_where};
 use crate::i18n::tr;
 
 pub fn root() -> Option<PathBuf> {
@@ -199,7 +199,10 @@ fn trash_in(root: &Path, topdir: Option<&Path>, original: &Path) -> io::Result<P
     }
     drop(record_file);
     if let Err(err) = move_path(path, &target) {
-        let _ = std::fs::remove_file(&record);
+        // A whole copy in the trash keeps its record: it is the only whole one there is, and the person can restore it
+        if !is_copied_not_removed(&err) {
+            let _ = std::fs::remove_file(&record);
+        }
         return Err(err);
     }
     Ok(target)
@@ -226,6 +229,7 @@ pub fn restore(trashed: &Path) -> io::Result<PathBuf> {
     let folder = original.parent().ok_or_else(|| io::Error::other("invalid original location"))?;
     std::fs::create_dir_all(folder)?;
     let target = unique_path(folder, original.file_name().unwrap_or_default(), "restored");
+    // When the copy is whole but the trashed item cannot be removed, the record stays with what is left of it
     move_path(trashed, &target)?;
     let _ = std::fs::remove_file(record);
     Ok(target)
@@ -461,6 +465,54 @@ mod tests {
         assert_eq!(decode(&encode(Path::new("/a b/ü%x"))), std::ffi::OsString::from("/a b/ü%x"));
         std::fs::remove_dir_all(&base).unwrap();
     }
+
+    #[test]
+    fn a_whole_copy_in_the_trash_keeps_its_record_when_the_original_cannot_be_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some((root, shm)) = crate::fs::ops::tests::two_file_systems("trash_leftover") else { return };
+        std::fs::create_dir_all(shm.join("tree/box")).unwrap();
+        std::fs::write(shm.join("tree/box/b.txt"), "two").unwrap();
+        std::fs::set_permissions(shm.join("tree/box"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        // A trash on another file system than the item, as when the drive has no trash of its own
+        let trash_root = root.join("Trash");
+
+        let err = trash_in(&trash_root, None, &shm.join("tree")).unwrap_err();
+        assert!(is_copied_not_removed(&err), "{err}");
+        assert_eq!(std::fs::read_to_string(trash_root.join("files/tree/box/b.txt")).unwrap(), "two", "the whole copy is in the trash");
+        assert!(trash_root.join("info/tree.trashinfo").exists(), "and it can be restored: its record stays");
+        assert!(shm.join("tree/box/b.txt").exists(), "the original is not all gone, and is not pretended to be");
+
+        // A copy that does not get made is another matter: no record is left for a name that holds nothing
+        std::fs::set_permissions(shm.join("tree/box"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(shm.join("tree/box/c.txt"), "three").unwrap();
+        std::fs::set_permissions(shm.join("tree/box/c.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = trash_in(&trash_root, None, &shm.join("tree")).unwrap_err();
+        assert!(!is_copied_not_removed(&err), "{err}");
+        let records: Vec<_> = std::fs::read_dir(trash_root.join("info")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(records, vec!["tree.trashinfo".to_owned()], "only the first, whole one has a record");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
+    }
+
+    #[test]
+    fn restoring_across_file_systems_whose_trashed_item_cannot_be_removed_keeps_the_record_and_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some((root, shm)) = crate::fs::ops::tests::two_file_systems("restore_leftover") else { return };
+        std::fs::create_dir_all(shm.join("tree/box")).unwrap();
+        std::fs::write(shm.join("tree/box/b.txt"), "two").unwrap();
+        let trash_root = root.join("Trash");
+        let trashed = trash_in(&trash_root, None, &shm.join("tree")).unwrap();
+        assert!(!shm.join("tree").exists());
+        std::fs::set_permissions(trashed.join("box"), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = restore(&trashed).unwrap_err();
+        assert!(is_copied_not_removed(&err), "{err}");
+        assert_eq!(std::fs::read_to_string(shm.join("tree/box/b.txt")).unwrap(), "two", "the item is back, whole");
+        assert!(trash_root.join("info/tree.trashinfo").exists(), "what is left in the trash keeps its record");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
+    }
+
 }
 
 /// Paths for which the tests pretend the trash cannot take them (any job's thread asks, so it is not thread-local).

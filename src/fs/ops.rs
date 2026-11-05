@@ -446,8 +446,37 @@ fn copy_contents(reader: &std::fs::File, writer: &std::fs::File, meta: &std::fs:
     io::copy(&mut &*reader, &mut &*writer).map(drop)
 }
 
+/// The error of a move across file systems whose copy is whole but whose original could not be removed completely.
+/// Nothing is lost: the copy stays where it was made, and so does what is left of the original. Callers that can
+/// still make sense of the move (the trash, an undo) look for it with `is_copied_not_removed` and say so.
+#[derive(Debug)]
+pub struct CopiedNotRemoved {
+    /// Where the whole copy is.
+    pub copy: PathBuf,
+    cause: io::Error,
+}
+
+impl std::fmt::Display for CopiedNotRemoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&trf("The copy is complete, but the original could not be fully removed: {}", &[&super::describe::io_error(&self.cause)]))
+    }
+}
+
+impl std::error::Error for CopiedNotRemoved {}
+
+/// The details when `err` is the error of a move whose copy is whole and whose original is not (all) gone.
+pub fn copied_not_removed(err: &io::Error) -> Option<&CopiedNotRemoved> {
+    err.get_ref().and_then(|inner| inner.downcast_ref::<CopiedNotRemoved>())
+}
+
+/// Whether `err` is that error, see `CopiedNotRemoved`.
+pub fn is_copied_not_removed(err: &io::Error) -> bool {
+    copied_not_removed(err).is_some()
+}
+
 /// Rename `src` to the exact path `dst`, copying across filesystems when it has to.
 /// Never replaces anything: `dst` is a name the caller has found free, and one taken since is an error.
+/// When the copy is whole and the original cannot be removed (all of it), the error is `CopiedNotRemoved`.
 pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
     match crate::compat::rename_noreplace(src, dst) {
         Ok(()) => Ok(()),
@@ -461,7 +490,7 @@ pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
                 }
                 return Err(err);
             }
-            remove_tree(src)
+            remove_tree(src).map_err(|cause| io::Error::other(CopiedNotRemoved { copy: dst.to_path_buf(), cause }))
         }
         Err(e) => Err(e),
     }
@@ -1185,6 +1214,53 @@ pub(crate) mod tests {
         std::fs::set_permissions(root.join("tree/sub/locked.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&shm).unwrap();
+    }
+
+    /// A folder on this disk and one on another file system (`/dev/shm`); `None` where that cannot be had, or as root,
+    /// who can remove what no one else can.
+    pub(crate) fn two_file_systems(name: &str) -> Option<(PathBuf, PathBuf)> {
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::temp_dir().join(format!("compression_{name}_{}", std::process::id()));
+        let shm = PathBuf::from("/dev/shm").join(format!("compression_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&shm);
+        std::fs::create_dir_all(&root).unwrap();
+        if std::fs::create_dir_all(&shm).is_err() || shm.metadata().unwrap().dev() == root.metadata().unwrap().dev() || unsafe { libc::geteuid() } == 0 {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&shm);
+            return None;
+        }
+        Some((root, shm))
+    }
+
+    /// Makes `dir` and everything in it removable again, then removes it.
+    pub(crate) fn unlock_and_remove(dir: &Path) {
+        let _ = Command::new("chmod").args(["-R", "u+rwx"]).arg(dir).status();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_move_across_file_systems_whose_original_cannot_be_removed_keeps_the_whole_copy_and_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some((root, shm)) = two_file_systems("ops_leftover") else { return };
+        std::fs::create_dir_all(root.join("tree/box")).unwrap();
+        std::fs::write(root.join("tree/a.txt"), "one").unwrap();
+        std::fs::write(root.join("tree/box/b.txt"), "two").unwrap();
+        // A folder that can be read but not emptied: the copy is whole, the original cannot be removed
+        std::fs::set_permissions(root.join("tree/box"), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = move_path(&root.join("tree"), &shm.join("tree")).unwrap_err();
+        assert!(is_copied_not_removed(&err), "{err}");
+        assert_eq!(copied_not_removed(&err).unwrap().copy, shm.join("tree"));
+        assert!(err.to_string().contains("The copy is complete, but the original could not be fully removed"), "{err}");
+        assert_eq!(std::fs::read_to_string(shm.join("tree/a.txt")).unwrap(), "one", "the copy is whole and stays");
+        assert_eq!(std::fs::read_to_string(shm.join("tree/box/b.txt")).unwrap(), "two");
+        assert!(root.join("tree/box/b.txt").exists(), "what is left of the original stays too");
+
+        // Other failures are not that error
+        assert!(!is_copied_not_removed(&io::Error::from(io::ErrorKind::PermissionDenied)));
+        unlock_and_remove(&root);
+        unlock_and_remove(&shm);
     }
 
     #[test]

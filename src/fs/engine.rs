@@ -844,6 +844,14 @@ fn copy_tree(w: &Worker, src: &Path, dst: &Path, mut skipped: Option<&mut Vec<(P
 fn clear_target(rec: &mut Record, target: &Path) -> io::Result<()> {
     match trash::trash(target) {
         Ok(trashed) => rec.replaced.push(trashed),
+        // The trash has a whole copy (and keeps its record) but what is left of the original is still here: that
+        // is cleared too, and an undo brings the copy back
+        Err(err) if ops::is_copied_not_removed(&err) => {
+            if let Some(copied) = ops::copied_not_removed(&err) {
+                rec.replaced.push(copied.copy.clone());
+            }
+            ops::remove_tree(target)?;
+        }
         Err(_) => {
             ops::remove_tree(target)?;
             rec.deleted_for_good.push(target.to_path_buf());

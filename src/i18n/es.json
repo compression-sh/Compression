@@ -845,5 +845,6 @@
   "A complete copy was made in “{}”, but the original could not be fully removed: {}": "Se hizo una copia completa en «{}», pero no se pudo eliminar del todo el original: {}",
   "Incomplete move of {}": "Movimiento incompleto de {}",
   "{} replaced items could not go to the trash and were deleted for good: undo cannot bring them back": "{} elemento reemplazado no pudo ir a la papelera y se eliminó definitivamente: deshacer no puede recuperarlo|{} elementos reemplazados no pudieron ir a la papelera y se eliminaron definitivamente: deshacer no puede recuperarlos",
-  "Settings could not be saved: {}": "No se pudieron guardar los ajustes: {}"
+  "Settings could not be saved: {}": "No se pudieron guardar los ajustes: {}",
+  "The copy is complete, but the original could not be fully removed: {}": "La copia está completa, pero el original no se pudo eliminar del todo: {}"
 }
