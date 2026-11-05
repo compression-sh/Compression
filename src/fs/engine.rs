@@ -1145,6 +1145,94 @@ pub(crate) fn left_out_note(list: &[(PathBuf, String)], head: String) -> String 
 }
 
 /// Delete for good, one item at a time.
+/// What `place_extracted` did, to be undone together.
+#[derive(Default)]
+pub struct Placement {
+    rec: Record,
+}
+
+impl Placement {
+    /// The entry that takes the extracted items away again (to the trash) and brings back what they replaced. It does
+    /// not move them back to where they were unpacked: that place is gone.
+    fn undo(&self, label: String) -> Option<UndoEntry> {
+        let mut edits: Vec<Edit> = self.rec.moved.iter().map(|(_, to)| Edit::Trash(to.clone())).collect();
+        edits.extend(self.rec.created.iter().cloned().map(Edit::Trash));
+        edits.extend(self.rec.replaced.iter().cloned().map(Edit::Restore));
+        (!edits.is_empty()).then(|| UndoEntry::new(label, edits))
+    }
+}
+
+/// Put what an archive was unpacked into (`stage`, a folder of `dest`) into `dest`, item by item, as a move does: a name
+/// that is taken is a question for the window (replace, skip, keep both, merge), and what is replaced goes to the trash.
+fn place_extracted(w: &mut Worker, stage: &Path, dest: &Path, placement: &mut Placement) -> io::Result<()> {
+    let mut failures = Vec::new();
+    for entry in std::fs::read_dir(stage)? {
+        let entry = entry?;
+        match transfer_one(w, Op::Move, &entry.path(), &dest.join(entry.file_name()), None, &mut placement.rec) {
+            Ok(()) => {}
+            Err(e) if is_cancel(&e) => return Err(e),
+            Err(e) => failures.push(format!("{}: {}", name_of(&entry.path()), crate::fs::describe::io_error(&e))),
+        }
+    }
+    if failures.is_empty() { Ok(()) } else { Err(io::Error::other(failures.join(" · "))) }
+}
+
+/// Unpack each archive of `items` into the folder `dest` ("Extract to…"). Nothing is written into `dest` that the
+/// person has not been asked about: an archive is unpacked into a folder of its own inside `dest` first, and its items
+/// are put into `dest` the way a move puts them, so a name that is taken is a question and what is replaced can be
+/// brought back. The undo takes the extracted items away again.
+pub fn extract_into(w: &mut Worker, items: Vec<PathBuf>, dest: PathBuf) -> Outcome {
+    let label = if items.len() == 1 { format!("“{}”", name_of(&items[0])) } else { trn(items.len(), "{} item", "{} items") };
+    let target = name_of(&dest);
+    let sizes: Vec<u64> = items.iter().map(|p| p.metadata().map_or(0, |m| m.len())).collect();
+    w.shared.files_total.store(items.len() as u64, Relaxed);
+    w.shared.bytes_total.store(sizes.iter().sum(), Relaxed);
+    let pairs: Vec<(PathBuf, PathBuf)> = items.iter().map(|item| (item.clone(), dest.clone())).collect();
+    if w.ensure_space_for_archives(&pairs, free_space).is_err() {
+        return Outcome::stopped();
+    }
+    let (mut placement, mut failures, mut done, mut stopped) = (Placement::default(), Vec::new(), 0, false);
+    for (item, size) in items.iter().zip(&sizes) {
+        if w.shared.checkpoint().is_err() {
+            stopped = true;
+            break;
+        }
+        let result = w.archive_control(done, *size, |control| ops::extract_staged(item, &dest, control)).and_then(|stage| {
+            let placed = place_extracted(w, &stage, &dest, &mut placement);
+            // What was left out (skipped, or not placed because of a failure) is not kept
+            let _ = ops::remove_tree(&stage);
+            placed
+        });
+        match result {
+            Err(err) if is_cancel(&err) => {
+                stopped = true;
+                break;
+            }
+            Err(err) => failures.push(format!("{}: {}", name_of(item), crate::fs::describe::io_error(&err))),
+            Ok(()) => {}
+        }
+        done += size;
+        w.shared.bytes_done.store(done, Relaxed);
+        w.shared.files_done.fetch_add(1, Relaxed);
+    }
+    // What was put in place stays, can be undone, and is not hidden by a later failure or a cancel
+    let effect = placement.undo(trf("Extraction of {}", &[&label])).map_or(Effect::None, Effect::Record);
+    let mut notes = Vec::new();
+    if placement.rec.skipped > 0 {
+        notes.push(trf("{} skipped", &[&placement.rec.skipped]));
+    }
+    notes.extend(deleted_for_good_note(&placement.rec.deleted_for_good));
+    let notes: String = notes.iter().map(|n| format!(" · {n}")).collect();
+    if stopped {
+        return Outcome::stopped().with(effect);
+    }
+    if failures.is_empty() {
+        Outcome::done(format!("{}{notes}", trf("Extracted {} to “{}”", &[&label, &target]))).with(effect)
+    } else {
+        Outcome::failed(format!("{}{notes}", failures.join(" · "))).with(effect)
+    }
+}
+
 pub fn delete_forever(w: &mut Worker, paths: Vec<PathBuf>) -> Outcome {
     w.shared.files_total.store(paths.len() as u64, Relaxed);
     let mut failures = Vec::new();
@@ -1252,6 +1340,154 @@ mod tests {
         let (_, error) = crate::fs::history::apply(entry);
         assert_eq!(error, None);
         assert_eq!(std::fs::read_to_string(dir.join("dst/a")).unwrap(), "old", "undo brings the old file back");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs any job to its end; every conflict is answered with `decision`.
+    fn run_job(job: impl FnOnce(&mut Worker) -> Outcome + Send + 'static, decision: Decision) -> (Outcome, usize) {
+        let mut e = engine();
+        e.spawn(JobKind::Extract, String::new(), String::new(), job);
+        let (mut done, mut asked) = (None, 0);
+        for _ in 0..500 {
+            for event in e.poll() {
+                match event {
+                    Event::Conflict(request) => {
+                        asked += 1;
+                        request.answer(decision, false);
+                    }
+                    Event::Done { outcome, .. } => done = Some(outcome),
+                    _ => {}
+                }
+            }
+            if !e.running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (done.expect("the job never finished"), asked)
+    }
+
+    /// `out/pack.zip` holding `top.txt` ("from the archive"), `data/new.txt` and `data/inner/deep.txt`; `dest` is a new folder.
+    fn zip_with_tree(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = sandbox(name);
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("data/inner")).unwrap();
+        std::fs::write(src.join("top.txt"), "from the archive").unwrap();
+        std::fs::write(src.join("data/new.txt"), "new").unwrap();
+        std::fs::write(src.join("data/inner/deep.txt"), "deep").unwrap();
+        let pack = dir.join("pack.zip");
+        ops::compress(&[src.join("top.txt"), src.join("data")], &pack, ops::ArchiveFormat::Zip, &ops::Control::unlimited()).unwrap();
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        (dir, pack, dest)
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn extracting_to_a_folder_without_clashes_places_everything_leaves_no_staging_folder_and_undoes_cleanly() {
+        let (dir, pack, dest) = zip_with_tree("extract_free");
+        let (p, d) = (pack.clone(), dest.clone());
+        let (outcome, asked) = run_job(move |w| extract_into(w, vec![p], d), Decision::Skip);
+        assert!(outcome.ok && asked == 0, "{}", outcome.message);
+        assert!(outcome.message.contains("Extracted"), "{}", outcome.message);
+        assert_eq!(names(&dest), vec!["data", "top.txt"], "no staging folder is left");
+        assert_eq!(std::fs::read_to_string(dest.join("data/inner/deep.txt")).unwrap(), "deep");
+        let Effect::Record(entry) = outcome.effect else { panic!("an extraction can be undone") };
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        assert_eq!(names(&dest), Vec::<String>::new(), "the undo took the extracted items away again");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extracting_over_a_name_that_is_taken_asks_and_skipping_changes_nothing() {
+        let (dir, pack, dest) = zip_with_tree("extract_skip");
+        std::fs::write(dest.join("top.txt"), "mine").unwrap();
+        let (p, d) = (pack.clone(), dest.clone());
+        let (outcome, asked) = run_job(move |w| extract_into(w, vec![p], d), Decision::Skip);
+        assert_eq!(asked, 1, "the taken name is a question");
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(outcome.message.contains("1 skipped"), "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dest.join("top.txt")).unwrap(), "mine", "not overwritten");
+        assert_eq!(names(&dest), vec!["data", "top.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extracting_over_a_name_that_is_taken_and_replacing_sends_the_old_one_to_the_trash_and_undo_brings_it_back() {
+        let (dir, pack, dest) = zip_with_tree("extract_replace");
+        std::fs::write(dest.join("top.txt"), "mine").unwrap();
+        let (p, d) = (pack.clone(), dest.clone());
+        let (outcome, asked) = run_job(move |w| extract_into(w, vec![p], d), Decision::Replace);
+        assert_eq!(asked, 1);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dest.join("top.txt")).unwrap(), "from the archive");
+        let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
+        assert!(entry.edits.iter().any(|e| matches!(e, Edit::Restore(_))), "the replaced file can be brought back");
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        assert_eq!(std::fs::read_to_string(dest.join("top.txt")).unwrap(), "mine", "undo: the old file is back");
+        assert_eq!(names(&dest), vec!["top.txt"], "and the rest of the extraction is gone");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extracting_over_a_folder_that_is_taken_can_merge_and_the_undo_removes_only_what_came_from_the_archive() {
+        let (dir, pack, dest) = zip_with_tree("extract_merge");
+        std::fs::create_dir_all(dest.join("data")).unwrap();
+        std::fs::write(dest.join("data/old.txt"), "old").unwrap();
+        let (p, d) = (pack.clone(), dest.clone());
+        let (outcome, _) = run_job(move |w| extract_into(w, vec![p], d), Decision::Merge);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(names(&dest.join("data")), vec!["inner", "new.txt", "old.txt"]);
+        let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        assert_eq!(names(&dest.join("data")), vec!["old.txt"], "what was there before stays");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extracting_and_keeping_both_never_overwrites() {
+        let (dir, pack, dest) = zip_with_tree("extract_both");
+        std::fs::write(dest.join("top.txt"), "mine").unwrap();
+        let (p, d) = (pack.clone(), dest.clone());
+        let (outcome, _) = run_job(move |w| extract_into(w, vec![p], d), Decision::KeepBoth);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dest.join("top.txt")).unwrap(), "mine");
+        assert_eq!(names(&dest).len(), 3, "{:?}", names(&dest));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cancelling_the_question_leaves_the_target_as_it_was_and_no_staging_folder() {
+        let (dir, pack, dest) = zip_with_tree("extract_cancel");
+        std::fs::write(dest.join("top.txt"), "mine").unwrap();
+        let (p, d) = (pack.clone(), dest.clone());
+        let (outcome, asked) = run_job(move |w| extract_into(w, vec![p], d), Decision::Cancel);
+        assert_eq!(asked, 1);
+        assert!(outcome.cancelled, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dest.join("top.txt")).unwrap(), "mine");
+        assert!(!names(&dest).iter().any(|n| n.starts_with(".compression-extract")), "{:?}", names(&dest));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_archive_that_cannot_be_read_fails_and_leaves_nothing_in_the_target() {
+        let dir = sandbox("extract_bad");
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dir.join("bad.zip"), "this is not a zip file").unwrap();
+        let (bad, d) = (dir.join("bad.zip"), dest.clone());
+        let (outcome, _) = run_job(move |w| extract_into(w, vec![bad], d), Decision::Skip);
+        assert!(!outcome.ok && !outcome.cancelled, "{}", outcome.message);
+        assert!(outcome.message.contains("bad.zip"), "{}", outcome.message);
+        assert_eq!(names(&dest), Vec::<String>::new());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

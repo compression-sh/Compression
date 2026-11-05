@@ -787,6 +787,32 @@ fn unpack(archive: &Path, dest: &Path, control: &Control) -> io::Result<()> {
     }
 }
 
+/// Unpack `archive` into a new folder of its own inside `dest` and return it. Nothing that is in `dest` can be written
+/// over this way; the caller puts the items where they go (and asks about names that are taken), then removes the
+/// folder. A failure or a stop takes the folder away again.
+pub fn extract_staged(archive: &Path, dest: &Path, control: &Control) -> io::Result<PathBuf> {
+    let mut stage = None;
+    for n in 0..1000 {
+        let candidate = dest.join(format!(".compression-extract-{}-{n}", std::process::id()));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                stage = Some(candidate);
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let stage = stage.ok_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists))?;
+    match extract(archive, &stage, control) {
+        Ok(()) => Ok(stage),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            Err(e)
+        }
+    }
+}
+
 /// Extract into a fresh folder next to the archive (`<archive stem>`), returning that folder.
 pub fn extract_beside(archive: &Path, control: &Control) -> io::Result<PathBuf> {
     let parent = archive.parent().ok_or_else(|| io::Error::other("no parent folder"))?;

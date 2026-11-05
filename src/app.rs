@@ -1357,32 +1357,7 @@ impl CompressionApp {
         match op {
             TransferOp::Extract => {
                 let title = trf("Extracting {}…", &[&label]);
-                self.engine.spawn(JobKind::Extract, title, detail, move |w| {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    let sizes: Vec<u64> = items.iter().map(|p| p.metadata().map_or(0, |m| m.len())).collect();
-                    w.shared.files_total.store(items.len() as u64, Relaxed);
-                    w.shared.bytes_total.store(sizes.iter().sum(), Relaxed);
-                    let pairs: Vec<(PathBuf, PathBuf)> = items.iter().map(|item| (item.clone(), dest.clone())).collect();
-                    if w.ensure_space_for_archives(&pairs, engine::free_space).is_err() {
-                        return Outcome::stopped();
-                    }
-                    let mut failures = Vec::new();
-                    let mut done = 0;
-                    for (item, size) in items.iter().zip(&sizes) {
-                        if w.shared.checkpoint().is_err() {
-                            return Outcome::stopped();
-                        }
-                        match w.archive_control(done, *size, |control| ops::extract(item, &dest, control)) {
-                            Err(err) if engine::is_cancel(&err) => return Outcome::stopped(),
-                            Err(err) => failures.push(format!("{}: {}", item.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), crate::fs::describe::io_error(&err))),
-                            Ok(()) => {}
-                        }
-                        done += size;
-                        w.shared.bytes_done.store(done, Relaxed);
-                        w.shared.files_done.fetch_add(1, Relaxed);
-                    }
-                    if failures.is_empty() { Outcome::done(trf("Extracted {} to “{}”", &[&label, &target])) } else { Outcome::failed(failures.join(" · ")) }
-                });
+                self.engine.spawn(JobKind::Extract, title, detail, move |w| engine::extract_into(w, items, dest));
             }
             TransferOp::Copy | TransferOp::Move => {
                 let pairs: Vec<(PathBuf, PathBuf)> = items.iter().filter_map(|p| p.file_name().map(|n| (p.clone(), dest.join(n)))).collect();
