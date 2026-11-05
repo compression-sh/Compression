@@ -942,6 +942,28 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
     Ok(())
 }
 
+/// The room the copy of `src` takes in `dest`, given that its size, holes included, is `size`. A file with holes
+/// copied within one file system keeps them (that file system has holes, the source is the proof), so it takes what
+/// the source takes; on another one the target may not have holes, so its whole size is counted. Nothing is guessed
+/// about copies that share their blocks (reflinks): they are counted in full, and the question can be answered "continue".
+fn room_for(src: &Path, dest: Option<&Path>, size: u64) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fn used(path: &Path, device: u64) -> u64 {
+        let Ok(meta) = path.symlink_metadata() else { return 0 };
+        if meta.is_dir() {
+            std::fs::read_dir(path).map_or(0, |entries| entries.flatten().fold(0u64, |sum, entry| sum.saturating_add(used(&entry.path(), device))))
+        } else if meta.dev() == device && ops::may_have_holes(&meta) {
+            meta.blocks().saturating_mul(512).min(meta.len())
+        } else {
+            meta.len()
+        }
+    }
+    match dest.and_then(|d| d.metadata().ok()) {
+        Some(dest) => used(src, dest.dev()).min(size),
+        None => size,
+    }
+}
+
 /// The disk a copy or move writes to, for `Engine::spawn_queued`. A move that stays on one file
 /// system is a rename and finishes at once, so it is never queued.
 pub fn queue_key(op: Op, sources: &[PathBuf], dest_dir: &Path) -> Option<u64> {
@@ -978,7 +1000,7 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
             .iter()
             .zip(&sizes)
             .filter(|((src, target), _)| op == Op::Copy || target.parent().is_none_or(|parent| !same_device(src, parent)))
-            .fold(0u64, |sum, (_, size)| sum.saturating_add(size.1));
+            .fold(0u64, |sum, ((src, target), size)| sum.saturating_add(room_for(src, target.parent(), size.1)));
         if let Err(err) = w.ensure_space(dest, needed, free) {
             return if is_cancel(&err) { Outcome::stopped() } else { Outcome::failed(err.to_string()) };
         }
