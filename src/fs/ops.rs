@@ -898,7 +898,8 @@ pub(crate) mod tests {
     const MIB: u64 = 1 << 20;
 
     /// Files (by device and inode) whose `SEEK_DATA`/`SEEK_HOLE` fail with the given error, as on a file system that
-    /// cannot tell data from holes.
+    /// cannot tell data from holes. An entry lasts as long as the `SeekFails` that made it: a file system hands out
+    /// the number of a deleted file again, and a later file must not be taken for this one.
     static SEEK_FAILS: std::sync::Mutex<Vec<((u64, u64), i32)>> = std::sync::Mutex::new(Vec::new());
 
     pub(super) fn seek_fails_for(file: &std::fs::File) -> Option<i32> {
@@ -907,10 +908,23 @@ pub(crate) mod tests {
         SEEK_FAILS.lock().ok()?.iter().find(|(key, _)| *key == (meta.dev(), meta.ino())).map(|(_, errno)| *errno)
     }
 
-    pub(crate) fn make_seek_fail(path: &Path, errno: i32) {
+    pub(crate) struct SeekFails((u64, u64));
+
+    impl Drop for SeekFails {
+        fn drop(&mut self) {
+            if let Ok(mut fails) = SEEK_FAILS.lock() {
+                fails.retain(|(key, _)| *key != self.0);
+            }
+        }
+    }
+
+    #[must_use = "the file stops failing when this is dropped"]
+    pub(crate) fn make_seek_fail(path: &Path, errno: i32) -> SeekFails {
         use std::os::unix::fs::MetadataExt;
         let meta = path.metadata().unwrap();
-        SEEK_FAILS.lock().unwrap().push(((meta.dev(), meta.ino()), errno));
+        let key = (meta.dev(), meta.ino());
+        SEEK_FAILS.lock().unwrap().push((key, errno));
+        SeekFails(key)
     }
 
     #[test]
@@ -1020,7 +1034,7 @@ pub(crate) mod tests {
         for (n, errno) in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP].into_iter().enumerate() {
             let dir = dir(&format!("holey_unavailable_{n}"));
             holey_file(&dir.join("src"), 8 * MIB, &[(0, b"a"), (4 * MIB, b"b")]);
-            make_seek_fail(&dir.join("src"), errno);
+            let seek_fails = make_seek_fail(&dir.join("src"), errno);
             let (reader, writer) = (std::fs::File::open(dir.join("src")).unwrap(), std::fs::File::create(dir.join("dst")).unwrap());
             let mut passed = 0;
             let result = copy_holey(&reader, &writer, 8 * MIB, &mut || Ok(()), &mut |_, _| panic!("nothing is copied when holes cannot be told"), &mut |n| passed += n).unwrap();
@@ -1029,6 +1043,8 @@ pub(crate) mod tests {
             // The caller then copies the plain way: whole, as long, the same
             copy_tree(&dir.join("src"), &dir.join("plain")).unwrap();
             assert_eq!(std::fs::read(dir.join("src")).unwrap(), std::fs::read(dir.join("plain")).unwrap(), "errno {errno}");
+            // Before the file goes: its number may be given to the next file
+            drop(seek_fails);
             std::fs::remove_dir_all(&dir).unwrap();
         }
     }
@@ -1037,10 +1053,23 @@ pub(crate) mod tests {
     fn any_other_error_from_telling_holes_is_an_error_and_not_a_silent_plain_copy() {
         let dir = dir("holey_io_error");
         holey_file(&dir.join("src"), 8 * MIB, &[(0, b"a")]);
-        make_seek_fail(&dir.join("src"), libc::EIO);
+        let seek_fails = make_seek_fail(&dir.join("src"), libc::EIO);
         let (reader, writer) = (std::fs::File::open(dir.join("src")).unwrap(), std::fs::File::create(dir.join("dst")).unwrap());
         let err = copy_holey(&reader, &writer, 8 * MIB, &mut || Ok(()), &mut |_, _| Ok(0), &mut |_| {}).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        drop(seek_fails);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_stops_failing_to_tell_holes_when_its_guard_is_dropped() {
+        let dir = dir("seek_guard");
+        std::fs::write(dir.join("a"), "x").unwrap();
+        let file = std::fs::File::open(dir.join("a")).unwrap();
+        let guard = make_seek_fail(&dir.join("a"), libc::EINVAL);
+        assert_eq!(seek_fails_for(&file), Some(libc::EINVAL));
+        drop(guard);
+        assert_eq!(seek_fails_for(&file), None, "the number of this file may be given to the next one");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

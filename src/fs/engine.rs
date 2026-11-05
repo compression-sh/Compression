@@ -1789,11 +1789,12 @@ mod tests {
             file.write_all_at(b"tail", len - 4).unwrap();
             file.sync_all().unwrap();
         }
-        ops::tests::make_seek_fail(&dir.join("image"), libc::EOPNOTSUPP);
+        let seek_fails = ops::tests::make_seek_fail(&dir.join("image"), libc::EOPNOTSUPP);
         let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("image"), dir.join("copy"))], Decision::Skip);
         assert!(outcome.ok, "{}", outcome.message);
         assert_eq!(dir.join("copy").metadata().unwrap().len(), len);
         assert_eq!(std::fs::read(dir.join("image")).unwrap(), std::fs::read(dir.join("copy")).unwrap());
+        drop(seek_fails);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
