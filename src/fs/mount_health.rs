@@ -109,3 +109,165 @@ fn statvfs(local: &Path) -> std::io::Result<()> {
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn mount(name: &str) -> PathBuf {
+        PathBuf::from(format!("/run/user/1/gvfs/{name}"))
+    }
+
+    /// A probe that records who was asked; the answer is sent by the test.
+    struct Asked(RefCell<Vec<(PathBuf, mpsc::Sender<Answer>)>>);
+    impl Asked {
+        fn new() -> Self {
+            Asked(RefCell::new(Vec::new()))
+        }
+        fn start(&self) -> impl Fn(PathBuf, mpsc::Sender<Answer>) + '_ {
+            |local, tx| self.0.borrow_mut().push((local, tx))
+        }
+        fn count(&self) -> usize {
+            self.0.borrow().len()
+        }
+        fn answer(&self, which: usize, ok: bool) {
+            let asked = self.0.borrow();
+            asked[which].1.send((asked[which].0.clone(), ok)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_good_answer_keeps_a_mount_connected_and_is_asked_again_after_fifteen_seconds() {
+        let (mut probes, asked, a) = (Probes::new(), Asked::new(), mount("a"));
+        let t0 = Instant::now();
+        probes.tick(std::slice::from_ref(&a), t0, asked.start());
+        assert_eq!(asked.count(), 1);
+        assert_eq!(probes.health(&a, t0), Health::Connected);
+        asked.answer(0, true);
+        let t1 = t0 + Duration::from_secs(1);
+        probes.tick(std::slice::from_ref(&a), t1, asked.start());
+        assert!(!probes.asking());
+        assert_eq!(probes.health(&a, t1), Health::Connected);
+        // Not yet due, then due
+        probes.tick(std::slice::from_ref(&a), t1 + PROBE_EVERY - Duration::from_secs(1), asked.start());
+        assert_eq!(asked.count(), 1);
+        probes.tick(std::slice::from_ref(&a), t1 + PROBE_EVERY, asked.start());
+        assert_eq!(asked.count(), 2);
+    }
+
+    #[test]
+    fn a_question_unanswered_for_three_seconds_is_slow_and_a_late_answer_makes_it_connected_again() {
+        let (mut probes, asked, a) = (Probes::new(), Asked::new(), mount("a"));
+        let t0 = Instant::now();
+        probes.tick(std::slice::from_ref(&a), t0, asked.start());
+        assert_eq!(probes.health(&a, t0 + SLOW_AFTER - Duration::from_millis(1)), Health::Connected);
+        assert_eq!(probes.health(&a, t0 + SLOW_AFTER), Health::Slow);
+        assert!(probes.asking());
+        asked.answer(0, true);
+        let t1 = t0 + Duration::from_secs(10);
+        probes.tick(std::slice::from_ref(&a), t1, asked.start());
+        assert_eq!(probes.health(&a, t1), Health::Connected);
+    }
+
+    #[test]
+    fn a_mount_that_never_answers_is_asked_once_not_every_round() {
+        let (mut probes, asked, a) = (Probes::new(), Asked::new(), mount("a"));
+        let t0 = Instant::now();
+        for second in 0..120 {
+            probes.tick(std::slice::from_ref(&a), t0 + Duration::from_secs(second), asked.start());
+        }
+        assert_eq!(asked.count(), 1);
+        assert_eq!(probes.health(&a, t0 + Duration::from_secs(120)), Health::Slow);
+    }
+
+    #[test]
+    fn an_error_makes_a_mount_broken_until_it_answers_well() {
+        let (mut probes, asked, a) = (Probes::new(), Asked::new(), mount("a"));
+        let t0 = Instant::now();
+        probes.tick(std::slice::from_ref(&a), t0, asked.start());
+        asked.answer(0, false);
+        let t1 = t0 + Duration::from_secs(1);
+        probes.tick(std::slice::from_ref(&a), t1, asked.start());
+        assert_eq!(probes.health(&a, t1), Health::Broken);
+        // Asked again later; while that question is young the mount stays broken, then slow
+        let t2 = t1 + PROBE_EVERY;
+        probes.tick(std::slice::from_ref(&a), t2, asked.start());
+        assert_eq!(asked.count(), 2);
+        assert_eq!(probes.health(&a, t2 + Duration::from_secs(1)), Health::Broken);
+        assert_eq!(probes.health(&a, t2 + SLOW_AFTER), Health::Slow);
+        asked.answer(1, true);
+        let t3 = t2 + Duration::from_secs(4);
+        probes.tick(std::slice::from_ref(&a), t3, asked.start());
+        assert_eq!(probes.health(&a, t3), Health::Connected);
+    }
+
+    #[test]
+    fn each_mount_has_its_own_state_and_a_mount_that_went_away_is_forgotten() {
+        let (mut probes, asked, a, b) = (Probes::new(), Asked::new(), mount("a"), mount("b"));
+        let t0 = Instant::now();
+        probes.tick(&[a.clone(), b.clone()], t0, asked.start());
+        assert_eq!(asked.count(), 2);
+        asked.answer(0, false);
+        asked.answer(1, true);
+        let t1 = t0 + Duration::from_secs(1);
+        probes.tick(&[a.clone(), b.clone()], t1, asked.start());
+        assert_eq!((probes.health(&a, t1), probes.health(&b, t1)), (Health::Broken, Health::Connected));
+        // `a` is gone: forgotten, and a mount that comes back starts afresh
+        probes.tick(std::slice::from_ref(&b), t1, asked.start());
+        assert_eq!(probes.health(&a, t1), Health::Connected);
+        probes.tick(&[a.clone(), b], t1, asked.start());
+        assert_eq!(asked.count(), 3);
+    }
+
+    #[test]
+    fn an_answer_from_a_mount_that_is_not_listed_any_more_is_dropped() {
+        let (mut probes, asked, a) = (Probes::new(), Asked::new(), mount("a"));
+        let t0 = Instant::now();
+        probes.tick(std::slice::from_ref(&a), t0, asked.start());
+        probes.tick(&[], t0 + Duration::from_secs(1), asked.start());
+        asked.answer(0, true);
+        probes.tick(&[], t0 + Duration::from_secs(2), asked.start());
+        assert!(probes.entries.is_empty());
+    }
+
+    #[test]
+    fn a_folder_answers_and_a_missing_one_does_not() {
+        let dir = std::env::temp_dir().join(format!("compression_health_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(answers(&dir));
+        assert!(!answers(&dir.join("gone")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mount_is_asked_with_statvfs_which_the_kernel_does_not_answer_from_its_cache() {
+        let dir = std::env::temp_dir();
+        let enotconn = |_: &Path| Err(std::io::Error::from_raw_os_error(libc::ENOTCONN));
+        // The folder itself still answers stat (the cache of a dead sshfs does), but statvfs finds the server gone
+        assert!(std::fs::metadata(&dir).is_ok());
+        assert!(!answers_with(&dir, enotconn));
+        assert!(!answers_with(&dir, |_| Err(std::io::Error::from_raw_os_error(libc::EIO))));
+        // A server that answers is well
+        assert!(answers_with(&dir, |_| Ok(())));
+    }
+
+    #[test]
+    fn a_mount_that_cannot_answer_statvfs_is_asked_with_stat_instead() {
+        let dir = std::env::temp_dir();
+        let missing = dir.join("compression_health_missing_folder");
+        for unsupported in [libc::ENOSYS, libc::EOPNOTSUPP] {
+            let answer = |_: &Path| Err(std::io::Error::from_raw_os_error(unsupported));
+            assert!(answers_with(&dir, answer), "{unsupported}");
+            assert!(!answers_with(&missing, answer), "{unsupported}");
+        }
+    }
+
+    #[test]
+    fn the_real_question_is_yes_for_a_folder_and_no_for_a_missing_one_or_a_name_with_a_nul() {
+        let dir = std::env::temp_dir();
+        assert!(answers(&dir));
+        assert!(!answers(&dir.join("compression_health_missing_folder")));
+        assert!(!answers(Path::new("/tmp/a\0b")));
+    }
+}
