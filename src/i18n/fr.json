@@ -848,5 +848,10 @@
   "Settings could not be saved: {}": "Les réglages n'ont pas pu être enregistrés : {}",
   "The copy is complete, but the original could not be fully removed: {}": "La copie est complète, mais l'original n'a pas pu être entièrement supprimé : {}",
   "{} of {} steps could not be done and are kept for another try: {}": "{} étapes sur {} n'ont pas pu être faites et sont conservées pour un nouvel essai : {}",
-  "{} of {} steps could not be done and were given up on: {}": "{} étapes sur {} n'ont pas pu être faites et sont abandonnées : {}"
+  "{} of {} steps could not be done and were given up on: {}": "{} étapes sur {} n'ont pas pu être faites et sont abandonnées : {}",
+  "Not replaced: items on a server have no trash, and the old item would be lost for good": "Non remplacé : il n'y a pas de corbeille sur un serveur et l'ancien élément serait perdu définitivement",
+  "Not replaced: the old item cannot go to the trash and would be lost for good ({})": "Non remplacé : l'ancien élément ne peut pas aller dans la corbeille et serait perdu définitivement ({})",
+  "Not replaced: {}": "Non remplacé : {}",
+  "Not replaced: the old item is in the trash, but the new one could not take its place ({})": "Non remplacé : l'ancien élément est dans la corbeille, mais le nouveau n'a pas pu prendre sa place ({})",
+  "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "Non remplacé : le nouvel élément n'a pas pu prendre la place de l'ancien ({}) ; il est conservé sous « {} »"
 }

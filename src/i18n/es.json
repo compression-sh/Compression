@@ -848,5 +848,10 @@
   "Settings could not be saved: {}": "No se pudieron guardar los ajustes: {}",
   "The copy is complete, but the original could not be fully removed: {}": "La copia está completa, pero el original no se pudo eliminar del todo: {}",
   "{} of {} steps could not be done and are kept for another try: {}": "{} de {} pasos no se pudieron hacer y se conservan para otro intento: {}",
-  "{} of {} steps could not be done and were given up on: {}": "{} de {} pasos no se pudieron hacer y se abandonan: {}"
+  "{} of {} steps could not be done and were given up on: {}": "{} de {} pasos no se pudieron hacer y se abandonan: {}",
+  "Not replaced: items on a server have no trash, and the old item would be lost for good": "No reemplazado: en un servidor no hay papelera y el elemento antiguo se perdería para siempre",
+  "Not replaced: the old item cannot go to the trash and would be lost for good ({})": "No reemplazado: el elemento antiguo no puede ir a la papelera y se perdería para siempre ({})",
+  "Not replaced: {}": "No reemplazado: {}",
+  "Not replaced: the old item is in the trash, but the new one could not take its place ({})": "No reemplazado: el elemento antiguo está en la papelera, pero el nuevo no pudo ocupar su lugar ({})",
+  "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "No reemplazado: el elemento nuevo no pudo ocupar el lugar del antiguo ({}); se conserva como «{}»"
 }

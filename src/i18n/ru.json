@@ -848,5 +848,10 @@
   "Settings could not be saved: {}": "Не удалось сохранить настройки: {}",
   "The copy is complete, but the original could not be fully removed: {}": "Копия полная, но оригинал не удалось удалить целиком: {}",
   "{} of {} steps could not be done and are kept for another try: {}": "{} из {} шагов не удалось выполнить, они сохранены для новой попытки: {}",
-  "{} of {} steps could not be done and were given up on: {}": "{} из {} шагов не удалось выполнить, от них отказались: {}"
+  "{} of {} steps could not be done and were given up on: {}": "{} из {} шагов не удалось выполнить, от них отказались: {}",
+  "Not replaced: items on a server have no trash, and the old item would be lost for good": "Не заменено: на сервере нет корзины, и старый элемент был бы потерян навсегда",
+  "Not replaced: the old item cannot go to the trash and would be lost for good ({})": "Не заменено: старый элемент нельзя поместить в корзину, и он был бы потерян навсегда ({})",
+  "Not replaced: {}": "Не заменено: {}",
+  "Not replaced: the old item is in the trash, but the new one could not take its place ({})": "Не заменено: старый элемент в корзине, но новый не смог занять его место ({})",
+  "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "Не заменено: новый элемент не смог занять место старого ({}); он сохранён как «{}»"
 }

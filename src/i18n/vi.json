@@ -848,5 +848,10 @@
   "Settings could not be saved: {}": "Không thể lưu cài đặt: {}",
   "The copy is complete, but the original could not be fully removed: {}": "Bản sao đã đầy đủ, nhưng không thể xóa hết bản gốc: {}",
   "{} of {} steps could not be done and are kept for another try: {}": "{} trong {} bước không thể thực hiện và được giữ lại để thử lại: {}",
-  "{} of {} steps could not be done and were given up on: {}": "{} trong {} bước không thể thực hiện và đã bị bỏ qua: {}"
+  "{} of {} steps could not be done and were given up on: {}": "{} trong {} bước không thể thực hiện và đã bị bỏ qua: {}",
+  "Not replaced: items on a server have no trash, and the old item would be lost for good": "Không thay thế: máy chủ không có thùng rác và mục cũ sẽ mất vĩnh viễn",
+  "Not replaced: the old item cannot go to the trash and would be lost for good ({})": "Không thay thế: không thể chuyển mục cũ vào thùng rác và nó sẽ mất vĩnh viễn ({})",
+  "Not replaced: {}": "Không thay thế: {}",
+  "Not replaced: the old item is in the trash, but the new one could not take its place ({})": "Không thay thế: mục cũ nằm trong thùng rác nhưng mục mới không thể thế chỗ ({})",
+  "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "Không thay thế: mục mới không thể thế chỗ mục cũ ({}); nó được giữ lại với tên “{}”"
 }

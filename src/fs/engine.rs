@@ -848,21 +848,129 @@ fn copy_tree(w: &Worker, src: &Path, dst: &Path, mut skipped: Option<&mut Vec<(P
     }
 }
 
-/// Take `target` out of the way: to the trash if possible, so the undo can bring it back.
-fn clear_target(rec: &mut Record, target: &Path) -> io::Result<()> {
+/// How the new item for `replace_target` was made.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Built {
+    /// `src` itself was renamed to the staging name (a move within one file system).
+    Moved,
+    /// A copy of `src` is at the staging name; `src` is as it was.
+    Copied,
+}
+
+/// Take away what `replace_target` made, or give a moved item back: the old target has not been touched, or is back.
+fn discard_staged(src: &Path, staged: &Path, built: Built) -> io::Result<()> {
+    match built {
+        Built::Copied => ops::remove_tree(staged),
+        Built::Moved => crate::compat::rename_noreplace(staged, src),
+    }
+}
+
+/// Send the old `target` to the trash, where an undo finds it. There is no other way for it to go: it is never
+/// deleted for good here.
+fn trash_old(rec: &mut Record, target: &Path) -> io::Result<()> {
     match trash::trash(target) {
-        Ok(trashed) => rec.replaced.push(trashed),
+        Ok(trashed) => {
+            rec.replaced.push(trashed);
+            Ok(())
+        }
         // The trash has a whole copy (and keeps its record) but what is left of the original is still here: that
         // is cleared too, and an undo brings the copy back
         Err(err) if ops::is_copied_not_removed(&err) => {
             if let Some(copied) = ops::copied_not_removed(&err) {
                 rec.replaced.push(copied.copy.clone());
             }
-            ops::remove_tree(target)?;
+            ops::remove_tree(target)
         }
-        Err(_) => {
-            ops::remove_tree(target)?;
-            rec.deleted_for_good.push(target.to_path_buf());
+        Err(err) => Err(err),
+    }
+}
+
+/// "Replace". The new item is made complete first, next to the old one, under a name of its own; only then does the old
+/// one go to the trash and the new one take its name (without replacing anything: a name taken in between is an error).
+/// So a failure or a cancel before the swap leaves the old item as it was and only the new one's remains are removed. If
+/// the old item cannot go to the trash it is left alone and this position is not replaced, and said not to be: it is
+/// never deleted for good. Items on a server are not replaced either (no trash there, and nothing was asked about it).
+fn replace_target(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option<(u64, u64)>, rec: &mut Record) -> io::Result<()> {
+    w.shared.set_current(&name_of(src));
+    if crate::fs::network::is_remote(target) {
+        return Err(io::Error::other(tr("Not replaced: items on a server have no trash, and the old item would be lost for good")));
+    }
+    let parent = target.parent().ok_or_else(|| io::Error::other("no folder"))?;
+
+    // 1. The new item, complete, under a name of its own
+    let staged = (0..1000u32)
+        .map(|n| parent.join(format!(".compression-new-{}-{n}", std::process::id())))
+        .find(|candidate| candidate.symlink_metadata().is_err())
+        .ok_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists))?;
+    let built = match op {
+        Op::Copy => copy_new(w, src, &staged, Some(&mut rec.unreadable)).map(|()| Built::Copied)?,
+        Op::Move => match crate::compat::rename_noreplace(src, &staged) {
+            Ok(()) => Built::Moved,
+            // Another file system: copy, and take the original away once the copy has its place
+            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => copy_new(w, src, &staged, None).map(|()| Built::Copied)?,
+            Err(e) => return Err(e),
+        },
+    };
+    let give_back = |why: io::Error| -> io::Error {
+        match discard_staged(src, &staged, built) {
+            Ok(()) => why,
+            Err(_) => io::Error::other(trf("Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”", &[&crate::fs::describe::io_error(&why), &name_of(&staged)])),
+        }
+    };
+
+    // 2. A cancel before the swap costs nothing but the new item
+    #[cfg(test)]
+    tests::cancel_before_swap(w, target);
+    if let Err(err) = w.shared.checkpoint() {
+        return Err(give_back(err));
+    }
+
+    // 3. The old item to the trash; if that cannot be, it stays and this position is left out
+    let kept = rec.replaced.len();
+    if let Err(err) = trash_old(rec, target) {
+        rec.replaced.truncate(kept);
+        let why = io::Error::other(trf("Not replaced: the old item cannot go to the trash and would be lost for good ({})", &[&crate::fs::describe::io_error(&err)]));
+        return Err(give_back(why));
+    }
+
+    // 4. The new item takes the name. A name taken meanwhile is not replaced
+    #[cfg(test)]
+    tests::race_here(target);
+    if let Err(err) = crate::compat::rename_noreplace(&staged, target) {
+        let old = rec.replaced.get(kept).cloned();
+        let failure = give_back(err);
+        // The old item back where it was, if it can be
+        return Err(match old.map(|trashed| trash::restore(&trashed)) {
+            Some(Ok(_)) => {
+                rec.replaced.truncate(kept);
+                io::Error::other(trf("Not replaced: {}", &[&crate::fs::describe::io_error(&failure)]))
+            }
+            _ => io::Error::other(trf("Not replaced: the old item is in the trash, but the new one could not take its place ({})", &[&crate::fs::describe::io_error(&failure)])),
+        });
+    }
+
+    // 5. Done: what an undo needs, and the progress
+    match (op, built) {
+        (Op::Copy, _) => rec.created.push(target.to_path_buf()),
+        (Op::Move, Built::Moved) => {
+            let (files, bytes) = known.unwrap_or_else(|| {
+                let (mut f, mut b) = (0, 0);
+                measure(target, &mut f, &mut b);
+                (f, b)
+            });
+            w.shared.files_done.fetch_add(files, Relaxed);
+            w.add_bytes(bytes);
+            rec.moved.push((src.to_path_buf(), target.to_path_buf()));
+        }
+        (Op::Move, Built::Copied) => {
+            if let Err(err) = ops::remove_tree(src) {
+                // The copy is whole and has its place; the original is still (at least partly) where it was. That is
+                // said, and an undo takes the copy away again
+                let folder = target.parent().map(name_of).unwrap_or_default();
+                rec.created.push(target.to_path_buf());
+                return Err(io::Error::other(trf("A complete copy was made in “{}”, but the original could not be fully removed: {}", &[&folder, &crate::fs::describe::io_error(&err)])));
+            }
+            rec.moved.push((src.to_path_buf(), target.to_path_buf()));
         }
     }
     Ok(())
@@ -903,7 +1011,7 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
                 }
                 Decision::Cancel => return Err(cancelled()),
                 Decision::KeepBoth => target = unique_path(parent, &name, "copy"),
-                Decision::Replace => clear_target(rec, &target)?,
+                Decision::Replace => return replace_target(w, op, src, &target, known, rec),
                 Decision::Merge => merge = true,
             }
         }
@@ -1267,6 +1375,15 @@ mod tests {
     /// Targets at which a file appears just before the move is made: the moment between settling a conflict and the rename.
     static RACES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+    /// Targets for which the job is cancelled once the new item is complete and before the swap.
+    static CANCELS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) fn cancel_before_swap(w: &Worker, target: &Path) {
+        if CANCELS.lock().unwrap().iter().any(|p| p == target) {
+            w.shared.cancel.store(true, Relaxed);
+        }
+    }
+
     pub(super) fn race_here(target: &Path) {
         if RACES.lock().unwrap().iter().any(|p| p == target) {
             let _ = std::fs::write(target, "intruder");
@@ -1308,21 +1425,286 @@ mod tests {
         (done.expect("the job never finished"), asked)
     }
 
-    #[test]
-    fn a_replaced_item_the_trash_cannot_take_is_said_to_be_deleted_for_good() {
-        let dir = sandbox("replace_no_trash");
+    fn is_root() -> bool {
+        // SAFETY: `geteuid` has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// `dir/src/<name>` ("new") and `dir/dst/<name>` ("old"), both files.
+    fn clash(name: &str) -> PathBuf {
+        let dir = sandbox(name);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("dst")).unwrap();
-        std::fs::write(dir.join("a"), "new").unwrap();
+        std::fs::write(dir.join("src/a"), "new").unwrap();
         std::fs::write(dir.join("dst/a"), "old").unwrap();
-        crate::fs::trash::tests_refuse::refuse(&dir.join("dst/a"));
-        let (outcome, asked) = run(JobKind::Copy, Op::Copy, vec![(dir.join("a"), dir.join("dst/a"))], Decision::Replace);
-        assert_eq!(asked, 1);
+        dir
+    }
+
+    fn pair(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+        vec![(dir.join("src/a"), dir.join("dst/a"))]
+    }
+
+    #[test]
+    fn what_was_deleted_for_good_is_said_in_words_and_counted() {
+        assert_eq!(deleted_for_good_note(&[]), None);
+        let one = deleted_for_good_note(&[PathBuf::from("/x")]).unwrap();
+        assert_eq!(one, "1 replaced item could not go to the trash and was deleted for good: undo cannot bring it back");
+        let two = deleted_for_good_note(&[PathBuf::from("/x"), PathBuf::from("/y")]).unwrap();
+        assert!(two.starts_with("2 replaced items could not go to the trash and were deleted for good"), "{two}");
+    }
+
+    #[test]
+    fn replacing_a_file_puts_the_new_one_in_place_sends_the_old_one_to_the_trash_and_leaves_nothing_behind() {
+        for op in [Op::Copy, Op::Move] {
+            let dir = clash(&format!("replace_file_{op:?}"));
+            let (outcome, asked) = run(JobKind::Copy, op, pair(&dir), Decision::Replace);
+            assert_eq!(asked, 1);
+            assert!(outcome.ok, "{op:?}: {}", outcome.message);
+            assert!(!outcome.message.contains("deleted for good"), "{}", outcome.message);
+            assert_eq!(std::fs::read_to_string(dir.join("dst/a")).unwrap(), "new");
+            assert_eq!(names(&dir.join("dst")), vec!["a"], "{op:?}: no staging name is left");
+            assert_eq!(dir.join("src/a").exists(), op == Op::Copy, "a move takes the original, a copy leaves it");
+            let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
+            assert!(entry.edits.iter().any(|e| matches!(e, Edit::Restore(_))), "the old file can be brought back");
+            let (_, error) = crate::fs::history::apply(entry);
+            assert_eq!(error, None);
+            assert_eq!(std::fs::read_to_string(dir.join("dst/a")).unwrap(), "old", "{op:?}: undo brings the old file back");
+            assert_eq!(std::fs::read_to_string(dir.join("src/a")).unwrap(), "new", "{op:?}: and the original is where it was");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_staging_name_that_is_already_taken_is_not_used_and_what_is_there_stays() {
+        let dir = clash("replace_staging_taken");
+        let taken = dir.join("dst").join(format!(".compression-new-{}-0", std::process::id()));
+        std::fs::write(&taken, "somebody else's").unwrap();
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, pair(&dir), Decision::Replace);
         assert!(outcome.ok, "{}", outcome.message);
-        assert!(outcome.message.contains("deleted for good") && outcome.message.contains("undo cannot bring it back"), "{}", outcome.message);
         assert_eq!(std::fs::read_to_string(dir.join("dst/a")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "somebody else's", "not written over, not removed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replacing_a_folder_swaps_the_whole_folder_and_an_undo_brings_the_old_one_back() {
+        let dir = sandbox("replace_folder");
+        std::fs::create_dir_all(dir.join("src/tree/inner")).unwrap();
+        std::fs::create_dir_all(dir.join("dst/tree")).unwrap();
+        std::fs::write(dir.join("src/tree/inner/new.txt"), "new").unwrap();
+        std::fs::write(dir.join("dst/tree/old.txt"), "old").unwrap();
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("src/tree"), dir.join("dst/tree"))], Decision::Replace);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(names(&dir.join("dst")), vec!["tree"]);
+        assert_eq!(names(&dir.join("dst/tree")), vec!["inner"], "the folder is the new one as a whole, not a merge");
         let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
-        assert!(entry.edits.iter().any(|e| matches!(e, Edit::Trash(_))), "the copy can still be taken back");
-        assert!(!entry.edits.iter().any(|e| matches!(e, Edit::Restore(_))), "nothing was put in the trash, so nothing can be brought back");
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        assert_eq!(names(&dir.join("dst/tree")), vec!["old.txt"], "undo: the old folder is back, the new one gone");
+        // A file by a folder and a folder by a file
+        std::fs::write(dir.join("src/mix"), "file").unwrap();
+        std::fs::create_dir_all(dir.join("dst/mix")).unwrap();
+        std::fs::write(dir.join("dst/mix/in.txt"), "in").unwrap();
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("src/mix"), dir.join("dst/mix"))], Decision::Replace);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dir.join("dst/mix")).unwrap(), "file");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replacing_by_a_move_across_file_systems_copies_first_and_takes_the_original_away_after_the_swap() {
+        let Some((root, shm)) = crate::fs::ops::tests::two_file_systems("replace_across") else { return };
+        std::fs::create_dir_all(shm.join("dst")).unwrap();
+        std::fs::write(root.join("a"), "new").unwrap();
+        std::fs::write(shm.join("dst/a"), "old").unwrap();
+        let (outcome, _) = run(JobKind::Move, Op::Move, vec![(root.join("a"), shm.join("dst/a"))], Decision::Replace);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(shm.join("dst/a")).unwrap(), "new");
+        assert!(!root.join("a").exists(), "the original is gone once the copy has its place");
+        assert_eq!(names(&shm.join("dst")), vec!["a"], "no staging name is left");
+        let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        assert_eq!(std::fs::read_to_string(shm.join("dst/a")).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "new");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
+    }
+
+    #[test]
+    fn replacing_by_a_move_across_file_systems_whose_original_cannot_be_removed_keeps_the_copy_and_the_old_item_in_the_trash() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some((root, shm)) = crate::fs::ops::tests::two_file_systems("replace_across_left") else { return };
+        std::fs::create_dir_all(root.join("tree/box")).unwrap();
+        std::fs::write(root.join("tree/box/b.txt"), "new").unwrap();
+        std::fs::set_permissions(root.join("tree/box"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::create_dir_all(shm.join("dst/tree")).unwrap();
+        std::fs::write(shm.join("dst/tree/old.txt"), "old").unwrap();
+        let (outcome, _) = run(JobKind::Move, Op::Move, vec![(root.join("tree"), shm.join("dst/tree"))], Decision::Replace);
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert!(outcome.message.contains("could not be fully removed"), "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(shm.join("dst/tree/box/b.txt")).unwrap(), "new", "the copy has its place");
+        assert_eq!(names(&shm.join("dst")), vec!["tree"]);
+        let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        assert_eq!(names(&shm.join("dst/tree")), vec!["old.txt"], "an undo takes the copy away and brings the old folder back");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
+    }
+
+    #[test]
+    fn a_new_item_that_cannot_be_made_leaves_the_old_one_whole_and_no_leftover() {
+        if is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = clash("replace_unreadable");
+        std::fs::set_permissions(dir.join("src/a"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, pair(&dir), Decision::Replace);
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dir.join("dst/a")).unwrap(), "old", "the old item was not touched");
+        assert_eq!(names(&dir.join("dst")), vec!["a"], "and nothing of the new one is left");
+        assert!(matches!(outcome.effect, Effect::None), "nothing was done, so there is nothing to undo");
+        std::fs::set_permissions(dir.join("src/a"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn when_the_trash_cannot_take_the_old_item_it_stays_and_the_position_is_said_not_to_be_replaced() {
+        for op in [Op::Copy, Op::Move] {
+            let dir = clash(&format!("replace_no_trash_{op:?}"));
+            crate::fs::trash::tests_refuse::refuse(&dir.join("dst/a"));
+            let (outcome, asked) = run(JobKind::Copy, op, pair(&dir), Decision::Replace);
+            assert_eq!(asked, 1);
+            assert!(!outcome.ok && !outcome.cancelled, "{op:?}: {}", outcome.message);
+            assert!(outcome.message.contains("Not replaced: the old item cannot go to the trash and would be lost for good"), "{}", outcome.message);
+            assert!(!outcome.message.contains("deleted for good"), "nothing was deleted: {}", outcome.message);
+            assert_eq!(std::fs::read_to_string(dir.join("dst/a")).unwrap(), "old", "{op:?}: the old item was not deleted");
+            assert_eq!(names(&dir.join("dst")), vec!["a"], "{op:?}: no staging name is left");
+            assert_eq!(std::fs::read_to_string(dir.join("src/a")).unwrap(), "new", "{op:?}: the original is where it was");
+            assert!(matches!(outcome.effect, Effect::None));
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_cancel_after_the_new_item_is_complete_and_before_the_swap_removes_only_the_new_item() {
+        for op in [Op::Copy, Op::Move] {
+            let dir = clash(&format!("replace_cancel_{op:?}"));
+            CANCELS.lock().unwrap().push(dir.join("dst/a"));
+            let (outcome, _) = run(JobKind::Copy, op, pair(&dir), Decision::Replace);
+            assert!(outcome.cancelled, "{op:?}: {}", outcome.message);
+            assert_eq!(std::fs::read_to_string(dir.join("dst/a")).unwrap(), "old", "{op:?}");
+            assert_eq!(names(&dir.join("dst")), vec!["a"], "{op:?}: no staging name is left");
+            assert_eq!(std::fs::read_to_string(dir.join("src/a")).unwrap(), "new", "{op:?}: the original is where it was");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_cancel_in_the_middle_of_making_the_new_item_leaves_the_old_one_and_no_leftover() {
+        let dir = sandbox("replace_cancel_midway");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        std::fs::write(dir.join("big"), vec![1u8; 200_000_000]).unwrap();
+        std::fs::write(dir.join("dst/big"), "old").unwrap();
+        let mut seen_midway = false;
+        for _ in 0..5 {
+            let mut e = engine();
+            let pairs = vec![(dir.join("big"), dir.join("dst/big"))];
+            let id = e.spawn(JobKind::Copy, "Copy".into(), String::new(), move |w| transfer(w, Op::Copy, pairs));
+            let mut cancelled_midway = false;
+            let mut events = Vec::new();
+            for _ in 0..3000 {
+                for event in e.poll() {
+                    match event {
+                        Event::Conflict(request) => request.answer(Decision::Replace, false),
+                        other => events.push(other),
+                    }
+                }
+                // The new item is being made under its staging name: now
+                if !cancelled_midway && names(&dir.join("dst")).iter().any(|n| n.starts_with(".compression-new")) {
+                    e.cancel(id);
+                    cancelled_midway = true;
+                }
+                if !e.running() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            events.extend(e.poll());
+            let outcome = events.into_iter().find_map(|ev| match ev {
+                Event::Done { outcome, .. } => Some(outcome),
+                _ => None,
+            });
+            let outcome = outcome.expect("the job never finished");
+            if outcome.cancelled && cancelled_midway {
+                seen_midway = true;
+                assert_eq!(std::fs::read_to_string(dir.join("dst/big")).unwrap(), "old", "the old item is whole");
+                assert_eq!(names(&dir.join("dst")), vec!["big"], "the half-made new item is gone");
+                break;
+            }
+            // The copy was over before the cancel took hold: put the old item back and try again
+            let _ = std::fs::remove_dir_all(dir.join("dst"));
+            std::fs::create_dir_all(dir.join("dst")).unwrap();
+            std::fs::write(dir.join("dst/big"), "old").unwrap();
+        }
+        assert!(seen_midway, "a cancel in the middle of the copy was never seen");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn on_a_server_nothing_is_replaced_and_nothing_goes_to_a_trash_nobody_asked_for() {
+        let dir = sandbox("replace_server");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("server")).unwrap();
+        std::fs::write(dir.join("src/a"), "new").unwrap();
+        std::fs::write(dir.join("server/a"), "old").unwrap();
+        crate::fs::network::declare_remote_for_tests(&dir.join("server"));
+        let (outcome, asked) = run(JobKind::Copy, Op::Copy, vec![(dir.join("src/a"), dir.join("server/a"))], Decision::Replace);
+        assert_eq!(asked, 1, "the person is asked about the name as before");
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert!(outcome.message.contains("Not replaced: items on a server have no trash"), "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dir.join("server/a")).unwrap(), "old");
+        assert_eq!(names(&dir.join("server")), vec!["a"], "nothing was staged on the server and no trash was made there");
+        assert!(matches!(outcome.effect, Effect::None));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_name_taken_again_between_the_trash_and_the_swap_is_not_replaced_and_the_old_item_is_not_lost() {
+        let dir = clash("replace_race");
+        RACES.lock().unwrap().push(dir.join("dst/a"));
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, pair(&dir), Decision::Replace);
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert!(outcome.message.contains("Not replaced"), "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dir.join("dst/a")).unwrap(), "intruder", "what appeared in the meantime is not touched");
+        assert!(!names(&dir.join("dst")).iter().any(|n| n.starts_with(".compression-new")), "{:?}", names(&dir.join("dst")));
+        // The old item was put back (under another name, the original one being taken) or is in the trash
+        let back = names(&dir.join("dst")).into_iter().any(|n| n != "a" && std::fs::read_to_string(dir.join("dst").join(&n)).is_ok_and(|c| c == "old"));
+        assert!(back || outcome.message.contains("in the trash"), "{:?} {}", names(&dir.join("dst")), outcome.message);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_a_copy_over_a_folder_left_out_is_told_by_the_name_it_would_have_and_not_by_the_staging_name() {
+        if is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = sandbox("replace_note");
+        std::fs::create_dir_all(dir.join("src/tree")).unwrap();
+        std::fs::create_dir_all(dir.join("dst/tree")).unwrap();
+        std::fs::write(dir.join("src/tree/ok.txt"), "ok").unwrap();
+        std::fs::write(dir.join("src/tree/locked.txt"), "no").unwrap();
+        std::fs::set_permissions(dir.join("src/tree/locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(dir.join("dst/tree/old.txt"), "old").unwrap();
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("src/tree"), dir.join("dst/tree"))], Decision::Replace);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(outcome.message.contains("locked.txt"), "{}", outcome.message);
+        assert!(!outcome.message.contains(".compression-new"), "{}", outcome.message);
+        assert_eq!(names(&dir.join("dst/tree")), vec!["ok.txt"]);
+        std::fs::set_permissions(dir.join("src/tree/locked.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
