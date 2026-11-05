@@ -7565,6 +7565,47 @@ mod tests {
         (w, root, ok)
     }
 
+    /// A window whose copy asks "Replace?": `root/src/a` ("new") onto `root/dst/a` ("old"); `dst` may be declared a server.
+    fn window_with_the_conflict_question(name: &str, on_server: bool) -> (Window, PathBuf) {
+        let root = window_dir(name);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("dst")).unwrap();
+        std::fs::write(root.join("src/a"), "new").unwrap();
+        std::fs::write(root.join("dst/a"), "old").unwrap();
+        if on_server {
+            network::declare_remote_for_tests(&root.join("dst"));
+        }
+        let mut w = Window::new(root.clone());
+        let pairs = vec![(root.join("src/a"), root.join("dst/a"))];
+        w.app.engine.spawn(JobKind::Copy, "Copying".into(), String::new(), move |worker| engine::transfer(worker, Op::Copy, pairs));
+        w.until("the question", |w| matches!(w.app.dialog, Some(Dialog::Conflict { .. })) && w.shows("Keep both"));
+        (w, root)
+    }
+
+    #[test]
+    fn replace_is_offered_for_a_local_name_and_not_for_a_name_on_a_server() {
+        const HINT: &str = "Nothing is replaced on a server: there is no trash there, and the old item would be lost for good.";
+        // Local: no hint, and Replace works
+        let (mut w, root) = window_with_the_conflict_question("conflict_local", false);
+        assert!(w.shows("Replace") && w.shows("Skip") && !w.shows(HINT), "{:?}", w.last);
+        w.click(w.at("Replace"), egui::PointerButton::Primary);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert_eq!(std::fs::read_to_string(root.join("dst/a")).unwrap(), "new");
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // On a server: the button is there but cannot be pressed, the reason is said, the other answers work
+        let (mut w, root) = window_with_the_conflict_question("conflict_server", true);
+        assert!(w.shows(HINT), "{:?}", w.last);
+        w.click(w.at("Replace"), egui::PointerButton::Primary);
+        w.run(Vec::new(), 3);
+        assert!(matches!(w.app.dialog, Some(Dialog::Conflict { .. })), "a click on a disabled button answers nothing");
+        assert_eq!(std::fs::read_to_string(root.join("dst/a")).unwrap(), "old");
+        w.click(w.at("Skip"), egui::PointerButton::Primary);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert_eq!(std::fs::read_to_string(root.join("dst/a")).unwrap(), "old", "skipped: untouched");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn the_free_room_is_asked_for_a_new_folder_and_again_only_when_old() {
         use std::time::{Duration, Instant};

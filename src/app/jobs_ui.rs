@@ -447,6 +447,8 @@ impl CompressionApp {
         let name = req.target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let folder = req.target.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let merge = req.can_merge();
+        // Nothing is replaced on a server (no trash there): the button would only lead to "Not replaced"
+        let on_server = network::is_remote(&req.target);
         let title = if merge { trf("Merge “{}”?", &[&name]) } else { trf("Replace “{}”?", &[&name]) };
 
         let mut decision = None;
@@ -497,16 +499,19 @@ impl CompressionApp {
             }
         });
 
+        if on_server {
+            material::hint_label(ui, tr("Nothing is replaced on a server: there is no trash there, and the old item would be lost for good."), &theme);
+        }
         ui.add_space(4.0);
         ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), material::BUTTON_HEIGHT), egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if merge {
                 if material::button(ui, "cf_merge", Some(icons::FOLDER_MOVE), tr("Merge"), &theme, ButtonKind::Filled, true).clicked() {
                     decision = Some(Decision::Merge);
                 }
-                if material::button(ui, "cf_replace", None, tr("Replace"), &theme, ButtonKind::Tonal, true).clicked() {
+                if material::button(ui, "cf_replace", None, tr("Replace"), &theme, ButtonKind::Tonal, !on_server).clicked() {
                     decision = Some(Decision::Replace);
                 }
-            } else if material::button(ui, "cf_replace", Some(icons::CHECK), tr("Replace"), &theme, ButtonKind::Filled, true).clicked() {
+            } else if material::button(ui, "cf_replace", Some(icons::CHECK), tr("Replace"), &theme, ButtonKind::Filled, !on_server).clicked() {
                 decision = Some(Decision::Replace);
             }
             if material::button(ui, "cf_both", None, tr("Keep both"), &theme, ButtonKind::Tonal, true).clicked() {

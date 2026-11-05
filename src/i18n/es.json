@@ -855,5 +855,6 @@
   "Not replaced: the old item is in the trash, but the new one could not take its place ({})": "No reemplazado: el elemento antiguo está en la papelera, pero el nuevo no pudo ocupar su lugar ({})",
   "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "No reemplazado: el elemento nuevo no pudo ocupar el lugar del antiguo ({}); se conserva como «{}»",
   "The list of servers could not be read. The file was kept as “{}” and a new list is used.": "No se pudo leer la lista de servidores. El archivo se conservó como «{}» y se usa una lista nueva.",
-  "The list of servers could not be read, and the file could not be put aside. It is left as it is and not written over.": "No se pudo leer la lista de servidores y el archivo no se pudo apartar. Se deja como está y no se sobrescribe."
+  "The list of servers could not be read, and the file could not be put aside. It is left as it is and not written over.": "No se pudo leer la lista de servidores y el archivo no se pudo apartar. Se deja como está y no se sobrescribe.",
+  "Nothing is replaced on a server: there is no trash there, and the old item would be lost for good.": "En un servidor no se reemplaza nada: allí no hay papelera y el elemento antiguo se perdería para siempre."
 }
