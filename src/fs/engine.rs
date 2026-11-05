@@ -1565,4 +1565,139 @@ mod tests {
         assert_eq!(getfacl(&dir.join("t/f")), before);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn a_job_copies_a_file_with_holes_without_filling_them() {
+        let dir = sandbox("copy_holey");
+        let len = 48 << 20;
+        {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::File::create(dir.join("image")).unwrap();
+            file.set_len(len).unwrap();
+            file.write_all_at(b"head", 0).unwrap();
+            file.write_all_at(&[9u8; 5000], 20 << 20).unwrap();
+            file.write_all_at(b"tail", len - 4).unwrap();
+            file.sync_all().unwrap();
+        }
+        let source = dir.join("image").metadata().unwrap();
+        let keeps_holes = source.blocks() * 512 < source.len();
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("image"), dir.join("copy"))], Decision::Skip);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read(dir.join("image")).unwrap(), std::fs::read(dir.join("copy")).unwrap());
+        if keeps_holes {
+            assert!(dir.join("copy").metadata().unwrap().blocks() * 512 < 1 << 20, "the copy was filled up");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_says_more_than_it_holds_is_copied_as_it_reads() {
+        // Files in /sys claim a size (a page) and give less, and use no blocks: not a file with holes
+        let source = Path::new("/sys/kernel/mm/transparent_hugepage/enabled");
+        let Ok(text) = std::fs::read(source) else { return };
+        let dir = sandbox("copy_sysfs");
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(source.to_path_buf(), dir.join("copy"))], Decision::Skip);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read(dir.join("copy")).unwrap(), text);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_room_a_copy_needs_counts_holes_only_where_they_stay() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let dir = sandbox("room");
+        let len = 64u64 << 20;
+        std::fs::create_dir_all(dir.join("tree")).unwrap();
+        {
+            let file = std::fs::File::create(dir.join("tree/image")).unwrap();
+            file.set_len(len).unwrap();
+            file.write_all_at(&[1u8; 8192], 1 << 20).unwrap();
+            file.sync_all().unwrap();
+        }
+        std::fs::write(dir.join("tree/plain"), vec![2u8; 1 << 20]).unwrap();
+        let image = dir.join("tree/image").metadata().unwrap();
+        if image.blocks() * 512 >= image.len() {
+            return;
+        }
+        let all = len + (1 << 20);
+        // Within one file system the holes stay holes: what the data uses, and a plain file in full
+        let same = room_for(&dir.join("tree"), Some(&dir), all);
+        assert!(((1 << 20)..(2 << 20)).contains(&same), "{same}");
+        assert_eq!(room_for(&dir.join("tree/plain"), Some(&dir), 1 << 20), 1 << 20);
+        assert_eq!(room_for(&dir.join("tree/image"), Some(&dir), len), image.blocks() * 512);
+        // Nowhere to look, or another file system: the whole size, as before
+        assert_eq!(room_for(&dir.join("tree"), None, all), all);
+        let other = Path::new("/dev/shm");
+        if other.metadata().is_ok_and(|m| m.dev() != dir.metadata().unwrap().dev()) {
+            assert_eq!(room_for(&dir.join("tree"), Some(other), all), all);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs a copy where `free` bytes are left; returns the outcome and the `needed` of every question about room.
+    fn run_with_room(pairs: Vec<(PathBuf, PathBuf)>, free: u64) -> (Outcome, Vec<u64>) {
+        let mut e = engine();
+        e.spawn(JobKind::Copy, String::new(), String::new(), move |w| transfer_with(w, Op::Copy, pairs, move |_| Some(free)));
+        let (mut done, mut asked) = (None, Vec::new());
+        for _ in 0..500 {
+            for event in e.poll() {
+                match event {
+                    Event::LowSpace(request) => {
+                        asked.push(request.needed);
+                        request.answer(false);
+                    }
+                    Event::Done { outcome, .. } => done = Some(outcome),
+                    _ => {}
+                }
+            }
+            if !e.running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (done.expect("the job never finished"), asked)
+    }
+
+    #[test]
+    fn a_copy_of_a_file_with_holes_is_not_warned_about_when_what_it_uses_fits() {
+        use std::os::unix::fs::FileExt;
+        let dir = sandbox("room_job");
+        let len = 64u64 << 20;
+        let file = std::fs::File::create(dir.join("image")).unwrap();
+        file.set_len(len).unwrap();
+        file.write_all_at(&[1u8; 8192], 1 << 20).unwrap();
+        file.sync_all().unwrap();
+        std::fs::write(dir.join("plain"), vec![2u8; 4 << 20]).unwrap();
+        if std::os::unix::fs::MetadataExt::blocks(&dir.join("image").metadata().unwrap()) * 512 >= len {
+            return;
+        }
+        // 10 MiB are left: the image uses next to nothing of that, the same size in plain data would not fit
+        let (outcome, asked) = run_with_room(vec![(dir.join("image"), dir.join("copy"))], 10 << 20);
+        assert!(outcome.ok && asked.is_empty(), "{} {asked:?}", outcome.message);
+        let (outcome, asked) = run_with_room(vec![(dir.join("plain"), dir.join("copy2")), (dir.join("image"), dir.join("copy3"))], 4 << 20);
+        assert!(!outcome.ok && asked.len() == 1 && asked[0] >= 4 << 20 && asked[0] < len, "the plain file is counted in full, the image by its data: {asked:?}");
+        assert!(!dir.join("copy2").exists(), "and nothing was copied after the answer");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_job_copies_a_file_the_plain_way_when_the_file_system_cannot_tell_holes() {
+        use std::os::unix::fs::FileExt;
+        let dir = sandbox("copy_no_holes_info");
+        let len = 12u64 << 20;
+        {
+            let file = std::fs::File::create(dir.join("image")).unwrap();
+            file.set_len(len).unwrap();
+            file.write_all_at(b"head", 0).unwrap();
+            file.write_all_at(&[5u8; 4096], 6 << 20).unwrap();
+            file.write_all_at(b"tail", len - 4).unwrap();
+            file.sync_all().unwrap();
+        }
+        ops::tests::make_seek_fail(&dir.join("image"), libc::EOPNOTSUPP);
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("image"), dir.join("copy"))], Decision::Skip);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(dir.join("copy").metadata().unwrap().len(), len);
+        assert_eq!(std::fs::read(dir.join("image")).unwrap(), std::fs::read(dir.join("copy")).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
