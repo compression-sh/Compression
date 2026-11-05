@@ -299,3 +299,57 @@ pub fn sort_items(items: &mut [FileItem], opts: &ListOptions) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folders_sort_by_item_count_and_uncounted_ones_last_either_way() {
+        use super::super::dirsize;
+        let root = std::env::temp_dir().join(format!("compression-sortsize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["big", "small", "unknown-a", "unknown-b"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        dirsize::store_count(&root.join("big"), Some(90));
+        dirsize::store_count(&root.join("small"), Some(2));
+        let items = || ["unknown-b", "big", "unknown-a", "small"].map(|n| FileItem::from_path(&root.join(n)).unwrap()).to_vec();
+        let names = |items: &[FileItem]| items.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
+        let opts = |sort_order| ListOptions { show_hidden: false, sort_by: SortBy::Size, sort_order, folders_first: true, type_filter: TypeFilter::All };
+
+        let mut ascending = items();
+        sort_items(&mut ascending, &opts(SortOrder::Ascending));
+        assert_eq!(names(&ascending), ["small", "big", "unknown-a", "unknown-b"]);
+        let mut descending = items();
+        sort_items(&mut descending, &opts(SortOrder::Descending));
+        assert_eq!(names(&descending), ["big", "small", "unknown-a", "unknown-b"]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn numbers_sort_by_value() {
+        let mut names = ["Episode 10", "episode 2", "Episode 1", "Episode 02a"];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(names, ["Episode 1", "episode 2", "Episode 02a", "Episode 10"]);
+    }
+
+    #[test]
+    fn accents_sort_with_their_letter() {
+        let mut names = ["zebra", "école", "über", "apple", "Eagle"];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(names, ["apple", "Eagle", "école", "über", "zebra"]);
+        // composed and decomposed spellings of the same name tie, so the raw-name fallback decides
+        assert_eq!(natural_cmp("e\u{301}cole", "\u{e9}cole"), Ordering::Equal);
+    }
+
+    #[test]
+    fn prefixes_ignore_case_and_accents() {
+        assert!(starts_with_folded("École.txt", "ec"));
+        assert!(!starts_with_folded("e", "ec"));
+    }
+
+    #[test]
+    fn prefix_sorts_first() {
+        assert_eq!(natural_cmp("report", "report-notes"), Ordering::Less);
+    }
+}

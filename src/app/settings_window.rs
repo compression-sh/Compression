@@ -225,3 +225,33 @@ impl CompressionApp {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_trace_log_stays_small_and_keeps_working() {
+        let dir = std::env::temp_dir().join(format!("compression_trace_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.log");
+        let (limit, line) = (1000u64, "x".repeat(49));
+        // Writes ten times the limit
+        for i in 0..200 {
+            append_capped(&file, &format!("{i:03} {line}"), limit);
+            let size = |f: &std::path::Path| f.metadata().map_or(0, |m| m.len());
+            assert!(size(&file) < limit + 60, "the log grew past the limit: {} bytes after line {i}", size(&file));
+            assert!(size(&dir.join("settings.log.1")) < limit + 60);
+        }
+        // Only the log and the one rotated copy exist, nothing else was made
+        let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["settings.log", "settings.log.1"]);
+        // The newest line is in the log, and writing still works after many rotations
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.lines().last().unwrap().starts_with("199 "));
+        append_capped(&file, "after", limit);
+        assert!(std::fs::read_to_string(&file).unwrap().ends_with("after\n"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

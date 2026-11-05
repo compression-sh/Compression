@@ -699,3 +699,185 @@ impl Plugin for Compare {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Quiet;
+
+    impl Progress for Quiet {
+        fn checkpoint(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn current(&self, _: &str) {}
+        fn plan(&self, _: u64, _: u64) {}
+        fn bytes(&self, _: u64) {}
+        fn file_done(&self) {}
+    }
+
+    fn folder(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression-compare-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn put(path: &Path, text: &str, age_secs: u64) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+        let time = SystemTime::now() - Duration::from_secs(age_secs);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(time).unwrap();
+    }
+
+    fn run(left: &Path, right: &Path, options: Options) -> Vec<(String, Class)> {
+        let mut rows = Vec::new();
+        compare(left, right, options, &Quiet, &mut |e| rows.push((e.rel.display().to_string(), e.class))).unwrap();
+        rows
+    }
+
+    #[test]
+    fn every_class_is_found() {
+        let base = folder("classes");
+        let (l, r) = (base.join("l"), base.join("r"));
+        std::fs::create_dir_all(&l).unwrap();
+        std::fs::create_dir_all(&r).unwrap();
+        put(&l.join("only-left.txt"), "a", 100);
+        put(&r.join("only-right.txt"), "b", 100);
+        put(&l.join("same.txt"), "same", 500);
+        put(&r.join("same.txt"), "same", 500);
+        put(&l.join("newer-left.txt"), "new", 10);
+        put(&r.join("newer-left.txt"), "new", 5000);
+        put(&l.join("newer-right.txt"), "old", 5000);
+        put(&r.join("newer-right.txt"), "new!", 10);
+        put(&l.join("different.txt"), "aaaa", 300);
+        put(&r.join("different.txt"), "bbb", 300);
+        // A folder on one side is one row, however much is in it
+        put(&l.join("lonely/deep/file.txt"), "x", 100);
+        put(&l.join("lonely/other.txt"), "y", 100);
+        // Folders on both sides are walked
+        put(&l.join("both/a.txt"), "a", 100);
+        put(&r.join("both/a.txt"), "a", 100);
+        put(&r.join("both/extra.txt"), "e", 100);
+        // Links compare by where they point
+        std::os::unix::fs::symlink("target-one", l.join("link-same")).unwrap();
+        std::os::unix::fs::symlink("target-one", r.join("link-same")).unwrap();
+        std::os::unix::fs::symlink("target-one", l.join("link-diff")).unwrap();
+        std::os::unix::fs::symlink("target-two", r.join("link-diff")).unwrap();
+
+        let rows = run(&l, &r, Options::default());
+        let class_of = |name: &str| rows.iter().find(|(n, _)| n == name).map(|(_, c)| *c);
+        assert_eq!(class_of("only-left.txt"), Some(Class::OnlyLeft));
+        assert_eq!(class_of("only-right.txt"), Some(Class::OnlyRight));
+        assert_eq!(class_of("same.txt"), Some(Class::Same));
+        assert_eq!(class_of("newer-left.txt"), Some(Class::NewerLeft));
+        assert_eq!(class_of("newer-right.txt"), Some(Class::NewerRight));
+        assert_eq!(class_of("different.txt"), Some(Class::Different));
+        assert_eq!(class_of("lonely"), Some(Class::OnlyLeft));
+        assert!(rows.iter().all(|(n, _)| !n.starts_with("lonely/")), "a one-sided folder is a single row");
+        assert_eq!(class_of("both/a.txt"), Some(Class::Same));
+        assert_eq!(class_of("both/extra.txt"), Some(Class::OnlyRight));
+        assert_eq!(class_of("both"), None, "a folder both sides have is not a row of its own");
+        assert_eq!(class_of("link-same"), Some(Class::Same));
+        assert_eq!(class_of("link-diff"), Some(Class::Different));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn times_a_second_apart_are_equal_but_five_are_not() {
+        let base = folder("tolerance");
+        let (l, r) = (base.join("l"), base.join("r"));
+        std::fs::create_dir_all(&l).unwrap();
+        std::fs::create_dir_all(&r).unwrap();
+        let now = SystemTime::now() - Duration::from_secs(1000);
+        for (dir, name, shift) in [(&l, "near", 0), (&r, "near", 1), (&l, "far", 0), (&r, "far", 5)] {
+            let path = dir.join(name);
+            std::fs::write(&path, "same size").unwrap();
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(now + Duration::from_secs(shift)).unwrap();
+        }
+        let rows = run(&l, &r, Options::default());
+        assert_eq!(rows, vec![("far".to_owned(), Class::NewerRight), ("near".to_owned(), Class::Same)]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn comparing_contents_sees_through_equal_sizes_and_different_times() {
+        let base = folder("contents");
+        let (l, r) = (base.join("l"), base.join("r"));
+        put(&l.join("copy.txt"), "same bytes", 5000);
+        put(&r.join("copy.txt"), "same bytes", 10);
+        put(&l.join("edited.txt"), "abcdefgh", 300);
+        put(&r.join("edited.txt"), "abcdefgX", 300);
+        // By size and time the first pair is newer on the right; by contents it is the same
+        let quick = run(&l, &r, Options::default());
+        assert_eq!(quick, vec![("copy.txt".to_owned(), Class::NewerRight), ("edited.txt".to_owned(), Class::Same)]);
+        let deep = run(&l, &r, Options { contents: true });
+        assert_eq!(deep, vec![("copy.txt".to_owned(), Class::Same), ("edited.txt".to_owned(), Class::Different)]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn selected_rows_become_copy_pairs() {
+        let (l, r) = (PathBuf::from("/l"), PathBuf::from("/r"));
+        let side = Some(Side { size: 1, modified: None, is_dir: false });
+        let mut view = View::new(1, String::new(), String::new());
+        view.scanned = Some((l, r));
+        view.add(vec![
+            Entry { rel: "b/only-left".into(), class: Class::OnlyLeft, left: side.clone(), right: None },
+            Entry { rel: "a/only-right".into(), class: Class::OnlyRight, left: None, right: side.clone() },
+            Entry { rel: "c/both".into(), class: Class::NewerLeft, left: side.clone(), right: side },
+        ]);
+        view.selected = HashSet::from([0, 1, 2]);
+        assert_eq!(view.pairs(true), vec![("/l/b/only-left".into(), "/r/b/only-left".into()), ("/l/c/both".into(), "/r/c/both".into())]);
+        assert_eq!(view.pairs(false), vec![("/r/a/only-right".into(), "/l/a/only-right".into()), ("/r/c/both".into(), "/l/c/both".into())]);
+        assert_eq!(view.paths_on(true), vec![PathBuf::from("/l/b/only-left"), PathBuf::from("/l/c/both")]);
+        // Identical items are hidden by default but counted
+        view.add(vec![Entry { rel: "same".into(), class: Class::Same, left: None, right: None }]);
+        assert_eq!(view.visible.len(), 3);
+        assert_eq!(view.counts[Class::Same.index()], 1);
+        view.show[Class::Same.index()] = true;
+        view.refilter();
+        assert_eq!(view.visible.len(), 4);
+    }
+
+    #[test]
+    fn copying_across_goes_through_the_file_operations() {
+        let base = folder("copy");
+        let (l, r) = (base.join("l"), base.join("r"));
+        put(&l.join("new/inner.txt"), "inner", 10);
+        put(&l.join("file.txt"), "file", 10);
+        std::fs::create_dir_all(&r).unwrap();
+        let mut compare_plugin = Compare::default();
+        compare_plugin.open(&l, Some(&r));
+        // The job is queued for the app; run it the way the app would
+        let Reaction::Job(job) = compare_plugin.reaction() else { panic!("no scan job") };
+        let mut engine = crate::fs::engine::Engine::new(&egui::Context::default());
+        engine.spawn(crate::fs::engine::JobKind::Other, job.title, String::new(), job.work);
+        for _ in 0..500 {
+            engine.poll();
+            compare_plugin.poll();
+            if !engine.running() && !compare_plugin.busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let view = compare_plugin.view.as_mut().unwrap();
+        assert_eq!(view.entries.len(), 2);
+        view.selected = (0..view.entries.len()).collect();
+        compare_plugin.copy(true);
+        let Reaction::Job(job) = compare_plugin.reaction() else { panic!("no copy job") };
+        engine.spawn(crate::fs::engine::JobKind::Copy, job.title, String::new(), job.work);
+        for _ in 0..500 {
+            engine.poll();
+            if !engine.running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(r.join("new/inner.txt")).unwrap(), "inner");
+        assert_eq!(std::fs::read_to_string(r.join("file.txt")).unwrap(), "file");
+        // The copy asked for a fresh comparison
+        compare_plugin.poll();
+        assert!(matches!(compare_plugin.reaction(), Reaction::Job(_)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

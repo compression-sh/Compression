@@ -562,6 +562,27 @@ pub struct CompressionApp {
     type_ahead: (String, std::time::Instant),
 }
 
+/// The items of the Recent and Bookmarks views for `paths`: what is still there, and passes the hidden-files setting and
+/// the type filter. Asks the file system about every path, so it runs on a thread when a server is among them.
+fn recent_listing(paths: Vec<PathBuf>, show_hidden: bool, filter: TypeFilter) -> Vec<FileItem> {
+    const LIMIT: usize = 150;
+    paths
+        .into_iter()
+        .filter(|p| show_hidden || !p.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')))
+        .filter_map(|p| FileItem::from_path(&p).filter(|_| p.symlink_metadata().is_ok()))
+        .filter(|i| filter.accepts(i))
+        .take(LIMIT)
+        .collect()
+}
+
+/// What to tell about a rename that did not work.
+fn rename_error(err: &std::io::Error, new_name: &str) -> String {
+    match err.kind() {
+        std::io::ErrorKind::AlreadyExists => trf("“{}” already exists", &[&new_name]),
+        _ => crate::fs::describe::io_error(err),
+    }
+}
+
 impl CompressionApp {
     pub fn new(initial_path: PathBuf, theme: SerpantinumTheme, settings: Settings, ctx: &egui::Context) -> Self {
         apps::preload();
@@ -933,7 +954,19 @@ impl CompressionApp {
         self.pending_reload = None;
         self.resync_watch();
         let opts = self.list_options();
-        let listing = if self.in_recent() { Ok(self.recent_items()) } else { read_folder(&self.current_path, &opts) };
+        let paths = if self.in_recent() { self.recent_paths() } else { Vec::new() };
+        if paths.iter().any(|p| network::is_remote(p)) {
+            // A server in the list may not answer: its entries are asked about on a thread, and the window keeps the
+            // listing it has until they are in (`poll_reload`)
+            let (show_hidden, filter) = (self.show_hidden, self.type_filter);
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(Ok(recent_listing(paths, show_hidden, filter)));
+            });
+            self.pending_reload = Some((self.current_path.clone(), rx));
+            return;
+        }
+        let listing = if self.in_recent() { Ok(recent_listing(paths, self.show_hidden, self.type_filter)) } else { read_folder(&self.current_path, &opts) };
         self.show_listing(listing);
     }
 
@@ -1083,23 +1116,15 @@ impl CompressionApp {
         self.plugins.directory_changed(&here);
     }
 
-    /// The files and folders used lately, most recent first, or the bookmarked ones in the Bookmarks view.
-    fn recent_items(&self) -> Vec<FileItem> {
-        const LIMIT: usize = 150;
-        let paths = if self.in_bookmarks() { self.bookmarks.clone() } else { recent::load() };
-        paths
-            .into_iter()
-            .filter(|p| self.show_hidden || !p.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')))
-            .filter_map(|p| FileItem::from_path(&p).filter(|_| p.symlink_metadata().is_ok()))
-            .filter(|i| self.type_filter.accepts(i))
-            .take(LIMIT)
-            .collect()
+    /// The paths of the Recent view, or of the Bookmarks view.
+    fn recent_paths(&self) -> Vec<PathBuf> {
+        if self.in_bookmarks() { self.bookmarks.clone() } else { recent::load() }
     }
 
     /// Bring the listing up to date after files changed under it.
     fn refresh_listing(&mut self) {
         if self.is_mixed_listing() {
-            self.items.retain(|i| i.path.symlink_metadata().is_ok());
+            self.items.retain(|i| network::is_remote(&i.path) || i.path.symlink_metadata().is_ok());
             self.selected_index = None;
             self.sync_selection(true);
         } else {
@@ -1263,9 +1288,14 @@ impl CompressionApp {
         self.set_toast_action(trf("Pasted {}", &[&name]), ToastAction::Undo);
     }
 
+    /// `path` with its links resolved; a path on a server is left as it is (resolving would ask the server in the frame).
+    fn resolved(path: &Path) -> PathBuf {
+        if network::is_remote(path) { path.to_path_buf() } else { path.canonicalize().unwrap_or_else(|_| path.to_path_buf()) }
+    }
+
     fn paste(&mut self) {
         // Files copied in another application count too, and win when they are newer than ours
-        let external = crate::clipboard::get_files().filter(|(paths, _)| paths.iter().all(|p| p.exists()));
+        let external = crate::clipboard::get_files().filter(|(paths, _)| paths.iter().all(|p| network::is_remote(p) || p.exists()));
         let Some((paths, cut)) = external.or_else(|| self.clipboard.clone()) else {
             if self.can_modify_here() && let Some(png) = crate::clipboard::get_image_png() {
                 self.paste_image(&png);
@@ -1280,14 +1310,14 @@ impl CompressionApp {
         }
         let dest = self.current_path.clone();
         if cut {
-            let dest_canon = dest.canonicalize().unwrap_or_else(|_| dest.clone());
+            let dest_canon = Self::resolved(&dest);
             let same_folder = paths.iter().any(|p| {
                 p.parent()
-                    .map(|parent| parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf()) == dest_canon)
+                    .map(|parent| Self::resolved(parent) == dest_canon)
                     .unwrap_or(false)
             });
             if same_folder {
-                let any_dir = paths.iter().any(|p| p.is_dir());
+                let any_dir = paths.iter().any(|p| !network::is_remote(p) && p.is_dir());
                 let (title, body) = if paths.len() == 1 && any_dir {
                     (
                         tr("Can't move a folder over itself").to_owned(),
@@ -3179,6 +3209,15 @@ impl CompressionApp {
         }
     }
 
+    /// Whether a pinned path is a folder. A pin on a server is not looked at in the frame (the server may hang): it
+    /// counts as a folder until a thread has said otherwise, and one that is not connected is still a folder.
+    fn pin_is_folder(&self, pin: &Path, ctx: &egui::Context) -> bool {
+        if !network::is_remote(pin) {
+            return pin.is_dir();
+        }
+        network::is_disconnected(pin) || !matches!(self.net.known.get(pin, ctx), Some(network_ui::Kind::Other | network_ui::Kind::Missing))
+    }
+
     /// The folders leading to the current one, starting at Home, the trash or the root.
     fn crumbs(&self) -> Vec<Crumb> {
         let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
@@ -3251,7 +3290,7 @@ impl CompressionApp {
                     let mut rects = Vec::with_capacity(self.pins.len());
                     for (idx, pin) in self.pins.iter().enumerate() {
                         // A pinned folder on a server that is not connected is still a folder: opening it connects
-                        let is_dir = pin.is_dir() || network::is_remote(pin) && network::is_disconnected(pin);
+                        let is_dir = self.pin_is_folder(pin, ui.ctx());
                         let selected = browsing && is_dir && self.current_path == *pin;
                         let name = pin.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| pin.display().to_string());
                         let own = crate::fs::places::folder_glyph(pin).map(String::from);
@@ -4378,15 +4417,19 @@ impl CompressionApp {
             return Ok(());
         }
         let target = path.with_file_name(new_name);
-        if target.symlink_metadata().is_ok() {
-            return Err(trf("“{}” already exists", &[&new_name]));
+        if network::is_remote(path) {
+            // A server may take its time: the name is checked and the item renamed on a thread, and the window goes
+            // on with the result (`NetMsg::Renamed`)
+            self.rename_on_server(path.to_path_buf(), target, new_name.to_owned());
+            return Ok(());
         }
-        // A name taken since the check above must not be replaced
-        crate::compat::rename_noreplace(path, &target).map_err(|err| match err.kind() {
-            std::io::ErrorKind::AlreadyExists => trf("“{}” already exists", &[&new_name]),
-            _ => crate::fs::describe::io_error(&err),
-        })?;
+        crate::compat::rename_noreplace(path, &target).map_err(|err| rename_error(&err, new_name))?;
+        self.renamed(path, target, new_name);
+        Ok(())
+    }
 
+    /// An item was renamed: show it under its new name, selected, and record the way back.
+    fn renamed(&mut self, path: &Path, target: PathBuf, new_name: &str) {
         self.retarget_path(path, &target);
 
         if self.is_mixed_listing() {
@@ -4405,7 +4448,6 @@ impl CompressionApp {
         }
         self.history.record(UndoEntry::new(trf("Renaming of {}", &[&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()]), vec![Edit::Move { from: target.clone(), to: path.to_path_buf() }]));
         self.set_toast_action(trf("Renamed to “{}”", &[&new_name]), ToastAction::Undo);
-        Ok(())
     }
 
     /// Move to the trash, with an Undo in the toast.
@@ -6572,3 +6614,1564 @@ fn name_field(ui: &mut egui::Ui, theme: &SerpantinumTheme, text: &mut String, fi
     (changed, submitted)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn previews_are_prepared_for_the_screen_then_two_pages_below_then_one_above() {
+        assert_eq!(preview_order(0..0, 0).count(), 0);
+        assert_eq!(preview_order(0..3, 3).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(preview_order(5..7, 2).collect::<Vec<_>>(), [5, 6, 7, 8, 9, 10, 4, 3]);
+        let big: Vec<_> = preview_order(100..110, 10).collect();
+        assert_eq!(big.len(), 40);
+        assert_eq!(&big[..10], &(100..110).collect::<Vec<_>>()[..]);
+        assert_eq!((big[10], big[29], big[30], big[39]), (110, 129, 99, 90));
+        assert!(preview_order(usize::MAX - 1..usize::MAX, 5).count() > 0);
+    }
+
+    #[test]
+    fn a_type_nothing_opens_asks_which_app_to_use_and_a_failure_is_told() {
+        let work = std::env::temp_dir().join(format!("compression_app_openreport_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let file = work.join("thing.zzqq");
+        std::fs::write(&file, "x").unwrap();
+        let mut w = Window::new(work.clone());
+        w.app.open_tx.send(OpenReport::Failed("boom".into())).unwrap();
+        w.app.poll_opened();
+        assert!(w.app.status_toast.as_ref().is_some_and(|t| t.message.contains("boom")));
+        assert!(w.app.dialog.is_none());
+        w.app.open_tx.send(OpenReport::NoApp(file.clone())).unwrap();
+        w.app.poll_opened();
+        assert!(matches!(&w.app.dialog, Some(Dialog::OpenWith { path, .. }) if *path == file));
+        assert!(w.app.status_toast.as_ref().is_some_and(|t| t.message == tr("No app is set to open this file. Choose one.")));
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    /// "Always" measures the folders of the listing, the selection's status line adds them up, and
+    /// changing a folder from inside Compression makes its total (and its parents') stale.
+    #[test]
+    fn folder_sizes_are_measured_shown_and_invalidated() {
+        let work = std::env::temp_dir().join(format!("compression_app_sizes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("big")).unwrap();
+        std::fs::create_dir_all(work.join("empty")).unwrap();
+        std::fs::write(work.join("big/data.bin"), vec![0u8; 5000]).unwrap();
+        std::fs::write(work.join("note.txt"), "12345").unwrap();
+
+        let ctx = egui::Context::default();
+        let settings = Settings { folder_sizes: crate::settings::FolderSizeMode::Always, ..Settings::default() };
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), settings, &ctx);
+        let big = work.join("big");
+        for _ in 0..300 {
+            app.tick_folder_sizes(&ctx);
+            if crate::fs::dirsize::totals(&big).is_some() && crate::fs::dirsize::totals(&work.join("empty")).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let item = app.items.iter().find(|i| i.name == "big").unwrap().clone();
+        assert_eq!(item.formatted_size(), crate::fs::file_item::format_bytes(5000));
+
+        // The status line adds the folder to the files that are selected with it
+        app.selection = app.items.iter().enumerate().filter(|(_, i)| i.name == "big" || i.name == "note.txt").map(|(n, _)| n).collect();
+        let summary = app.selection_summary().unwrap();
+        assert!(summary.ends_with(&crate::fs::file_item::format_bytes(5005)), "{summary}");
+
+        // Something changed inside: the folder and its parent must be measured again
+        app.rename_entry(&big.join("data.bin"), "renamed.bin").unwrap();
+        assert!(crate::fs::dirsize::totals(&big).is_none());
+        assert!(crate::fs::dirsize::totals(&work).is_none());
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    /// "Calculate size" says it started, keeps measuring a folder that is not in the listing after
+    /// leaving for another folder, and tells the total in a toast.
+    #[test]
+    fn calculate_size_reports_in_a_toast() {
+        let work = std::env::temp_dir().join(format!("compression_app_calcsize_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("place/inner")).unwrap();
+        std::fs::create_dir_all(work.join("elsewhere")).unwrap();
+        std::fs::write(work.join("place/inner/data.bin"), vec![0u8; 3000]).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.join("elsewhere"), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let place = work.join("place");
+        app.calculate_sizes(std::slice::from_ref(&place));
+        let toast = |app: &CompressionApp| app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+        assert_eq!(toast(&app), "Calculating the size of “place”…");
+        app.sizes.cancel_all();
+        for _ in 0..300 {
+            app.tick_folder_sizes(&ctx);
+            if app.sizes.asked.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(toast(&app), format!("“place” takes {}", crate::fs::file_item::format_bytes(3000)));
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    /// Sorting by size orders folders by how many items they hold, not by their bytes.
+    #[test]
+    fn sorting_by_size_orders_folders_by_item_count() {
+        let work = std::env::temp_dir().join(format!("compression_app_sortsize_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        // The fewest items hold the most bytes, so a sort by bytes would come out the other way
+        for (name, files, bytes) in [("a-small", 1, 9000), ("b-big", 5, 1), ("c-mid", 3, 10)] {
+            for n in 0..files {
+                std::fs::create_dir_all(work.join(name)).unwrap();
+                std::fs::write(work.join(name).join(format!("{n}.bin")), vec![0u8; bytes]).unwrap();
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let settings = Settings { folder_sizes: crate::settings::FolderSizeMode::Always, ..Settings::default() };
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), settings, &ctx);
+        app.sort_by = SortBy::Size;
+        app.sort_order = SortOrder::Descending;
+        app.apply_sort();
+        let names = |app: &CompressionApp| app.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
+        for _ in 0..300 {
+            app.tick_folder_sizes(&ctx);
+            if names(&app) == ["b-big", "c-mid", "a-small"] {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(names(&app), ["b-big", "c-mid", "a-small"]);
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    /// Drives rename, trash, undo and permanent delete through the app, in a sandboxed data folder.
+    #[test]
+    fn rename_trash_restore_delete() {
+        let base = std::env::temp_dir().join(format!("compression_app_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let work = base.join("work");
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        std::fs::write(work.join("a.txt"), "a").unwrap();
+        std::fs::write(work.join("taken.txt"), "t").unwrap();
+        // The trash and the settings are those of the test run, which has its own home (see docs/releasing.md); the
+        // process environment is not touched here, other tests read it at the same time
+        assert!(
+            dirs::data_dir().is_some_and(|d| d.starts_with(std::env::temp_dir())),
+            "run the tests with an empty HOME and XDG folders, as CI does"
+        );
+
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let names = |app: &CompressionApp| app.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&app), ["sub", "a.txt", "taken.txt"]);
+
+        // Rename keeps the item selected, refuses clashes and bad names
+        let a = app.current_path.join("a.txt");
+        assert!(app.rename_entry(&a, "taken.txt").is_err());
+        assert!(app.rename_entry(&a, "x/y").is_err());
+        assert!(app.rename_entry(&a, "  ").is_err());
+        app.rename_entry(&a, "b.txt").unwrap();
+        assert_eq!(names(&app), ["sub", "b.txt", "taken.txt"]);
+        assert_eq!(app.selected_index.map(|i| app.items[i].name.as_str()), Some("b.txt"));
+        assert!(app.rename_entry(&app.current_path.join("b.txt"), "b.txt").is_ok(), "same name is a no-op");
+
+        let settle = |app: &mut CompressionApp| {
+            for _ in 0..200 {
+                app.poll_jobs();
+                if !app.engine.running() { break; }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            app.poll_jobs();
+            while app.poll_reload() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+
+        // Trash removes it from the listing, offers Undo, and Undo brings it back
+        let b = app.current_path.join("b.txt");
+        app.trash_paths(vec![b.clone()]);
+        assert_eq!(names(&app), ["sub", "taken.txt"]);
+        assert!(!b.exists());
+        assert!(matches!(app.status_toast.take(), Some(Toast { action: Some(ToastAction::Undo), .. })), "no undo offered");
+        app.undo();
+        settle(&mut app);
+        assert_eq!(names(&app), ["sub", "b.txt", "taken.txt"]);
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "a");
+
+        // Redo trashes it again; rename can be undone too
+        app.redo();
+        settle(&mut app);
+        assert_eq!(names(&app), ["sub", "taken.txt"]);
+        app.undo();
+        settle(&mut app);
+        app.rename_entry(&b, "c.txt").unwrap();
+        app.undo();
+        settle(&mut app);
+        assert_eq!(names(&app), ["sub", "b.txt", "taken.txt"]);
+
+        // Delete forever runs as a job; the trash record goes with the file
+        app.trash_paths(vec![b.clone()]);
+        // Where it went is read from the undo entry: the trash is shared with the other tests of the run, which put
+        // other things in it, so nothing here may assume it holds only this
+        let entry = app.history.pop_undo().expect("trashing is undoable");
+        let trashed = match entry.edits.as_slice() {
+            [Edit::Restore(path)] => path.clone(),
+            other => panic!("unexpected undo entry {other:?}"),
+        };
+        app.history.push_undo(entry);
+        let record = trashed.parent().and_then(Path::parent).unwrap().join("info").join(format!("{}.trashinfo", trashed.file_name().unwrap().to_string_lossy()));
+        assert!(trashed.exists() && record.exists());
+        app.delete_forever(vec![trashed.clone()]);
+        settle(&mut app);
+        assert!(!trashed.exists());
+        assert!(!record.exists(), "the trash record goes with the file");
+
+        // The Recent view is a place of its own, and going back returns to the folder
+        app.navigate_to(PathBuf::from(RECENT_PATH));
+        assert!(app.in_recent() && !app.can_modify_here());
+        app.go_back();
+        assert_eq!(app.current_path, work.canonicalize().unwrap());
+        assert!(app.can_modify_here());
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn typing_a_name_jumps_to_it_and_a_pause_starts_over() {
+        let base = std::env::temp_dir().join(format!("compression_typeahead_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for name in ["alpha.txt", "beta.txt", "bravo.txt", "Charlie.txt"] {
+            std::fs::write(base.join(name), "x").unwrap();
+        }
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let selected = |app: &CompressionApp| app.selected_index.map(|i| app.items[i].name.clone());
+
+        app.type_ahead("b");
+        assert_eq!(selected(&app).as_deref(), Some("beta.txt"));
+        app.type_ahead("r");
+        assert_eq!(selected(&app).as_deref(), Some("bravo.txt"));
+        app.type_ahead("x");
+        assert_eq!(selected(&app).as_deref(), Some("bravo.txt"), "no match keeps the selection");
+        app.type_ahead.1 -= TYPE_AHEAD_TIMEOUT;
+        assert!(!app.type_ahead_active());
+        app.type_ahead("C");
+        assert_eq!(selected(&app).as_deref(), Some("Charlie.txt"), "a pause starts a new word, case is ignored");
+        assert_eq!(app.selection.len(), 1);
+        app.type_ahead.1 -= TYPE_AHEAD_TIMEOUT;
+        app.type_ahead("b");
+        assert_eq!(selected(&app).as_deref(), Some("beta.txt"));
+        app.type_ahead("b");
+        assert_eq!(selected(&app).as_deref(), Some("bravo.txt"), "the same letter again steps to the next match");
+        app.type_ahead("b");
+        assert_eq!(selected(&app).as_deref(), Some("beta.txt"), "and wraps around");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn plugin_entries_follow_their_switch() {
+        let base = std::env::temp_dir().join(format!("compression_plugin_menu_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.txt"), "x").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        assert!(app.plugins.is_enabled("quick_look") && app.plugins.is_enabled("git"));
+        app.plugins.set_enabled("git", false);
+        assert!(!app.plugins.is_enabled("git"));
+        let item = app.items[0].clone();
+        // No action definitions in the test's config folder: the menu gains nothing
+        let count = |app: &CompressionApp| app.menu_entries(&MenuTarget::Item(item.clone())).len();
+        let before = count(&app);
+        app.plugins.set_enabled("actions", false);
+        assert_eq!(count(&app), before);
+        app.selected_index = Some(0);
+        app.open_quick_look();
+        assert!(matches!(app.dialog, Some(Dialog::QuickLook { .. })));
+        app.dialog = None;
+        std::fs::create_dir(base.join("0dir")).unwrap();
+        app.reload_items();
+        app.selected_index = app.items.iter().position(|i| i.is_dir);
+        assert!(app.selected_index.is_some());
+        app.open_quick_look();
+        assert!(app.dialog.is_none(), "folders are not previewed");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn tabs_keep_their_own_folder_history_and_selection() {
+        let base = std::env::temp_dir().join(format!("compression_tabs_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (one, two) = (base.join("one"), base.join("two"));
+        std::fs::create_dir_all(one.join("inner")).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        std::fs::write(one.join("a.txt"), "a").unwrap();
+        std::fs::write(one.join("b.txt"), "b").unwrap();
+        std::fs::write(two.join("c.txt"), "c").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(one.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.selection = BTreeSet::from([1, 2]);
+        app.selected_index = Some(1);
+        app.last_cursor = Some(1);
+
+        app.new_tab(two.clone());
+        assert_eq!((app.tabs.len(), app.active_tab), (2, 1));
+        assert_eq!(app.current_path, two.canonicalize().unwrap());
+        assert_eq!(app.items.len(), 1);
+        assert!(app.selection.is_empty() && app.back_history.is_empty());
+
+        app.switch_tab(0);
+        assert_eq!(app.current_path, one.canonicalize().unwrap());
+        assert_eq!(app.selected_paths().len(), 2, "selection survives a round trip");
+
+        app.navigate_known(one.join("inner"));
+        assert_eq!(app.back_history.len(), 1);
+        app.switch_tab(1);
+        assert!(app.back_history.is_empty(), "history belongs to the tab");
+        app.switch_tab(0);
+        assert_eq!(app.back_history.len(), 1);
+
+        app.close_tab(&ctx, 0);
+        assert_eq!((app.tabs.len(), app.active_tab), (1, 0));
+        assert_eq!(app.current_path, two.canonicalize().unwrap());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn tabs_are_saved_restored_and_reopened() {
+        let base = std::env::temp_dir().join(format!("compression_session_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (a, b, c) = (base.join("a"), base.join("b"), base.join("c"));
+        for d in [&a, &b, &c] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(a.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.new_tab(b.clone());
+        app.new_tab(c.clone());
+        app.switch_tab(1);
+        let (paths, active) = app.session();
+        let canon = |p: &PathBuf| p.canonicalize().unwrap();
+        assert_eq!(paths, vec![canon(&a), canon(&b), canon(&c)]);
+        assert_eq!(active, 1);
+
+        // A new run: one folder is gone, the active tab moves with the others
+        std::fs::remove_dir_all(&a).unwrap();
+        let settings = Settings { session_tabs: paths, session_active: active, ..Settings::default() };
+        let (kept, shown) = settings.restorable_session();
+        assert_eq!(kept, vec![canon(&b), canon(&c)]);
+        assert_eq!(shown, 0);
+        let mut again = CompressionApp::new(kept[0].clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        again.restore_tabs(&kept, shown);
+        assert_eq!((again.tabs.len(), again.active_tab), (2, 0));
+        assert_eq!(again.session().0, kept);
+
+        // Closing a tab can be undone, once per tab, and a folder that vanished is skipped
+        again.close_tab(&ctx, 1);
+        assert_eq!(again.tabs.len(), 1);
+        again.reopen_tab();
+        assert_eq!((again.tabs.len(), again.current_path.clone()), (2, canon(&c)));
+        // (A tab is reopened without asking the file system; one whose folder has vanished is moved on afterwards,
+        // see `reopening_a_closed_tab_does_not_ask_about_its_folder_and_a_vanished_one_is_moved_after`.)
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_settings_file_written_elsewhere_is_taken_up_once_and_keeps_this_windows_tabs() {
+        let base = std::env::temp_dir().join(format!("compression_settings_file_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        // As after a save: the settings and what the file holds agree
+        app.settings.session_tabs = vec![base.clone()];
+        app.saved_settings = app.settings.clone();
+        let before = app.saved_settings.clone();
+
+        // What the file already says changes nothing
+        assert!(!app.apply_settings_file(before.clone()));
+        // Another window's tabs alone are not a change either, or the two would save each other's for good
+        let other_tabs = Settings { session_tabs: vec![PathBuf::from("/tmp")], session_active: 3, ..before.clone() };
+        assert!(!app.apply_settings_file(other_tabs));
+        assert_eq!(app.settings.session_tabs, vec![base.clone()]);
+
+        // An edit by hand takes effect, and applying the same file again does not
+        let hidden = !before.show_hidden;
+        let edited = Settings { show_hidden: hidden, sort_order: SortOrder::Descending, ..before.clone() };
+        assert!(app.apply_settings_file(edited.clone()));
+        assert_eq!((app.show_hidden, app.sort_order), (hidden, SortOrder::Descending));
+        assert_eq!(app.settings.session_tabs, vec![base.clone()]);
+        assert!(!app.apply_settings_file(edited));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn another_window_moving_on_is_taken_up_without_a_message() {
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(std::env::temp_dir(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.status_toast = None;
+        // Another window went to another folder and widened a column: its file differs, and nothing is announced
+        let moved = Settings { last_dir: Some(PathBuf::from("/tmp")), column_widths: [90.0; 6], ..app.saved_settings.clone() };
+        assert!(app.apply_settings_file(moved));
+        assert_eq!(app.settings.last_dir, Some(PathBuf::from("/tmp")));
+        assert!(app.status_toast.is_none(), "a message for a window moving on");
+        // A real change is announced
+        let chosen = Settings { show_hidden: !app.settings.show_hidden, ..app.saved_settings.clone() };
+        assert!(app.apply_settings_file(chosen));
+        assert!(app.status_toast.is_some());
+    }
+
+    /// Connect to server is off until turned on; hiding other places does not touch it.
+    #[test]
+    fn connect_to_server_is_opt_in() {
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(std::env::temp_dir(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        assert!(!app.place_shown(SidebarPlace::ConnectToServer));
+        assert!(app.place_shown(SidebarPlace::Home));
+        app.settings.hidden_places.push(SidebarPlace::ConnectToServer);
+        app.settings.hidden_places.push(SidebarPlace::Home);
+        assert!(!app.place_shown(SidebarPlace::ConnectToServer) && !app.place_shown(SidebarPlace::Home));
+        app.settings.shown_places.push(SidebarPlace::ConnectToServer);
+        assert!(app.place_shown(SidebarPlace::ConnectToServer));
+    }
+
+    #[test]
+    fn a_reopened_tab_keeps_its_place_history_and_selection() {
+        let base = std::env::temp_dir().join(format!("compression_reopen_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (a, b, c) = (base.join("a"), base.join("b"), base.join("c"));
+        std::fs::create_dir_all(b.join("inner")).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::write(b.join("x.txt"), "x").unwrap();
+        std::fs::write(b.join("y.txt"), "y").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(a.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.new_tab(b.clone());
+        app.new_tab(c.clone());
+        app.switch_tab(1);
+        app.navigate_known(b.join("inner"));
+        app.navigate_known(b.clone());
+        let selected = app.items.iter().position(|i| i.path.ends_with("y.txt")).unwrap();
+        app.selection = BTreeSet::from([selected]);
+        app.selected_index = Some(selected);
+        let history = app.back_history.len();
+        assert!(history > 0);
+
+        app.close_tab(&ctx, 1);
+        assert_eq!(app.tabs.len(), 2);
+        app.reopen_tab();
+        assert_eq!((app.tabs.len(), app.active_tab), (3, 1), "back in its slot, not after the active tab");
+        assert_eq!(app.current_path, b.canonicalize().unwrap());
+        assert_eq!(app.back_history.len(), history);
+        assert!(app.selected_paths().iter().any(|p| p.ends_with("y.txt")));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn rubberband_drag_selects_from_any_point() {
+        let base = std::env::temp_dir().join(format!("compression_drag_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        for name in ["alpha.txt", "beta.txt", "gamma.txt", "delta.txt"] {
+            std::fs::write(base.join(name), name).unwrap();
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.view_mode = ViewMode::Grid;
+
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let item_rects = vec![
+            (0, egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(100.0, 100.0))),
+            (1, egui::Rect::from_min_size(egui::pos2(140.0, 20.0), egui::vec2(100.0, 100.0))),
+            (2, egui::Rect::from_min_size(egui::pos2(260.0, 20.0), egui::vec2(100.0, 100.0))),
+            (3, egui::Rect::from_min_size(egui::pos2(380.0, 20.0), egui::vec2(100.0, 100.0))),
+        ];
+
+        // Start dragging in the gap above item 0 (a press on an item itself picks the item up
+        // instead, see app/dnd.rs) and drag across to item 2
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::PointerMoved(egui::pos2(10.0, 10.0)));
+        raw.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(10.0, 10.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut out = ctx.run_ui(raw, |ui| {
+            assert!(!app.handle_drag_select(ui, viewport, 0.0, 0.0, &item_rects));
+        });
+        out.textures_delta.clear();
+
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::PointerMoved(egui::pos2(300.0, 90.0)));
+        let mut out = ctx.run_ui(raw, |ui| {
+            assert!(app.handle_drag_select(ui, viewport, 0.0, 0.0, &item_rects));
+        });
+        out.textures_delta.clear();
+        assert_eq!(app.selection, BTreeSet::from([0, 1, 2]));
+        assert_eq!(app.selected_index, Some(2));
+
+        // Release ends the drag while keeping the selection and suppressing click-select
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(300.0, 90.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut out = ctx.run_ui(raw, |ui| {
+            assert!(app.handle_drag_select(ui, viewport, 0.0, 0.0, &item_rects));
+        });
+        out.textures_delta.clear();
+        assert!(app.drag_select.is_none());
+        assert_eq!(app.selection, BTreeSet::from([0, 1, 2]));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+    #[test]
+    fn type_to_filter_takes_the_first_letter_even_when_it_is_a_vim_key() {
+        use eframe::App;
+        let base = std::env::temp_dir().join(format!("compression_ttf_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("jam.txt"), "x").unwrap();
+        let ctx = egui::Context::default();
+        let settings = Settings { type_to_filter: true, vim_keys: true, ..Default::default() };
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), settings, &ctx);
+        let frame = |app: &mut CompressionApp, key: Option<&str>| {
+            let mut raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 600.0))), ..Default::default() };
+            if let Some(k) = key {
+                raw.events.push(egui::Event::Key {
+                    key: egui::Key::J,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                raw.events.push(egui::Event::Text(k.to_owned()));
+            }
+            let mut out = ctx.run_ui(raw, |ui| {
+                // SAFETY: the frame is never read by `ui`
+                let mut f = unsafe { std::mem::zeroed::<eframe::Frame>() };
+                app.ui(ui, &mut f);
+                std::mem::forget(f);
+            });
+            out.textures_delta.clear();
+        };
+        frame(&mut app, None);
+        frame(&mut app, Some("j"));
+        assert_eq!(app.search_query, "j");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Files changed by another program show up without a refresh: new ones appear, edits update the
+    /// size, deletions go, and the selection stays on the same file.
+    #[test]
+    fn changes_made_outside_reach_the_listing() {
+        let work = std::env::temp_dir().join(format!("compression_app_watch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("a.txt"), "1").unwrap();
+        std::fs::write(work.join("c.txt"), "1").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.selected_index = app.items.iter().position(|i| i.name == "c.txt");
+        app.sync_selection(true);
+        let names = |app: &CompressionApp| app.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
+        let settle = |app: &mut CompressionApp, done: &dyn Fn(&CompressionApp) -> bool| {
+            for _ in 0..200 {
+                app.poll_watch(&ctx);
+                app.poll_reload();
+                if done(app) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+
+        std::fs::write(work.join("b.txt"), "22").unwrap();
+        assert!(settle(&mut app, &|a| names(a).contains(&"b.txt".to_owned())), "{:?}", names(&app));
+        assert_eq!(app.selected_index.map(|i| app.items[i].name.as_str()), Some("c.txt"), "the selection follows its file");
+
+        std::fs::write(work.join("b.txt"), "333333").unwrap();
+        assert!(settle(&mut app, &|a| a.items.iter().any(|i| i.name == "b.txt" && i.size == 6)));
+
+        std::fs::remove_file(work.join("a.txt")).unwrap();
+        assert!(settle(&mut app, &|a| !names(a).contains(&"a.txt".to_owned())));
+        assert_eq!(app.selected_index.map(|i| app.items[i].name.as_str()), Some("c.txt"));
+
+        // The open folder going away takes the window to the nearest one that is left
+        let inner = work.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        app.navigate_to(inner.clone());
+        std::fs::remove_dir_all(&inner).unwrap();
+        assert!(settle(&mut app, &|a| a.current_path == work.canonicalize().unwrap()));
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    /// A parked tab keeps following its folder, so switching back shows the current files at once,
+    /// with the selection where it was; a search follows the files it found.
+    #[test]
+    fn parked_tabs_and_search_results_follow_the_disk() {
+        let base = std::env::temp_dir().join(format!("compression_app_tabwatch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        for n in ["one.txt", "two.txt", "three.txt"] {
+            std::fs::write(a.join(n), "x").unwrap();
+        }
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(a.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.new_tab(b.clone());
+        app.switch_tab(0);
+        app.selection = app.items.iter().enumerate().filter(|(_, i)| i.name != "one.txt").map(|(n, _)| n).collect();
+        app.selected_index = app.selection.iter().next().copied();
+        app.switch_tab(1);
+        let pump = |app: &mut CompressionApp, done: &dyn Fn(&CompressionApp) -> bool| {
+            for _ in 0..200 {
+                app.poll_watch(&ctx);
+                app.poll_reload();
+                if done(app) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+
+        // Changed while tab 0 is parked: its listing is patched without anyone looking at it
+        std::fs::write(a.join("zed.txt"), "x").unwrap();
+        std::fs::remove_file(a.join("one.txt")).unwrap();
+        let parked = |app: &CompressionApp| app.tabs[0].saved.as_ref().and_then(|s| s.items.as_ref()).map(|v| v.iter().map(|i| i.name.clone()).collect::<Vec<_>>());
+        assert!(pump(&mut app, &|a| parked(a).is_some_and(|n| n.contains(&"zed.txt".to_owned()) && !n.contains(&"one.txt".to_owned()))), "{:?}", parked(&app));
+        app.switch_tab(0);
+        assert!(!app.loading && app.pending_reload.is_none(), "switching back reads nothing");
+        let names: Vec<_> = app.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["three.txt", "two.txt", "zed.txt"]);
+        let selected: Vec<_> = app.selection.iter().map(|&i| app.items[i].name.as_str()).collect();
+        assert_eq!(selected, ["three.txt", "two.txt"], "the selection is where it was");
+
+        // Search results: a file that goes disappears, one that changes is read again, and new files do not join
+        app.search_query = "txt".to_owned();
+        app.items = ["three.txt", "two.txt"].iter().map(|n| FileItem::from_path(&a.join(n)).unwrap()).collect();
+        app.resync_watch();
+        std::fs::remove_file(a.join("two.txt")).unwrap();
+        std::fs::write(a.join("three.txt"), "longer").unwrap();
+        std::fs::write(a.join("extra.txt"), "x").unwrap();
+        assert!(pump(&mut app, &|x| x.items.len() == 1 && x.items[0].size == 6));
+        assert_eq!(app.items[0].name, "three.txt");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    // --- Whole-window tests: the real `ui` runs headless with synthetic input, so what is checked is
+    // what the window would draw and do, though not how it looks.
+
+    struct Window {
+        app: CompressionApp,
+        ctx: egui::Context,
+        frame: eframe::Frame,
+        time: f64,
+        last: Vec<String>,
+        shapes: Vec<(String, egui::Rect)>,
+        /// Circles drawn last frame: where, how big, filled with what, and the stroke color if outlined.
+        circles: Vec<(egui::Pos2, f32, egui::Color32, egui::Color32)>,
+    }
+
+    impl Window {
+        fn new(folder: PathBuf) -> Self {
+            let ctx = egui::Context::default();
+            crate::settings::NO_SAVE.with(|no_save| no_save.set(true));
+            let mut app = CompressionApp::new(folder, SerpantinumTheme::default(), Settings::default(), &ctx);
+            // The settings file is shared by the whole test run; a window that watched it would take over what another
+            // test writes there (its search scope, its sort order) in the middle of its own steps
+            app.settings_watch = None;
+            let mut window = Self { app, ctx, frame: eframe::Frame::_new_kittest(), time: 0.0, last: Vec::new(), shapes: Vec::new(), circles: Vec::new() };
+            window.run(Vec::new(), 12);
+            window
+        }
+
+        fn run(&mut self, events: Vec<egui::Event>, frames: usize) {
+            for n in 0..frames {
+                self.time += 0.05;
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 700.0))),
+                    time: Some(self.time),
+                    events: if n == 0 { events.clone() } else { Vec::new() },
+                    ..Default::default()
+                };
+                let (app, frame) = (&mut self.app, &mut self.frame);
+                let mut out = self.ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, frame));
+                out.textures_delta.clear();
+                self.shapes.clear();
+                self.circles.clear();
+                for clipped in &out.shapes {
+                    collect_text(&clipped.shape, &mut self.shapes);
+                    collect_circles(&clipped.shape, &mut self.circles);
+                }
+                self.last = self.shapes.iter().map(|(t, _)| t.clone()).collect();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        fn click(&mut self, pos: egui::Pos2, button: egui::PointerButton) {
+            let m = egui::Modifiers::NONE;
+            self.run(vec![egui::Event::PointerMoved(pos)], 3);
+            self.run(vec![egui::Event::PointerButton { pos, button, pressed: true, modifiers: m }], 2);
+            self.run(vec![egui::Event::PointerButton { pos, button, pressed: false, modifiers: m }], 8);
+        }
+
+        fn key(&mut self, key: egui::Key) {
+            let m = egui::Modifiers::NONE;
+            self.run(vec![egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers: m }], 1);
+            self.run(vec![egui::Event::Key { key, physical_key: Some(key), pressed: false, repeat: false, modifiers: m }], 10);
+        }
+
+        fn shows(&self, text: &str) -> bool {
+            self.last.iter().any(|t| t == text)
+        }
+
+        /// Where the text `text` is drawn.
+        fn at(&self, text: &str) -> egui::Pos2 {
+            self.shapes.iter().find(|(t, _)| t == text).unwrap_or_else(|| panic!("{text:?} is not on screen: {:?}", self.last)).1.center()
+        }
+
+        fn until(&mut self, what: &str, mut done: impl FnMut(&mut Self) -> bool) {
+            for _ in 0..300 {
+                self.run(Vec::new(), 1);
+                if done(self) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("{what}: not reached");
+        }
+    }
+
+    fn collect_circles(shape: &egui::Shape, out: &mut Vec<(egui::Pos2, f32, egui::Color32, egui::Color32)>) {
+        match shape {
+            egui::Shape::Circle(c) => out.push((c.center, c.radius, c.fill, c.stroke.color)),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_circles(s, out)),
+            _ => {}
+        }
+    }
+
+    fn collect_text(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let rect = text.galley.rect.translate(text.pos.to_vec2());
+                out.push((text.galley.text().to_owned(), rect));
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_text(s, out)),
+            _ => {}
+        }
+    }
+
+    fn window_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression_window_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn a_right_click_on_a_tab_opens_the_menu_and_its_entries_work() {
+        let root = window_dir("tabmenu");
+        let folders: Vec<PathBuf> = (0..3).map(|i| {
+            std::fs::create_dir_all(root.join(format!("t{i}"))).unwrap();
+            root.join(format!("t{i}"))
+        }).collect();
+        let mut w = Window::new(folders[0].clone());
+        for f in &folders[1..] {
+            w.app.new_tab(f.clone());
+        }
+        w.run(Vec::new(), 20);
+        assert_eq!(w.app.tabs.len(), 3);
+        assert!(w.shows("t0") && w.shows("t1") && w.shows("t2"), "{:?}", w.last);
+
+        // Right-click the first tab (its title is drawn in the tab bar)
+        let first = w.app.tabs[0].id;
+        w.click(w.at("t0"), egui::PointerButton::Secondary);
+        assert!(matches!(w.app.menu.as_ref().map(|m| &m.target), Some(MenuTarget::Tab(id)) if *id == first), "the menu did not open");
+        for entry in ["Duplicate tab", "Close other tabs", "Close tabs to the right", "Close tab"] {
+            assert!(w.shows(entry), "{entry:?} missing: {:?}", w.last);
+        }
+
+        // "Duplicate tab": a fourth tab right of the first, on the same folder, shown
+        w.click(w.at("Duplicate tab"), egui::PointerButton::Primary);
+        assert!(w.app.menu.is_none(), "the menu stays open");
+        assert_eq!(w.app.tabs.len(), 4);
+        assert_eq!(w.app.active_tab, 1);
+        assert_eq!(w.app.session().0, vec![folders[0].clone(), folders[0].clone(), folders[1].clone(), folders[2].clone()]);
+
+        // The last tab has nothing to its right: that entry is not offered
+        let last = w.at("t2");
+        w.click(last, egui::PointerButton::Secondary);
+        assert!(w.shows("Close other tabs") && !w.shows("Close tabs to the right"), "{:?}", w.last);
+        w.key(egui::Key::Escape);
+        assert!(w.app.menu.is_none());
+
+        // "Close tabs to the right" on the second tab leaves two. The tab titles share one row: the one
+        // of the last tab gives it, and the second "t0" on that row is the duplicate
+        let ids: Vec<u64> = w.app.tabs.iter().map(|t| t.id).collect();
+        let row = w.at("t2").y;
+        let mut titles: Vec<egui::Pos2> = w.shapes.iter().filter(|(t, r)| t == "t0" && (r.center().y - row).abs() < 3.0).map(|(_, r)| r.center()).collect();
+        titles.sort_by(|a, b| a.x.total_cmp(&b.x));
+        assert_eq!(titles.len(), 2, "{:?}", w.shapes);
+        w.click(titles[1], egui::PointerButton::Secondary);
+        assert!(matches!(w.app.menu.as_ref().map(|m| &m.target), Some(MenuTarget::Tab(id)) if *id == ids[1]));
+        w.click(w.at("Close tabs to the right"), egui::PointerButton::Primary);
+        assert_eq!(w.app.tabs.iter().map(|t| t.id).collect::<Vec<_>>(), ids[..2].to_vec());
+        assert_eq!(w.app.active_tab, 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The real thing, with the real `statvfs`: a sparse file whose size is a little above the room left
+    /// on /dev/shm is copied there by a paste. Nothing is ever written: the answer is "Cancel".
+    #[test]
+    fn a_real_copy_that_cannot_fit_asks_with_the_real_free_space() {
+        let shm = PathBuf::from("/dev/shm").join(format!("compression_window_real_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&shm);
+        if std::fs::create_dir_all(&shm).is_err() {
+            return;
+        }
+        let Some(free) = crate::fs::engine::free_space(&shm) else {
+            let _ = std::fs::remove_dir_all(&shm);
+            return;
+        };
+        let root = window_dir("real");
+        let source = root.join("huge.bin");
+        // Sparse: it takes no room here, but the copy would need far more than there is there. Other tests put
+        // files in /dev/shm and take them away while this one runs, so the margin is not a few bytes
+        let size = free.saturating_mul(2).saturating_add(1 << 30);
+        let made = std::fs::File::create(&source).and_then(|f| f.set_len(size));
+        if made.is_err() {
+            let _ = std::fs::remove_dir_all(&shm);
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        let mut w = Window::new(shm.clone());
+        w.app.transfer(TransferOp::Copy, vec![source.clone()], shm.clone());
+        w.until("the question", |w| matches!(w.app.dialog, Some(Dialog::LowSpace { .. })) && w.shows("Not enough free space"));
+        let figures = |b: u64| crate::fs::file_item::format_bytes(b);
+        let shown = w.last.iter().find(|t| t.starts_with("Needed: ")).cloned().unwrap_or_default();
+        assert!(shown.starts_with(&format!("Needed: {} · Available: ", figures(size))), "{shown:?}");
+        w.click(w.at("Cancel"), egui::PointerButton::Primary);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert_eq!(std::fs::read_dir(&shm).unwrap().count(), 0, "nothing was written");
+        assert!(source.exists());
+        let _ = std::fs::remove_dir_all(&shm);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Opens the window on `root`, starts a job that finds 10 bytes free where 100 are needed, and
+    /// returns once the window shows the question.
+    fn window_with_the_space_question(name: &str) -> (Window, PathBuf, Arc<AtomicBool>) {
+        let root = window_dir(name);
+        let mut w = Window::new(root.clone());
+        let finished = Arc::new(AtomicBool::new(false));
+        let ok = Arc::new(AtomicBool::new(false));
+        let (flag, result) = (finished.clone(), ok.clone());
+        let dest = root.clone();
+        w.app.engine.spawn(JobKind::Copy, "Copying".into(), String::new(), move |worker| {
+            let outcome = match worker.ensure_space(&dest, 100, |_| Some(10)) {
+                Ok(()) => {
+                    result.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Outcome::done("done".into())
+                }
+                Err(_) => Outcome::stopped(),
+            };
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            outcome
+        });
+        w.until("the question", |w| matches!(w.app.dialog, Some(Dialog::LowSpace { .. })) && w.shows("Not enough free space"));
+        (w, root, ok)
+    }
+
+    #[test]
+    fn the_free_room_is_asked_for_a_new_folder_and_again_only_when_old() {
+        use std::time::{Duration, Instant};
+        let (a, b) = (PathBuf::from("/a"), PathBuf::from("/b"));
+        let now = Instant::now();
+        assert!(free_space_due(None, &a, now));
+        assert!(!free_space_due(Some(&(a.clone(), now)), &a, now));
+        assert!(!free_space_due(Some(&(a.clone(), now)), &a, now + FREE_SPACE_EVERY - Duration::from_secs(1)));
+        assert!(free_space_due(Some(&(a.clone(), now)), &a, now + FREE_SPACE_EVERY));
+        // Another folder is asked at once, however fresh the last answer
+        assert!(free_space_due(Some(&(a, now)), &b, now));
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_free_room_until_something_is_selected() {
+        let work = std::env::temp_dir().join(format!("compression_app_freeroom_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("one.txt"), "x").unwrap();
+        let mut w = Window::new(work.clone());
+        let real = crate::fs::engine::free_space(&work).expect("a temp folder has a size");
+        w.until("the free room to arrive", |w| w.app.free_space.is_some());
+        w.run(Vec::new(), 12);
+        // Made up, so the text does not depend on the disk changing between two questions
+        w.app.free_space = Some((work.clone(), 123_456_789));
+        w.app.free_space_asked = Some((work.clone(), std::time::Instant::now()));
+        w.run(Vec::new(), 12);
+        let text = trf("{} free", &[&crate::fs::file_item::format_bytes(123_456_789)]);
+        assert!(w.shows(&text), "{text:?} not in {:?} (real {real})", w.last);
+        // A selection takes the place of it
+        w.app.selection = std::collections::BTreeSet::from([0]);
+        w.app.selected_index = Some(0);
+        w.run(Vec::new(), 30);
+        assert!(!w.shows(&text) && w.last.iter().any(|t| t.contains("selected")), "{:?}", w.last);
+        // Switched off with the status bar
+        w.app.selection.clear();
+        w.app.settings.show_status_bar = false;
+        w.run(Vec::new(), 30);
+        assert!(!w.shows(&text), "{:?}", w.last);
+        // The number of another folder is not shown for this one
+        w.app.settings.show_status_bar = true;
+        w.app.free_space = Some((work.join("elsewhere"), 5));
+        assert_eq!(w.app.free_space_text(), None);
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn a_late_answer_for_another_folder_is_dropped_and_a_hidden_bar_asks_nothing() {
+        let work = std::env::temp_dir().join(format!("compression_app_freeroom_late_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let mut w = Window::new(work.clone());
+        w.until("the free room to arrive", |w| w.app.free_space.is_some());
+        let mine = w.app.free_space.clone();
+        w.app.free_space_tx.send((PathBuf::from("/somewhere/else"), Some(1))).unwrap();
+        w.app.poll_free_space();
+        assert_eq!(w.app.free_space, mine);
+        // With the status bar off nothing is asked
+        w.app.settings.show_status_bar = false;
+        w.app.free_space_asked = None;
+        w.app.poll_free_space();
+        assert!(w.app.free_space_asked.is_none());
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn connected_servers_are_probed_and_a_folder_that_does_not_answer_is_broken() {
+        use crate::fs::mount_health::Health;
+        use crate::fs::network::{Address, Mount, MountKind};
+        let work = std::env::temp_dir().join(format!("compression_app_probe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("up")).unwrap();
+        let mut w = Window::new(work.clone());
+        let mount = |name: &str, with_address: bool| Mount {
+            name: name.into(),
+            address: with_address.then(|| Address::parse("sftp://me@example.org/").unwrap()),
+            local: work.join(name),
+            kind: MountKind::Helper,
+        };
+        let (up, down, phone) = (mount("up", true), mount("down", true), mount("phone", false));
+        w.app.net.mounts = vec![up.clone(), down.clone(), phone.clone()];
+        let ctx = w.ctx.clone();
+        w.app.poll_network(&ctx);
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            w.app.poll_network(&ctx);
+            if w.app.mount_health(&down) == Health::Broken {
+                break;
+            }
+        }
+        assert_eq!(w.app.mount_health(&down), Health::Broken);
+        assert_eq!(w.app.mount_health(&up), Health::Connected);
+        // A phone has no address and is not asked: its folder is missing too, yet it is not marked
+        assert_eq!(w.app.mount_health(&phone), Health::Connected);
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn the_dot_in_front_of_a_server_follows_its_mount_and_its_health() {
+        use crate::fs::mount_health::Health;
+        use super::network_ui::LinkState as L;
+        // Not mounted: a saved server that is just not connected, whatever the health says
+        for h in [Health::Connected, Health::Slow, Health::Broken] {
+            assert_eq!(L::of(false, true, h), Some(L::Offline));
+        }
+        assert_eq!(L::of(true, true, Health::Connected), Some(L::Connected));
+        assert_eq!(L::of(true, true, Health::Slow), Some(L::Slow));
+        assert_eq!(L::of(true, true, Health::Broken), Some(L::Broken));
+        // A phone or camera is no server
+        assert_eq!(L::of(true, false, Health::Broken), None);
+        let theme = SerpantinumTheme::default();
+        assert_eq!(L::Connected.look(&theme), (theme.green, true));
+        assert_eq!(L::Slow.look(&theme), (theme.yellow, true));
+        assert_eq!(L::Broken.look(&theme), (theme.red, true));
+        assert_eq!(L::Offline.look(&theme), (theme.subtext0, false));
+        let words: Vec<_> = [L::Connected, L::Slow, L::Broken, L::Offline].map(|s| s.words()).to_vec();
+        assert_eq!(words, [tr("Connected"), tr("Answering slowly"), tr("Not answering"), tr("Not connected")]);
+        let mut unique = words.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 4);
+    }
+
+    #[test]
+    fn the_network_rows_carry_the_state_of_each_server() {
+        use crate::fs::network::{Address, Mount, MountKind, Server};
+        use super::network_ui::LinkState as L;
+        let work = std::env::temp_dir().join(format!("compression_app_rows_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("up")).unwrap();
+        let mut w = Window::new(work.clone());
+        let address = |host: &str| Address::parse(&format!("sftp://me@{host}/")).unwrap();
+        let mount = |name: &str, host: Option<&str>| Mount { name: name.into(), address: host.map(address), local: work.join(name), kind: MountKind::Helper };
+        w.app.net.servers.saved = vec![
+            Server { name: "off".into(), address: address("off.example") },
+            Server { name: "up".into(), address: address("up.example") },
+            Server { name: "down".into(), address: address("down.example") },
+        ];
+        w.app.net.mounts = vec![mount("up", Some("up.example")), mount("down", Some("down.example")), mount("phone", None), mount("stray", Some("stray.example"))];
+        let ctx = w.ctx.clone();
+        for _ in 0..200 {
+            w.app.poll_network(&ctx);
+            if w.app.network_rows().iter().any(|r| r.state == Some(L::Broken)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let states: Vec<_> = w.app.network_rows().iter().map(|r| (r.name.clone(), r.state)).collect();
+        let of = |name: &str| states.iter().find(|(n, _)| n.contains(name)).map(|(_, s)| *s);
+        assert_eq!(of("off"), Some(Some(L::Offline)), "{states:?}");
+        assert_eq!(of("up"), Some(Some(L::Connected)), "{states:?}");
+        assert_eq!(of("down"), Some(Some(L::Broken)), "{states:?}");
+        assert_eq!(of("phone"), Some(None), "{states:?}");
+        // A connected server that is not in the sidebar's list has a state as well (its folder is missing here)
+        assert_eq!(of("stray"), Some(Some(L::Broken)), "{states:?}");
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn each_server_row_draws_its_dot_in_the_color_of_its_state() {
+        use crate::fs::network::{Address, Mount, MountKind, Server};
+        let work = std::env::temp_dir().join(format!("compression_app_dots_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("up")).unwrap();
+        let mut w = Window::new(work.clone());
+        let theme = w.app.theme;
+        let address = |host: &str| Address::parse(&format!("sftp://me@{host}/")).unwrap();
+        let mount = |name: &str, host: &str| Mount { name: name.into(), address: Some(address(host)), local: work.join(name), kind: MountKind::Helper };
+        w.app.net.servers.saved = vec![Server { name: "off".into(), address: address("off.example") }];
+        w.app.net.mounts = vec![mount("up", "up.example"), mount("down", "down.example")];
+        let ctx = w.ctx.clone();
+        for _ in 0..200 {
+            w.run(Vec::new(), 1);
+            w.app.poll_network(&ctx);
+            if w.app.network_rows().iter().any(|r| r.state == Some(super::network_ui::LinkState::Broken)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        w.run(Vec::new(), 12);
+        // The dot of each row sits at the lower right of its icon, in the row of its name
+        let dot_of = |name: &str| {
+            let row = w.shapes.iter().find(|(t, _)| t == name).unwrap_or_else(|| panic!("{name} not drawn: {:?}", w.last)).1;
+            w.circles.iter().filter(|(c, r, _, _)| (c.y - row.center().y - 8.0).abs() < 1.0 && *r < 6.0 && c.x < row.left()).copied().collect::<Vec<_>>()
+        };
+        let green = dot_of("up").iter().any(|(_, r, fill, _)| *r == 3.5 && *fill == theme.green);
+        let red = dot_of("down").iter().any(|(_, r, fill, _)| *r == 3.5 && *fill == theme.red);
+        // Not connected: a ring, not a filled dot
+        let ring = dot_of("off").iter().any(|(_, r, fill, stroke)| *r == 3.0 && *fill == egui::Color32::TRANSPARENT && *stroke == theme.subtext0);
+        assert!(green && red && ring, "green {green}, red {red}, ring {ring}: {:?}", w.circles);
+        // Resting the pointer on a row says the state in words
+        for (name, words) in [("up", "Connected"), ("down", "Not answering"), ("off", "Not connected")] {
+            let at = w.at(name);
+            w.run(vec![egui::Event::PointerMoved(egui::pos2(0.0, 0.0))], 3);
+            w.run(vec![egui::Event::PointerMoved(at)], 40);
+            assert!(w.shows(words), "{words:?} not shown for {name}: {:?}", w.last);
+        }
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    fn server_for_reconnect(work: &Path, name: &str, kind: crate::fs::network::MountKind, with_address: bool) -> crate::fs::network::Mount {
+        use crate::fs::network::{Address, Mount};
+        Mount { name: name.into(), address: with_address.then(|| Address::parse("sftp://me@example.org/").unwrap()), local: work.join(name), kind }
+    }
+
+    #[test]
+    fn reconnect_is_offered_only_for_a_slow_or_broken_server_compression_can_let_go_of() {
+        use crate::fs::network::MountKind::{Gvfs, Helper, System};
+        use super::network_ui::{LinkState as L, offers_reconnect};
+        let work = Path::new("/tmp/x");
+        let m = |kind, addr| server_for_reconnect(work, "s", kind, addr);
+        for kind in [Gvfs, Helper] {
+            assert!(offers_reconnect(&m(kind, true), Some(L::Slow)));
+            assert!(offers_reconnect(&m(kind, true), Some(L::Broken)));
+            assert!(!offers_reconnect(&m(kind, true), Some(L::Connected)));
+            assert!(!offers_reconnect(&m(kind, true), Some(L::Offline)));
+            assert!(!offers_reconnect(&m(kind, true), None));
+        }
+        // The system's own mounts need more rights, and a phone is no server
+        assert!(!offers_reconnect(&m(System, true), Some(L::Broken)));
+        assert!(!offers_reconnect(&m(Helper, false), Some(L::Broken)));
+    }
+
+    #[test]
+    fn the_menu_of_a_broken_server_has_reconnect_and_that_of_a_good_one_does_not() {
+        use crate::fs::network::MountKind::Helper;
+        let work = window_dir("reconnect_menu");
+        let mut w = Window::new(work.clone());
+        let ctx = w.ctx.clone();
+        w.app.net.mounts = vec![server_for_reconnect(&work, "gone", Helper, true), server_for_reconnect(&work, "here", Helper, true)];
+        std::fs::create_dir_all(work.join("here")).unwrap();
+        for _ in 0..200 {
+            w.app.poll_network(&ctx);
+            if w.app.network_rows().iter().any(|r| r.state == Some(super::network_ui::LinkState::Broken)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let labels = |name: &str| {
+            let rows = w.app.network_rows();
+            let row = rows.iter().find(|r| r.name == name).unwrap();
+            w.app.server_menu(row).into_iter().flatten().map(|(_, label, _)| label).collect::<Vec<_>>()
+        };
+        assert!(labels("gone").contains(&tr("Reconnect")), "{:?}", labels("gone"));
+        assert!(labels("gone").contains(&tr("Disconnect")));
+        assert!(!labels("here").contains(&tr("Reconnect")), "{:?}", labels("here"));
+        // Reconnect sits in the block of Disconnect, directly below it, not behind a separator of its own
+        let rows = w.app.network_rows();
+        let groups: Vec<Vec<String>> = w.app.server_menu(rows.iter().find(|r| r.name == "gone").unwrap()).into_iter().map(|g| g.into_iter().map(|(_, label, _)| label.to_string()).collect()).collect();
+        let group = groups.iter().find(|g| g.iter().any(|l| *l == tr("Disconnect"))).unwrap();
+        let at = group.iter().position(|l| *l == tr("Disconnect")).unwrap();
+        assert_eq!(group.get(at + 1), Some(&tr("Reconnect").to_string()), "{groups:?}");
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn letting_go_of_a_mount_takes_every_tab_out_of_it() {
+        let work = window_dir("leave_mount");
+        let (mount, other) = (work.join("mount"), work.join("other"));
+        std::fs::create_dir_all(mount.join("sub")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let home = dirs::home_dir().unwrap();
+        let mut w = Window::new(other.clone());
+        w.app.new_tab(mount.join("sub"));
+        w.app.new_tab(other.clone());
+        w.run(Vec::new(), 20);
+        // The tab in the middle is parked inside the mount, the one on screen is not
+        assert_eq!(w.app.session().0, vec![other.clone(), mount.join("sub"), other.clone()]);
+        w.app.leave_mount(&mount);
+        assert_eq!(w.app.session().0, vec![other.clone(), home.clone(), other.clone()]);
+        // A tab on screen inside the mount goes too
+        w.app.new_tab(mount.join("sub"));
+        w.run(Vec::new(), 20);
+        assert_eq!(w.app.session().0.last(), Some(&mount.join("sub")));
+        w.app.leave_mount(&mount);
+        assert_eq!(w.app.session().0.last(), Some(&home));
+        // A folder that only starts with the same letters is not inside it
+        w.app.new_tab(work.join("mount2"));
+        w.app.leave_mount(&mount);
+        assert_eq!(w.app.session().0.last(), Some(&work.join("mount2")));
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn disconnecting_and_reconnecting_both_take_the_tabs_out_of_the_mount_first() {
+        use crate::fs::network::MountKind::Helper;
+        for reconnect in [false, true] {
+            let work = window_dir(if reconnect { "leave_by_reconnect" } else { "leave_by_disconnect" });
+            let mount = server_for_reconnect(&work, "box", Helper, true);
+            std::fs::create_dir_all(mount.local.join("sub")).unwrap();
+            let home = dirs::home_dir().unwrap();
+            let mut w = Window::new(work.clone());
+            w.app.new_tab(mount.local.join("sub"));
+            w.app.new_tab(work.clone());
+            w.run(Vec::new(), 20);
+            assert_eq!(w.app.session().0[1], mount.local.join("sub"));
+            let ctx = w.ctx.clone();
+            if reconnect {
+                w.app.reconnect(&ctx, mount);
+            } else {
+                w.app.disconnect(&ctx, mount);
+            }
+            assert_eq!(w.app.session().0[1], home, "reconnect: {reconnect}");
+            std::fs::remove_dir_all(&work).unwrap();
+        }
+    }
+
+    #[test]
+    fn changing_permissions_in_a_tree_starts_a_job_that_can_be_cancelled() {
+        let work = window_dir("perm_job");
+        let mut w = Window::new(work.clone());
+        w.app.apply_mode_to_contents(work.clone(), 0o755);
+        let job = w.app.engine.jobs.last().unwrap();
+        assert_eq!(job.kind, JobKind::Permissions);
+        assert!(job.controllable());
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn reconnect_waits_while_a_job_runs_and_otherwise_lets_go_and_says_why_if_it_cannot() {
+        use crate::fs::network::MountKind::Helper;
+        let work = window_dir("reconnect_run");
+        let mut w = Window::new(work.clone());
+        let ctx = w.ctx.clone();
+        let mount = server_for_reconnect(&work, "gone", Helper, true);
+        w.app.net.mounts = vec![mount.clone()];
+
+        // A job is running: nothing is let go of
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        w.app.engine.spawn(JobKind::Other, "holding".into(), String::new(), move |_| {
+            let _ = hold.recv();
+            Outcome::done(String::new())
+        });
+        assert!(w.app.engine.running());
+        w.app.run_action(&ctx, MenuAction::Reconnect(mount.local.clone()));
+        assert_eq!(w.app.status_toast.as_ref().map(|t| t.message.clone()), Some(tr("Wait for the running jobs to finish, then reconnect").to_owned()));
+        w.app.status_toast = None;
+        w.run(Vec::new(), 3);
+        // (another test's file watcher may toast meanwhile; what must not come is an answer about this mount)
+        assert!(!w.app.status_toast.as_ref().is_some_and(|t| t.message.contains("gone")), "something was started anyway");
+        release.send(()).unwrap();
+        w.until("the job to end", |w| !w.app.engine.running());
+        w.run(Vec::new(), 10);
+        w.app.status_toast = None;
+
+        // Nothing is running: it tries to let go; this folder is no mount, so that fails and the reason is told
+        w.app.net.mounts = vec![mount.clone()];
+        w.app.run_action(&ctx, MenuAction::Reconnect(mount.local.clone()));
+        w.until("the answer", |w| {
+            w.app.poll_network(&w.ctx.clone());
+            w.app.status_toast.is_some()
+        });
+        let message = w.app.status_toast.as_ref().unwrap().message.clone();
+        assert!(message.starts_with("Could not disconnect “gone”: "), "{message:?}");
+        // And it can be tried again: the failed try did not leave it marked as being disconnected.
+        // (The real mount list of this computer may have replaced the made-up one meanwhile)
+        w.app.net.mounts = vec![mount.clone()];
+        w.app.status_toast = None;
+        w.app.run_action(&ctx, MenuAction::Reconnect(mount.local.clone()));
+        w.until("the second answer", |w| {
+            w.app.poll_network(&w.ctx.clone());
+            w.app.status_toast.is_some()
+        });
+        assert!(w.app.status_toast.as_ref().unwrap().message.starts_with("Could not disconnect “gone”: "));
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn a_system_mount_or_a_phone_is_never_let_go_of_by_reconnect() {
+        use crate::fs::network::MountKind::{Helper, System};
+        let work = window_dir("reconnect_never");
+        let mut w = Window::new(work.clone());
+        let ctx = w.ctx.clone();
+        for mount in [server_for_reconnect(&work, "fstab", System, true), server_for_reconnect(&work, "phone", Helper, false)] {
+            w.app.net.mounts = vec![mount.clone()];
+            w.app.run_action(&ctx, MenuAction::Reconnect(mount.local.clone()));
+            for _ in 0..30 {
+                w.app.poll_network(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(w.app.status_toast.is_none(), "{}: {:?}", mount.name, w.app.status_toast.as_ref().map(|t| &t.message));
+        }
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn the_space_question_shows_the_figures_and_each_answer_works() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let figures = |b: u64| crate::fs::file_item::format_bytes(b);
+        let expected = format!("Needed: {} · Available: {} · Missing: {}", figures(100), figures(10), figures(90));
+
+        // "Continue anyway" lets the job go on
+        let (mut w, root, ok) = window_with_the_space_question("space_go");
+        assert!(w.shows(&expected), "{expected:?} not in {:?}", w.last);
+        assert!(w.shows("Cancel") && w.shows("Continue anyway"));
+        w.click(w.at("Continue anyway"), egui::PointerButton::Primary);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert!(ok.load(SeqCst) && w.app.dialog.is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // "Cancel" stops it
+        let (mut w, root, ok) = window_with_the_space_question("space_cancel");
+        w.click(w.at("Cancel"), egui::PointerButton::Primary);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert!(!ok.load(SeqCst));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // Enter is "Cancel": the safe answer is the default one
+        let (mut w, root, ok) = window_with_the_space_question("space_enter");
+        w.key(egui::Key::Enter);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert!(!ok.load(SeqCst));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // So is Escape, which closes the dialog
+        let (mut w, root, ok) = window_with_the_space_question("space_escape");
+        w.key(egui::Key::Escape);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert!(!ok.load(SeqCst));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // --- Search keeps matching results while the query changes (ported from ilyamiro/Ski 771d1fd)
+
+    fn search_dir(name: &str, files: &[&str]) -> PathBuf {
+        let dir = window_dir(name);
+        for f in files {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        dir
+    }
+
+    fn names(w: &Window) -> Vec<String> {
+        let mut n: Vec<String> = w.app.items.iter().map(|i| i.name.clone()).collect();
+        n.sort();
+        n
+    }
+
+    fn search_for(w: &mut Window, query: &str) {
+        w.app.settings.search_scope = SearchScope::ThisFolder;
+        w.app.search_query = query.to_owned();
+        let ctx = w.ctx.clone();
+        w.app.on_query_changed(&ctx);
+    }
+
+    fn finish_search(w: &mut Window) {
+        w.until("the search to end", |w| !w.app.search.is_running());
+        w.run(Vec::new(), 3);
+    }
+
+    #[test]
+    fn typing_narrows_the_results_instead_of_blanking_them() {
+        let dir = search_dir("search_narrow", &["alpha1.txt", "alpha2.txt", "beta.txt"]);
+        let mut w = Window::new(dir.clone());
+        search_for(&mut w, "alpha");
+        finish_search(&mut w);
+        assert_eq!(names(&w), ["alpha1.txt", "alpha2.txt"]);
+
+        // One more letter: what still matches stays on screen at once, the rest is gone at once
+        search_for(&mut w, "alpha1");
+        assert_eq!(names(&w), ["alpha1.txt"], "the list was blanked or kept too much");
+        assert!(w.app.search_unconfirmed.contains(&dir.join("alpha1.txt")));
+        finish_search(&mut w);
+        assert_eq!(names(&w), ["alpha1.txt"]);
+        assert!(w.app.search_unconfirmed.is_empty());
+
+        // A shorter query brings the others back as the search finds them
+        search_for(&mut w, "alpha");
+        assert_eq!(names(&w), ["alpha1.txt"]);
+        finish_search(&mut w);
+        assert_eq!(names(&w), ["alpha1.txt", "alpha2.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_result_the_new_search_does_not_find_leaves_when_it_ends() {
+        let dir = search_dir("search_gone", &["alpha1.txt", "alpha2.txt"]);
+        let mut w = Window::new(dir.clone());
+        search_for(&mut w, "alpha");
+        finish_search(&mut w);
+        assert_eq!(names(&w).len(), 2);
+
+        // The file goes while the list still shows it: "alph" keeps it for now and drops it at the end
+        std::fs::remove_file(dir.join("alpha2.txt")).unwrap();
+        search_for(&mut w, "alph");
+        assert!(names(&w).contains(&"alpha2.txt".to_owned()), "kept while the search runs");
+        finish_search(&mut w);
+        assert_eq!(names(&w), ["alpha1.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn nothing_unconfirmed_survives_a_cancel_a_clear_or_another_tab() {
+        let dir = search_dir("search_reset", &["alpha1.txt", "alpha2.txt"]);
+        let mut w = Window::new(dir.clone());
+        search_for(&mut w, "alpha");
+        finish_search(&mut w);
+
+        // Closing the search
+        search_for(&mut w, "alpha1");
+        assert!(!w.app.search_unconfirmed.is_empty());
+        w.app.close_search();
+        assert!(w.app.search_unconfirmed.is_empty());
+        w.run(Vec::new(), 10);
+        assert!(w.app.search_query.is_empty());
+
+        // Another tab takes the window over while a search runs
+        search_for(&mut w, "alpha");
+        finish_search(&mut w);
+        search_for(&mut w, "alpha1");
+        assert!(!w.app.search_unconfirmed.is_empty());
+        w.app.new_tab(dir.clone());
+        assert!(w.app.search_unconfirmed.is_empty());
+        w.run(Vec::new(), 10);
+        assert!(w.app.search_query.is_empty());
+        assert_eq!(w.app.tabs.len(), 2);
+
+        // Back on the first tab its search starts over from nothing and finds what matches
+        w.app.switch_tab(0);
+        assert!(w.app.search_unconfirmed.is_empty());
+        w.until("the search of the first tab", |w| !w.app.search.is_running() && !w.app.items.is_empty());
+        assert_eq!(names(&w), ["alpha1.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- Down in the search field moves to the results (ported from ilyamiro/Ski a4e3bdd)
+
+    fn window_searching(name: &str) -> (Window, PathBuf) {
+        let dir = window_dir(name);
+        for d in ["alpha1", "alpha2", "beta"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let mut w = Window::new(dir.clone());
+        w.app.show_search = true;
+        w.app.focus_search = true;
+        search_for(&mut w, "alpha");
+        finish_search(&mut w);
+        w.run(Vec::new(), 5);
+        (w, dir)
+    }
+
+    #[test]
+    fn down_leaves_the_search_field_and_the_arrows_then_walk_the_results() {
+        let (mut w, dir) = window_searching("search_down");
+        assert_eq!(names(&w), ["alpha1", "alpha2"]);
+        assert!(w.ctx.egui_wants_keyboard_input(), "the search field should have the focus");
+        assert_eq!(w.app.selected_index, None);
+
+        w.key(egui::Key::ArrowDown);
+        assert!(!w.ctx.egui_wants_keyboard_input(), "Down did not leave the field");
+        assert_eq!(w.app.selected_index, Some(0));
+
+        // In the results every arrow walks them, as in a folder
+        w.key(egui::Key::ArrowDown);
+        assert_eq!(w.app.selected_index, Some(1));
+        w.key(egui::Key::ArrowUp);
+        assert_eq!(w.app.selected_index, Some(0));
+
+        // Enter opens the result reached
+        let target = w.app.items[0].path.clone();
+        w.key(egui::Key::Enter);
+        assert_eq!(w.app.current_path, target.canonicalize().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn up_stays_in_the_field_and_shift_down_leaves_it_like_down() {
+        let (mut w, dir) = window_searching("search_up");
+        // Up has nowhere to go from the field
+        w.key(egui::Key::ArrowUp);
+        assert_eq!(w.app.selected_index, None);
+        assert!(w.ctx.egui_wants_keyboard_input());
+        // egui matches a plain key press when Shift is held too, so Shift+Down is Down; it no longer
+        // stretches a selection from the field, which the old code did
+        let shift = egui::Modifiers::SHIFT;
+        w.run(vec![egui::Event::Key { key: egui::Key::ArrowDown, physical_key: Some(egui::Key::ArrowDown), pressed: true, repeat: false, modifiers: shift }], 1);
+        w.run(vec![egui::Event::Key { key: egui::Key::ArrowDown, physical_key: Some(egui::Key::ArrowDown), pressed: false, repeat: false, modifiers: shift }], 5);
+        assert_eq!(w.app.selected_index, Some(0));
+        assert!(!w.ctx.egui_wants_keyboard_input());
+        assert_eq!(w.app.selection.len(), 1, "one result, not a range");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- The wheel scroll speed (ported from ilyamiro/Ski e4794c7)
+
+    #[test]
+    fn the_wheel_speed_reaches_egui_and_wild_values_are_made_safe() {
+        let dir = window_dir("wheel_speed");
+        let mut w = Window::new(dir.clone());
+        let ctx = w.ctx.clone();
+        let step = crate::settings::SCROLL_STEP;
+        let applied = |w: &mut Window, speed: f32| {
+            w.app.settings.scroll_speed = speed;
+            w.app.apply_look(&ctx);
+            ctx.options(|o| o.input_options.line_scroll_speed)
+        };
+        assert_eq!(step, 60.0);
+        assert_eq!(applied(&mut w, 1.0), step);
+        assert_eq!(applied(&mut w, 1.5), step * 1.5);
+        // The ends of the range are allowed, and nothing beyond them
+        assert_eq!(applied(&mut w, 0.1), step * 0.1);
+        assert_eq!(applied(&mut w, 5.0), step * 5.0);
+        assert_eq!(applied(&mut w, 0.0), step * 0.1);
+        assert_eq!(applied(&mut w, -3.0), step * 0.1);
+        assert_eq!(applied(&mut w, 99.0), step * 5.0);
+        // Not a number, or not finite: the default
+        assert_eq!(applied(&mut w, f32::NAN), step);
+        assert_eq!(applied(&mut w, f32::INFINITY), step);
+        assert_eq!(applied(&mut w, f32::NEG_INFINITY), step);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- rename_entry uses a rename that cannot replace
+
+    #[test]
+    fn renaming_moves_the_item_and_a_taken_name_leaves_both_alone() {
+        let dir = window_dir("rename_noreplace");
+        std::fs::write(dir.join("one.txt"), "one").unwrap();
+        std::fs::write(dir.join("two.txt"), "two").unwrap();
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        let mut w = Window::new(dir.clone());
+        w.run(Vec::new(), 8);
+
+        w.app.rename_entry(&dir.join("one.txt"), "uno.txt").unwrap();
+        assert!(!dir.join("one.txt").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("uno.txt")).unwrap(), "one");
+
+        // A name that is taken: the message says so and nothing changes
+        let err = w.app.rename_entry(&dir.join("uno.txt"), "two.txt").unwrap_err();
+        assert!(err.contains("two.txt") && err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read_to_string(dir.join("uno.txt")).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(dir.join("two.txt")).unwrap(), "two");
+        let err = w.app.rename_entry(&dir.join("uno.txt"), "folder").unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(dir.join("folder").is_dir());
+
+        // The undo still puts it back
+        w.app.undo();
+        w.until("the undo to end", |w| !w.app.engine.running());
+        assert!(dir.join("one.txt").exists() && !dir.join("uno.txt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- The search says when it stopped at its limit
+
+    #[test]
+    fn the_window_says_when_a_search_stopped_at_its_limit() {
+        let dir = window_dir("search_limit");
+        for n in 0..450 {
+            std::fs::write(dir.join(format!("needle_{n:03}.txt")), "x").unwrap();
+        }
+        let hint = format!("{} results. Narrow down the search.", crate::fs::search::MAX_RESULTS);
+        let mut w = Window::new(dir.clone());
+        search_for(&mut w, "needle");
+        finish_search(&mut w);
+        w.run(Vec::new(), 12);
+        assert_eq!(w.app.items.len(), crate::fs::search::MAX_RESULTS);
+        assert!(w.shows(&hint), "no hint: {:?}", w.last);
+
+        // A narrower search finds fewer than the limit: no hint
+        search_for(&mut w, "needle_00");
+        finish_search(&mut w);
+        w.run(Vec::new(), 12);
+        assert_eq!(w.app.items.len(), 10);
+        assert!(!w.shows(&hint));
+
+        // And the hint is gone once the search is closed
+        search_for(&mut w, "needle");
+        finish_search(&mut w);
+        w.run(Vec::new(), 12);
+        assert!(w.shows(&hint));
+        w.app.close_search();
+        w.run(Vec::new(), 12);
+        assert!(!w.shows(&hint));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

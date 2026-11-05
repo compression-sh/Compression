@@ -317,24 +317,22 @@ mod tests {
 
     #[test]
     fn without_noreplace_support_trashing_is_refused_and_the_item_and_its_trash_stay_untouched() {
-        let isolated = dirs::data_dir().is_some_and(|d| d.starts_with(std::env::temp_dir()));
-        if !isolated {
-            return;
-        }
+        assert!(dirs::data_dir().is_some_and(|d| d.starts_with(std::env::temp_dir())), "run the tests with an empty HOME and XDG folders, as CI does");
         let dir = std::env::temp_dir().join(format!("compression_trash_fb_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        std::fs::create_dir_all(dir.join("trash_fb_folder")).unwrap();
         crate::compat::tests::without_support_under(&dir);
-        std::fs::write(dir.join("file"), "data").unwrap();
-        for name in ["file", "folder"] {
+        std::fs::write(dir.join("trash_fb_file"), "data").unwrap();
+        for name in ["trash_fb_file", "trash_fb_folder"] {
             let err = trash(&dir.join(name)).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{name}");
             assert!(dir.join(name).exists());
         }
-        assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "data");
-        // No record was left behind for what did not go
+        assert_eq!(std::fs::read_to_string(dir.join("trash_fb_file")).unwrap(), "data");
+        // No record was left behind for what did not go (the trash is shared with the other tests: their names are
+        // not these)
         let info = dirs::data_dir().unwrap().join("Trash/info");
-        for name in ["file", "folder"] {
+        for name in ["trash_fb_file", "trash_fb_folder"] {
             assert!(!info.join(format!("{name}.trashinfo")).exists(), "{name}");
         }
         std::fs::remove_dir_all(&dir).unwrap();

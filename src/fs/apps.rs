@@ -518,3 +518,24 @@ pub fn name_is_mime(name: &str, pattern: &str) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(id: &str, mimes: &[&str]) -> AppEntry {
+        AppEntry { id: id.into(), name: id.into(), exec: "true".into(), mimes: mimes.iter().map(|m| m.to_string()).collect(), icon: None }
+    }
+
+    #[test]
+    fn a_type_needs_a_default_or_an_app_that_lists_it() {
+        let apps = [app("viewer.desktop", &["image/png"])];
+        // Nothing is set up for it
+        assert!(!has_handler(&apps, "application/x-unknown-thing", None));
+        assert!(!has_handler(&[], "image/png", None));
+        // An app lists the type, or the system names a default
+        assert!(has_handler(&apps, "image/png", None));
+        assert!(has_handler(&apps, "application/x-unknown-thing", Some("other.desktop")));
+        assert!(has_handler(&[], "image/png", Some("viewer.desktop")));
+    }
+}

@@ -144,3 +144,127 @@ pub fn open_folder(dir: &Path) -> io::Result<mpsc::Receiver<io::Error>> {
     Ok(rx)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_elevated_start_runs_this_program_itself_and_not_env() {
+        let environment = environment_words(
+            |name| match name {
+                "WAYLAND_DISPLAY" => Some(OsString::from("wayland-1")),
+                "XDG_RUNTIME_DIR" => Some(OsString::from("/run/user/1000")),
+                // Not passed on, however it is set
+                "LD_LIBRARY_PATH" | "LD_PRELOAD" | "PATH" | "HOME" => Some(OsString::from("/home/me/evil")),
+                _ => None,
+            },
+            Some(PathBuf::from("/home/me/.config")),
+        );
+        assert_eq!(environment, words(&["WAYLAND_DISPLAY=wayland-1", "XDG_RUNTIME_DIR=/run/user/1000", "COMPRESSION_ADMIN_CONFIG=/home/me/.config"]));
+
+        let command = elevation_command(Path::new("/usr/bin/pkexec"), Path::new("/usr/bin/compression"), Path::new("/etc"), environment);
+        assert_eq!(command.get_program(), "/usr/bin/pkexec");
+        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            ["/usr/bin/compression", "--admin-environment", "WAYLAND_DISPLAY=wayland-1", "XDG_RUNTIME_DIR=/run/user/1000", "COMPRESSION_ADMIN_CONFIG=/home/me/.config", "--", "/etc"]
+        );
+        // polkit is asked about this program, never about env
+        assert!(!args.iter().any(|a| a == "env" || a.ends_with("/env")));
+        // A folder whose name starts with a dash is still only a folder
+        let command = elevation_command(Path::new("pkexec"), Path::new("/usr/bin/compression"), Path::new("-oops"), Vec::new());
+        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(&args[args.len() - 2..], ["--", "-oops"]);
+        // Values that are not text are left out rather than mangled
+        let odd = environment_words(|name| (name == "XAUTHORITY").then(|| std::os::unix::ffi::OsStringExt::from_vec(vec![0xff, b'x'])), None);
+        assert!(odd.is_empty());
+    }
+
+    #[test]
+    fn the_environment_that_goes_to_root_has_no_places_to_load_things_from() {
+        let everything = |name: &str| Some(OsString::from(format!("/home/me/{name}")));
+        let passed: Vec<String> = environment_words(everything, None).iter().map(|w| w.split('=').next().unwrap().to_owned()).collect();
+        for allowed in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "LANG", "LANGUAGE", "LC_ALL", "XCURSOR_THEME", "XCURSOR_SIZE", "GDK_SCALE"] {
+            assert!(passed.iter().any(|n| n == allowed), "{allowed} should go along");
+        }
+        assert_eq!(passed.len(), 12);
+        // Not sent, and not taken from the arguments either
+        let forbidden = ["XDG_DATA_DIRS", "XDG_CONFIG_DIRS", "LD_LIBRARY_PATH", "LD_PRELOAD", "PATH", "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "PYTHONPATH"];
+        let args: Vec<String> = std::iter::once(ENV_FLAG.to_owned()).chain(forbidden.iter().map(|n| format!("{n}=/home/me/x"))).chain([ "--".to_owned(), "/srv".to_owned()]).collect();
+        let (taken, rest) = split_environment(&args).unwrap();
+        assert!(taken.is_empty(), "{taken:?}");
+        assert_eq!(rest, ["/srv"]);
+        for name in forbidden {
+            assert!(!passed.iter().any(|n| n == name), "{name} must not go along");
+        }
+    }
+
+    #[test]
+    fn a_program_is_run_as_root_only_when_nobody_else_can_change_it() {
+        let (root, me, other) = (0, 1000, 1001);
+        // Ordinary installs: root's file in root's folder, or the person's own build
+        assert!(is_trusted(root, 0o100755, me, false) && is_trusted(root, 0o40755, me, true));
+        assert!(is_trusted(me, 0o100755, me, false) && is_trusted(me, 0o40700, me, true));
+        // Somebody else's, or open to group and world
+        assert!(!is_trusted(other, 0o100755, me, false));
+        assert!(!is_trusted(root, 0o100775, me, false) && !is_trusted(root, 0o100757, me, false) && !is_trusted(root, 0o100777, me, false));
+        assert!(!is_trusted(root, 0o40775, me, true) && !is_trusted(me, 0o40777, me, true));
+        // A folder anyone may write to is fine only when it is sticky
+        assert!(is_trusted(root, 0o41777, me, true));
+        assert!(!is_trusted(root, 0o100777 | 0o1000, me, false), "sticky does not help a file");
+    }
+
+    #[test]
+    fn the_check_looks_at_the_real_file_and_its_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("compression_admin_bin_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let set = |path: &Path, mode: u32| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let exe = dir.join("compression");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        set(&dir, 0o755);
+        set(&exe, 0o755);
+        assert!(check_binary(&exe).is_ok(), "a program of the person's own, closed to others");
+        // Others may write to the file, or to the folder it is in
+        set(&exe, 0o775);
+        assert!(check_binary(&exe).is_err());
+        set(&exe, 0o757);
+        assert!(check_binary(&exe).is_err());
+        set(&exe, 0o755);
+        set(&dir, 0o777);
+        assert!(check_binary(&exe).is_err());
+        set(&dir, 0o1777);
+        assert!(check_binary(&exe).is_ok());
+        set(&dir, 0o755);
+        assert!(check_binary(&dir.join("missing")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_elevated_program_takes_only_the_environment_it_passes_and_returns_the_rest() {
+        let args = words(&["--admin-environment", "DISPLAY=:0", "LD_PRELOAD=/tmp/x.so", "PATH=/tmp", "COMPRESSION_ADMIN_CONFIG=/home/me/.config", "LD_LIBRARY_PATH=/tmp", "=x", "novalue", "--", "-folder"]);
+        let (pairs, rest) = split_environment(&args).expect("carries an environment");
+        assert_eq!(pairs, [("DISPLAY".to_owned(), ":0".to_owned()), ("COMPRESSION_ADMIN_CONFIG".to_owned(), "/home/me/.config".to_owned())]);
+        assert_eq!(rest, ["-folder"]);
+        // A value may hold an equals sign, and a missing `--` leaves no folder
+        let (pairs, rest) = split_environment(&words(&["--admin-environment", "LANG=a=b"])).unwrap();
+        assert_eq!(pairs, [("LANG".to_owned(), "a=b".to_owned())]);
+        assert!(rest.is_empty());
+        // An ordinary start is not touched, and does not set anything
+        assert!(split_environment(&words(&["/home/me"])).is_none());
+        assert!(split_environment(&[]).is_none());
+        assert_eq!(take_environment(words(&["/home/me", "--admin-environment"])), words(&["/home/me", "--admin-environment"]));
+        // Not root: the arguments are stripped, and the environment of this process stays as it is
+        if !is_admin() {
+            let before = std::env::var_os("GDK_SCALE");
+            assert_eq!(take_environment(words(&["--admin-environment", "GDK_SCALE=7", "--", "/srv"])), ["/srv"]);
+            assert_eq!(std::env::var_os("GDK_SCALE"), before);
+        }
+    }
+}

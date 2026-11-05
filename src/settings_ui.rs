@@ -1561,3 +1561,200 @@ fn category_row(
     );
     resp
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{Settings, SCROLL_SPEED_DEFAULT};
+
+    fn texts(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut found));
+        found
+    }
+
+    /// The behavior page of a window, run headless with synthetic input.
+    struct Page {
+        app: CompressionApp,
+        ctx: egui::Context,
+        time: f64,
+        shown: Vec<(String, egui::Rect)>,
+    }
+
+    impl Page {
+        fn run(&mut self, events: Vec<egui::Event>, frames: usize) {
+            for n in 0..frames {
+                self.time += 0.05;
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 1400.0))),
+                    time: Some(self.time),
+                    events: if n == 0 { events.clone() } else { Vec::new() },
+                    ..Default::default()
+                };
+                let app = &mut self.app;
+                let mut out = self.ctx.run_ui(raw, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| app.behavior_tab(ui));
+                });
+                out.textures_delta.clear();
+                self.shown = texts(&out);
+            }
+        }
+
+        fn click(&mut self, pos: egui::Pos2) {
+            let m = egui::Modifiers::NONE;
+            let b = egui::PointerButton::Primary;
+            self.run(vec![egui::Event::PointerMoved(pos)], 3);
+            self.run(vec![egui::Event::PointerButton { pos, button: b, pressed: true, modifiers: m }], 2);
+            self.run(vec![egui::Event::PointerButton { pos, button: b, pressed: false, modifiers: m }], 6);
+        }
+
+        fn find(&self, text: &str) -> egui::Rect {
+            self.shown.iter().find(|(t, _)| t == text).unwrap_or_else(|| panic!("{text:?} not on the page: {:?}", self.shown.iter().map(|s| &s.0).collect::<Vec<_>>())).1
+        }
+    }
+
+    #[test]
+    fn the_slider_sets_the_wheel_speed_and_its_button_puts_the_default_back() {
+        // This page saves what it changes; the test must not touch a settings file
+        crate::settings::NO_SAVE.with(|no_save| no_save.set(true));
+        let dir = std::env::temp_dir().join(format!("compression_wheel_ui_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = egui::Context::default();
+        let app = CompressionApp::new(dir.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let mut page = Page { app, ctx, time: 0.0, shown: Vec::new() };
+        page.run(Vec::new(), 8);
+
+        assert!(page.shown.iter().any(|(t, _)| t == "Mouse and touchpad"));
+        assert!(page.shown.iter().any(|(t, _)| t == "Wheel scroll speed"));
+        assert_eq!(page.app.settings.scroll_speed, SCROLL_SPEED_DEFAULT);
+        assert!(page.shown.iter().any(|(t, _)| t == "1×"), "the value is shown");
+
+        // Clicking at a mark (its name is part of the track's hit area) snaps to it
+        let fast = page.find("Fast").center();
+        page.click(fast);
+        assert_eq!(page.app.settings.scroll_speed, 1.5);
+        let slow = page.find("Slow").center();
+        page.click(slow);
+        assert_eq!(page.app.settings.scroll_speed, 0.5);
+
+        // The button before the value puts the default back; it sits left of the value text
+        let value = page.find("0.5×");
+        let reset = egui::pos2(value.right() - 52.0 - 4.0 - crate::ui::material::CONTROL_HEIGHT / 2.0, value.center().y);
+        page.click(reset);
+        assert_eq!(page.app.settings.scroll_speed, SCROLL_SPEED_DEFAULT);
+        // At the default the button does nothing more
+        page.click(reset);
+        assert_eq!(page.app.settings.scroll_speed, SCROLL_SPEED_DEFAULT);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mark_names_that_would_touch_are_left_out_and_the_rest_never_overlap() {
+        crate::settings::NO_SAVE.with(|n| n.set(true));
+        let dir = std::env::temp_dir().join(format!("compression_slider_names_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (width, expected) in [(420.0f32, vec!["Slow", "Default", "Fast", "Faster"]), (520.0, vec!["Slow", "Default", "Fast", "Faster"]), (900.0, vec!["Slow", "Default", "Fast", "Faster"])] {
+            let ctx = egui::Context::default();
+            let app = CompressionApp::new(dir.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+            let mut page = Page { app, ctx, time: 0.0, shown: Vec::new() };
+            for _ in 0..8 {
+                page.time += 0.05;
+                let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 1400.0))), time: Some(page.time), ..Default::default() };
+                let app = &mut page.app;
+                let mut out = page.ctx.run_ui(raw, |ui| { egui::ScrollArea::vertical().show(ui, |ui| app.behavior_tab(ui)); });
+                out.textures_delta.clear();
+                page.shown = texts(&out);
+            }
+            let mut names: Vec<(&str, egui::Rect)> = ["Slow", "Default", "Fast", "Faster"].into_iter().filter_map(|n| page.shown.iter().find(|(t, _)| t == n).map(|(_, r)| (n, *r))).collect();
+            names.sort_by(|a, b| a.1.left().total_cmp(&b.1.left()));
+            assert_eq!(names.iter().map(|n| n.0).collect::<Vec<_>>(), expected, "width {width}");
+            for pair in names.windows(2) {
+                let gap = pair[1].1.left() - pair[0].1.right();
+                assert!(gap >= 3.9, "width {width}: {} and {} are {gap} px apart", pair[0].0, pair[1].0);
+            }
+            // The current value is still shown
+            assert!(page.shown.iter().any(|(t, _)| t == "1×"), "width {width}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs `ui` in a window `width` wide and returns the texts drawn, with where.
+    fn drawn(width: f32, mut add: impl FnMut(&mut egui::Ui)) -> Vec<(String, egui::Rect)> {
+        let ctx = egui::Context::default();
+        let mut shown = Vec::new();
+        for n in 0..8 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 600.0))), time: Some(n as f64 * 0.05), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| add(ui));
+            out.textures_delta.clear();
+            shown = texts(&out);
+        }
+        shown
+    }
+
+    #[test]
+    fn the_wheel_speed_name_is_whole_above_the_slider_and_nothing_overlaps_at_any_width() {
+        let theme = SerpantinumTheme::default();
+        let marks = [(0.5, "Slow"), (1.0, "Default"), (1.5, "Fast"), (2.0, "Faster")];
+        let long = "A much longer name of this setting in some other language, which has to wrap";
+        for width in [420.0f32, 520.0, 900.0] {
+            for label in ["Wheel scroll speed", long] {
+                let mut value = 1.0f32;
+                let shown = drawn(width, |ui| {
+                    crate::ui::material::marked_slider_row(ui, "t", crate::ui::icons::MOUSE, label, &theme, &mut value, 0.25..=2.25, &marks, "×", Some(1.0));
+                });
+                let find = |t: &str| shown.iter().find(|(s, _)| s == t).unwrap_or_else(|| panic!("width {width}: {t:?} missing in {:?}", shown.iter().map(|s| &s.0).collect::<Vec<_>>())).1;
+                // The whole name is drawn, not cut with an ellipsis
+                let name = find(label);
+                let value_text = find("1×");
+                // It ends before the reset button, which sits left of the value, and starts at the usual inset
+                let reset_left = value_text.right() - 52.0 - 4.0 - crate::ui::material::CONTROL_HEIGHT;
+                assert!(name.right() <= reset_left + 0.5, "width {width}: the name runs into the button ({} > {reset_left})", name.right());
+                assert!(name.left() >= 40.0, "width {width}");
+                // The value and the name share the first line; the marks are under the slider, below it
+                assert!((value_text.center().y - name.center().y).abs() < 14.0, "width {width}");
+                let slow = find("Slow");
+                assert!(slow.top() > name.bottom() + 6.0, "width {width}: marks at {} under the name ending {}", slow.top(), name.bottom());
+                // The marks keep clear of one another and stay inside the row
+                let mut names: Vec<egui::Rect> = ["Slow", "Default", "Fast", "Faster"].iter().filter_map(|n| shown.iter().find(|(t, _)| t == n).map(|(_, r)| *r)).collect();
+                names.sort_by(|a, b| a.left().total_cmp(&b.left()));
+                for pair in names.windows(2) {
+                    assert!(pair[1].left() - pair[0].right() >= 3.9, "width {width}");
+                }
+                assert!(names.iter().all(|r| r.left() >= 0.0 && r.right() <= width), "width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_next_setting_keeps_its_distance_from_the_slider_marks() {
+        crate::settings::NO_SAVE.with(|n| n.set(true));
+        let dir = std::env::temp_dir().join(format!("compression_slider_gap_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for width in [420.0f32, 900.0] {
+            let ctx = egui::Context::default();
+            let app = CompressionApp::new(dir.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+            let mut page = Page { app, ctx, time: 0.0, shown: Vec::new() };
+            for _ in 0..8 {
+                page.time += 0.05;
+                let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 1400.0))), time: Some(page.time), ..Default::default() };
+                let app = &mut page.app;
+                let mut out = page.ctx.run_ui(raw, |ui| { egui::ScrollArea::vertical().show(ui, |ui| app.behavior_tab(ui)); });
+                out.textures_delta.clear();
+                page.shown = texts(&out);
+            }
+            let swipe = page.find("Swipe to go back and forward");
+            let marks_bottom = ["Slow", "Default", "Fast", "Faster"].iter().map(|n| page.find(n).bottom()).fold(0.0f32, f32::max);
+            assert!(swipe.top() - marks_bottom >= 18.0, "width {width}: only {} px between the marks and the swipe setting", swipe.top() - marks_bottom);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+
+}

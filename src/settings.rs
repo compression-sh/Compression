@@ -304,6 +304,13 @@ pub(crate) fn file() -> Option<PathBuf> {
     crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("compression").join("settings.json"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Set by a test that runs a whole window on its thread: its tabs and layout are not kept in the
+    /// settings file.
+    pub(crate) static NO_SAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Settings {
     pub fn load() -> Self {
         Self::read().and_then(Result::ok).unwrap_or_default().for_session(crate::fs::admin::is_admin())
@@ -367,6 +374,10 @@ impl Settings {
         if crate::fs::admin::is_admin() {
             return;
         }
+        #[cfg(test)]
+        if NO_SAVE.with(std::cell::Cell::get) {
+            return;
+        }
         let Some(file) = file() else { return };
         if let Some(dir) = file.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -377,3 +388,65 @@ impl Settings {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_administrator_session_ignores_the_terminal_command_of_the_settings() {
+        let settings = Settings { terminal: "sh -c evil {}".into(), ..Default::default() };
+        assert_eq!(settings.clone().for_session(true).terminal, "");
+        assert_eq!(settings.for_session(false).terminal, "sh -c evil {}");
+    }
+
+    #[test]
+    fn settings_saved_by_ski_name_the_views_by_their_current_names() {
+        let json = r#"{"start_path":"ski:recent","last_dir":"ski:bookmarks","session_tabs":["ski:recent","/tmp"],"folder_views":{"ski:bookmarks":"List"}}"#;
+        let settings = serde_json::from_str::<Settings>(json).unwrap().with_current_view_names();
+        assert_eq!(settings.start_path, Some(PathBuf::from("compression:recent")));
+        assert_eq!(settings.last_dir, Some(PathBuf::from("compression:bookmarks")));
+        assert_eq!(settings.session_tabs, [PathBuf::from("compression:recent"), PathBuf::from("/tmp")]);
+        assert!(settings.folder_views.contains_key(&PathBuf::from("compression:bookmarks")));
+    }
+
+    #[test]
+    fn a_settings_file_is_read_with_the_current_names_and_a_broken_one_is_an_error() {
+        let read = Settings::parse(r#"{"start_path":"ski:recent","session_tabs":["ski:bookmarks"]}"#).unwrap();
+        assert_eq!(read.start_path, Some(PathBuf::from("compression:recent")));
+        assert_eq!(read.session_tabs, [PathBuf::from("compression:bookmarks")]);
+        // Half way through an edit by hand
+        assert!(Settings::parse(r#"{"show_hidden": tr"#).is_err());
+        assert!(Settings::parse("").is_err());
+    }
+
+    #[test]
+    fn where_a_window_was_and_how_wide_its_columns_are_is_no_choice() {
+        let base = Settings::default();
+        let moved = Settings { last_dir: Some(PathBuf::from("/tmp")), column_widths: [120.0; 6], folder_views: [(PathBuf::from("/x"), crate::app::ViewMode::Grid)].into(), ..base.clone() };
+        assert!(base.same_choices_as(&moved));
+        // Anything a person picks is
+        assert!(!base.same_choices_as(&Settings { show_hidden: !base.show_hidden, ..moved.clone() }));
+        assert!(!base.same_choices_as(&Settings { theme: "nord".into(), ..base.clone() }));
+    }
+
+    #[test]
+    fn the_wheel_speed_defaults_round_trips_and_may_be_missing_from_an_old_file() {
+        assert_eq!(Settings::default().scroll_speed, SCROLL_SPEED_DEFAULT);
+        assert_eq!(SCROLL_SPEED_DEFAULT, 1.0);
+        assert!(SCROLL_SPEED_SLIDER.start() >= SCROLL_SPEED_RANGE.start() && SCROLL_SPEED_SLIDER.end() <= SCROLL_SPEED_RANGE.end());
+        // A file from before the setting existed
+        let old: Settings = serde_json::from_str(r#"{ "theme": "nord" }"#).unwrap();
+        assert_eq!(old.scroll_speed, SCROLL_SPEED_DEFAULT);
+        assert_eq!(old.theme, "nord");
+        // It is kept
+        let s = Settings { scroll_speed: 1.75, ..Settings::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.scroll_speed, 1.75);
+        // Whatever a hand-edited file holds is loaded as it is (the window clamps it when it applies it)
+        let wild: Settings = serde_json::from_str(r#"{ "scroll_speed": 99.0 }"#).unwrap();
+        assert_eq!(wild.scroll_speed, 99.0);
+        // Not a number at all: the file is refused as a whole, like any other wrong type
+        assert!(serde_json::from_str::<Settings>(r#"{ "scroll_speed": "fast" }"#).is_err());
+    }
+}

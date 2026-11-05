@@ -650,54 +650,72 @@ fn name_of(path: &Path) -> String {
 /// Bytes copied between two checks for pause and cancel.
 const CHUNK: usize = 1 << 20;
 
-/// Up to `CHUNK` bytes from `reader` to `writer` inside the kernel, at both files' positions. The data
+/// Up to `most` (at most `CHUNK`) bytes from `reader` to `writer` inside the kernel, at both files' positions. The data
 /// never passes through Compression, and file systems that can (btrfs, XFS, NFS) share the blocks instead of copying them.
-fn copy_range(reader: &std::fs::File, writer: &std::fs::File) -> io::Result<usize> {
+fn copy_range(reader: &std::fs::File, writer: &std::fs::File, most: usize) -> io::Result<usize> {
     use std::os::fd::AsRawFd;
     // SAFETY: two open descriptors; null offsets make the kernel use and advance the files' own positions
-    let n = unsafe { libc::copy_file_range(reader.as_raw_fd(), std::ptr::null_mut(), writer.as_raw_fd(), std::ptr::null_mut(), CHUNK, 0) };
+    let n = unsafe { libc::copy_file_range(reader.as_raw_fd(), std::ptr::null_mut(), writer.as_raw_fd(), std::ptr::null_mut(), most.min(CHUNK), 0) };
     if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
 }
 
-fn copy_file(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
-    let mut reader = std::fs::File::open(src)?;
-    let meta = reader.metadata()?;
-    // `create_new`: a file that is already there is an error, and not ours to remove below
-    let mut writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
-    let result = (|| {
-        let mut in_kernel = true;
-        let mut buffer = Vec::new();
-        let mut copied = 0u64;
+/// How the bytes of a file get from one place to the other: inside the kernel while that works, through a buffer when it
+/// does not.
+struct Mover {
+    in_kernel: bool,
+    buffer: Vec<u8>,
+}
+
+impl Mover {
+    fn new() -> Self {
+        Self { in_kernel: true, buffer: Vec::new() }
+    }
+
+    /// Up to `most` bytes from `reader` to `writer`, at their positions; 0 is the end. `first`: nothing was copied yet.
+    fn step(&mut self, reader: &std::fs::File, writer: &std::fs::File, most: usize, first: bool) -> io::Result<usize> {
         loop {
-            w.shared.checkpoint()?;
-            let n = if in_kernel {
-                match copy_range(&reader, &writer) {
+            if self.in_kernel {
+                match copy_range(reader, writer, most) {
                     // Files such as those in /proc claim to be empty to the kernel copy; read them the plain way
-                    Ok(0) if copied == 0 => {
-                        in_kernel = false;
-                        continue;
-                    }
-                    Ok(n) => n,
+                    Ok(0) if first => self.in_kernel = false,
+                    Ok(n) => return Ok(n),
                     // Not supported between these files: copy through a buffer instead
-                    Err(e) if matches!(e.raw_os_error(), Some(libc::EXDEV | libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM | libc::EBADF)) => {
-                        in_kernel = false;
-                        continue;
-                    }
+                    Err(e) if matches!(e.raw_os_error(), Some(libc::EXDEV | libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM | libc::EBADF)) => self.in_kernel = false,
                     Err(e) => return Err(e),
                 }
             } else {
-                if buffer.is_empty() {
-                    buffer = vec![0u8; CHUNK];
+                if self.buffer.is_empty() {
+                    self.buffer = vec![0u8; CHUNK];
                 }
-                let n = reader.read(&mut buffer)?;
-                writer.write_all(&buffer[..n])?;
-                n
-            };
-            if n == 0 {
-                break;
+                let n = (&*reader).read(&mut self.buffer[..most.min(CHUNK)])?;
+                (&*writer).write_all(&self.buffer[..n])?;
+                return Ok(n);
             }
-            copied += n as u64;
-            w.add_bytes(n as u64);
+        }
+    }
+}
+
+fn copy_file(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
+    let reader = std::fs::File::open(src)?;
+    let meta = reader.metadata()?;
+    // `create_new`: a file that is already there is an error, and not ours to remove below
+    let writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
+    let result = (|| {
+        let mut mover = Mover::new();
+        // A file with holes (a disk image, a database) keeps them instead of becoming as big as it says
+        let holey = ops::may_have_holes(&meta)
+            && ops::copy_holey(&reader, &writer, meta.len(), &mut || w.shared.checkpoint(), &mut |most, first| mover.step(&reader, &writer, most as usize, first), &mut |n| w.add_bytes(n))? == ops::Holey::Copied;
+        let mut copied = 0u64;
+        if !holey {
+            loop {
+                w.shared.checkpoint()?;
+                let n = mover.step(&reader, &writer, CHUNK, copied == 0)?;
+                if n == 0 {
+                    break;
+                }
+                copied += n as u64;
+                w.add_bytes(n as u64);
+            }
         }
         // Tags, comments and ratings live in extended attributes; set them while the copy is still writable
         let permissions = w.keep_attributes(src, dst, &meta);
@@ -909,13 +927,41 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
             // Another filesystem: copy, then remove the original once the copy is whole
             Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
                 copy_new(w, src, &target, None)?;
-                ops::remove_tree(src)?;
+                if let Err(err) = ops::remove_tree(src) {
+                    // The copy is whole and stays; the original is still (at least partly) where it was. That is
+                    // said, and an undo takes the copy away again
+                    let folder = target.parent().map(name_of).unwrap_or_default();
+                    rec.created.push(target);
+                    return Err(io::Error::other(trf("A complete copy was made in “{}”, but the original could not be fully removed: {}", &[&folder, &crate::fs::describe::io_error(&err)])));
+                }
                 rec.moved.push((src.to_path_buf(), target));
             }
             Err(e) => return Err(e),
         },
     }
     Ok(())
+}
+
+/// The room the copy of `src` takes in `dest`, given that its size, holes included, is `size`. A file with holes
+/// copied within one file system keeps them (that file system has holes, the source is the proof), so it takes what
+/// the source takes; on another one the target may not have holes, so its whole size is counted. Nothing is guessed
+/// about copies that share their blocks (reflinks): they are counted in full, and the question can be answered "continue".
+fn room_for(src: &Path, dest: Option<&Path>, size: u64) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fn used(path: &Path, device: u64) -> u64 {
+        let Ok(meta) = path.symlink_metadata() else { return 0 };
+        if meta.is_dir() {
+            std::fs::read_dir(path).map_or(0, |entries| entries.flatten().fold(0u64, |sum, entry| sum.saturating_add(used(&entry.path(), device))))
+        } else if meta.dev() == device && ops::may_have_holes(&meta) {
+            meta.blocks().saturating_mul(512).min(meta.len())
+        } else {
+            meta.len()
+        }
+    }
+    match dest.and_then(|d| d.metadata().ok()) {
+        Some(dest) => used(src, dest.dev()).min(size),
+        None => size,
+    }
 }
 
 /// The disk a copy or move writes to, for `Engine::spawn_queued`. A move that stays on one file
@@ -954,7 +1000,7 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
             .iter()
             .zip(&sizes)
             .filter(|((src, target), _)| op == Op::Copy || target.parent().is_none_or(|parent| !same_device(src, parent)))
-            .fold(0u64, |sum, (_, size)| sum.saturating_add(size.1));
+            .fold(0u64, |sum, ((src, target), size)| sum.saturating_add(room_for(src, target.parent(), size.1)));
         if let Err(err) = w.ensure_space(dest, needed, free) {
             return if is_cancel(&err) { Outcome::stopped() } else { Outcome::failed(err.to_string()) };
         }
@@ -986,7 +1032,9 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
         }
         Op::Move => {
             edits.extend(rec.moved.iter().rev().map(|(from, to)| Edit::Move { from: to.clone(), to: from.clone() }));
-            trf("Move of {}", &[&label])
+            // Copies whose originals could not be removed: an undo takes those copies away, it does not put the originals back
+            edits.extend(rec.created.iter().cloned().map(Edit::Trash));
+            if rec.created.is_empty() { trf("Move of {}", &[&label]) } else { trf("Incomplete move of {}", &[&label]) }
         }
     };
     edits.extend(rec.replaced.iter().cloned().map(Edit::Restore));
@@ -1516,5 +1564,272 @@ mod tests {
         assert_eq!(crate::fs::xattr::get(&link, "system.posix_acl_access").ok().flatten(), None);
         assert_eq!(getfacl(&dir.join("t/f")), before);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_job_copies_a_file_with_holes_without_filling_them() {
+        let dir = sandbox("copy_holey");
+        let len = 48 << 20;
+        {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::File::create(dir.join("image")).unwrap();
+            file.set_len(len).unwrap();
+            file.write_all_at(b"head", 0).unwrap();
+            file.write_all_at(&[9u8; 5000], 20 << 20).unwrap();
+            file.write_all_at(b"tail", len - 4).unwrap();
+            file.sync_all().unwrap();
+        }
+        let source = dir.join("image").metadata().unwrap();
+        let keeps_holes = source.blocks() * 512 < source.len();
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("image"), dir.join("copy"))], Decision::Skip);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read(dir.join("image")).unwrap(), std::fs::read(dir.join("copy")).unwrap());
+        if keeps_holes {
+            assert!(dir.join("copy").metadata().unwrap().blocks() * 512 < 1 << 20, "the copy was filled up");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_says_more_than_it_holds_is_copied_as_it_reads() {
+        // Files in /sys claim a size (a page) and give less, and use no blocks: not a file with holes
+        let source = Path::new("/sys/kernel/mm/transparent_hugepage/enabled");
+        let Ok(text) = std::fs::read(source) else { return };
+        let dir = sandbox("copy_sysfs");
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(source.to_path_buf(), dir.join("copy"))], Decision::Skip);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read(dir.join("copy")).unwrap(), text);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `(path relative to root, content)` of every file under `root`, sorted: the real state of a folder.
+    fn listing(root: &Path) -> Vec<(String, String)> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    out.push((path.strip_prefix(root).unwrap().display().to_string(), std::fs::read_to_string(&path).unwrap_or_default()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// A second file system and a user who cannot remove what is locked; `None` (with a note) where there is none.
+    fn two_file_systems(name: &str) -> Option<(PathBuf, PathBuf)> {
+        use std::os::unix::fs::MetadataExt;
+        let (from, to) = (sandbox(name), PathBuf::from("/dev/shm").join(format!("compression_engine_{name}_{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&to);
+        std::fs::create_dir_all(&to).unwrap();
+        if from.metadata().unwrap().dev() == to.metadata().unwrap().dev() || unsafe { libc::geteuid() } == 0 {
+            std::fs::remove_dir_all(&from).unwrap();
+            std::fs::remove_dir_all(&to).unwrap();
+            return None;
+        }
+        Some((from, to))
+    }
+
+    fn mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn a_move_to_another_file_system_whose_original_cannot_be_removed_says_so_and_undoes_only_the_copy() {
+        let Some((from, to)) = two_file_systems("move_stays") else { return };
+        std::fs::create_dir_all(from.join("box/tree/sub")).unwrap();
+        std::fs::write(from.join("box/tree/a.txt"), "one").unwrap();
+        std::fs::write(from.join("box/tree/sub/b.txt"), "two").unwrap();
+        std::fs::write(from.join("box/file.txt"), "three").unwrap();
+        // The loose file cannot be unlinked from a locked folder; in the tree one file can go and one cannot
+        mode(&from.join("box/tree/sub"), 0o555);
+        mode(&from.join("box"), 0o555);
+        let before = listing(&from);
+        let pairs = vec![(from.join("box/file.txt"), to.join("file.txt")), (from.join("box/tree"), to.join("tree"))];
+        let (outcome, _) = run(JobKind::Move, Op::Move, pairs, Decision::Skip);
+        // What is there once the job is over, and again a moment later: nothing tries again, nothing is put back
+        let after = listing(&from);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(listing(&from), after, "nothing touches the original after the job");
+        let copies = listing(&to);
+        assert!(!outcome.ok, "no silent partial success: {}", outcome.message);
+        assert!(outcome.message.contains("could not be fully removed") && outcome.message.contains("file.txt") && outcome.message.contains("tree"), "{}", outcome.message);
+        // The copies are whole
+        assert_eq!(copies, vec![("file.txt".into(), "three".into()), ("tree/a.txt".into(), "one".into()), ("tree/sub/b.txt".into(), "two".into())]);
+        // The originals: the loose file is there. Of the tree, the file in the locked folder is certainly there; the other
+        // may or may not be (which goes first is up to the system), so the state is read and not assumed
+        assert!(after.contains(&("box/file.txt".into(), "three".into())));
+        assert!(after.contains(&("box/tree/sub/b.txt".into(), "two".into())));
+        assert!(after.iter().all(|entry| before.contains(entry)), "the original lost files at most, it gained none");
+        // The undo is of the copies, and says so
+        let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
+        assert!(entry.label.starts_with("Incomplete move of"), "{}", entry.label);
+        assert!(entry.edits.iter().all(|e| matches!(e, Edit::Trash(p) if p.starts_with(&to))) && entry.edits.len() == 2, "{:?}", entry.edits);
+        // Doing it takes the copies away and does not touch the originals
+        // The trash of that file system is made in its top folder
+        let trash = PathBuf::from("/dev/shm").join(format!(".Trash-{}", unsafe { libc::geteuid() }));
+        let trash_existed = trash.exists();
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        let gone = !to.join("file.txt").exists() && !to.join("tree").exists();
+        let originals_unchanged = listing(&from) == after;
+        mode(&from.join("box"), 0o755);
+        mode(&from.join("box/tree/sub"), 0o755);
+        assert!(gone, "the copies are in the trash");
+        assert!(originals_unchanged, "and the originals are as they were");
+        std::fs::remove_dir_all(&from).unwrap();
+        if !trash_existed {
+            // What was trashed has the locked folder in it; only a trash this test made is removed
+            let _ = std::process::Command::new("chmod").args(["-R", "u+rwx"]).arg(&trash).status();
+            let _ = std::fs::remove_dir_all(&trash);
+        }
+        let _ = std::fs::remove_dir_all(&to);
+    }
+
+    #[test]
+    fn the_room_a_copy_needs_counts_holes_only_where_they_stay() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let dir = sandbox("room");
+        let len = 64u64 << 20;
+        std::fs::create_dir_all(dir.join("tree")).unwrap();
+        {
+            let file = std::fs::File::create(dir.join("tree/image")).unwrap();
+            file.set_len(len).unwrap();
+            file.write_all_at(&[1u8; 8192], 1 << 20).unwrap();
+            file.sync_all().unwrap();
+        }
+        std::fs::write(dir.join("tree/plain"), vec![2u8; 1 << 20]).unwrap();
+        let image = dir.join("tree/image").metadata().unwrap();
+        if image.blocks() * 512 >= image.len() {
+            return;
+        }
+        let all = len + (1 << 20);
+        // Within one file system the holes stay holes: what the data uses, and a plain file in full
+        let same = room_for(&dir.join("tree"), Some(&dir), all);
+        assert!(((1 << 20)..(2 << 20)).contains(&same), "{same}");
+        assert_eq!(room_for(&dir.join("tree/plain"), Some(&dir), 1 << 20), 1 << 20);
+        assert_eq!(room_for(&dir.join("tree/image"), Some(&dir), len), image.blocks() * 512);
+        // Nowhere to look, or another file system: the whole size, as before
+        assert_eq!(room_for(&dir.join("tree"), None, all), all);
+        let other = Path::new("/dev/shm");
+        if other.metadata().is_ok_and(|m| m.dev() != dir.metadata().unwrap().dev()) {
+            assert_eq!(room_for(&dir.join("tree"), Some(other), all), all);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs a copy where `free` bytes are left; returns the outcome and the `needed` of every question about room.
+    fn run_with_room(pairs: Vec<(PathBuf, PathBuf)>, free: u64) -> (Outcome, Vec<u64>) {
+        let mut e = engine();
+        e.spawn(JobKind::Copy, String::new(), String::new(), move |w| transfer_with(w, Op::Copy, pairs, move |_| Some(free)));
+        let (mut done, mut asked) = (None, Vec::new());
+        for _ in 0..500 {
+            for event in e.poll() {
+                match event {
+                    Event::LowSpace(request) => {
+                        asked.push(request.needed);
+                        request.answer(false);
+                    }
+                    Event::Done { outcome, .. } => done = Some(outcome),
+                    _ => {}
+                }
+            }
+            if !e.running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (done.expect("the job never finished"), asked)
+    }
+
+    #[test]
+    fn a_copy_of_a_file_with_holes_is_not_warned_about_when_what_it_uses_fits() {
+        use std::os::unix::fs::FileExt;
+        let dir = sandbox("room_job");
+        let len = 64u64 << 20;
+        let file = std::fs::File::create(dir.join("image")).unwrap();
+        file.set_len(len).unwrap();
+        file.write_all_at(&[1u8; 8192], 1 << 20).unwrap();
+        file.sync_all().unwrap();
+        std::fs::write(dir.join("plain"), vec![2u8; 4 << 20]).unwrap();
+        if std::os::unix::fs::MetadataExt::blocks(&dir.join("image").metadata().unwrap()) * 512 >= len {
+            return;
+        }
+        // 10 MiB are left: the image uses next to nothing of that, the same size in plain data would not fit
+        let (outcome, asked) = run_with_room(vec![(dir.join("image"), dir.join("copy"))], 10 << 20);
+        assert!(outcome.ok && asked.is_empty(), "{} {asked:?}", outcome.message);
+        let (outcome, asked) = run_with_room(vec![(dir.join("plain"), dir.join("copy2")), (dir.join("image"), dir.join("copy3"))], 4 << 20);
+        assert!(!outcome.ok && asked.len() == 1 && asked[0] >= 4 << 20 && asked[0] < len, "the plain file is counted in full, the image by its data: {asked:?}");
+        assert!(!dir.join("copy2").exists(), "and nothing was copied after the answer");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_job_copies_a_file_the_plain_way_when_the_file_system_cannot_tell_holes() {
+        use std::os::unix::fs::FileExt;
+        let dir = sandbox("copy_no_holes_info");
+        let len = 12u64 << 20;
+        {
+            let file = std::fs::File::create(dir.join("image")).unwrap();
+            file.set_len(len).unwrap();
+            file.write_all_at(b"head", 0).unwrap();
+            file.write_all_at(&[5u8; 4096], 6 << 20).unwrap();
+            file.write_all_at(b"tail", len - 4).unwrap();
+            file.sync_all().unwrap();
+        }
+        ops::tests::make_seek_fail(&dir.join("image"), libc::EOPNOTSUPP);
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("image"), dir.join("copy"))], Decision::Skip);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(dir.join("copy").metadata().unwrap().len(), len);
+        assert_eq!(std::fs::read(dir.join("image")).unwrap(), std::fs::read(dir.join("copy")).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_move_tried_again_after_an_incomplete_one_asks_about_the_copy_that_is_there_and_nothing_goes_unasked() {
+        let Some((from, to)) = two_file_systems("move_again") else { return };
+        let trash = PathBuf::from("/dev/shm").join(format!(".Trash-{}", unsafe { libc::geteuid() }));
+        let trash_existed = trash.exists();
+        std::fs::create_dir_all(from.join("box/tree/sub")).unwrap();
+        std::fs::write(from.join("box/tree/a.txt"), "one").unwrap();
+        std::fs::write(from.join("box/tree/sub/b.txt"), "two").unwrap();
+        mode(&from.join("box/tree/sub"), 0o555);
+        mode(&from.join("box"), 0o555);
+        let pair = || vec![(from.join("box/tree"), to.join("tree"))];
+        let (first, _) = run(JobKind::Move, Op::Move, pair(), Decision::Skip);
+        assert!(!first.ok && first.message.contains("could not be fully removed"), "{}", first.message);
+        let copy_after_first = listing(&to);
+        // The person unlocks what was in the way and tries again
+        mode(&from.join("box"), 0o755);
+        mode(&from.join("box/tree/sub"), 0o755);
+        let unlocked = listing(&from);
+
+        // Saying "skip" changes nothing at all
+        let (second, asked) = run(JobKind::Move, Op::Move, pair(), Decision::Skip);
+        assert_eq!(asked, 1, "the copy that is there is a name that is taken, and that is asked");
+        assert!(second.ok, "{}", second.message);
+        assert_eq!((listing(&from), listing(&to)), (unlocked.clone(), copy_after_first.clone()), "nothing was touched");
+
+        // Saying "replace" moves what is left of the original over the copy and the copy goes to the trash
+        let (third, asked) = run(JobKind::Move, Op::Move, pair(), Decision::Replace);
+        assert_eq!(asked, 1);
+        assert!(third.ok, "{}", third.message);
+        assert!(!from.join("box/tree").exists(), "the original is gone now");
+        assert_eq!(listing(&to), unlocked.iter().map(|(p, c)| (p.strip_prefix("box/").unwrap().to_owned(), c.clone())).collect::<Vec<_>>(), "and it is all there");
+        let Effect::Record(entry) = third.effect else { panic!("no undo entry") };
+        assert!(entry.edits.iter().any(|e| matches!(e, Edit::Restore(_))), "the replaced copy can be brought back");
+
+        std::fs::remove_dir_all(&from).unwrap();
+        if !trash_existed {
+            let _ = std::process::Command::new("chmod").args(["-R", "u+rwx"]).arg(&trash).status();
+            let _ = std::fs::remove_dir_all(&trash);
+        }
+        let _ = std::fs::remove_dir_all(&to);
     }
 }

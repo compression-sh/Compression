@@ -66,3 +66,24 @@ fn class_len(p: &[char], c: char) -> Option<usize> {
     (hit != negated).then_some(end + 1)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::matches;
+
+    #[test]
+    fn wildcards_lists_and_plain_text() {
+        assert!(matches("*.png", "a.PNG", false));
+        assert!(!matches("*.png", "a.PNG", true));
+        assert!(matches("*.png, *.jpg", "b.jpg", true));
+        assert!(matches("report?.txt", "report1.txt", true));
+        assert!(!matches("report?.txt", "report12.txt", true));
+        assert!(matches("holiday", "My Holiday 2024.mov", false), "plain text matches anywhere");
+        assert!(matches("a*b*c", "aXXbYYc", true));
+        assert!(!matches("a*b*c", "aXXbYY", true));
+        assert!(matches("*.[pP][nN][gG]", "a.PNG", true));
+        assert!(matches("*.[a-c]x", "f.bx", true));
+        assert!(!matches("*.[!a-c]x", "f.bx", true));
+        assert!(!matches("*.[pP][nN][gG]", "a.jpg", true));
+        assert!(!matches("  ,; ", "anything", true), "empty patterns match nothing");
+    }
+}

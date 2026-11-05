@@ -85,12 +85,25 @@ impl CompressionApp {
         Some((dest, rect))
     }
 
+    /// Whether `dest` is a folder, without asking a server in the frame: what the listing shows is believed, and
+    /// one on a server that it does not show is taken for a folder until a thread has said otherwise (if it is not,
+    /// the job reports it).
+    pub(super) fn is_folder(&self, dest: &Path) -> bool {
+        if let Some(item) = self.items.iter().find(|i| i.path == dest) {
+            return item.is_dir;
+        }
+        if !network::is_remote(dest) {
+            return dest.is_dir();
+        }
+        !matches!(self.net.known.get(dest, &self.ctx), Some(network_ui::Kind::Other | network_ui::Kind::Missing))
+    }
+
     /// Dropping is pointless on the folder the items already sit in, and impossible into themselves.
     fn accepts(&self, dest: &Path, items: &[PathBuf]) -> bool {
         if trash::is_trash_folder(dest) {
             return true;
         }
-        if dest.as_os_str() == RECENT_PATH || !dest.is_dir() || trash::contains(dest) {
+        if dest.as_os_str() == RECENT_PATH || !self.is_folder(dest) || trash::contains(dest) {
             return false;
         }
         !items.iter().all(|i| i.parent() == Some(dest)) && !items.iter().any(|i| dest.starts_with(i))
@@ -103,7 +116,12 @@ impl CompressionApp {
         if modifiers.command || modifiers.shift {
             return modifiers.command;
         }
-        let (Some(first), Ok(dest)) = (items.first(), std::fs::metadata(dest)) else { return false };
+        let Some(first) = items.first() else { return false };
+        // Between servers, or between a server and a drive, nothing is asked: the mounts tell whether it is one drive
+        if network::is_remote(dest) || network::is_remote(first) {
+            return network::mount_root(dest) != network::mount_root(first);
+        }
+        let Ok(dest) = std::fs::metadata(dest) else { return false };
         std::fs::symlink_metadata(first).is_ok_and(|m| m.dev() != dest.dev())
     }
 
@@ -326,3 +344,103 @@ impl CompressionApp {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Settings;
+    use crate::ui::theme::SerpantinumTheme;
+
+    #[test]
+    fn drops_need_a_different_folder_that_is_not_inside_the_items() {
+        let base = std::env::temp_dir().join(format!("compression_dnd_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("a/inner")).unwrap();
+        std::fs::create_dir_all(base.join("b")).unwrap();
+        std::fs::write(base.join("a/file.txt"), "x").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let items = vec![base.join("a/file.txt")];
+        assert!(app.accepts(&base.join("b"), &items));
+        assert!(!app.accepts(&base.join("a"), &items), "already there");
+        assert!(!app.accepts(&base.join("a/file.txt"), &items), "not a folder");
+        let folder = vec![base.join("a")];
+        assert!(!app.accepts(&base.join("a/inner"), &folder), "into itself");
+        assert!(app.accepts(&base.join("b"), &folder));
+
+        let zone = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 30.0));
+        app.drop_zones.push(DropZone { rect: zone, dest: base.join("b") });
+        assert_eq!(app.drop_target(egui::pos2(10.0, 10.0), &items).map(|t| t.0), Some(base.join("b")));
+        assert!(app.drop_target(egui::pos2(500.0, 10.0), &items).is_none());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Files dropped into the folder on show are selected where the sort puts them, unless the
+    /// user picked something else in the meantime.
+    #[test]
+    fn dropped_files_are_selected_once_they_arrive() {
+        let base = std::env::temp_dir().join(format!("compression_dnd_arrive_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (here, there) = (base.join("here"), base.join("there"));
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&there).unwrap();
+        for name in ["a.txt", "z.txt"] {
+            std::fs::write(here.join(name), "x").unwrap();
+        }
+        std::fs::write(there.join("m.txt"), "x").unwrap();
+        std::fs::write(there.join("n.txt"), "x").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(here.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.reload_items();
+        app.select_path(&here.join("a.txt"));
+        let wait = |paths: &[&str], app: &CompressionApp| Arrivals {
+            folder: here.clone(),
+            paths: paths.iter().map(|n| here.join(n)).collect(),
+            shown: app.selected_paths().into_iter().collect(),
+            until: Instant::now() + ARRIVAL_WAIT,
+        };
+        app.arrivals = Some(wait(&["m.txt"], &app));
+        app.scroll_to_selected = false;
+        std::fs::rename(there.join("m.txt"), here.join("m.txt")).unwrap();
+        app.reload_items();
+        assert_eq!(app.selected_paths(), vec![here.join("m.txt")]);
+        assert_eq!(app.selected_index, Some(1), "sorted between a and z");
+        assert!(app.scroll_to_selected && app.arrivals.is_none());
+
+        // A click elsewhere before the file turns up keeps the user's choice
+        app.arrivals = Some(wait(&["n.txt"], &app));
+        app.select_path(&here.join("z.txt"));
+        std::fs::rename(there.join("n.txt"), here.join("n.txt")).unwrap();
+        app.keep_selection_through_reload();
+        app.reload_items();
+        assert_eq!(app.selected_paths(), vec![here.join("z.txt")]);
+        assert!(app.arrivals.is_none());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A fake server folder that does not exist, so that only a stat could say anything about it.
+    fn fake_server(name: &str) -> PathBuf {
+        let top = PathBuf::from(format!("/nonexistent/compression_dnd_{name}_{}", std::process::id()));
+        network::declare_remote_for_tests(&top);
+        top
+    }
+
+    #[test]
+    fn dropping_onto_or_from_a_server_decides_copy_or_move_without_asking_it() {
+        let (a, b) = (fake_server("copies_a"), fake_server("copies_b"));
+        let (one, two) = (vec![a.join("x")], b.join("y"));
+        let none = egui::Modifiers::NONE;
+        assert!(!CompressionApp::copies(&one, &a.join("sub"), none), "within one server: a move");
+        assert!(CompressionApp::copies(&one, &two, none), "from one server to another: a copy");
+        assert!(CompressionApp::copies(&one, &std::env::temp_dir(), none), "from a server to a local folder: a copy");
+        assert!(CompressionApp::copies(&[std::env::temp_dir().join("x")], &a, none), "from a local folder to a server: a copy");
+        // GVfs mounts are told apart by their folder name
+        let gvfs = |server: &str, file: &str| network::gvfs_root().join(server).join(file);
+        assert!(!CompressionApp::copies(&[gvfs("sftp:host=a", "x")], &gvfs("sftp:host=a", "dir"), none), "within one GVfs server: a move");
+        assert!(CompressionApp::copies(&[gvfs("sftp:host=a", "x")], &gvfs("sftp:host=b", "dir"), none), "between two GVfs servers: a copy");
+        assert!(CompressionApp::copies(&[gvfs("sftp:host=a", "x")], &a, none), "between a GVfs server and another one: a copy");
+        assert!(CompressionApp::copies(&one, &two, egui::Modifiers::COMMAND) && !CompressionApp::copies(&one, &two, egui::Modifiers::SHIFT));
+    }
+}

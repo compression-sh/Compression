@@ -398,3 +398,111 @@ fn text_details(path: &Path, size: u64) -> Option<Vec<(&'static str, String)>> {
     ])
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression-props-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn ages_follow_the_calendar() {
+        let now = (2026, 10, 22, 14, 0);
+        assert_eq!(describe_age(now, (2026, 10, 22, 8, 5)), "Today, 08:05");
+        // Yesterday is a calendar day, even when it was only a few hours ago
+        assert_eq!(describe_age((2026, 10, 22, 1, 0), (2026, 10, 21, 23, 30)), "Yesterday, 23:30");
+        assert_eq!(describe_age(now, (2026, 10, 19, 9, 0)), "3 days ago");
+        assert_eq!(describe_age(now, (2026, 10, 12, 9, 0)), "Last week");
+        assert_eq!(describe_age(now, (2026, 10, 1, 9, 0)), "3 weeks ago");
+        assert_eq!(describe_age(now, (2026, 9, 20, 9, 0)), "Last month");
+        assert_eq!(describe_age(now, (2026, 3, 2, 9, 0)), "7 months ago");
+        assert_eq!(describe_age(now, (2025, 8, 2, 9, 0)), "Last year");
+        assert_eq!(describe_age(now, (2023, 1, 2, 9, 0)), "3 years ago");
+        assert_eq!(describe_age(now, (2026, 10, 23, 9, 0)), "In the future");
+        // Across a year boundary and a leap day
+        assert_eq!(describe_age((2024, 3, 1, 0, 0), (2024, 2, 28, 0, 0)), "2 days ago");
+        assert_eq!(describe_age((2026, 1, 2, 9, 0), (2025, 12, 31, 9, 0)), "2 days ago");
+    }
+
+    #[test]
+    fn walk_counts_hard_links_once_and_does_not_follow_symlinks() {
+        let dir = tree("walk");
+        std::fs::create_dir_all(dir.join("sub/deeper")).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![1u8; 1000]).unwrap();
+        std::fs::hard_link(dir.join("a.bin"), dir.join("sub/a-link.bin")).unwrap();
+        std::fs::write(dir.join("sub/deeper/b.bin"), vec![2u8; 500]).unwrap();
+        let outside = tree("outside");
+        std::fs::write(outside.join("big.bin"), vec![3u8; 100_000]).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link-to-folder")).unwrap();
+        std::os::unix::fs::symlink(outside.join("big.bin"), dir.join("link-to-file")).unwrap();
+
+        let state = ScanState::default();
+        walk(&dir, &state);
+        let totals = state.totals();
+        // The two names of one inode count once; the links count as links, not as their targets
+        assert_eq!(totals.folders, 2);
+        assert!(totals.bytes >= 1500 && totals.bytes < 2000, "{totals:?}");
+        assert!(!totals.partial);
+        assert!(totals.disk >= totals.bytes.min(4096));
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_folder_makes_the_total_partial() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root reads everything
+        // SAFETY: geteuid has no preconditions
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tree("partial");
+        std::fs::create_dir_all(dir.join("locked")).unwrap();
+        std::fs::write(dir.join("ok.txt"), "12345").unwrap();
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let state = ScanState::default();
+        walk(&dir, &state);
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(state.totals().partial);
+        assert_eq!(state.totals().bytes, 5);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_walk_stops_at_once() {
+        let dir = tree("cancel");
+        for i in 0..50 {
+            std::fs::write(dir.join(format!("{i}.txt")), "x").unwrap();
+        }
+        let state = ScanState::default();
+        state.cancel.store(true, Ordering::Relaxed);
+        walk(&dir, &state);
+        assert_eq!(state.files.load(Ordering::Relaxed), 0);
+
+        // Dropping a running scan raises the flag its thread watches
+        let scan = FolderScan::start(dir.clone());
+        let state = Arc::clone(&scan.state);
+        drop(scan);
+        assert!(state.cancel.load(Ordering::Relaxed));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn deep_trees_do_not_overflow_the_stack() {
+        let dir = tree("deep");
+        let mut path = dir.clone();
+        // Long relative path chain built level by level through the parent
+        for _ in 0..200 {
+            path.push("d");
+            std::fs::create_dir_all(&path).unwrap();
+        }
+        let state = ScanState::default();
+        walk(&dir, &state);
+        assert_eq!(state.folders.load(Ordering::Relaxed), 200);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

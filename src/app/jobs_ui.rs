@@ -100,7 +100,8 @@ impl CompressionApp {
         if changed && self.search_query.trim().is_empty() {
             self.reload_items_later();
         } else if changed {
-            self.items.retain(|i| i.path.symlink_metadata().is_ok());
+            // A server is not asked in the frame (it may hang); its entries are read again with the listing
+            self.items.retain(|i| network::is_remote(&i.path) || i.path.symlink_metadata().is_ok());
         }
     }
 

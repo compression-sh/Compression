@@ -421,3 +421,114 @@ impl Plugins {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plugin that records what it is told, to test the routing.
+    struct Fake {
+        id: &'static str,
+        on: bool,
+        events: std::rc::Rc<std::cell::RefCell<Vec<FileOpEvent>>>,
+    }
+
+    impl Plugin for Fake {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn name(&self) -> &'static str {
+            "Fake"
+        }
+        fn description(&self) -> &'static str {
+            ""
+        }
+        fn icon(&self) -> &'static str {
+            ""
+        }
+        fn default_enabled(&self) -> bool {
+            self.on
+        }
+        fn marks(&self, _item: &FileItem) -> Vec<Mark> {
+            vec![Mark::Dot([1, 2, 3]), Mark::Dot([4, 5, 6])]
+        }
+        fn menu_items(&self, _selection: &[FileItem]) -> Vec<MenuItem> {
+            vec![MenuItem::new("go", "Go", "").confirm("Sure?")]
+        }
+        fn run(&mut self, id: &str, _paths: &[PathBuf], dir: &Path) -> Reaction {
+            if id == "go" { Reaction::Search(dir.display().to_string()) } else { Reaction::None }
+        }
+        fn file_op_done(&mut self, op: &FileOpEvent) {
+            self.events.borrow_mut().push(op.clone());
+        }
+    }
+
+    fn fakes(on: bool) -> (Plugins, std::rc::Rc<std::cell::RefCell<Vec<FileOpEvent>>>) {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let plugins = Plugins { list: vec![Box::new(Fake { id: "fake", on, events: events.clone() })], enabled: BTreeMap::new() };
+        (plugins, events)
+    }
+
+    fn item() -> FileItem {
+        FileItem::from_path(Path::new("/")).expect("root")
+    }
+
+    #[test]
+    fn marks_come_back_in_order() {
+        let (plugins, _) = fakes(true);
+        assert_eq!(plugins.marks(&item()), vec![Mark::Dot([1, 2, 3]), Mark::Dot([4, 5, 6])]);
+    }
+
+    #[test]
+    fn a_disabled_plugin_contributes_nothing() {
+        let (mut plugins, events) = fakes(false);
+        assert!(plugins.marks(&item()).is_empty());
+        assert!(plugins.menu_items(&[item()]).is_empty());
+        plugins.file_op_done(&FileOpEvent::Removed(vec![PathBuf::from("/x")]));
+        assert!(events.borrow().is_empty());
+        assert!(matches!(plugins.run("fake", "go", &[], Path::new("/")), Reaction::None));
+    }
+
+    #[test]
+    fn menu_items_carry_the_confirmation_and_run_reports_a_reaction() {
+        let (mut plugins, _) = fakes(true);
+        let entries = plugins.menu_items(&[item()]);
+        assert_eq!(entries[0].0, "fake");
+        assert_eq!(entries[0].1.confirm, Some("Sure?"));
+        assert!(matches!(plugins.run("fake", "go", &[], Path::new("/tmp")), Reaction::Search(q) if q == "/tmp"));
+    }
+
+    #[test]
+    fn file_operations_reach_enabled_plugins() {
+        let (mut plugins, events) = fakes(true);
+        let op = FileOpEvent::Moved(vec![(PathBuf::from("/a"), PathBuf::from("/b"))]);
+        plugins.file_op_done(&op);
+        assert_eq!(*events.borrow(), vec![op]);
+    }
+
+    #[test]
+    fn interning_leaks_each_text_once() {
+        let a = intern("same text");
+        let b = intern(&String::from("same text"));
+        assert!(std::ptr::eq(a, b));
+    }
+
+    #[test]
+    fn switches_override_defaults() {
+        let mut plugins = Plugins::bundled(&BTreeMap::new());
+        assert!(plugins.is_enabled("git"));
+        assert!(!plugins.is_enabled("no-such-plugin"));
+        plugins.set_enabled("git", false);
+        assert!(!plugins.is_enabled("git"));
+        assert_eq!(plugins.enabled_map().get("git"), Some(&false));
+    }
+
+    #[test]
+    fn plugin_ids_are_unique() {
+        let plugins = Plugins::bundled(&BTreeMap::new());
+        let mut ids: Vec<_> = plugins.catalog().iter().map(|c| c.0).collect();
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total);
+    }
+}

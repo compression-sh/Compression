@@ -273,3 +273,70 @@ pub fn is_action_pressed(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_bare_letter() {
+        assert!(is_bare_letter("j"));
+        assert!(is_bare_letter("k"));
+        assert!(is_bare_letter("g"));
+        assert!(is_bare_letter("Shift+G"));
+        assert!(is_bare_letter("y"));
+        assert!(!is_bare_letter("ArrowDown"));
+        assert!(!is_bare_letter("Ctrl+C"));
+        assert!(!is_bare_letter("Alt+Enter"));
+        assert!(!is_bare_letter("Enter"));
+        assert!(!is_bare_letter("Backspace"));
+        assert!(!is_bare_letter("F5"));
+        assert!(!is_bare_letter("?"));
+        assert!(!is_bare_letter("/"));
+    }
+
+    #[test]
+    fn test_bindings_default_and_override() {
+        let mut overrides = std::collections::BTreeMap::new();
+        assert_eq!(bindings(&overrides, Action::MoveDown), vec!["ArrowDown", "j"]);
+
+        overrides.insert("move_down".to_string(), vec!["Down".to_string()]);
+        assert_eq!(bindings(&overrides, Action::MoveDown), vec!["Down"]);
+    }
+
+    #[test]
+    fn test_display_and_hint() {
+        assert_eq!(display("Alt+ArrowLeft"), "Alt+←");
+        assert_eq!(display("ArrowDown"), "↓");
+        assert_eq!(display("Ctrl+Shift+N"), "Ctrl+Shift+N");
+        let none = std::collections::BTreeMap::new();
+        assert_eq!(hint(&none, Action::MoveDown, true).as_deref(), Some("↓"));
+        // Without vim keys the bare-letter binding is skipped
+        assert_eq!(hint(&none, Action::CopyPath, false), None);
+        assert_eq!(hint(&none, Action::CopyPath, true).as_deref(), Some("y"));
+        assert_eq!(hint(&none, Action::Rename, true).as_deref(), Some("F2"));
+    }
+
+    #[test]
+    fn test_every_action_has_a_unique_binding_id() {
+        let mut ids: Vec<&str> = Action::ALL.iter().map(|a| a.id()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), Action::ALL.len());
+        // No two actions share a default binding, or the first one would shadow the other
+        let mut bindings: Vec<&str> = Action::ALL.iter().flat_map(|a| a.default_bindings().iter().copied()).collect();
+        let total = bindings.len();
+        bindings.sort_unstable();
+        bindings.dedup();
+        assert_eq!(bindings.len(), total, "duplicate default binding");
+    }
+
+    #[test]
+    fn test_format_and_parse_binding() {
+        let (k, m) = parse_binding("Ctrl+Shift+N").expect("parse Ctrl+Shift+N");
+        assert_eq!(k, egui::Key::N);
+        assert!(m.command);
+        assert!(m.shift);
+        assert!(!m.alt);
+        assert_eq!(format_binding(k, m), "Ctrl+Shift+N");
+    }
+}

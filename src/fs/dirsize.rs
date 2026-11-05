@@ -162,3 +162,55 @@ pub fn count_in_background(folders: Vec<PathBuf>, busy: std::sync::Arc<AtomicBoo
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sizes are one store for the whole process, and a test that runs a window refreshes it (`clear`) at any
+    /// moment. A check made here is therefore done again when its data was wiped between storing and looking.
+    fn undisturbed(check: impl Fn() -> Option<()>) {
+        for _ in 0..200 {
+            if check().is_some() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("still disturbed after 200 attempts, or wrong");
+    }
+
+    #[test]
+    fn labels_follow_what_is_known() {
+        undisturbed(labels_check);
+    }
+
+    fn labels_check() -> Option<()> {
+        let p = Path::new("/compression-test/labels");
+        forget(p);
+        let ok = |condition: bool| condition.then_some(());
+        ok(label(p) == "—")?;
+        store_count(p, Some(3));
+        ok(label(p) == "3 items" && known_count(p) == Some(3))?;
+        mark_pending(p);
+        ok(label(p) == "…")?;
+        store(p, Totals { bytes: 2048, disk: 4096, files: 2, folders: 1, partial: false });
+        ok(label(p) == format_bytes(2048))?;
+        store(p, Totals { bytes: 10, disk: 10, files: 1, folders: 0, partial: true });
+        ok(label(p) == format!("≥ {}", format_bytes(10)))
+    }
+
+    #[test]
+    fn invalidating_drops_the_folder_its_parents_and_its_children() {
+        undisturbed(invalidating_check);
+    }
+
+    fn invalidating_check() -> Option<()> {
+        let t = Totals { bytes: 1, disk: 1, files: 1, folders: 0, partial: false };
+        for p in ["/compression-test/inv", "/compression-test/inv/a", "/compression-test/inv/a/b", "/compression-test/inv/other", "/compression-test/elsewhere"] {
+            store(Path::new(p), t);
+        }
+        invalidate(Path::new("/compression-test/inv/a"));
+        let gone = ["/compression-test/inv", "/compression-test/inv/a", "/compression-test/inv/a/b"];
+        let kept = ["/compression-test/inv/other", "/compression-test/elsewhere"];
+        (gone.iter().all(|p| totals(Path::new(p)).is_none()) && kept.iter().all(|p| totals(Path::new(p)).is_some())).then_some(())
+    }
+}

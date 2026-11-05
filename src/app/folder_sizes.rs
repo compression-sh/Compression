@@ -153,7 +153,8 @@ impl CompressionApp {
 
     /// "Calculate size" on folders. A toast says it started, and another the total once known.
     pub(super) fn calculate_sizes(&mut self, paths: &[PathBuf]) {
-        let folders: Vec<PathBuf> = paths.iter().filter(|p| p.is_dir()).cloned().collect();
+        // The listing says what is a folder; a path on a server that it does not show is not looked at in the frame
+        let folders: Vec<PathBuf> = paths.iter().filter(|p| self.is_folder(p)).cloned().collect();
         for path in &folders {
             self.sizes.discard(path);
             dirsize::forget(path);
@@ -258,3 +259,29 @@ fn folder_name(path: &Path) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_on_screen_become_a_range() {
+        let rect = |y: f32| egui::Rect::from_min_size(egui::pos2(0.0, y), egui::vec2(100.0, 10.0));
+        let rects: Vec<(usize, egui::Rect)> = (0..10).map(|i| (i, rect(i as f32 * 10.0))).collect();
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 35.0), egui::vec2(100.0, 30.0));
+        assert_eq!(visible_rows(&rects, viewport), 3..7);
+        assert_eq!(visible_rows(&rects, egui::Rect::from_min_size(egui::pos2(0.0, 500.0), egui::vec2(1.0, 1.0))), 0..0);
+    }
+
+    #[test]
+    fn scrolled_to_folders_jump_the_queue() {
+        let (a, b, c) = (Path::new("/compression-test/queue/a"), Path::new("/compression-test/queue/b"), Path::new("/compression-test/queue/c"));
+        let mut scheduler = SizeScheduler::default();
+        scheduler.request(a);
+        scheduler.request(b);
+        scheduler.request(c);
+        scheduler.prioritize(c);
+        scheduler.prioritize(b);
+        assert_eq!(scheduler.queue, VecDeque::from([b.to_path_buf(), c.to_path_buf(), a.to_path_buf()]));
+        scheduler.cancel_all();
+    }
+}
