@@ -846,5 +846,7 @@
   "Incomplete move of {}": "Di chuyển chưa hoàn tất {}",
   "{} replaced items could not go to the trash and were deleted for good: undo cannot bring them back": "{} mục bị thay thế không thể chuyển vào thùng rác và đã bị xóa vĩnh viễn: hoàn tác không thể khôi phục",
   "Settings could not be saved: {}": "Không thể lưu cài đặt: {}",
-  "The copy is complete, but the original could not be fully removed: {}": "Bản sao đã đầy đủ, nhưng không thể xóa hết bản gốc: {}"
+  "The copy is complete, but the original could not be fully removed: {}": "Bản sao đã đầy đủ, nhưng không thể xóa hết bản gốc: {}",
+  "{} of {} steps could not be done and are kept for another try: {}": "{} trong {} bước không thể thực hiện và được giữ lại để thử lại: {}",
+  "{} of {} steps could not be done and were given up on: {}": "{} trong {} bước không thể thực hiện và đã bị bỏ qua: {}"
 }

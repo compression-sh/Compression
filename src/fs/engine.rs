@@ -155,24 +155,32 @@ pub struct Outcome {
     pub cancelled: bool,
     pub message: String,
     pub effect: Effect,
+    /// Steps of an undo (`false`) or redo (`true`) that failed and wait for another try, see `history::apply_entry`.
+    pub left: Option<(bool, UndoEntry)>,
 }
 
 impl Outcome {
     pub fn done(message: String) -> Self {
-        Self { ok: true, cancelled: false, message, effect: Effect::None }
+        Self { ok: true, cancelled: false, message, effect: Effect::None, left: None }
     }
 
     pub fn failed(message: String) -> Self {
-        Self { ok: false, cancelled: false, message, effect: Effect::None }
+        Self { ok: false, cancelled: false, message, effect: Effect::None, left: None }
     }
 
     /// The job was cancelled and took back what it had begun.
     pub fn stopped() -> Self {
-        Self { ok: false, cancelled: true, message: tr("Cancelled").to_owned(), effect: Effect::None }
+        Self { ok: false, cancelled: true, message: tr("Cancelled").to_owned(), effect: Effect::None, left: None }
     }
 
     pub fn with(mut self, effect: Effect) -> Self {
         self.effect = effect;
+        self
+    }
+
+    /// Keep `entry`, the steps that failed, for another try on the side of the history it came from.
+    pub fn keeping(mut self, redo: bool, entry: Option<UndoEntry>) -> Self {
+        self.left = entry.map(|entry| (redo, entry));
         self
     }
 }

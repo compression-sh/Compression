@@ -26,11 +26,13 @@ pub struct UndoEntry {
     /// What the change was, for the toast and the menu: "Move of 3 items".
     pub label: String,
     pub edits: Vec<Edit>,
+    /// How often the steps of this entry were tried again after they had failed (see `apply_entry`).
+    retries: u8,
 }
 
 impl UndoEntry {
     pub fn new(label: impl Into<String>, edits: Vec<Edit>) -> Self {
-        Self { label: label.into(), edits }
+        Self { label: label.into(), edits, retries: 0 }
     }
 }
 
@@ -85,38 +87,99 @@ impl History {
 
 /// Carry out an entry. Returns the entry that reverses it, plus the first error if some edit
 /// failed (the edits that worked are still reversible).
-pub fn apply(entry: UndoEntry) -> (Option<UndoEntry>, Option<String>) {
-    let mut inverse = Vec::new();
-    let mut error = None;
-    for edit in entry.edits {
-        let result = match edit {
-            Edit::Trash(path) => trash::trash(&path).map(Edit::Restore),
-            Edit::Restore(trashed) => trash::restore(&trashed).map(Edit::Trash),
-            Edit::Move { from, to } => {
-                if to.symlink_metadata().is_ok() {
-                    Err(io::Error::other(format!("“{}” already exists", to.display())))
-                } else {
-                    if let Some(parent) = to.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    ops::move_path(&from, &to).map(|_| Edit::Move { from: to, to: from })
-                }
-            }
-            Edit::Renames(pairs) => rename_many(&pairs).map(|_| Edit::Renames(pairs.into_iter().map(|(a, b)| (b, a)).collect())),
-            Edit::Chmod { path, mode } => std::fs::metadata(&path).and_then(|meta| {
-                let old = meta.permissions().mode() & 0o7777;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map(|_| Edit::Chmod { path, mode: old })
-            }),
-        };
-        match result {
-            Ok(reverse) => inverse.push(reverse),
-            Err(err) => {
+/// How often the steps that failed are kept for another try. After that they are given up on, or an entry that can
+/// never work would stay at the top of the history for good and hide everything under it.
+const RETRIES: u8 = 2;
+
+/// What `apply_entry` did.
+pub struct Applied {
+    /// What takes back (or, for an undo, repeats) the steps that were done; `None` when none was.
+    pub inverse: Option<UndoEntry>,
+    /// The steps that failed, unchanged, for the next try (the same entry on the same side of the history); `None`
+    /// when all went well, or when they were tried too often.
+    pub left: Option<UndoEntry>,
+    /// Why the first step went wrong.
+    pub error: Option<String>,
+    pub failed: usize,
+    pub total: usize,
+    /// The failed steps are not kept (tried `RETRIES` times).
+    pub given_up: bool,
+}
+
+/// What one step came to.
+enum Step {
+    Done(Edit),
+    /// The move was made across file systems and its copy is whole, but the original could not be removed (all):
+    /// the step counts as done, with a warning.
+    DoneWithLeftovers(Edit, io::Error),
+    Failed(io::Error),
+}
+
+/// Do the steps of `entry` in order. A step that fails does not stop the others; it is handed back in `left`, so that
+/// it is not lost from the history and can be tried again.
+pub fn apply_entry(entry: UndoEntry) -> Applied {
+    let UndoEntry { label, edits, retries } = entry;
+    let total = edits.len();
+    let (mut inverse, mut kept, mut error) = (Vec::new(), Vec::new(), None);
+    for edit in edits {
+        let again = edit.clone();
+        match step(edit) {
+            Step::Done(reverse) => inverse.push(reverse),
+            Step::DoneWithLeftovers(reverse, err) => {
+                inverse.push(reverse);
                 error.get_or_insert(crate::fs::describe::io_error(&err));
+            }
+            Step::Failed(err) => {
+                error.get_or_insert(crate::fs::describe::io_error(&err));
+                kept.push(again);
             }
         }
     }
     inverse.reverse();
-    (if inverse.is_empty() { None } else { Some(UndoEntry { label: entry.label, edits: inverse }) }, error)
+    let failed = kept.len();
+    let given_up = failed > 0 && retries >= RETRIES;
+    let left = (failed > 0 && !given_up).then(|| UndoEntry { label: label.clone(), edits: kept, retries: retries + 1 });
+    let inverse = (!inverse.is_empty()).then(|| UndoEntry::new(label, inverse));
+    Applied { inverse, left, error, failed, total, given_up }
+}
+
+/// `apply_entry` without what failed: the entry that takes back what was done, and the first error.
+#[cfg(test)]
+pub fn apply(entry: UndoEntry) -> (Option<UndoEntry>, Option<String>) {
+    let applied = apply_entry(entry);
+    (applied.inverse, applied.error)
+}
+
+fn step(edit: Edit) -> Step {
+    match edit {
+        Edit::Trash(path) => done(trash::trash(&path).map(Edit::Restore)),
+        Edit::Restore(trashed) => done(trash::restore(&trashed).map(Edit::Trash)),
+        Edit::Move { from, to } => {
+            if to.symlink_metadata().is_ok() {
+                Step::Failed(io::Error::other(format!("“{}” already exists", to.display())))
+            } else {
+                if let Some(parent) = to.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let reverse = Edit::Move { from: to.clone(), to: from.clone() };
+                match ops::move_path(&from, &to) {
+                    Ok(()) => Step::Done(reverse),
+                    // The copy is whole where the move was meant to go: the step is done, what is left behind is said
+                    Err(err) if ops::is_copied_not_removed(&err) => Step::DoneWithLeftovers(reverse, err),
+                    Err(err) => Step::Failed(err),
+                }
+            }
+        }
+        Edit::Renames(pairs) => done(rename_many(&pairs).map(|_| Edit::Renames(pairs.into_iter().map(|(a, b)| (b, a)).collect()))),
+        Edit::Chmod { path, mode } => done(std::fs::metadata(&path).and_then(|meta| {
+            let old = meta.permissions().mode() & 0o7777;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map(|_| Edit::Chmod { path, mode: old })
+        })),
+    }
+}
+
+fn done(result: io::Result<Edit>) -> Step {
+    result.map_or_else(Step::Failed, Step::Done)
 }
 
 /// Rename `(from, to)` pairs together, going through temporary names so names can be swapped.
@@ -251,5 +314,89 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("taken")).unwrap(), "keep me");
         assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "a");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn plain_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression_history_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_step_that_fails_is_kept_for_another_try_and_the_other_steps_are_done() {
+        let dir = plain_dir("kept");
+        for (name, text) in [("a", "A"), ("b", "B"), ("c", "C"), ("taken", "keep me")] {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let entry = UndoEntry::new(
+            "three steps",
+            vec![
+                Edit::Move { from: dir.join("a"), to: dir.join("a2") },
+                Edit::Move { from: dir.join("b"), to: dir.join("taken") },
+                Edit::Chmod { path: dir.join("c"), mode: 0o600 },
+            ],
+        );
+        let applied = apply_entry(entry);
+        assert_eq!((applied.failed, applied.total, applied.given_up), (1, 3, false));
+        assert!(applied.error.as_deref().is_some_and(|e| e.contains("already exists")), "{:?}", applied.error);
+        // The first and the third step were done, the second was not
+        assert!(dir.join("a2").exists() && !dir.join("a").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("taken")).unwrap(), "keep me", "nothing was replaced");
+        let inverse = applied.inverse.expect("what was done can be taken back");
+        assert_eq!(inverse.edits.len(), 2);
+        assert_eq!(std::fs::metadata(dir.join("c")).unwrap().permissions().mode() & 0o777, 0o600);
+        let left = applied.left.expect("the failed steps are kept");
+        assert_eq!(left.edits.len(), 1);
+        assert_eq!(left.label, "three steps");
+        assert!(matches!(left.edits[0], Edit::Move { .. }), "in their order, unchanged");
+
+        // The cause is put right, and the kept steps work
+        std::fs::remove_file(dir.join("taken")).unwrap();
+        let again = apply_entry(UndoEntry { edits: vec![left.edits[0].clone()], ..left });
+        assert!(again.error.is_none() && again.left.is_none(), "{:?}", again.error);
+        assert_eq!(std::fs::read_to_string(dir.join("taken")).unwrap(), "B");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn steps_that_keep_failing_are_given_up_on_after_a_few_tries() {
+        let dir = plain_dir("given_up");
+        let entry = || UndoEntry::new("never", vec![Edit::Restore(dir.join("not-in-the-trash"))]);
+        let first = apply_entry(entry());
+        let second = apply_entry(first.left.expect("kept the first time"));
+        let third = apply_entry(second.left.expect("kept the second time"));
+        assert!(third.left.is_none() && third.given_up, "after {RETRIES} tries it is dropped, or it would block the history for good");
+        assert_eq!((third.failed, third.total), (1, 1));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_entry_that_goes_through_leaves_nothing_behind() {
+        let dir = plain_dir("clean");
+        std::fs::write(dir.join("a"), "A").unwrap();
+        let applied = apply_entry(UndoEntry::new("one", vec![Edit::Move { from: dir.join("a"), to: dir.join("b") }]));
+        assert!(applied.left.is_none() && applied.error.is_none() && applied.failed == 0 && !applied.given_up);
+        assert_eq!(applied.inverse.unwrap().edits.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_undo_move_across_file_systems_with_leftovers_counts_as_done_and_says_what_is_left() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some((root, shm)) = crate::fs::ops::tests::two_file_systems("history_leftover") else { return };
+        std::fs::create_dir_all(root.join("tree/box")).unwrap();
+        std::fs::write(root.join("tree/box/b.txt"), "two").unwrap();
+        std::fs::set_permissions(root.join("tree/box"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let entry = UndoEntry::new("move", vec![Edit::Move { from: root.join("tree"), to: shm.join("tree") }]);
+        let applied = apply_entry(entry);
+        assert!(applied.error.as_deref().is_some_and(|e| e.contains("The copy is complete")), "{:?}", applied.error);
+        assert_eq!(applied.failed, 0, "the step is done: the copy is whole where it was meant to go");
+        assert!(applied.left.is_none(), "so it is not tried again");
+        let inverse = applied.inverse.expect("and it can be taken back");
+        assert!(matches!(&inverse.edits[0], Edit::Move { from, to } if *from == shm.join("tree") && *to == root.join("tree")));
+        assert_eq!(std::fs::read_to_string(shm.join("tree/box/b.txt")).unwrap(), "two");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
     }
 }

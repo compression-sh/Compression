@@ -846,5 +846,7 @@
   "Incomplete move of {}": "Déplacement incomplet de {}",
   "{} replaced items could not go to the trash and were deleted for good: undo cannot bring them back": "{} élément remplacé n'a pas pu aller dans la corbeille et a été supprimé définitivement : annuler ne peut pas le rétablir|{} éléments remplacés n'ont pas pu aller dans la corbeille et ont été supprimés définitivement : annuler ne peut pas les rétablir",
   "Settings could not be saved: {}": "Les réglages n'ont pas pu être enregistrés : {}",
-  "The copy is complete, but the original could not be fully removed: {}": "La copie est complète, mais l'original n'a pas pu être entièrement supprimé : {}"
+  "The copy is complete, but the original could not be fully removed: {}": "La copie est complète, mais l'original n'a pas pu être entièrement supprimé : {}",
+  "{} of {} steps could not be done and are kept for another try: {}": "{} étapes sur {} n'ont pas pu être faites et sont conservées pour un nouvel essai : {}",
+  "{} of {} steps could not be done and were given up on: {}": "{} étapes sur {} n'ont pas pu être faites et sont abandonnées : {}"
 }

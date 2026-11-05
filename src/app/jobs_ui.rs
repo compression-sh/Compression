@@ -55,6 +55,25 @@ fn format_eta(eta: std::time::Duration) -> String {
     }
 }
 
+/// The outcome of an undo (`redo` false) or redo: what takes it back goes to the other side of the history, the steps
+/// that failed stay on this side for another try, and the message says how many and why.
+fn history_outcome(redo: bool, label: &str, applied: history::Applied) -> Outcome {
+    let history::Applied { inverse, left, error, failed, total, given_up } = applied;
+    let effect = match inverse {
+        Some(inverse) if redo => Effect::Redone(inverse),
+        Some(inverse) => Effect::Undone(inverse),
+        None => Effect::None,
+    };
+    let message = if redo { trf("Redid: {}", &[&label]) } else { trf("Undid: {}", &[&label]) };
+    let outcome = match error {
+        None => Outcome::done(message),
+        Some(err) if failed == 0 => Outcome::failed(err),
+        Some(err) if given_up => Outcome::failed(trf("{} of {} steps could not be done and were given up on: {}", &[&failed, &total, &err])),
+        Some(err) => Outcome::failed(trf("{} of {} steps could not be done and are kept for another try: {}", &[&failed, &total, &err])),
+    };
+    outcome.with(effect).keeping(redo, left)
+}
+
 impl CompressionApp {
     /// Called once per frame: take in what finished jobs report and open the next question.
     pub(super) fn poll_jobs(&mut self) {
@@ -105,8 +124,10 @@ impl CompressionApp {
         }
     }
 
-    fn finish_job(&mut self, outcome: Outcome) {
+    fn finish_job(&mut self, mut outcome: Outcome) {
         let mut undoable = false;
+        // Steps of an undo or redo that failed stay on their side of the history, on top, for the next try
+        let kept = outcome.left.take();
         match outcome.effect {
             Effect::Record(entry) => {
                 undoable = outcome.ok;
@@ -124,6 +145,13 @@ impl CompressionApp {
             }
             // A job that changed things without an undo (deleting for good, a cancelled copy)
             Effect::None => crate::fs::dirsize::clear(),
+        }
+        if let Some((redo, entry)) = kept {
+            if redo {
+                self.history.push_redo(entry);
+            } else {
+                self.history.push_undo(entry);
+            }
         }
         let message = if outcome.cancelled || outcome.ok { outcome.message } else { trf("Failed: {}", &[&outcome.message]) };
         if undoable {
@@ -153,19 +181,7 @@ impl CompressionApp {
         };
         let label = entry.label.clone();
         let title = if redo { trf("Redoing {}…", &[&label]) } else { trf("Undoing {}…", &[&label]) };
-        let id = self.engine.spawn(JobKind::Other, title, String::new(), move |_| {
-            let (inverse, error) = history::apply(entry);
-            let effect = match inverse {
-                Some(inverse) if redo => Effect::Redone(inverse),
-                Some(inverse) => Effect::Undone(inverse),
-                None => Effect::None,
-            };
-            let message = if redo { trf("Redid: {}", &[&label]) } else { trf("Undid: {}", &[&label]) };
-            match error {
-                None => Outcome::done(message).with(effect),
-                Some(err) => Outcome::failed(err).with(effect),
-            }
-        });
+        let id = self.engine.spawn(JobKind::Other, title, String::new(), move |_| history_outcome(redo, &label, history::apply_entry(entry)));
         self.history_job = Some(id);
     }
 
@@ -508,5 +524,76 @@ impl CompressionApp {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::history::{Edit, UndoEntry};
+
+    fn app_in(name: &str) -> (CompressionApp, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("compression_jobs_ui_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        crate::settings::NO_SAVE.with(|n| n.set(true));
+        let app = CompressionApp::new(dir.clone(), crate::ui::theme::SerpantinumTheme::default(), crate::settings::Settings::default(), &egui::Context::default());
+        (app, dir)
+    }
+
+    fn settle(app: &mut CompressionApp) {
+        for _ in 0..500 {
+            app.poll_jobs();
+            if app.history_job.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the undo never finished");
+    }
+
+    #[test]
+    fn the_steps_of_an_undo_that_failed_stay_on_top_of_the_history_and_work_once_the_cause_is_gone() {
+        let (mut app, dir) = app_in("undo_kept");
+        for (name, text) in [("b", "B"), ("c", "C"), ("taken", "keep me")] {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        app.history.record(UndoEntry::new(
+            "two renamings",
+            vec![Edit::Move { from: dir.join("b"), to: dir.join("a") }, Edit::Move { from: dir.join("c"), to: dir.join("taken") }],
+        ));
+        app.undo();
+        settle(&mut app);
+        assert!(dir.join("a").exists() && dir.join("c").exists(), "one step was done, the other was not");
+        assert_eq!(std::fs::read_to_string(dir.join("taken")).unwrap(), "keep me");
+        let said = app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+        assert!(said.contains("1 of 2 steps could not be done and are kept for another try"), "{said:?}");
+        assert!(said.contains("already exists"), "{said:?}");
+        assert_eq!(app.history.undo_label(), Some("two renamings"), "what failed is still there to undo");
+        assert_eq!(app.history.redo_label(), Some("two renamings"), "and what was done can be done again");
+
+        // The cause is put right; the next undo does the step that was left
+        std::fs::remove_file(dir.join("taken")).unwrap();
+        app.undo();
+        settle(&mut app);
+        assert_eq!(std::fs::read_to_string(dir.join("taken")).unwrap(), "C");
+        assert!(app.history.undo_label().is_none(), "nothing is left to undo");
+        std::fs::remove_dir_all(&dir).unwrap();
+        crate::settings::NO_SAVE.with(|n| n.set(false));
+    }
+
+    #[test]
+    fn the_steps_of_a_redo_that_failed_go_back_to_the_redo_side() {
+        let (mut app, dir) = app_in("redo_kept");
+        std::fs::write(dir.join("x"), "X").unwrap();
+        let entry = UndoEntry::new("one step", vec![Edit::Restore(dir.join("not-in-the-trash"))]);
+        let outcome = history_outcome(true, "one step", crate::fs::history::apply_entry(entry));
+        assert!(!outcome.ok && outcome.message.contains("1 of 1 steps could not be done"), "{}", outcome.message);
+        app.finish_job(outcome);
+        assert_eq!(app.history.redo_label(), Some("one step"));
+        assert!(app.history.undo_label().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+        crate::settings::NO_SAVE.with(|n| n.set(false));
     }
 }
