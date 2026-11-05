@@ -182,4 +182,74 @@ mod tests {
         assert!(!dir.join("old_name").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn rename_swap_and_chmod_round_trip() {
+        let dir = std::env::temp_dir().join(format!("compression_history_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, "A").unwrap();
+        std::fs::write(&b, "B").unwrap();
+
+        let entry = UndoEntry::new("swap", vec![Edit::Renames(vec![(a.clone(), b.clone()), (b.clone(), a.clone())])]);
+        let (inverse, error) = apply(entry);
+        assert!(error.is_none());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "B");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "A");
+        let (back, _) = apply(inverse.unwrap());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "A");
+        assert!(back.is_some());
+
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (inverse, _) = apply(UndoEntry::new("x", vec![Edit::Chmod { path: a.clone(), mode: 0o755 }]));
+        assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o755);
+        apply(inverse.unwrap());
+        assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o644);
+
+        let mut history = History::default();
+        history.record(UndoEntry::new("one", vec![Edit::Trash(a.clone())]));
+        let undone = history.pop_undo().unwrap();
+        history.push_redo(undone);
+        assert_eq!(history.redo_label(), Some("one"));
+        history.record(UndoEntry::new("two", vec![Edit::Trash(b.clone())]));
+        assert!(history.redo_label().is_none(), "a new change drops the redo stack");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn renaming_many_never_replaces_a_file_that_is_in_the_way() {
+        let dir = std::env::temp_dir().join(format!("compression_many_noreplace_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (n, text) in [("a", "a"), ("b", "b"), ("taken", "keep me")] {
+            std::fs::write(dir.join(n), text).unwrap();
+        }
+        let err = rename_many(&[(dir.join("a"), dir.join("taken"))]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(std::fs::read_to_string(dir.join("taken")).unwrap(), "keep me");
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "a", "put back under its name");
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(".compression-rename")), "no staging name is left");
+
+        // Names that trade places still do
+        rename_many(&[(dir.join("a"), dir.join("b")), (dir.join("b"), dir.join("a"))]).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "b");
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "a");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_undo_that_meets_a_taken_name_says_so_in_plain_words() {
+        let dir = std::env::temp_dir().join(format!("compression_history_words_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "a").unwrap();
+        std::fs::write(dir.join("taken"), "keep me").unwrap();
+        let (inverse, error) = apply(UndoEntry::new("rename", vec![Edit::Renames(vec![(dir.join("a"), dir.join("taken"))])]));
+        assert!(inverse.is_none());
+        assert_eq!(error.as_deref(), Some("Already exists"));
+        assert_eq!(std::fs::read_to_string(dir.join("taken")).unwrap(), "keep me");
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "a");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

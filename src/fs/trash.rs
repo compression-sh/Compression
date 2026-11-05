@@ -317,26 +317,144 @@ mod tests {
 
     #[test]
     fn without_noreplace_support_trashing_is_refused_and_the_item_and_its_trash_stay_untouched() {
-        let isolated = dirs::data_dir().is_some_and(|d| d.starts_with(std::env::temp_dir()));
-        if !isolated {
-            return;
-        }
+        assert!(dirs::data_dir().is_some_and(|d| d.starts_with(std::env::temp_dir())), "run the tests with an empty HOME and XDG folders, as CI does");
         let dir = std::env::temp_dir().join(format!("compression_trash_fb_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        std::fs::create_dir_all(dir.join("trash_fb_folder")).unwrap();
         crate::compat::tests::without_support_under(&dir);
-        std::fs::write(dir.join("file"), "data").unwrap();
-        for name in ["file", "folder"] {
+        std::fs::write(dir.join("trash_fb_file"), "data").unwrap();
+        for name in ["trash_fb_file", "trash_fb_folder"] {
             let err = trash(&dir.join(name)).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{name}");
             assert!(dir.join(name).exists());
         }
-        assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "data");
-        // No record was left behind for what did not go
+        assert_eq!(std::fs::read_to_string(dir.join("trash_fb_file")).unwrap(), "data");
+        // No record was left behind for what did not go (the trash is shared with the other tests: their names are
+        // not these)
         let info = dirs::data_dir().unwrap().join("Trash/info");
-        for name in ["file", "folder"] {
+        for name in ["trash_fb_file", "trash_fb_folder"] {
             assert!(!info.join(format!("{name}.trashinfo")).exists(), "{name}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn items_with_one_name_get_a_record_each_and_a_record_in_the_way_is_never_replaced() {
+        let base = std::env::temp_dir().join(format!("compression_trash_record_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, work) = (base.join("Trash"), base.join("work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let record = |kept: &Path| record_of(&root, kept);
+
+        // One after the other
+        std::fs::write(work.join("a.txt"), "first").unwrap();
+        let first = trash_in(&root, None, &absolute(&work.join("a.txt")).unwrap()).unwrap();
+        std::fs::write(work.join("a.txt"), "second").unwrap();
+        let second = trash_in(&root, None, &absolute(&work.join("a.txt")).unwrap()).unwrap();
+        assert_ne!(first, second);
+        for (kept, content) in [(&first, "first"), (&second, "second")] {
+            assert_eq!(std::fs::read_to_string(kept).unwrap(), content);
+            assert!(std::fs::read_to_string(record(kept)).unwrap().contains(&format!("Path={}", encode(&work.join("a.txt")))));
+        }
+
+        // A record already in the way, as another window's trashing would have left it, keeps its content
+        let reserved = root.join("info").join("b.txt.trashinfo");
+        std::fs::write(&reserved, "[Trash Info]\nPath=/somewhere/else/b.txt\n").unwrap();
+        std::fs::write(work.join("b.txt"), "mine").unwrap();
+        let kept = trash_in(&root, None, &absolute(&work.join("b.txt")).unwrap()).unwrap();
+        assert_ne!(kept.file_name().unwrap(), "b.txt", "the reserved name is not used");
+        assert_eq!(std::fs::read_to_string(&reserved).unwrap(), "[Trash Info]\nPath=/somewhere/else/b.txt\n");
+        assert!(std::fs::read_to_string(record(&kept)).unwrap().contains("Path="));
+        assert_eq!(restore(&kept).unwrap(), work.join("b.txt"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn many_items_with_one_name_trashed_at_once_each_keep_their_own_record() {
+        let base = std::env::temp_dir().join(format!("compression_trash_race_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("Trash");
+        let sources: Vec<PathBuf> = (0..12).map(|i| base.join(format!("w{i}")).join("same.txt")).collect();
+        for (i, source) in sources.iter().enumerate() {
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(source, format!("content {i}")).unwrap();
+        }
+        let start = std::sync::Arc::new(std::sync::Barrier::new(sources.len()));
+        let threads: Vec<_> = sources
+            .iter()
+            .cloned()
+            .map(|source| {
+                let (root, start) = (root.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    trash_in(&root, None, &absolute(&source).unwrap()).unwrap()
+                })
+            })
+            .collect();
+        let kept: Vec<PathBuf> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let distinct: std::collections::HashSet<_> = kept.iter().collect();
+        assert_eq!(distinct.len(), sources.len(), "two items got one name");
+        for (i, (source, kept)) in sources.iter().zip(&kept).enumerate() {
+            assert_eq!(std::fs::read_to_string(kept).unwrap(), format!("content {i}"));
+            let text = std::fs::read_to_string(record_of(&root, kept)).unwrap();
+            assert!(text.contains(&format!("Path={}", encode(source))), "{text}");
+        }
+        assert_eq!(std::fs::read_dir(root.join("info")).unwrap().count(), sources.len());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn mount_fields_unescape_and_drive_trash_folders_are_recognised() {
+        assert_eq!(unescape_mount("/run/media/me/My\\040Stick"), std::ffi::OsString::from("/run/media/me/My Stick"));
+        assert!(topdir_of(Path::new("/mnt/d/.Trash-1000")).is_some());
+        assert!(topdir_of(Path::new("/mnt/d/.Trash/1000")).is_some());
+        assert!(topdir_of(Path::new("/home/me/.local/share/Trash")).is_none());
+    }
+
+    #[test]
+    fn trash_and_restore() {
+        let base = std::env::temp_dir().join(format!("compression_trash_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, work) = (base.join("Trash"), base.join("work dir"));
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        std::fs::write(work.join("a b.txt"), "x").unwrap();
+        std::fs::write(work.join("sub/in.txt"), "y").unwrap();
+
+        let t1 = trash_in(&root, None, &absolute(&work.join("a b.txt")).unwrap()).unwrap();
+        assert!(t1.exists() && !work.join("a b.txt").exists());
+        std::fs::write(work.join("a b.txt"), "second").unwrap();
+        let t2 = trash_in(&root, None, &absolute(&work.join("a b.txt")).unwrap()).unwrap();
+        assert_ne!(t1, t2, "clashing names get a fresh name");
+        let t3 = trash_in(&root, None, &absolute(&work.join("sub")).unwrap()).unwrap();
+
+        // Restore puts items back, and moves aside what is in the way
+        std::fs::write(work.join("a b.txt"), "occupied").unwrap();
+        let back = restore(&t1).unwrap();
+        assert_eq!(std::fs::read_to_string(&back).unwrap(), "x");
+        assert_ne!(back, work.join("a b.txt"));
+        let back = restore(&t3).unwrap();
+        assert_eq!(back, work.join("sub"));
+        assert!(work.join("sub/in.txt").exists());
+        assert!(!root.join("info").join(format!("{}.trashinfo", t1.file_name().unwrap().to_string_lossy())).exists());
+
+        // Something inside a trashed folder has no record of its own and can't be restored alone
+        let again = trash_in(&root, None, &absolute(&work.join("sub")).unwrap()).unwrap();
+        assert!(restore(&again.join("in.txt")).is_err());
+        assert!(again.join("in.txt").exists());
+
+        // On another drive the record is relative to the drive's top folder, and restoring joins it back
+        let (drive, stray) = (base.join("drive"), base.join("drive/docs/x.txt"));
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::write(&stray, "z").unwrap();
+        let drive = drive.canonicalize().unwrap();
+        let drive_root = drive.join(".Trash-1000");
+        let kept = trash_in(&drive_root, Some(&drive), &absolute(&stray).unwrap()).unwrap();
+        assert_eq!(kept.parent().unwrap(), drive_root.join("files"));
+        assert!(std::fs::read_to_string(record_of(&drive_root, &kept)).unwrap().contains("Path=docs/x.txt"));
+        assert_eq!(topdir_of(&drive_root), Some(drive.as_path()));
+        assert_eq!(restore(&kept).unwrap(), drive.join("docs/x.txt"));
+
+        assert_eq!(decode(&encode(Path::new("/a b/ü%x"))), std::ffi::OsString::from("/a b/ü%x"));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

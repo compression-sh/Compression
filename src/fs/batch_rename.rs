@@ -345,4 +345,162 @@ mod tests {
         assert_eq!(left, vec!["folder", "one", "two"], "no staging name is left");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    fn entry(path: &str) -> Entry {
+        Entry { path: PathBuf::from(path), is_dir: false, date: "2026-01-02".to_owned() }
+    }
+
+    fn rules(template: &str) -> Rules {
+        Rules { template: template.to_owned(), ..Rules::new() }
+    }
+
+    #[test]
+    fn template_keeps_extension_and_numbers_files() {
+        let entries = [entry("/d/a.pdf"), entry("/d/b.tar.gz"), entry("/d/c")];
+        let names = preview(&entries, &rules("Trip [01, 02, 03] [Original name]"));
+        assert_eq!(names, ["Trip 01 a.pdf", "Trip 02 b.tar.gz", "Trip 03 c"]);
+    }
+
+    #[test]
+    fn plain_numbers_and_date() {
+        let entries = [entry("/d/a.txt"), entry("/d/b.txt")];
+        assert_eq!(preview(&entries, &rules("[Modified date]-[1, 2, 3]")), ["2026-01-02-1.txt", "2026-01-02-2.txt"]);
+        assert_eq!(preview(&entries, &rules("x[001, 002, 003]")), ["x001.txt", "x002.txt"]);
+    }
+
+    #[test]
+    fn numbering_start_step_and_order() {
+        let entries = [entry("/d/b.txt"), entry("/d/a.txt")];
+        let r = Rules { template: "n[01, 02, 03]".to_owned(), start: "10".to_owned(), step: "5".to_owned(), order: Order::Name, ..Rules::new() };
+        assert_eq!(preview(&entries, &r), ["n15.txt", "n10.txt"]);
+    }
+
+    #[test]
+    fn case_spaces_trim_prefix_and_extension() {
+        let entries = [entry("/d/hello big World.JPG")];
+        let r = Rules { case: Case::Title, spaces: Spaces::Underscore, prefix: "p_".to_owned(), lowercase_ext: true, ..Rules::new() };
+        assert_eq!(preview(&entries, &r), ["p_Hello_Big_World.jpg"]);
+        let r = Rules { trim_start: "6".to_owned(), trim_end: "2".to_owned(), suffix: "!".to_owned(), ..Rules::new() };
+        assert_eq!(preview(&entries, &r), ["big Wor!.JPG"]);
+        let r = Rules { case: Case::Sentence, ..Rules::new() };
+        assert_eq!(preview(&entries, &r), ["Hello big world.JPG"]);
+    }
+
+    #[test]
+    fn folder_and_extension_tokens() {
+        let entries = [entry("/d/photos/a.png")];
+        assert_eq!(preview(&entries, &rules("[Parent folder]-[Original name]-[Extension]")), ["photos-a-png.png"]);
+    }
+
+    #[test]
+    fn case_insensitive_replace() {
+        let entries = [entry("/d/Foo foo FOO.txt")];
+        let r = Rules { mode: Mode::Replace, find: "foo".to_owned(), replace: "x".to_owned(), match_case: false, ..Rules::new() };
+        assert_eq!(preview(&entries, &r), ["x x x.txt"]);
+    }
+
+    #[test]
+    fn find_and_replace_leaves_the_extension_alone() {
+        let entries = [entry("/d/IMG_1.jpg"), entry("/d/jpg_notes.txt")];
+        let rules = Rules { mode: Mode::Replace, find: "jpg".to_owned(), replace: "pic".to_owned(), ..Rules::new() };
+        assert_eq!(preview(&entries, &rules), ["IMG_1.jpg", "pic_notes.txt"]);
+        let empty = Rules { mode: Mode::Replace, ..Rules::new() };
+        assert_eq!(preview(&entries, &empty), ["IMG_1.jpg", "jpg_notes.txt"]);
+    }
+
+    #[test]
+    fn problems_are_reported() {
+        let entries = [entry("/d/a.txt"), entry("/d/b.txt")];
+        assert!(problem(&entries, &["x.txt".into(), "x.txt".into()]).is_some());
+        assert!(problem(&entries, &["".into(), "y.txt".into()]).is_some());
+        assert!(problem(&entries, &["a/b".into(), "y.txt".into()]).is_some());
+        assert!(problem(&entries, &["b.txt".into(), "a.txt".into()]).is_none());
+    }
+
+    #[test]
+    fn apply_renames_and_swaps() {
+        let dir = std::env::temp_dir().join(format!("compression-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "A").unwrap();
+        std::fs::write(dir.join("b.txt"), "B").unwrap();
+        let entries = [
+            Entry { path: dir.join("a.txt"), is_dir: false, date: String::new() },
+            Entry { path: dir.join("b.txt"), is_dir: false, date: String::new() },
+        ];
+        let names = vec!["b.txt".to_owned(), "a.txt".to_owned()];
+        assert!(problem(&entries, &names).is_none());
+        let (done, err) = apply(&entries, &names);
+        assert!(err.is_none());
+        assert_eq!(done.len(), 2);
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "A");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "B");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_name_whose_lowercase_form_has_other_positions_does_not_panic() {
+        // "İ" (2 bytes) lowercases to 3 bytes and the Kelvin sign U+212A (3 bytes) to the letter k (1 byte):
+        // the text and its lowercase form are both 8 bytes long, but a match in one is not at the place it
+        // is in the other
+        let text = "İaİ\u{212A}";
+        // Used to cut the text inside a letter (a panic); now the exact match counts, and finds nothing
+        assert_eq!(replace_text(text, "k", "x", false), text);
+        // Used to cut it at the wrong place; now the exact match counts
+        assert_eq!(replace_text(text, "a", "x", false), "İxİ\u{212A}");
+        // A plain case-insensitive replace still works
+        assert_eq!(replace_text("Photo PHOTO photo", "photo", "x", false), "x x x");
+    }
+
+    #[test]
+    fn a_huge_start_or_step_does_not_overflow() {
+        let entries = [entry("/d/a.txt"), entry("/d/b.txt"), entry("/d/c.txt")];
+        let r = Rules { template: "[1, 2, 3]".to_owned(), step: i64::MAX.to_string(), start: i64::MAX.to_string(), ..Rules::new() };
+        let names = preview(&entries, &r);
+        assert_eq!(names.len(), 3);
+        assert_eq!(names[2], format!("{}.txt", i64::MAX));
+    }
+
+    #[test]
+    fn applying_never_replaces_a_file_that_is_in_the_way() {
+        let dir = std::env::temp_dir().join(format!("compression_batch_noreplace_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (n, text) in [("a.txt", "a"), ("b.txt", "b"), ("c.txt", "not in the batch")] {
+            std::fs::write(dir.join(n), text).unwrap();
+        }
+        let entry = |n: &str| Entry { path: dir.join(n), is_dir: false, date: String::new() };
+        // c.txt appeared after the dialog checked: a.txt must not take its name
+        let (done, failure) = apply(&[entry("a.txt"), entry("b.txt")], &["c.txt".to_owned(), "d.txt".to_owned()]);
+        assert!(failure.is_some(), "the clash must be reported");
+        assert_eq!(std::fs::read_to_string(dir.join("c.txt")).unwrap(), "not in the batch");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a", "the file is put back");
+        // What did not clash was renamed
+        assert_eq!(done, vec![(dir.join("b.txt"), dir.join("d.txt"))]);
+        assert_eq!(std::fs::read_to_string(dir.join("d.txt")).unwrap(), "b");
+
+        // Swapping two names of the batch still works
+        std::fs::write(dir.join("x"), "x").unwrap();
+        std::fs::write(dir.join("y"), "y").unwrap();
+        let (done, failure) = apply(&[entry("x"), entry("y")], &["y".to_owned(), "x".to_owned()]);
+        assert!(failure.is_none(), "{failure:?}");
+        assert_eq!(done.len(), 2);
+        assert_eq!(std::fs::read_to_string(dir.join("x")).unwrap(), "y");
+        assert_eq!(std::fs::read_to_string(dir.join("y")).unwrap(), "x");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_clash_found_while_applying_is_reported_in_plain_words() {
+        let dir = std::env::temp_dir().join(format!("compression_batch_words_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::write(dir.join("c.txt"), "c").unwrap();
+        let entry = Entry { path: dir.join("a.txt"), is_dir: false, date: String::new() };
+        let (done, failure) = apply(&[entry], &["c.txt".to_owned()]);
+        assert!(done.is_empty());
+        assert_eq!(failure.as_deref(), Some("Already exists"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
