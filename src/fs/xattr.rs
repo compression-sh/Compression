@@ -157,4 +157,54 @@ pub(crate) mod tests {
     pub(crate) fn refuse_attributes_under(dir: &Path) {
         REFUSING.lock().unwrap().push(dir.to_path_buf());
     }
+
+    /// A temp file on a file system that stores attributes, or None when the test cannot run here.
+    pub(crate) fn scratch_file(tag: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let dir = std::env::temp_dir().join(format!("compression-xattr-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").ok()?;
+        match set(&file, "user.ski.probe", b"1") {
+            Ok(()) => Some((dir, file)),
+            Err(e) if is_unsupported(&e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                None
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn set_get_list_remove_round_trip() {
+        let Some((dir, file)) = scratch_file("rt") else { return };
+        assert_eq!(get(&file, "user.ski.probe").unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(get(&file, "user.ski.missing").unwrap(), None);
+        assert!(list(&file).unwrap().contains(&"user.ski.probe".to_owned()));
+        remove(&file, "user.ski.probe").unwrap();
+        remove(&file, "user.ski.probe").unwrap();
+        assert_eq!(get(&file, "user.ski.probe").unwrap(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copy_user_carries_attributes_over() {
+        let Some((dir, file)) = scratch_file("copy") else { return };
+        set(&file, "user.xdg.tags", b"work,home").unwrap();
+        let copy = dir.join("b.txt");
+        std::fs::write(&copy, "x").unwrap();
+        copy_user(&file, &copy);
+        assert_eq!(get(&copy, "user.xdg.tags").unwrap().as_deref(), Some(&b"work,home"[..]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn symbolic_links_are_not_followed() {
+        let Some((dir, file)) = scratch_file("link") else { return };
+        set(&file, "user.xdg.tags", b"work").unwrap();
+        let link = dir.join("l");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(get(&link, "user.xdg.tags").unwrap(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
