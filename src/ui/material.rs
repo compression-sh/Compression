@@ -2675,3 +2675,54 @@ mod slider_layout_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translucent_layers_fade_in_proportionally() {
+        let accent = Color32::from_rgba_unmultiplied(200, 100, 50, 80);
+        assert_eq!(lerp_color(Color32::TRANSPARENT, accent, 1.0), accent);
+        assert_eq!(lerp_color(Color32::TRANSPARENT, accent, 0.0), Color32::TRANSPARENT);
+        // Halfway is half the alpha, not a quarter of it
+        let half = lerp_color(Color32::TRANSPARENT, accent, 0.5);
+        assert_eq!(half.a(), 40);
+        // Opaque colors blend as usual
+        assert_eq!(lerp_color(Color32::BLACK, Color32::WHITE, 0.5), Color32::from_rgb(128, 128, 128));
+    }
+
+    #[test]
+    fn mid_flight_reversal_is_continuous_without_jumps() {
+        set_animations(true);
+        let ctx = egui::Context::default();
+        let id = egui::Id::unique("test_reversal");
+
+        let step = |time: f64, target: bool| -> f32 {
+            let raw = egui::RawInput { time: Some(time), predicted_dt: 0.016, ..Default::default() };
+            let mut val = 0.0;
+            let mut out = ctx.run_ui(raw, |ui| {
+                val = animate(ui.ctx(), id, target);
+            });
+            out.textures_delta.clear();
+            val
+        };
+
+        // Frame 0: initial state false -> 0.0
+        assert_eq!(step(0.0, false), 0.0);
+        // Frame 1..3: animate toward true (0.0 -> ~0.67 at t=50ms)
+        let v1 = step(0.016, true);
+        let v2 = step(0.032, true);
+        let v3 = step(0.050, true);
+        assert!(v1 > 0.0 && v2 > v1 && v3 > v2);
+        assert!(v3 > 0.5, "OutQuint should pass 0.5 early in the transition, got {v3}");
+
+        // Frame 4: reverse back to false mid-flight!
+        // Must descend smoothly from `v3` rather than teleporting down to near 0.0.
+        let v4 = step(0.066, false);
+        assert!(
+            v4 < v3 && v4 > v3 - 0.25,
+            "mid-flight reversal should be continuous from {v3}, got {v4}"
+        );
+    }
+}

@@ -236,4 +236,108 @@ pub(crate) mod tests {
         assert_eq!(rename_noreplace(&dir.join("c"), &dir.join("b")).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    use std::collections::HashMap;
+
+    fn sandbox(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression_compat_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn legacy(base: &Path) {
+        std::fs::create_dir_all(base.join("ski/themes")).unwrap();
+        std::fs::write(base.join("ski/settings.json"), "old settings").unwrap();
+        std::fs::write(base.join("ski/themes/mine.json"), "theme").unwrap();
+        std::os::unix::fs::symlink("settings.json", base.join("ski/link")).unwrap();
+    }
+
+    #[test]
+    fn user_data_is_copied_and_the_old_folder_stays_whole() {
+        let base = sandbox("copy");
+        legacy(&base);
+        migrate_dir(&base).unwrap();
+        assert_eq!(std::fs::read_to_string(base.join("compression/settings.json")).unwrap(), "old settings");
+        assert_eq!(std::fs::read_to_string(base.join("compression/themes/mine.json")).unwrap(), "theme");
+        assert_eq!(std::fs::read_link(base.join("compression/link")).unwrap(), Path::new("settings.json"));
+        assert_eq!(std::fs::read_to_string(base.join("ski/settings.json")).unwrap(), "old settings");
+        assert!(base.join("ski/themes/mine.json").exists());
+        let leftovers = std::fs::read_dir(&base).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains("migrating")).count();
+        assert_eq!(leftovers, 0);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn an_existing_compression_folder_is_never_touched() {
+        for existing in [true, false] {
+            let base = sandbox(if existing { "keep_full" } else { "keep_empty" });
+            legacy(&base);
+            std::fs::create_dir(base.join("compression")).unwrap();
+            if existing {
+                std::fs::write(base.join("compression/settings.json"), "new settings").unwrap();
+            }
+            migrate_dir(&base).unwrap();
+            if existing {
+                assert_eq!(std::fs::read_to_string(base.join("compression/settings.json")).unwrap(), "new settings");
+            }
+            // Not even an empty folder is filled in or replaced
+            assert_eq!(std::fs::read_dir(base.join("compression")).unwrap().count(), usize::from(existing));
+            assert!(base.join("ski/settings.json").exists());
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+    }
+
+    #[test]
+    fn nothing_is_made_without_old_data() {
+        let base = sandbox("none");
+        migrate_dir(&base).unwrap();
+        assert!(!base.join("compression").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_cut_short_migration_is_repeated_from_scratch() {
+        let base = sandbox("retry");
+        legacy(&base);
+        // What an aborted run leaves: a half copy under this process's name and one under another's
+        let mine = base.join(format!("compression.migrating.{}", std::process::id()));
+        std::fs::create_dir_all(mine.join("junk")).unwrap();
+        std::fs::write(mine.join("settings.json"), "half").unwrap();
+        std::fs::create_dir_all(base.join("compression.migrating.1")).unwrap();
+        migrate_dir(&base).unwrap();
+        assert_eq!(std::fs::read_to_string(base.join("compression/settings.json")).unwrap(), "old settings");
+        assert!(!base.join("compression/junk").exists());
+        assert!(!mine.exists());
+        // The other process's folder is not ours to remove
+        assert!(base.join("compression.migrating.1").exists());
+        // And a second run changes nothing
+        migrate_dir(&base).unwrap();
+        assert_eq!(std::fs::read_to_string(base.join("compression/settings.json")).unwrap(), "old settings");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_process_that_loses_the_race_leaves_the_winner_alone() {
+        let base = sandbox("race");
+        legacy(&base);
+        let winner = base.join("compression");
+        std::fs::create_dir_all(&winner).unwrap();
+        std::fs::write(winner.join("x"), "winner").unwrap();
+        let temp = base.join("compression.migrating.7");
+        copy_tree(&base.join("ski"), &temp).unwrap();
+        assert_eq!(rename_noreplace(&temp, &winner).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(winner.join("x")).unwrap(), "winner");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn compression_variables_win_over_the_legacy_ones() {
+        let vars = |pairs: &[(&str, &str)]| -> HashMap<String, OsString> { pairs.iter().map(|(k, v)| (k.to_string(), OsString::from(v))).collect() };
+        let both = vars(&[("COMPRESSION_ENGINE", "podman"), ("SKI_ENGINE", "docker")]);
+        assert_eq!(lookup("ENGINE", |k| both.get(k).cloned()), Some(OsString::from("podman")));
+        let old = vars(&[("SKI_ENGINE", "docker")]);
+        assert_eq!(lookup("ENGINE", |k| old.get(k).cloned()), Some(OsString::from("docker")));
+        assert_eq!(lookup("ENGINE", |_| None), None);
+    }
 }

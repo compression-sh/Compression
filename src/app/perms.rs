@@ -293,4 +293,83 @@ mod tests {
         assert_eq!(mode_of(&root.join("other/f.txt")), 0o644);
         assert!(root.join("other/dangling").symlink_metadata().unwrap().file_type().is_symlink(), "the link itself is kept");
     }
+
+    #[test]
+    fn permissions_without_the_execute_bit_can_be_given_to_a_whole_tree_and_taken_back() {
+        // root may enter any folder, so there is nothing to show
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("compression_perms_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+        std::fs::write(root.join("sub/deeper/f.txt"), "x").unwrap();
+        std::fs::write(root.join("a.sh"), "x").unwrap();
+        std::fs::set_permissions(root.join("a.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Read and write for everyone, no execute: the folders cannot be entered afterwards
+        let mut edits = Vec::new();
+        let result = chmod_contents(&engine::Shared::default(), &root, 0o666, &mut edits, &mut Vec::new());
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(mode_of(&root.join("sub")), 0o666);
+        // (Nothing below `sub` can be looked at now, which is the point)
+        assert!(root.join("sub/deeper").symlink_metadata().is_err());
+        // A file keeps its own execute bits
+        assert_eq!(mode_of(&root.join("a.sh")), 0o777);
+        assert_eq!(edits.len(), 4, "{edits:?}");
+
+        // Undo, as the history runs it: the list as the job recorded it
+        edits.reverse();
+        let (inverse, error) = crate::fs::history::apply(UndoEntry::new("x", edits));
+        assert_eq!(error, None);
+        assert!(inverse.is_some());
+        assert_eq!(mode_of(&root.join("sub")), 0o755);
+        assert_eq!(mode_of(&root.join("sub/deeper/f.txt")), 0o644);
+        assert_eq!(mode_of(&root.join("a.sh")), 0o755);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_permission_job_keeps_the_way_back_to_what_it_changed() {
+        let edit = |name: &str| Edit::Chmod { path: PathBuf::from(name), mode: 0o644 };
+        let cancelled = || Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+        // Stopped after two changes: a stop, not a failure, and the two can be undone
+        let stopped = chmod_outcome(cancelled(), vec![edit("/a"), edit("/b")], &[]);
+        assert!(stopped.cancelled && !stopped.ok);
+        assert!(matches!(stopped.effect, Effect::Record(_)));
+        // Stopped before anything was changed: nothing to undo
+        let early = chmod_outcome(cancelled(), Vec::new(), &[]);
+        assert!(early.cancelled && matches!(early.effect, Effect::None));
+        // Done, and failed for another reason, are what they were
+        let done = chmod_outcome(Ok(()), vec![edit("/a")], &[]);
+        assert!(done.ok && !done.cancelled && matches!(done.effect, Effect::Record(_)));
+        let failed = chmod_outcome(Err(std::io::Error::from_raw_os_error(13)), vec![edit("/a")], &[]);
+        assert!(!failed.ok && !failed.cancelled && matches!(failed.effect, Effect::Record(_)));
+    }
+
+    #[test]
+    fn the_walk_stops_at_a_cancel_and_leaves_everything_as_it_was() {
+        let root = std::env::temp_dir().join(format!("compression_perm_cancel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/f.txt"), "x").unwrap();
+        let before = mode_of(&root.join("sub/f.txt"));
+        let shared = engine::Shared::default();
+        shared.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut edits = Vec::new();
+        let err = chmod_contents(&shared, &root, 0o700, &mut edits, &mut Vec::new()).unwrap_err();
+        assert!(engine::is_cancel(&err));
+        assert!(edits.is_empty());
+        assert_eq!(mode_of(&root.join("sub/f.txt")), before);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_permission_job_has_a_cancel_button_and_other_jobs_still_have_none() {
+        let mut engine = Engine::new(&egui::Context::default());
+        for (kind, expected) in [(JobKind::Permissions, true), (JobKind::Other, false)] {
+            let id = engine.spawn(kind, "t".into(), String::new(), |_| Outcome::done("x".into()));
+            assert_eq!(engine.jobs.iter().find(|j| j.id == id).unwrap().controllable(), expected, "{kind:?}");
+        }
+    }
 }

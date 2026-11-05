@@ -2228,4 +2228,42 @@ mod tests {
         std::fs::remove_dir_all(&local).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn host_key_questions_are_retold() {
+        let message = "The identity of the remote computer (example.com) is unknown.\nThe identity sent by the remote computer is SHA256:abc123.";
+        let (title, body) = describe_question(message);
+        assert_eq!(title, "Unknown server");
+        assert!(body.contains("example.com") && body.contains("SHA256:abc123") && !body.contains("abc123.."));
+        assert_eq!(choice_label("Log In Anyway"), "Connect anyway");
+        assert_eq!(choice_label("Something"), "Something");
+    }
+
+    #[test]
+    fn saved_servers_find_their_folder_inside_a_mount() {
+        let mount = Mount {
+            name: "x".into(),
+            address: Address::parse("smb://nas/media"),
+            local: PathBuf::from("/run/user/1/gvfs/smb-share:server=nas,share=media"),
+            kind: network::MountKind::Gvfs,
+        };
+        let deep = Address::parse("smb://nas/media/films/2024").unwrap();
+        assert_eq!(local_in(&mount, &deep), mount.local.join("films/2024"));
+        assert_eq!(local_in(&mount, &Address::parse("smb://nas/media").unwrap()), mount.local);
+    }
+
+    #[test]
+    fn kinds_tells_folders_files_and_what_is_not_there() {
+        let top = std::env::temp_dir().join(format!("compression_kinds_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        std::fs::create_dir_all(top.join("d")).unwrap();
+        std::fs::write(top.join("f"), "x").unwrap();
+        let got = kinds(&[top.join("d"), top.join("f"), top.join("none")], ANSWER_WAIT);
+        assert_eq!(got, vec![Some(Kind::Dir), Some(Kind::Other), Some(Kind::Missing)]);
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+
+
+
 }
