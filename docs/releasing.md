@@ -26,8 +26,9 @@ Pushing a tag `vMAJOR.MINOR.PATCH` runs `.github/workflows/release.yml`, which b
    ```sh
    cargo build --release --locked
    cargo clippy --locked --all-targets --all-features -- -D warnings
+   cargo test --locked   # with an isolated home and no display, as in step 4
    ```
-   Clippy must report no warnings. CI (`.github/workflows/ci.yml`) runs clippy (`-D warnings`) on pull requests and on pushes to branches; it builds nothing for release and publishes nothing.
+   Clippy must report no warnings, and the tests must pass. CI (`.github/workflows/ci.yml`) runs Clippy (`-D warnings`) and `cargo test --locked` (whatever tests the repository holds, in folders of their own and without a display) on pull requests and on pushes to branches; it builds nothing for release and publishes nothing.
 4. Smoke-test the release binary for a few seconds with an isolated environment. **Never use real user data**: a home of its own, `XDG_*` folders of their own and a separate `XDG_RUNTIME_DIR`.
    ```sh
    S=$(mktemp -d); mkdir -p $S/home $S/run; chmod 700 $S/run
@@ -66,6 +67,8 @@ Pushing a tag `vMAJOR.MINOR.PATCH` runs `.github/workflows/release.yml`, which b
    gh run watch --repo compression-sh/Compression <id> --exit-status
    ```
    The warning that Node.js 20 is deprecated is harmless.
+
+   The run builds the binary, makes the packages (`packaging/stage.sh`, `cargo deb`, `cargo generate-rpm`) and then runs **"Smoke-test the packages"** (`packaging/smoke.sh`), before anything is uploaded: it installs the `.deb` in a clean Ubuntu 22.04 container and the `.rpm` in a clean Fedora 43 container, each with Nautilus installed first, and checks that `compression --version` prints the version, that the package has its own D-Bus service file (`org.compression.Compression.FileManager1.service`, not Nautilus's) and that the desktop file is there. If this step fails, no release is published. The usual causes are two packages claiming one file, a dependency that cannot be met, and a version that differs from `Cargo.toml`; fix it, then move the tag as described under "Things that go wrong".
 6. Confirm the release has four assets:
    ```sh
    gh release view v0.5.0 --repo compression-sh/Compression --json assets -q '.assets[].name'
@@ -75,7 +78,9 @@ Pushing a tag `vMAJOR.MINOR.PATCH` runs `.github/workflows/release.yml`, which b
    gh release edit v0.5.0 --repo compression-sh/Compression --notes-file release-notes-v0.5.0.md
    ```
    Keep the notes file outside the repository.
-7. The run's last step commits `nix/release.json` (the new version and the tarball's hash) to `master` as `github-actions[bot]`. Bring it in with `git pull --ff-only` before the next commit.
+7. The run's last step commits `nix/release.json` (the new version and the tarball's hash) to `master` as `github-actions[bot]`. Bring it in with `git pull --ff-only` before the next commit. The step tries up to five times, waiting 15, 30, 45 and 60 seconds, when GitHub answers with a temporary error. If it still fails, the release itself is published and fine, but `nix/release.json` names the previous version: set it by hand as described below (`default.nix` compiles the checkout until then).
+
+   **Do not start the run of a release again to fix that.** A new run builds and uploads the files again, so the tarball is replaced, and the hash in `nix/release.json` has to be the one of the new tarball; and the run of an **older** tag would write that old version into `nix/release.json` on `master`. Fix `release.json` by hand instead.
 
 Never edit or re-upload a release's tarball after that commit: its hash would no longer match and the Nix install would fail. To fix it by hand, `nix-prefetch-url <tarball url>` and put `sha256-` plus the base64 of that hash (`nix-hash --type sha256 --to-sri <hash>`) into `nix/release.json`. The hash in `SHA256SUMS` is the same digest in hex.
 
@@ -105,12 +110,20 @@ Never edit or re-upload a release's tarball after that commit: its hash would no
 
 - The workflow fails at "Check the tag matches Cargo.toml": the tag and `version` differ. Fix the version, commit, then move the tag (`git tag -d`, `git push origin :refs/tags/vX.Y.Z`, tag again), as long as the release was not published yet.
 - Never reuse a tag for a release that has already been published; cut a new patch version.
+- "Smoke-test the packages" fails: see step 5 of "2. Release". Nothing was uploaded, so the tag can be moved once the cause is fixed.
 - New files that the packages must contain go into `packaging/stage.sh` and then into both `[package.metadata.deb]` and `[package.metadata.generate-rpm]` in `Cargo.toml` (the `target/stage/...` sources must match what `stage.sh` writes). A new run-time library goes into the `depends` of the deb and the `requires` of the rpm, since neither is detected automatically. For the Nix packages (source build and release binary share `nix/runtime.nix`), a library Compression loads at run time goes into the `libs` list there, which ends up on `LD_LIBRARY_PATH`, and a program it runs goes into the `tools` list, which ends up on `PATH`.
 - Translation files are built into the binary (`include_str!`), so a new language needs no packaging change. It needs its `src/i18n/<code>.json` and its arms in the `Language` matches in `src/i18n/mod.rs`.
 - Builds are x86_64 only, on `ubuntu-22.04` so that the binary runs on older glibc. Do not move the runner to a newer image without a reason.
 - `docker.yml` runs on `ubuntu-latest`, which GitHub is moving to a newer Ubuntu; that is harmless for the image.
 - Workflows of a fork may not be registered until they have been pushed once: `gh workflow list` shows nothing and `gh workflow run` answers 404. Push a branch that contains them and check `gh workflow list` again.
 - `git push` asks for a password: run `gh auth setup-git`.
+
+## History of the tags and release pages
+
+- The tags `v0.1.0` to `v0.4.5` are the releases of [Ski](https://github.com/ilyamiro/Ski) by ilyamiro (annotated tags by ilyamiro). Their commits are part of this repository's history, and the tags stay as credit. The first Compression release is `v0.5.0`, based on Ski 0.4.5.
+- Ski's later tags `v0.4.6`, `v0.4.7` and `v0.4.8` point to commits that were never merged here, so they were removed from this repository's tags; they remain at <https://github.com/ilyamiro/Ski>.
+- The release pages of `v0.5.0` to `v0.5.6` were added later, without files: `v0.5.0` and `v0.5.1` from the changelog, `v0.5.6` from the text of its tag annotation, and `v0.5.2` to `v0.5.5` as lists of commits, because their notes were not kept. `v0.5.7` has notes but no files. From `v0.5.8` on, a release page has the four files.
+- Keep a copy of the notes of every release outside GitHub (the tag annotation, or the notes file kept beside the repository), so that a release page can be made again if it is ever lost. The annotation of `v0.5.6` is the only reason its notes survived.
 
 ## Checks with a real server and with Nix
 
@@ -130,13 +143,14 @@ Docker, `cargo-deb`, `cargo-generate-rpm` and Nix are not always installed where
 
 - [ ] Version in `Cargo.toml` updated
 - [ ] `Cargo.lock` updated
-- [ ] Build and clippy green
+- [ ] Build, clippy and tests green
 - [ ] Smoke test in an isolated environment
 - [ ] Tag created
 - [ ] Tag pushed
-- [ ] `release.yml` successful
+- [ ] `release.yml` successful, including "Smoke-test the packages"
 - [ ] `docker.yml` successful
 - [ ] Release artifacts present (`.tar.gz`, `.deb`, `.rpm`, `SHA256SUMS`)
 - [ ] Docker tags present (`<version>` and `latest`) and the package is public
+- [ ] Release notes set (`gh release edit --notes-file`), and a copy kept outside GitHub
 - [ ] `nix/release.json` updated by the workflow
 - [ ] `git pull --ff-only` after the Nix commit
