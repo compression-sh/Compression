@@ -7,7 +7,7 @@ Pushing a tag `vMAJOR.MINOR.PATCH` runs `.github/workflows/release.yml`, which b
 ## Before you start
 
 - **Authentication.** `origin` is `https://github.com/compression-sh/Compression.git`, and pushes authenticate through the GitHub CLI. Check with `gh auth status`. If git asks for a password, run `gh auth setup-git`.
-- **Pushing `master` publishes the Docker image.** `docker.yml` runs on every push to `master` and on every `v*` tag, and it pushes `ghcr.io/compression-sh/compression:latest`. Only push `master` when `latest` is meant to move.
+- **Pushing `master` publishes the `edge` Docker image, never `latest`.** `docker.yml` runs on every push to `master` and on every `v*` tag. A push to `master` moves only `ghcr.io/compression-sh/compression:edge`; only a release tag publishes `:<version>` and moves `:latest` (a pre-release tag such as `v1.2.3-rc.1` publishes its version and leaves `latest` alone). So `latest` is always the last release, and `edge` is whatever `master` is.
 - **Build tools.** On NixOS run cargo inside the Nix shell (`nix-shell --run "cargo …"`); outside it the binary has no system libraries and fails with `NoWaylandLib`. On other distributions plain `cargo` is enough, with the graphics libraries installed that the [Installation page of the wiki](https://github.com/compression-sh/Compression/wiki/Installation) lists.
 - **Use timeouts.** Give long commands a `timeout`, so a stuck build fails instead of hanging. A clean release build takes about 5 minutes and an incremental one 1–2 minutes. Never wait for a build with `pgrep -f "cargo build"`: the waiting shell's own command line matches the pattern, so the loop waits forever.
 - **Merge pull requests first**, for example translations, with `gh pr merge <n> --squash`. Then `git pull`.
@@ -53,7 +53,7 @@ Pushing a tag `vMAJOR.MINOR.PATCH` runs `.github/workflows/release.yml`, which b
    gh run watch --repo compression-sh/Compression <id> --exit-status
    ```
    The dry run uploads no artifacts, so it only proves that the build and the packaging commands succeed. Delete the branch afterwards (`git push origin --delete release-dry-run-vX.Y.Z`).
-4. Push `master` (this also runs `docker.yml` and updates `latest`), then tag and push the tag:
+4. Push `master` (this also runs `docker.yml` and updates `edge`, not `latest`), then tag and push the tag:
    ```sh
    git push origin master
    git tag -a v0.5.0 -m "Compression 0.5.0"
@@ -81,8 +81,8 @@ Never edit or re-upload a release's tarball after that commit: its hash would no
 
 ## 3. Docker image
 
-- The tag runs `docker.yml` in addition to `release.yml`. It builds the `Dockerfile` and pushes `ghcr.io/compression-sh/compression:0.5.0` (the semver tag) and moves `latest`. A push to `master` or a manual run of the workflow on `master` moves only `latest`.
-- The package must be **public**, so that users can pull it without logging in. The repository owner is a user account, so check the package settings at <https://github.com/compression-sh?tab=packages>. To test from outside: ask `https://ghcr.io/v2/compression-sh/compression/tags/list` with an anonymous pull token; it must answer with the tags `latest` and `0.5.0`.
+- The tag runs `docker.yml` in addition to `release.yml`. It builds the `Dockerfile`, pushes `ghcr.io/compression-sh/compression:0.5.0` (the semver tag) and moves `latest` (`flavor: latest=auto` of the metadata action; not for a pre-release tag). A push to `master`, or a manual run of the workflow on `master`, moves only `edge`. A manual run from any other branch builds the image and publishes nothing. `docker.yml` has no rule that sets `latest` for a branch: a change that adds one lets every push to `master` replace the release image with unreleased code.
+- The package must be **public**, so that users can pull it without logging in. The repository owner is a user account, so check the package settings at <https://github.com/compression-sh?tab=packages>. To test from outside: ask `https://ghcr.io/v2/compression-sh/compression/tags/list` with an anonymous pull token; it must answer with the tags `latest` and `0.5.0` (and `edge`, once `master` has been pushed).
 - If the push fails with `denied: permission_denied: read_package`, the workflow token has no write access to the package. Open the package's settings, choose "Manage Actions access" and add the repository Compression with the role Write. Then rerun the workflow.
 - Users run the image with `docker/compression-docker`; see the [Installation page of the wiki](https://github.com/compression-sh/Compression/wiki/Installation).
 
@@ -90,7 +90,7 @@ Never edit or re-upload a release's tarball after that commit: its hash would no
 
 - Wait until `release.yml` and `docker.yml` have both succeeded (`gh run list --repo compression-sh/Compression --limit 4`).
 - Check the release: `gh release view v0.5.0 --repo compression-sh/Compression`, with the four assets above.
-- Check the Docker tags `ghcr.io/compression-sh/compression:0.5.0` and `:latest`.
+- Check the Docker tags `ghcr.io/compression-sh/compression:0.5.0` and `:latest`. The tag run's log (step "Docker tags" of the metadata action) lists the tags it computed; for a release tag these are the version and `latest`, and for a push to `master` only `edge`.
 - Check the Nix follow-up commit on `master`: it changes only `nix/release.json`, to the new version and a hash that equals the tarball's entry in `SHA256SUMS`.
 - When the commit has landed: `git pull --ff-only`.
 

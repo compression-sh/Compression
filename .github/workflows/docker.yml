@@ -25,13 +25,17 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/compression
+          # `latest` only for a release tag (and not for a pre-release such as v1.2.3-rc.1); a push to master is `edge`
+          flavor: |
+            latest=auto
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
+            type=edge,branch=master
       - uses: docker/build-push-action@v7
         with:
           context: .
-          push: true
+          # A release tag and master publish; a manual run from any other branch only builds
+          push: ${{ github.ref_type == 'tag' || github.ref == 'refs/heads/master' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
