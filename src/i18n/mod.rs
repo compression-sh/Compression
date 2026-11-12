@@ -136,11 +136,31 @@ impl<'de> serde::Deserialize<'de> for Entries {
 
 static CURRENT: AtomicU8 = AtomicU8::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// The language of the texts made on this thread, for a test that checks a translation without changing the
+    /// language of the tests that run beside it.
+    static THREAD_LANGUAGE: std::cell::Cell<Option<Language>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `work` with the texts of this thread in `language` (tests only).
+#[cfg(test)]
+pub fn with_language<T>(language: Language, work: impl FnOnce() -> T) -> T {
+    THREAD_LANGUAGE.with(|l| l.set(Some(language)));
+    let out = work();
+    THREAD_LANGUAGE.with(|l| l.set(None));
+    out
+}
+
 pub fn set_language(language: Language) {
     CURRENT.store(language.index() as u8, Ordering::Relaxed);
 }
 
 pub fn language() -> Language {
+    #[cfg(test)]
+    if let Some(language) = THREAD_LANGUAGE.with(std::cell::Cell::get) {
+        return language;
+    }
     Language::ALL[(CURRENT.load(Ordering::Relaxed) as usize).min(Language::ALL.len() - 1)]
 }
 

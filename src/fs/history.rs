@@ -157,7 +157,7 @@ fn step(edit: Edit) -> Step {
         Edit::Restore(trashed) => done(trash::restore(&trashed).map(Edit::Trash)),
         Edit::Move { from, to } => {
             if to.symlink_metadata().is_ok() {
-                Step::Failed(io::Error::other(format!("“{}” already exists", to.display())))
+                Step::Failed(io::Error::other(trf("“{}” already exists", &[&to.file_name().map_or_else(|| to.to_string_lossy(), |n| n.to_string_lossy())])))
             } else {
                 if let Some(parent) = to.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -485,4 +485,18 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+
+    #[test]
+    fn a_name_that_is_taken_on_the_way_back_is_said_in_the_language_of_the_window() {
+        let dir = std::env::temp_dir().join(format!("compression_history_taken_lang_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("now"), "1").unwrap();
+        std::fs::write(dir.join("before"), "2").unwrap();
+        let entry = UndoEntry::new("x", vec![Edit::Move { from: dir.join("now"), to: dir.join("before") }]);
+        let applied = crate::i18n::with_language(crate::i18n::Language::German, || apply_entry(entry));
+        assert_eq!(applied.error.as_deref(), Some("„before“ existiert bereits"));
+        assert_eq!(std::fs::read_to_string(dir.join("before")).unwrap(), "2", "nothing is replaced");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
