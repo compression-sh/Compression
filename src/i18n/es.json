@@ -404,6 +404,7 @@
   "An undo or redo is still running, try again in a moment": "Aún se está deshaciendo o rehaciendo, inténtalo de nuevo en un momento",
   "Files that have no trash on their drive or server can't be moved to the trash. {} will be deleted for good.": "Los archivos que no tienen papelera en su unidad o servidor no se pueden mover a la papelera. {} se eliminará definitivamente.",
   "There is no trash on this drive": "No hay papelera en esta unidad",
+  "These items are already being moved": "Estos elementos ya se están moviendo",
   "Treat this folder as a server?": "¿Tratar esta carpeta como un servidor?",
   "Files deleted in “{}” can't be moved to the trash or restored. Previews are turned off, and nothing there is replaced.": "Los archivos eliminados en «{}» no van a la papelera y no se pueden restaurar. Las vistas previas se desactivan y allí no se reemplaza nada.",
   "Treated as a server: no trash, previews off, delete is permanent": "Se trata como servidor: sin papelera, sin vistas previas, eliminar es definitivo",

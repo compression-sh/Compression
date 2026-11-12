@@ -404,6 +404,7 @@
   "An undo or redo is still running, try again in a moment": "Une annulation ou un rétablissement est encore en cours, réessayez dans un instant",
   "Files that have no trash on their drive or server can't be moved to the trash. {} will be deleted for good.": "Les fichiers qui n’ont pas de corbeille sur leur disque ou serveur ne peuvent pas être mis à la corbeille. {} sera supprimé définitivement.",
   "There is no trash on this drive": "Il n’y a pas de corbeille sur ce disque",
+  "These items are already being moved": "Ces éléments sont déjà en cours de déplacement",
   "Treat this folder as a server?": "Traiter ce dossier comme un serveur ?",
   "Files deleted in “{}” can't be moved to the trash or restored. Previews are turned off, and nothing there is replaced.": "Les fichiers supprimés dans « {} » ne vont pas à la corbeille et ne peuvent pas être restaurés. Les aperçus sont désactivés et rien n’y est remplacé.",
   "Treated as a server: no trash, previews off, delete is permanent": "Traité comme un serveur : pas de corbeille, pas d’aperçus, la suppression est définitive",

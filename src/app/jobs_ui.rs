@@ -74,6 +74,14 @@ fn history_outcome(redo: bool, label: &str, applied: history::Applied) -> Outcom
     outcome.with(effect).keeping(redo, left)
 }
 
+/// The places the items of a move were taken from, as the undo entry of the job lists them.
+fn moved_sources(outcome: &Outcome) -> Vec<std::path::PathBuf> {
+    match &outcome.effect {
+        Effect::Record(entry) => entry.edits.iter().filter_map(|edit| if let Edit::Move { to, .. } = edit { Some(to.clone()) } else { None }).collect(),
+        _ => Vec::new(),
+    }
+}
+
 impl CompressionApp {
     /// Called once per frame: take in what finished jobs report and open the next question.
     pub(super) fn poll_jobs(&mut self) {
@@ -88,6 +96,10 @@ impl CompressionApp {
                     if self.history_job == Some(job) {
                         self.history_job = None;
                     }
+                    // What a move did move (not what the file system says now: a server may not answer)
+                    // A cancelled job can still say ok (nothing failed before it stopped): the cut is done with only when everything was moved
+                    let (moved, ok) = (moved_sources(&outcome), outcome.ok && !outcome.cancelled);
+                    self.paste_finished(job, &moved, ok);
                     self.finish_job(outcome);
                     self.report_removals(job);
                 }

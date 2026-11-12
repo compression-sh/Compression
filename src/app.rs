@@ -312,6 +312,15 @@ impl Dialog {
     }
 }
 
+/// What was copied or cut in this window: the paths, whether they are to be moved, and, while they are being moved,
+/// the job that does it. The job decides what stays: when it ends, what it moved is no longer waiting to be moved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Clipboard {
+    paths: Vec<PathBuf>,
+    cut: bool,
+    moving: Option<u64>,
+}
+
 /// Rubber-band drag selection started inside the file listing.
 struct DragSelect {
     /// Origin in content coordinates (`screen_y + scroll_offset.y`).
@@ -395,7 +404,10 @@ pub struct CompressionApp {
     anchor: Option<usize>,
     last_cursor: Option<usize>,
     /// Files copied or cut, waiting for a paste (`true` = cut).
-    clipboard: Option<(Vec<PathBuf>, bool)>,
+    clipboard: Option<Clipboard>,
+    /// The sources of the moves that were pasted and are still running, by job: what is on its way is not moved
+    /// again by a second paste.
+    pasting: HashMap<u64, Vec<PathBuf>>,
     engine: Engine,
     history: History,
     /// The undo or redo that is running, so a second one waits for it.
@@ -661,6 +673,7 @@ impl CompressionApp {
             anchor: None,
             last_cursor: None,
             clipboard: None,
+            pasting: HashMap::new(),
             engine: Engine::new(ctx),
             history: History::default(),
             history_job: None,
@@ -1316,7 +1329,7 @@ impl CompressionApp {
         }
         let what = Self::describe_count(&paths);
         let message = if cut { trf("Cut {}", &[&what]) } else { trf("Copied {}", &[&what]) };
-        self.clipboard = Some((paths, cut));
+        self.clipboard = Some(Clipboard { paths, cut, moving: None });
         self.set_toast(message);
     }
 
@@ -1350,16 +1363,34 @@ impl CompressionApp {
     fn paste(&mut self) {
         // Files copied in another application count too, and win when they are newer than ours
         let external = crate::clipboard::get_files().filter(|(paths, _)| paths.iter().all(|p| network::is_remote(p) || p.exists()));
-        let Some((paths, cut)) = external.or_else(|| self.clipboard.clone()) else {
-            if self.can_modify_here() && let Some(png) = crate::clipboard::get_image_png() {
-                self.paste_image(&png);
-            } else {
-                self.set_toast(tr("Nothing to paste"));
+        self.paste_with(external);
+    }
+
+    /// `paste`, with what the system clipboard holds (files of another application, or of this window, which put
+    /// them there too) given. Only what is this window's own clipboard is followed by it: its job decides what stays
+    /// (`paste_finished`); files of another application leave it alone.
+    fn paste_with(&mut self, external: Option<(Vec<PathBuf>, bool)>) {
+        let own = self.clipboard.clone();
+        let (paths, cut, tracked) = match (external, own) {
+            (Some((paths, cut)), Some(own)) if own.paths == paths && own.cut == cut => (paths, cut, true),
+            (Some((paths, cut)), _) => (paths, cut, false),
+            (None, Some(own)) => (own.paths, own.cut, true),
+            (None, None) => {
+                if self.can_modify_here() && let Some(png) = crate::clipboard::get_image_png() {
+                    self.paste_image(&png);
+                } else {
+                    self.set_toast(tr("Nothing to paste"));
+                }
+                return;
             }
-            return;
         };
         if !self.can_modify_here() {
             self.set_toast(tr("Open a regular folder to paste into"));
+            return;
+        }
+        // What is already being moved is not moved a second time: the second job would find nothing, or fight the first
+        if cut && self.pasting.values().any(|running| paths.iter().any(|p| running.contains(p))) {
+            self.set_toast(tr("These items are already being moved"));
             return;
         }
         let dest = self.current_path.clone();
@@ -1392,21 +1423,42 @@ impl CompressionApp {
                 return;
             }
         }
-        self.transfer(if cut { TransferOp::Move } else { TransferOp::Copy }, paths, dest);
+        let job = self.transfer(if cut { TransferOp::Move } else { TransferOp::Copy }, paths.clone(), dest);
         if cut {
+            // The cut stays (and shows) until the job has said what it moved
+            self.pasting.insert(job, paths);
+            if tracked && let Some(clipboard) = self.clipboard.as_mut() {
+                clipboard.moving = Some(job);
+            }
+        }
+    }
+
+    /// A paste that moves has ended: `moved` are the sources it moved, `ok` whether it did everything. When it did,
+    /// the cut is done with; when it failed or was stopped, what it did not move stays cut, to be pasted again. A
+    /// clipboard that is no longer the one the job was started from (something else was copied meanwhile) is left alone.
+    fn paste_finished(&mut self, job: u64, moved: &[PathBuf], ok: bool) {
+        self.pasting.remove(&job);
+        let Some(clipboard) = self.clipboard.as_mut().filter(|c| c.moving == Some(job)) else { return };
+        if ok {
+            self.clipboard = None;
+            return;
+        }
+        clipboard.paths.retain(|p| !moved.contains(p));
+        clipboard.moving = None;
+        if clipboard.paths.is_empty() {
             self.clipboard = None;
         }
     }
 
     /// Copy, move or extract `items` into `dest` on a worker thread.
-    fn transfer(&mut self, op: TransferOp, items: Vec<PathBuf>, dest: PathBuf) {
+    fn transfer(&mut self, op: TransferOp, items: Vec<PathBuf>, dest: PathBuf) -> u64 {
         let label = Self::describe_count(&items);
         let target = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dest.display().to_string());
         let detail = trf("to “{}”", &[&target]);
         match op {
             TransferOp::Extract => {
                 let title = trf("Extracting {}…", &[&label]);
-                self.engine.spawn(JobKind::Extract, title, detail, move |w| engine::extract_into(w, items, dest));
+                self.engine.spawn(JobKind::Extract, title, detail, move |w| engine::extract_into(w, items, dest))
             }
             TransferOp::Copy | TransferOp::Move => {
                 let pairs: Vec<(PathBuf, PathBuf)> = items.iter().filter_map(|p| p.file_name().map(|n| (p.clone(), dest.join(n)))).collect();
@@ -1416,7 +1468,7 @@ impl CompressionApp {
                     (JobKind::Move, Op::Move, trf("Moving {}", &[&label]))
                 };
                 let key = self.queue_key(engine_op, &items, &dest);
-                self.engine.spawn_queued(kind, title, detail, key, move |w| engine::transfer(w, engine_op, pairs));
+                self.engine.spawn_queued(kind, title, detail, key, move |w| engine::transfer(w, engine_op, pairs))
             }
         }
     }
@@ -3695,7 +3747,7 @@ impl CompressionApp {
             }
 
         let cut: &[PathBuf] = match &self.clipboard {
-            Some((paths, true)) => paths,
+            Some(Clipboard { paths, cut: true, .. }) => paths,
             _ => &[],
         };
         let mut clicked: Option<(usize, egui::Modifiers)> = None;
@@ -3792,7 +3844,7 @@ impl CompressionApp {
         let show_thumbs = self.settings.show_thumbnails;
 
         let cut: &[PathBuf] = match &self.clipboard {
-            Some((paths, true)) => paths,
+            Some(Clipboard { paths, cut: true, .. }) => paths,
             _ => &[],
         };
         let mut clicked: Option<(usize, egui::Modifiers)> = None;
@@ -4147,7 +4199,7 @@ impl CompressionApp {
             let pos = area.right_bottom() + egui::vec2(-14.0, -12.0 - 36.0 * i as f32);
             pill("plugin_status_area", pos, egui::Align2::RIGHT_BOTTOM, 1.0, Some(status.icon), &status.text);
         }
-        if let Some((paths, cut)) = &self.clipboard {
+        if let Some(Clipboard { paths, cut, .. }) = &self.clipboard {
             let (label, icon) = if *cut { (trf("{} ready to move", &[&paths.len()]), icons::CUT) } else { (trf("{} ready to copy", &[&paths.len()]), icons::COPY) };
             let lift = 36.0 * statuses.len() as f32;
             pill("clipboard_pill_area", area.right_bottom() + egui::vec2(-14.0, -12.0 - lift), egui::Align2::RIGHT_BOTTOM, 1.0, Some(icon), &label);
@@ -5788,10 +5840,7 @@ impl CompressionApp {
             close |= material::button(ui, "alert_ok", Some(icons::CHECK), tr("Got it"), &theme, ButtonKind::Filled, true).clicked();
         });
         close |= ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if close {
-            // Dismissing the "can't move over itself" notice drops the pending cut, like Nautilus
-            self.clipboard = None;
-        }
+        // Nothing has happened to the clipboard: it stays as it was, however the notice is closed
         close
     }
 
@@ -7775,6 +7824,188 @@ mod tests {
             assert!(w.app.dialog.is_none(), "{name} stays open when the click misses it");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn cut(paths: &[&Path]) -> Option<Clipboard> {
+        Some(Clipboard { paths: paths.iter().map(|p| p.to_path_buf()).collect(), cut: true, moving: None })
+    }
+
+    /// A window in `dst` with `src/a` and `src/b` cut, and `dst/<taken>` already there, so that the move stops at a question.
+    fn window_with_a_cut(name: &str, taken: &str) -> (Window, PathBuf) {
+        let root = window_dir(name);
+        for dir in ["src", "dst"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in ["a", "b"] {
+            std::fs::write(root.join("src").join(file), file).unwrap();
+        }
+        std::fs::write(root.join("dst").join(taken), "old").unwrap();
+        let mut w = Window::new(root.clone());
+        w.app.navigate_to(root.join("dst"));
+        w.run(Vec::new(), 15);
+        w.app.clipboard = cut(&[&root.join("src/a"), &root.join("src/b")]);
+        (w, root)
+    }
+
+    #[test]
+    fn a_cut_stays_cut_while_it_is_being_moved_is_not_moved_twice_and_is_done_with_when_the_move_succeeded() {
+        let (mut w, root) = window_with_a_cut("cut_running", "a");
+        let both = vec![root.join("src/a"), root.join("src/b")];
+        w.app.paste_with(None);
+        w.until("the question", |w| matches!(w.app.dialog, Some(Dialog::Conflict { .. })) && w.shows("Skip"));
+        // Running: the cut shows and is tied to the job
+        let job = w.app.clipboard.as_ref().and_then(|c| c.moving).expect("the clipboard does not know its job");
+        assert!(w.shows("2 ready to move"), "{:?}", w.last);
+        assert_eq!(w.app.pasting.get(&job), Some(&both));
+        // A second paste of the same files starts nothing: not from this clipboard, not from the system's
+        let jobs = w.app.engine.jobs.len();
+        w.app.status_toast = None;
+        w.app.paste_with(None);
+        assert_eq!(w.app.engine.jobs.len(), jobs, "a second job for the same files");
+        assert_eq!(w.app.status_toast.as_ref().map(|t| t.message.as_str()), Some("These items are already being moved"));
+        w.app.status_toast = None;
+        w.app.paste_with(Some((both.clone(), true)));
+        assert_eq!(w.app.engine.jobs.len(), jobs);
+        assert_eq!(w.app.status_toast.as_ref().map(|t| t.message.as_str()), Some("These items are already being moved"));
+        // A copy of the same files is another matter
+        w.app.paste_with(Some((both.clone(), false)));
+        assert_eq!(w.app.engine.jobs.len(), jobs + 1, "a copy is not held back by a move");
+        // The question is answered, the move ends: nothing waits to be moved any more
+        w.click(w.at("Skip"), egui::PointerButton::Primary);
+        w.until("the end of the move", |w| w.app.pasting.is_empty() && w.app.clipboard.is_none());
+        assert!(!w.shows("ready to move"));
+        assert!(root.join("dst/b").exists() && !root.join("src/b").exists(), "the other file was moved");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cut_that_could_not_be_moved_stays_cut_and_can_be_pasted_again() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root can write anywhere
+        }
+        let (mut w, root) = window_with_a_cut("cut_failed", "unrelated");
+        let both = [root.join("src/a"), root.join("src/b")];
+        std::fs::set_permissions(root.join("dst"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        w.app.paste_with(None);
+        finish_jobs(&mut w.app);
+        assert!(root.join("src/a").exists() && root.join("src/b").exists(), "nothing was moved");
+        assert_eq!(w.app.clipboard, cut(&[&both[0], &both[1]]), "what was not moved stays cut, and is no longer tied to the job");
+        assert!(w.app.pasting.is_empty());
+        // The reason is gone: pasting again works, and then the cut is done with
+        std::fs::set_permissions(root.join("dst"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        w.app.paste_with(None);
+        finish_jobs(&mut w.app);
+        assert!(root.join("dst/a").exists() && root.join("dst/b").exists());
+        assert!(w.app.clipboard.is_none());
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn a_move_that_did_part_of_its_work_leaves_only_what_it_did_not_move_cut() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = window_dir("cut_partial");
+        for dir in ["one", "two", "dst"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let (free, stuck) = (root.join("one/a"), root.join("two/b"));
+        std::fs::write(&free, "a").unwrap();
+        std::fs::write(&stuck, "b").unwrap();
+        // Nothing can be taken out of `two`: the second item fails, the first goes
+        std::fs::set_permissions(root.join("two"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let mut w = Window::new(root.clone());
+        w.app.navigate_to(root.join("dst"));
+        w.run(Vec::new(), 15);
+        w.app.clipboard = cut(&[&free, &stuck]);
+        w.app.paste_with(None);
+        finish_jobs(&mut w.app);
+        assert!(root.join("dst/a").exists() && stuck.exists());
+        assert_eq!(w.app.clipboard, cut(&[&stuck]), "only what was not moved stays cut");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn a_move_that_is_cancelled_leaves_what_it_did_not_move_cut() {
+        let (mut w, root) = window_with_a_cut("cut_cancelled", "b");
+        w.app.paste_with(None);
+        w.until("the question", |w| matches!(w.app.dialog, Some(Dialog::Conflict { .. })) && w.shows("Skip"));
+        let job = w.app.clipboard.as_ref().and_then(|c| c.moving).unwrap();
+        w.app.engine.cancel(job);
+        w.until("the end of the move", |w| w.app.pasting.is_empty());
+        assert!(root.join("dst/a").exists(), "the first file was moved before the question");
+        assert_eq!(w.app.clipboard, cut(&[&root.join("src/b")]), "what was not moved stays cut");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn something_copied_while_a_move_runs_is_not_touched_by_the_end_of_that_move() {
+        let (mut w, root) = window_with_a_cut("cut_replaced", "a");
+        w.app.paste_with(None);
+        w.until("the question", |w| matches!(w.app.dialog, Some(Dialog::Conflict { .. })) && w.shows("Skip"));
+        let job = w.app.clipboard.as_ref().and_then(|c| c.moving).unwrap();
+        // A new clipboard replaces the old one while the move still runs
+        let newer = Clipboard { paths: vec![root.join("src/b")], cut: false, moving: None };
+        w.app.clipboard = Some(newer.clone());
+        w.click(w.at("Skip"), egui::PointerButton::Primary);
+        w.until("the end of the move", |w| !w.app.pasting.contains_key(&job));
+        assert_eq!(w.app.clipboard, Some(newer), "the end of the old move changed the new clipboard");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn files_cut_in_another_application_are_moved_without_touching_the_clipboard_of_this_window() {
+        let root = window_dir("cut_foreign");
+        for dir in ["src", "dst"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let (mine, theirs) = (root.join("src/mine"), root.join("src/theirs"));
+        std::fs::write(&mine, "m").unwrap();
+        std::fs::write(&theirs, "t").unwrap();
+        let mut w = Window::new(root.clone());
+        w.app.navigate_to(root.join("dst"));
+        w.run(Vec::new(), 15);
+        let own = Clipboard { paths: vec![mine.clone()], cut: false, moving: None };
+        w.app.clipboard = Some(own.clone());
+        w.app.paste_with(Some((vec![theirs.clone()], true)));
+        assert!(w.app.pasting.values().any(|p| p == &vec![theirs.clone()]), "the move of the other application's files is not remembered");
+        finish_jobs(&mut w.app);
+        assert!(root.join("dst/theirs").exists() && !theirs.exists());
+        assert_eq!(w.app.clipboard, Some(own), "the clipboard of this window was changed by files that are not its own");
+        assert!(w.app.pasting.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn closing_the_notice_that_nothing_can_be_moved_over_itself_never_changes_the_clipboard() {
+        let root = window_dir("cut_alert");
+        std::fs::create_dir_all(root.join("here")).unwrap();
+        let file = root.join("here/f");
+        std::fs::write(&file, "x").unwrap();
+        let mut w = Window::new(root.clone());
+        w.app.navigate_to(root.join("here"));
+        w.run(Vec::new(), 15);
+        let original = cut(&[&file]);
+        for way in ["the button", "Enter", "Esc", "a click beside it"] {
+            w.app.clipboard = original.clone();
+            w.app.paste_with(None);
+            w.run(Vec::new(), 15);
+            assert!(matches!(w.app.dialog, Some(Dialog::Alert { .. })), "{way}: no notice");
+            match way {
+                "the button" => w.click(w.at("Got it"), egui::PointerButton::Primary),
+                "Enter" => w.key(egui::Key::Enter),
+                "Esc" => w.key(egui::Key::Escape),
+                _ => w.click(egui::pos2(1090.0, 690.0), egui::PointerButton::Primary),
+            }
+            w.run(Vec::new(), 10);
+            assert!(w.app.dialog.is_none(), "{way}: the notice stays");
+            assert_eq!(w.app.clipboard, original, "closing the notice by {way} changed the clipboard");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

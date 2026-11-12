@@ -404,6 +404,7 @@
   "An undo or redo is still running, try again in a moment": "Đang hoàn tác hoặc làm lại, hãy thử lại sau giây lát",
   "Files that have no trash on their drive or server can't be moved to the trash. {} will be deleted for good.": "Các tệp không có thùng rác trên ổ đĩa hoặc máy chủ của chúng không thể chuyển vào thùng rác. {} sẽ bị xóa vĩnh viễn.",
   "There is no trash on this drive": "Ổ đĩa này không có thùng rác",
+  "These items are already being moved": "Các mục này đang được di chuyển",
   "Treat this folder as a server?": "Coi thư mục này là máy chủ?",
   "Files deleted in “{}” can't be moved to the trash or restored. Previews are turned off, and nothing there is replaced.": "Tệp bị xóa trong “{}” không vào thùng rác và không thể khôi phục. Xem trước bị tắt và không có gì ở đó bị thay thế.",
   "Treated as a server: no trash, previews off, delete is permanent": "Được coi là máy chủ: không có thùng rác, không xem trước, xóa là vĩnh viễn",

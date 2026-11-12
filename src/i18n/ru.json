@@ -404,6 +404,7 @@
   "An undo or redo is still running, try again in a moment": "Отмена или повтор ещё выполняется, повторите чуть позже",
   "Files that have no trash on their drive or server can't be moved to the trash. {} will be deleted for good.": "Файлы, для которых на их диске или сервере нет корзины, нельзя переместить в корзину. {} будет удалено безвозвратно.",
   "There is no trash on this drive": "На этом диске нет корзины",
+  "These items are already being moved": "Эти элементы уже перемещаются",
   "Treat this folder as a server?": "Считать эту папку сервером?",
   "Files deleted in “{}” can't be moved to the trash or restored. Previews are turned off, and nothing there is replaced.": "Файлы, удалённые в «{}», не попадают в корзину и не восстанавливаются. Предпросмотр отключён, и там ничего не заменяется.",
   "Treated as a server: no trash, previews off, delete is permanent": "Считается сервером: без корзины, без предпросмотра, удаление необратимо",
