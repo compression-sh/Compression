@@ -3322,6 +3322,7 @@ impl CompressionApp {
                             _ => FileItem::from_path(pin).map_or(icons::FILE, |i| i.file_type.icon()),
                         };
                         let resp = nav_item(ui, ("pin", pin), icon, &name, &self.theme, selected);
+                        let resp = material::full_text_if_shortened(ui.ctx(), resp, &name);
                         rects.push(resp.rect);
                         if is_dir {
                             zones.push(dnd::DropZone { rect: resp.rect, dest: pin.clone() });
@@ -3374,10 +3375,10 @@ impl CompressionApp {
                             material::nav_item_usage(ui, ("place", idx), place_icon, &tr_dyn(&place.name), &self.theme, browsing && here, reserve, usage)
                         })
                         .inner;
-                    let resp = match space {
-                        Some((_, words)) => resp.on_hover_text(words),
-                        None => resp,
-                    };
+                    // The whole name when it is cut short, how full the drive is, and what a click does to one that is not mounted
+                    let unmounted = place.drive.as_ref().is_some_and(|d| !d.mounted);
+                    let tip = place_tooltip(material::is_shortened(ui.ctx(), &resp).then(|| tr_dyn(&place.name)), space.map(|(_, words)| words), unmounted);
+                    let resp = if tip.is_empty() { resp } else { resp.on_hover_text(tip) };
                     if ticking && let Some(builtin) = place.builtin {
                         let tick = egui::Rect::from_center_size(egui::pos2(resp.rect.right() - 22.0, resp.rect.center().y), egui::Vec2::splat(30.0));
                         let ticked = ui.scope_builder(egui::UiBuilder::new().max_rect(tick), |ui| material::checkbox(ui, ("place_tick", builtin), !hidden, true, &self.theme)).inner;
@@ -6637,6 +6638,12 @@ fn name_field(ui: &mut egui::Ui, theme: &SerpantinumTheme, text: &mut String, fi
 }
 
 
+/// The tooltip of a sidebar place: its whole name (when cut short), the room left on a drive, and
+/// that a click mounts a drive that is not mounted. Empty when there is nothing to add.
+fn place_tooltip(name: Option<String>, space: Option<String>, unmounted: bool) -> String {
+    [name, space, unmounted.then(|| tr("Not mounted – click to mount").to_owned())].into_iter().flatten().collect::<Vec<_>>().join("\n")
+}
+
 /// How long a message stays: at least 3 s (7 s with a button), longer for long text so it can be read.
 fn toast_seconds(message: &str, has_action: bool) -> f32 {
     const CHARACTERS_PER_SECOND: f32 = 15.0;
@@ -7535,6 +7542,71 @@ mod tests {
     }
 
     #[test]
+    fn the_tooltip_of_a_sidebar_place_has_what_is_cut_off_the_room_left_and_what_a_click_does() {
+        assert_eq!(place_tooltip(None, None, false), "");
+        assert_eq!(place_tooltip(Some("A long name".into()), None, false), "A long name");
+        assert_eq!(place_tooltip(None, Some("1 GB free of 2 GB".into()), false), "1 GB free of 2 GB");
+        assert_eq!(place_tooltip(None, None, true), "Not mounted – click to mount");
+        assert_eq!(place_tooltip(Some("Name".into()), Some("room".into()), true), "Name\nroom\nNot mounted – click to mount");
+    }
+
+    #[test]
+    fn a_sidebar_entry_that_is_cut_short_shows_its_whole_name_when_hovered_and_a_short_one_shows_nothing() {
+        let root = window_dir("sidebartip");
+        let long = root.join("a_folder_whose_name_is_far_too_long_for_the_sidebar_to_show");
+        let short = root.join("brief");
+        std::fs::create_dir_all(&long).unwrap();
+        std::fs::create_dir_all(&short).unwrap();
+        let mut w = Window::new(root.clone());
+        w.app.pins = vec![long.clone(), short.clone()];
+        w.run(Vec::new(), 20);
+        let full = long.file_name().unwrap().to_string_lossy().into_owned();
+        // The text of a cut label is the whole name too, so a tooltip shows as a second copy of it
+        let count = |w: &Window, text: &str| w.shapes.iter().filter(|(t, _)| t == text).count();
+        let (before_long, before_brief) = (count(&w, &full), count(&w, "brief"));
+        assert!(before_long >= 1 && before_brief >= 1, "{:?}", w.last);
+        let (cut, brief) = (w.at(&full), w.at("brief"));
+        // Hover the cut name until the tooltip is due
+        w.run(vec![egui::Event::PointerMoved(cut)], 40);
+        assert_eq!(count(&w, &full), before_long + 1, "no tooltip with the whole name: {:?}", w.last);
+        // A name that fits has nothing to add
+        w.run(vec![egui::Event::PointerMoved(egui::pos2(900.0, 650.0))], 10);
+        w.run(vec![egui::Event::PointerMoved(brief)], 40);
+        assert_eq!(count(&w, "brief"), before_brief, "a tooltip for a name that fits: {:?}", w.last);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_setting_whose_description_is_cut_short_has_the_whole_text_in_its_tooltip() {
+        let theme = SerpantinumTheme::default();
+        let long = "A description that is much too long for one line of a narrow settings window, it goes on and on";
+        for (desc, tooltip) in [(long, true), ("Short", false)] {
+            let ctx = egui::Context::default();
+            let mut time = 0.0;
+            let mut tips = 0;
+            for frame in 0..40 {
+                time += 0.05;
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(260.0, 160.0))),
+                    time: Some(time),
+                    events: if frame == 0 { vec![egui::Event::PointerMoved(egui::pos2(40.0, 25.0))] } else { Vec::new() },
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(raw, |ui| {
+                    material::switch_row_with(ui, "setting", icons::FOLDER, "Label", Some(desc), &theme, false);
+                });
+                out.textures_delta.clear();
+                let mut shapes = Vec::new();
+                for clipped in &out.shapes {
+                    super::tests::collect_text(&clipped.shape, &mut shapes);
+                }
+                tips = shapes.iter().filter(|(t, _)| *t == format!("Label\n{desc}")).count();
+            }
+            assert_eq!(tips > 0, tooltip, "{desc:?}: {tips} tooltips");
+        }
+    }
+
+    #[test]
     fn a_right_click_on_a_tab_opens_the_menu_and_its_entries_work() {
         let root = window_dir("tabmenu");
         let folders: Vec<PathBuf> = (0..3).map(|i| {
@@ -7879,12 +7951,16 @@ mod tests {
         // Not connected: a ring, not a filled dot
         let ring = dot_of("off").iter().any(|(_, r, fill, stroke)| *r == 3.0 && *fill == egui::Color32::TRANSPARENT && *stroke == theme.subtext0);
         assert!(green && red && ring, "green {green}, red {red}, ring {ring}: {:?}", w.circles);
-        // Resting the pointer on a row says the state in words
+        // Resting the pointer on a row gives its name, its address and the state in words
         for (name, words) in [("up", "Connected"), ("down", "Not answering"), ("off", "Not connected")] {
             let at = w.at(name);
             w.run(vec![egui::Event::PointerMoved(egui::pos2(0.0, 0.0))], 3);
             w.run(vec![egui::Event::PointerMoved(at)], 40);
-            assert!(w.shows(words), "{words:?} not shown for {name}: {:?}", w.last);
+            let tip = w.last.iter().find(|t| t.starts_with(&format!("{name}\n"))).unwrap_or_else(|| panic!("no tooltip for {name}: {:?}", w.last));
+            let lines: Vec<&str> = tip.lines().collect();
+            assert_eq!(lines.len(), 3, "{tip:?}");
+            assert!(lines[1].contains(&format!("{name}.example")), "the address is missing: {tip:?}");
+            assert_eq!(lines[2], words, "{tip:?}");
         }
         std::fs::remove_dir_all(&work).unwrap();
     }

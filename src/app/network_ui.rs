@@ -1077,8 +1077,12 @@ impl CompressionApp {
             let mut resp = material::nav_item_with(ui, ("net", idx, &row.name), row.icon, &row.name, &theme, here, reserve);
             if let Some(state) = row.state {
                 state.paint(ui, resp.rect, &theme);
-                resp = resp.on_hover_text(state.words());
             }
+            // Name and address in full, however narrow the sidebar is, then how the connection is
+            let mut tip = vec![row.name.clone()];
+            tip.extend(row.address.as_ref().map(|a| a.display()));
+            tip.extend(row.state.map(|s| s.words().to_owned()));
+            resp = resp.on_hover_text(tip.join("\n"));
             if busy {
                 let spot = egui::Rect::from_center_size(egui::pos2(resp.rect.right() - 8.0 - 14.0, resp.rect.center().y), egui::vec2(16.0, 16.0));
                 ui.put(spot, egui::Spinner::new().size(14.0).color(theme.subtext0));
@@ -1124,6 +1128,7 @@ impl CompressionApp {
                     material::nav_item_with(ui, "net_connect", icons::LAN_CONNECT, tr("Connect to server…"), &theme, false, reserve)
                 })
                 .inner;
+            let resp = material::full_text_if_shortened(ui.ctx(), resp, tr("Connect to server…"));
             if editing {
                 let tick = egui::Rect::from_center_size(egui::pos2(resp.rect.right() - 22.0, resp.rect.center().y), egui::Vec2::splat(30.0));
                 let ticked = ui.scope_builder(egui::UiBuilder::new().max_rect(tick), |ui| material::checkbox(ui, "net_connect_tick", shown, true, &theme)).inner;

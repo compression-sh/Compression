@@ -400,6 +400,7 @@
   "Unmounted “{}”": "« {} » démonté",
   "Could not unmount “{}”: {}": "Impossible de démonter « {} » : {}",
   "Authentication cancelled": "Authentification annulée",
+  "Not mounted – click to mount": "Non monté – cliquer pour monter",
   "Nothing to compress": "Rien à compresser",
   "No tool installed to unpack this kind of archive (install 7z)": "Aucun outil installé pour décompresser ce type d’archive (installez 7z)",
   "Unknown": "Inconnu",

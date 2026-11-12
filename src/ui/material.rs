@@ -560,9 +560,22 @@ pub fn truncated(ui: &egui::Ui, text: &str, size: f32, color: Color32, max_width
 }
 
 /// Paints single-line text, vertically centered on `y`, with its left edge at `x`.
-pub fn paint_label(ui: &egui::Ui, x: f32, y: f32, text: &str, size: f32, color: Color32, max_width: f32) {
+/// True when the text did not fit and ends in "…": the caller can offer the whole text as a tooltip.
+pub fn paint_label(ui: &egui::Ui, x: f32, y: f32, text: &str, size: f32, color: Color32, max_width: f32) -> bool {
     let galley = truncated(ui, text, size, color, max_width);
+    let shortened = galley.elided;
     ui.painter().galley(Pos2::new(x, y - galley.size().y / 2.0), galley, color);
+    shortened
+}
+
+/// Whether the label of a sidebar entry (drawn by `nav_item*`) was cut short last frame.
+pub fn is_shortened(ctx: &egui::Context, response: &egui::Response) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(response.id.with("shortened"))).unwrap_or(false)
+}
+
+/// The whole `text` as the tooltip of a sidebar entry, when its label was cut short.
+pub fn full_text_if_shortened(ctx: &egui::Context, response: egui::Response, text: &str) -> egui::Response {
+    if is_shortened(ctx, &response) { response.on_hover_text(text) } else { response }
 }
 
 /// Round icon-only button.
@@ -1090,12 +1103,14 @@ fn nav_item_sense(
     let color = lerp_color(theme.subtext0, theme.text, fx.hover.max(sel_t));
     paint_icon(ui.painter(), Pos2::new(rect.left() + INSET_ICON, rect.center().y), icon, ICON_MD, color);
     let label_width = rect.width() - INSET_LABEL - 14.0 - trailing;
+    // With a bar the name moves up to make room for it
+    let lift = if usage.is_some() { 4.0 } else { 0.0 };
+    let shortened = paint_label(ui, rect.left() + INSET_LABEL, rect.center().y - lift, label, FONT_BODY, color, label_width);
+    ui.ctx().data_mut(|d| d.insert_temp(response.id.with("shortened"), shortened));
     let Some(used) = usage else {
-        paint_label(ui, rect.left() + INSET_LABEL, rect.center().y, label, FONT_BODY, color, label_width);
         return response;
     };
-    // The name moves up to make room for the bar, which spans the name's column
-    paint_label(ui, rect.left() + INSET_LABEL, rect.center().y - 4.0, label, FONT_BODY, color, label_width);
+    // The bar spans the name's column
     let track = Rect::from_min_size(Pos2::new(rect.left() + INSET_LABEL, rect.center().y + 9.0), Vec2::new(label_width.max(0.0), 3.0));
     let round = CornerRadius::same(2);
     ui.painter().rect_filled(track, round, theme.with_alpha(theme.text, 34));
@@ -1693,16 +1708,22 @@ pub fn switch_row_with(
     paint_icon(ui.painter(), Pos2::new(rect.left() + INSET_ICON + 2.0, rect.center().y), icon, ICON_MD, lerp_color(theme.subtext0, theme.mauve, t));
     let text_x = rect.left() + INSET_LABEL + 2.0;
     let room = rect.width() - (text_x - rect.left()) - 76.0;
-    match description {
+    let shortened = match description {
         Some(desc) => {
-            paint_label(ui, text_x, rect.center().y - 9.0, label, FONT_BODY, theme.text, room);
-            paint_label(ui, text_x, rect.center().y + 10.0, desc, FONT_CAPTION, theme.subtext1, room);
+            let label_cut = paint_label(ui, text_x, rect.center().y - 9.0, label, FONT_BODY, theme.text, room);
+            let desc_cut = paint_label(ui, text_x, rect.center().y + 10.0, desc, FONT_CAPTION, theme.subtext1, room);
+            label_cut || desc_cut
         }
         None => paint_label(ui, text_x, rect.center().y, label, FONT_BODY, theme.text, room),
-    }
+    };
 
     paint_switch(ui, Pos2::new(rect.right() - 36.0, rect.center().y), t, fx.press, theme);
-    response
+    // What does not fit is in the tooltip
+    match description {
+        Some(desc) if shortened => response.on_hover_text(format!("{label}\n{desc}")),
+        None if shortened => response.on_hover_text(label),
+        _ => response,
+    }
 }
 
 /// Setting row for one of a list of things to include: icon, label and a tick box at the right.
@@ -2012,7 +2033,9 @@ fn stepper_row_with(
             paint_icon(ui.painter(), Pos2::new(rect.left() + INSET_ICON + 2.0, rect.center().y), icon, ICON_MD, theme.subtext0);
             paint_label(ui, rect.left() + INSET_LABEL + 2.0, rect.center().y, label, FONT_BODY, theme.text, rect.width() - 150.0);
         }
-        None => paint_label(ui, rect.left() + 12.0, rect.center().y, label, FONT_BODY, theme.text, rect.width() - 150.0),
+        None => {
+            paint_label(ui, rect.left() + 12.0, rect.center().y, label, FONT_BODY, theme.text, rect.width() - 150.0);
+        }
     }
     // The current value sits between the two buttons
     let value_galley = ui.painter().layout_no_wrap(value.to_owned(), egui::FontId::proportional(FONT_CAPTION), theme.subtext1);
