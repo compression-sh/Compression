@@ -5037,11 +5037,13 @@ impl CompressionApp {
 
     /// Rename `path` inside its folder and keep the renamed item selected.
     fn rename_entry(&mut self, path: &Path, new_name: &str) -> Result<(), String> {
-        let new_name = new_name.trim();
+        let old = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let new_name = &batch_rename::new_name(&old, new_name);
+        let new_name = new_name.as_str();
         if new_name.is_empty() || new_name == "." || new_name == ".." || new_name.contains('/') {
             return Err(tr("Enter a valid name").to_owned());
         }
-        if path.file_name().is_some_and(|n| n.to_string_lossy() == new_name) {
+        if old == new_name {
             return Ok(());
         }
         let target = path.with_file_name(new_name);
@@ -7723,6 +7725,21 @@ mod tests {
         drop(app);
         assert!(!note.exists());
         UNSAVED_NOTE_FOR_TESTS.with(|n| *n.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_rename_dialog_keeps_an_unchanged_name_and_takes_the_blanks_off_a_new_one() {
+        let base = window_dir("rename_blanks");
+        std::fs::write(base.join(" padded.txt"), "x").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        // Enter on the name as it was: nothing happens, the leading blank stays
+        app.rename_entry(&base.join(" padded.txt"), " padded.txt").unwrap();
+        assert!(base.join(" padded.txt").exists() && app.history.undo_label().is_none());
+        app.rename_entry(&base.join(" padded.txt"), "  report.txt ").unwrap();
+        assert!(base.join("report.txt").exists() && !base.join(" padded.txt").exists());
+        assert_eq!(app.rename_entry(&base.join("report.txt"), "   "), Err("Enter a valid name".to_owned()));
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -240,9 +240,15 @@ pub fn preview(entries: &[Entry], rules: &Rules) -> Vec<String> {
             };
             new_stem = rules.case.apply(&new_stem);
             let ext = if rules.lowercase_ext { ext.to_lowercase() } else { ext.to_owned() };
-            format!("{}{new_stem}{}{ext}", rules.prefix, rules.suffix)
+            new_name(&name, &format!("{}{new_stem}{}{ext}", rules.prefix, rules.suffix))
         })
         .collect()
+}
+
+/// The one rule for a new name, in the rename dialog and here: it does not start or end with blanks (they are hard to
+/// see and almost never meant), and a name that is the old one, blanks and all, is left exactly as it is.
+pub fn new_name(old: &str, typed: &str) -> String {
+    if typed == old { old.to_owned() } else { typed.trim().to_owned() }
 }
 
 fn expand(template: &str, stem: &str, number: i64, date: &str, folder: &str, ext: &str) -> String {
@@ -261,8 +267,7 @@ fn expand(template: &str, stem: &str, number: i64, date: &str, folder: &str, ext
 pub fn problem(entries: &[Entry], names: &[String]) -> Option<String> {
     let mut seen = HashSet::new();
     for (entry, new) in entries.iter().zip(names) {
-        let trimmed = new.trim();
-        if trimmed.is_empty() || trimmed == "." || trimmed == ".." || trimmed.contains('/') {
+        if new.trim().is_empty() || new == "." || new == ".." || new.contains('/') {
             return Some(tr("Some names would be empty or invalid").to_owned());
         }
         let dir = entry.path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -778,5 +783,28 @@ mod tests {
             let other = vec![Entry { path: dir.join("IMG_0001.jpg"), is_dir: false, date: String::new() }];
             assert!(problem(&other, &["IMG_0003.JPG".to_owned()]).is_some());
         });
+    }
+
+    #[test]
+    fn new_names_lose_their_outer_blanks_the_same_way_here_and_in_the_rename_dialog_and_old_ones_stay() {
+        let dir = std::env::temp_dir().join(format!("compression_batch_blanks_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in [" padded.txt", "plain.txt"] {
+            std::fs::write(dir.join(n), "x").unwrap();
+        }
+        let entries: Vec<Entry> = [" padded.txt", "plain.txt"].iter().map(|n| Entry { path: dir.join(n), is_dir: false, date: String::new() }).collect();
+        // Nothing asked: the names stay as they are, the blank of " padded.txt" too
+        assert_eq!(preview(&entries, &Rules::new()), [" padded.txt", "plain.txt"]);
+        // A suffix of blanks is not kept at the end of a name
+        let rules = Rules { prefix: "  ".into(), suffix: "  ".into(), ..Rules::new() };
+        let names = preview(&entries, &rules);
+        assert_eq!(names, ["padded  .txt", "plain  .txt"]);
+        assert!(names.iter().all(|n| n.trim() == n));
+        // The same rule as the rename dialog
+        for (old, typed) in [(" padded.txt", " padded.txt"), (" padded.txt", " other.txt "), ("plain.txt", "  plain.txt"), ("a", "b ")] {
+            assert_eq!(new_name(old, typed), if typed == old { old.to_owned() } else { typed.trim().to_owned() });
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
