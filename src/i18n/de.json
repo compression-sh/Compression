@@ -402,6 +402,8 @@
   "Authentication cancelled": "Anmeldung abgebrochen",
   "Not mounted – click to mount": "Nicht eingehängt – Klick zum Einhängen",
   "An undo or redo is still running, try again in a moment": "Rückgängig oder Wiederholen läuft noch, gleich noch einmal versuchen",
+  "Files that have no trash on their drive or server can't be moved to the trash. {} will be deleted for good.": "Dateien, für die es auf ihrem Laufwerk oder Server keinen Papierkorb gibt, können nicht in den Papierkorb verschoben werden. {} wird endgültig gelöscht.",
+  "There is no trash on this drive": "Auf diesem Laufwerk gibt es keinen Papierkorb",
   "Nothing to compress": "Nichts zu komprimieren",
   "No tool installed to unpack this kind of archive (install 7z)": "Kein Programm zum Entpacken dieser Archivart installiert (7z installieren)",
   "Unknown": "Unbekannt",

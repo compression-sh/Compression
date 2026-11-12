@@ -402,6 +402,8 @@
   "Authentication cancelled": "Autenticación cancelada",
   "Not mounted – click to mount": "No montado: clic para montar",
   "An undo or redo is still running, try again in a moment": "Aún se está deshaciendo o rehaciendo, inténtalo de nuevo en un momento",
+  "Files that have no trash on their drive or server can't be moved to the trash. {} will be deleted for good.": "Los archivos que no tienen papelera en su unidad o servidor no se pueden mover a la papelera. {} se eliminará definitivamente.",
+  "There is no trash on this drive": "No hay papelera en esta unidad",
   "Nothing to compress": "Nada que comprimir",
   "No tool installed to unpack this kind of archive (install 7z)": "No hay ninguna herramienta instalada para desempaquetar este tipo de archivo (instala 7z)",
   "Unknown": "Desconocido",

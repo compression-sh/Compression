@@ -4482,28 +4482,34 @@ impl CompressionApp {
 
     /// Move to the trash, with an Undo in the toast.
     fn trash_paths(&mut self, paths: Vec<PathBuf>) {
-        // Servers have no trash: what is on one is deleted for good, after asking, as Nautilus does
+        // Servers have no trash: what is on one is deleted for good, after asking, as Nautilus does. So is what is on a
+        // drive that has none and cannot be given one: a copy into the home trash would hold the window up
         let (remote, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| network::is_remote(p));
-        if !remote.is_empty() {
-            self.dialog = Some(Dialog::Confirm {
-                title: tr("Delete permanently?").to_owned(),
-                body: trf("Files on a server can't be moved to the trash. {} will be deleted for good.", &[&Self::describe_count(&remote)]),
-                confirm: tr("Delete").to_owned(),
-                action: ConfirmAction::DeleteForever(remote),
-            });
-        }
-        if paths.is_empty() {
-            return;
-        }
-        let (mut trashed, mut failed, mut removed) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut trashed, mut failed, mut removed, mut no_trash) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for path in &paths {
-            match trash::trash(path) {
+            match trash::trash_without_fallback(path) {
                 Ok(t) => {
                     trashed.push(t);
                     removed.push(path.clone());
                 }
+                Err(err) if trash::is_no_trash(&err) => no_trash.push(path.clone()),
                 Err(err) => failed.push(format!("{}: {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), crate::fs::describe::io_error(&err))),
             }
+        }
+        // One question for everything that has no trash: what is on a server and what is on a drive without one
+        let for_good: Vec<PathBuf> = remote.iter().chain(&no_trash).cloned().collect();
+        if !for_good.is_empty() {
+            let count = Self::describe_count(&for_good);
+            let body = if no_trash.is_empty() {
+                trf("Files on a server can't be moved to the trash. {} will be deleted for good.", &[&count])
+            } else {
+                trf("Files that have no trash on their drive or server can't be moved to the trash. {} will be deleted for good.", &[&count])
+            };
+            self.dialog = Some(Dialog::Confirm { title: tr("Delete permanently?").to_owned(), body, confirm: tr("Delete").to_owned(), action: ConfirmAction::DeleteForever(for_good) });
+        }
+        // Nothing was trashed and nothing failed: the question says it all
+        if trashed.is_empty() && failed.is_empty() {
+            return;
         }
         // What was moved, not what was asked for
         let label = Self::describe_count(&removed);
@@ -7027,6 +7033,64 @@ mod tests {
         app.trash_paths(vec![c, bad.clone(), d]);
         assert_eq!(said(&app), "Moved 2 items to trash · 1 failed: bad.txt: Permission denied");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn what_has_no_trash_on_its_drive_is_asked_about_once_together_with_what_is_on_a_server_and_the_rest_is_trashed() {
+        let Some((root, shm)) = crate::fs::ops::tests::two_file_systems("trash_ask") else { return };
+        crate::fs::trash::tests_refuse::no_drive_trash_for(&shm);
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(root.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let file = |dir: &Path, name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, "x").unwrap();
+            path
+        };
+        let asked = |app: &CompressionApp| match &app.dialog {
+            Some(Dialog::Confirm { title, body, action: ConfirmAction::DeleteForever(paths), .. }) => Some((title.clone(), body.clone(), paths.clone())),
+            _ => None,
+        };
+        let said = |app: &CompressionApp| app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+
+        // Only items on a drive without a trash: nothing is copied into the home trash, one question names them
+        let (bare1, bare2) = (file(&shm, "bare1.txt"), file(&shm, "bare2.txt"));
+        app.trash_paths(vec![bare1.clone(), bare2.clone()]);
+        let (title, body, paths) = asked(&app).expect("no question");
+        assert_eq!((title.as_str(), paths.as_slice()), ("Delete permanently?", [bare1.clone(), bare2.clone()].as_slice()));
+        assert_eq!(body, "Files that have no trash on their drive or server can't be moved to the trash. 2 items will be deleted for good.");
+        assert!(bare1.exists() && bare2.exists(), "nothing was copied away");
+        assert!(app.history.undo_label().is_none() && !said(&app).starts_with("Could not"), "{:?}", said(&app));
+
+        // The answer is yes: the deletion runs as a job
+        app.dialog = None;
+        app.delete_forever(paths);
+        finish_jobs(&mut app);
+        assert!(!bare1.exists() && !bare2.exists());
+
+        // Mixed with a normal item and an item on a server: the normal one is trashed, the other two are one question
+        let (fine, bare3, server) = (file(&root, "fine.txt"), file(&shm, "bare3.txt"), file(&root, "on_server.txt"));
+        network::declare_remote_for_tests(&server);
+        app.trash_paths(vec![fine.clone(), bare3.clone(), server.clone()]);
+        let (_, body, paths) = asked(&app).expect("no question");
+        assert_eq!(paths, vec![server.clone(), bare3.clone()], "one question for both");
+        assert!(body.starts_with("Files that have no trash on their drive or server"), "{body}");
+        assert!(!fine.exists() && bare3.exists() && server.exists());
+        assert_eq!(said(&app), "Moved “fine.txt” to trash");
+        assert_eq!(app.history.undo_label(), Some("Move of “fine.txt” to trash"));
+
+        // Only an item on a server: the question as it was, and nothing else
+        app.dialog = None;
+        app.trash_paths(vec![server.clone()]);
+        let (_, body, paths) = asked(&app).expect("no question");
+        assert_eq!((paths, body.as_str()), (vec![server.clone()], "Files on a server can't be moved to the trash. “on_server.txt” will be deleted for good."));
+
+        // A normal item alone: no question
+        app.dialog = None;
+        let plain = file(&root, "plain.txt");
+        app.trash_paths(vec![plain.clone()]);
+        assert!(app.dialog.is_none() && !plain.exists());
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
     }
 
     #[test]

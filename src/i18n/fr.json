@@ -402,6 +402,8 @@
   "Authentication cancelled": "Authentification annulée",
   "Not mounted – click to mount": "Non monté – cliquer pour monter",
   "An undo or redo is still running, try again in a moment": "Une annulation ou un rétablissement est encore en cours, réessayez dans un instant",
+  "Files that have no trash on their drive or server can't be moved to the trash. {} will be deleted for good.": "Les fichiers qui n’ont pas de corbeille sur leur disque ou serveur ne peuvent pas être mis à la corbeille. {} sera supprimé définitivement.",
+  "There is no trash on this drive": "Il n’y a pas de corbeille sur ce disque",
   "Nothing to compress": "Rien à compresser",
   "No tool installed to unpack this kind of archive (install 7z)": "Aucun outil installé pour décompresser ce type d’archive (installez 7z)",
   "Unknown": "Inconnu",

@@ -1532,6 +1532,26 @@ mod tests {
     }
 
     #[test]
+    fn replacing_on_a_drive_without_a_trash_still_puts_the_old_item_into_the_home_trash() {
+        let Some((root, shm)) = crate::fs::ops::tests::two_file_systems("replace_no_drive_trash") else { return };
+        crate::fs::trash::tests_refuse::no_drive_trash_for(&shm);
+        std::fs::create_dir_all(shm.join("dst")).unwrap();
+        std::fs::write(root.join("a"), "new").unwrap();
+        std::fs::write(shm.join("dst/a"), "old").unwrap();
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(root.join("a"), shm.join("dst/a"))], Decision::Replace);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(shm.join("dst/a")).unwrap(), "new");
+        let Effect::Record(entry) = outcome.effect else { panic!("no undo entry") };
+        let trashed = entry.edits.iter().find_map(|e| if let crate::fs::history::Edit::Restore(t) = e { Some(t.clone()) } else { None }).expect("the old item is in a trash");
+        assert!(trashed.starts_with(crate::fs::trash::files_dir().unwrap()), "{}", trashed.display());
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        assert_eq!(std::fs::read_to_string(shm.join("dst/a")).unwrap(), "old");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
+    }
+
+    #[test]
     fn replacing_by_a_move_across_file_systems_whose_original_cannot_be_removed_keeps_the_copy_and_the_old_item_in_the_trash() {
         use std::os::unix::fs::PermissionsExt;
         let Some((root, shm)) = crate::fs::ops::tests::two_file_systems("replace_across_left") else { return };

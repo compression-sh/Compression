@@ -402,6 +402,8 @@
   "Authentication cancelled": "Đã hủy xác thực",
   "Not mounted – click to mount": "Chưa gắn kết – nhấp để gắn kết",
   "An undo or redo is still running, try again in a moment": "Đang hoàn tác hoặc làm lại, hãy thử lại sau giây lát",
+  "Files that have no trash on their drive or server can't be moved to the trash. {} will be deleted for good.": "Các tệp không có thùng rác trên ổ đĩa hoặc máy chủ của chúng không thể chuyển vào thùng rác. {} sẽ bị xóa vĩnh viễn.",
+  "There is no trash on this drive": "Ổ đĩa này không có thùng rác",
   "Nothing to compress": "Không có gì để nén",
   "No tool installed to unpack this kind of archive (install 7z)": "Chưa cài công cụ nào để giải nén loại tệp này (hãy cài 7z)",
   "Unknown": "Không rõ",

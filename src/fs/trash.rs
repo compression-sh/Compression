@@ -107,7 +107,21 @@ pub fn is_empty() -> bool {
 
 /// Move `path` to the trash, returning where it ended up. Items on another drive go to a trash
 /// folder on that drive (as the freedesktop.org spec says), so deleting is a rename, not a copy.
+///
+/// A drive that has no trash folder and cannot be given one is not left out: the item goes to the home trash then,
+/// which the specification allows, by a copy if it must. Whoever cannot wait for such a copy, or wants to ask first,
+/// uses `trash_without_fallback`.
 pub fn trash(path: &Path) -> io::Result<PathBuf> {
+    trash_by(path, true)
+}
+
+/// `trash`, except that an item on a drive without a usable trash is not copied into the home trash: the error says
+/// so (`is_no_trash`) and nothing was changed.
+pub fn trash_without_fallback(path: &Path) -> io::Result<PathBuf> {
+    trash_by(path, false)
+}
+
+fn trash_by(path: &Path, fallback: bool) -> io::Result<PathBuf> {
     #[cfg(test)]
     if tests_refuse::refused(path) {
         return Err(io::Error::from_raw_os_error(libc::EACCES));
@@ -115,9 +129,38 @@ pub fn trash(path: &Path) -> io::Result<PathBuf> {
     let home = root().ok_or_else(|| io::Error::other("no trash folder"))?;
     let original = absolute(path)?;
     match drive_trash(&home, &original) {
-        Some((root, topdir)) => trash_in(&root, Some(&topdir), &original),
-        None => trash_in(&home, None, &original),
+        DriveTrash::Own(root, topdir) => trash_in(&root, Some(&topdir), &original),
+        DriveTrash::Home => trash_in(&home, None, &original),
+        DriveTrash::Unavailable if fallback => trash_in(&home, None, &original),
+        DriveTrash::Unavailable => Err(io::Error::other(NoTrash)),
     }
+}
+
+/// The item is on a drive that has no trash folder and cannot be given one.
+#[derive(Debug)]
+pub struct NoTrash;
+
+impl std::fmt::Display for NoTrash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(tr("There is no trash on this drive"))
+    }
+}
+
+impl std::error::Error for NoTrash {}
+
+/// Whether `err` says that the drive has no trash, see `NoTrash`.
+pub fn is_no_trash(err: &io::Error) -> bool {
+    err.get_ref().is_some_and(|inner| inner.is::<NoTrash>())
+}
+
+/// Where an item on a drive is trashed.
+enum DriveTrash {
+    /// The trash of the drive, and the drive's top folder.
+    Own(PathBuf, PathBuf),
+    /// The home trash: the item shares a file system with it (or nothing could be found out).
+    Home,
+    /// The drive is another file system and has no trash folder that can be made.
+    Unavailable,
 }
 
 /// `path` made absolute and canonical; a symlink is trashed as the link itself, so only its folder is made canonical.
@@ -129,23 +172,40 @@ fn absolute(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-/// The trash folder on the drive `original` lives on and the drive's top folder, or `None` when it
-/// shares a filesystem with the home trash (or the drive has no usable trash folder).
-fn drive_trash(home: &Path, original: &Path) -> Option<(PathBuf, PathBuf)> {
+/// Where `original` is trashed: on its own drive when that has a trash folder (or can be given one), in the home
+/// trash when it shares a file system with it (or nothing could be found out), and `Unavailable` when the drive is
+/// another file system and no trash folder can be made on it.
+fn drive_trash(home: &Path, original: &Path) -> DriveTrash {
     use std::os::unix::fs::MetadataExt;
-    let dev = std::fs::symlink_metadata(original).ok()?.dev();
-    let home_dev = home.ancestors().find_map(|a| std::fs::metadata(a).ok())?.dev();
-    if dev == home_dev {
-        return None;
-    }
-    // The top folder is the highest ancestor still on the same filesystem: the mount point
-    let mut topdir = original.parent()?;
-    while let Some(up) = topdir.parent() {
-        if std::fs::metadata(up).ok()?.dev() != dev {
-            break;
+    // The top folder is the highest ancestor still on the same filesystem: the mount point; `None` where the
+    // drive is the home one or cannot be looked at
+    let found = (|| {
+        let dev = std::fs::symlink_metadata(original).ok()?.dev();
+        let home_dev = home.ancestors().find_map(|a| std::fs::metadata(a).ok())?.dev();
+        if dev == home_dev {
+            return None;
         }
-        topdir = up;
+        let mut topdir = original.parent()?;
+        while let Some(up) = topdir.parent() {
+            if std::fs::metadata(up).ok()?.dev() != dev {
+                break;
+            }
+            topdir = up;
+        }
+        Some(topdir.to_path_buf())
+    })();
+    let Some(topdir) = found else { return DriveTrash::Home };
+    #[cfg(test)]
+    if tests_refuse::no_drive_trash(original) {
+        return DriveTrash::Unavailable;
     }
+    trash_on_drive(topdir)
+}
+
+/// The trash of the drive whose top folder is `topdir`: the shared `.Trash/<uid>` where that is set up, else
+/// `.Trash-<uid>`, made when it is not there yet. `Unavailable` when neither can be made.
+fn trash_on_drive(topdir: PathBuf) -> DriveTrash {
+    use std::os::unix::fs::MetadataExt;
     // SAFETY: `getuid` has no preconditions.
     let uid = unsafe { libc::getuid() };
     let shared = topdir.join(".Trash");
@@ -154,8 +214,10 @@ fn drive_trash(home: &Path, original: &Path) -> Option<(PathBuf, PathBuf)> {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).ok().map(|_| dir)
     };
-    let root = sticky.then(|| make(shared.join(uid.to_string()))).flatten().or_else(|| make(topdir.join(format!(".Trash-{uid}"))))?;
-    Some((root, topdir.to_path_buf()))
+    match sticky.then(|| make(shared.join(uid.to_string()))).flatten().or_else(|| make(topdir.join(format!(".Trash-{uid}")))) {
+        Some(root) => DriveTrash::Own(root, topdir),
+        None => DriveTrash::Unavailable,
+    }
 }
 
 /// The top folder of the drive a trash folder is on; `None` for the home trash.
@@ -494,6 +556,78 @@ mod tests {
         crate::fs::ops::tests::unlock_and_remove(&shm);
     }
 
+    /// Takes a trashed item and its record out of the home trash again (the trash is shared with the other tests).
+    fn forget_trashed(trashed: &Path) {
+        let record = trashed.parent().and_then(Path::parent).unwrap().join("info").join(format!("{}.trashinfo", trashed.file_name().unwrap().to_string_lossy()));
+        let _ = remove_tree(trashed);
+        let _ = std::fs::remove_file(record);
+    }
+
+    #[test]
+    fn a_drive_without_a_trash_is_refused_by_the_asking_variant_and_still_served_by_the_plain_one() {
+        let Some((root, shm)) = crate::fs::ops::tests::two_file_systems("no_drive_trash") else { return };
+        tests_refuse::no_drive_trash_for(&shm);
+        let (first, second) = (shm.join("first.txt"), shm.join("second.txt"));
+        std::fs::write(&first, "1").unwrap();
+        std::fs::write(&second, "2").unwrap();
+
+        // The asking variant changes nothing and says why
+        let err = trash_without_fallback(&first).unwrap_err();
+        assert!(is_no_trash(&err), "{err}");
+        assert_eq!(err.to_string(), "There is no trash on this drive");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "1", "nothing was copied away or removed");
+        assert!(!is_no_trash(&io::Error::from_raw_os_error(libc::EACCES)));
+
+        // The plain one goes on as before: the home trash takes it, by a copy across the file systems
+        let trashed = trash(&second).unwrap();
+        assert!(trashed.starts_with(files_dir().unwrap()), "{}", trashed.display());
+        assert!(!second.exists());
+        assert_eq!(std::fs::read_to_string(&trashed).unwrap(), "2");
+        forget_trashed(&trashed);
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
+    }
+
+    #[test]
+    fn a_drive_whose_top_folder_cannot_take_a_trash_folder_has_no_trash_and_one_that_can_gets_one() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root can make it anyway
+        }
+        let top = std::env::temp_dir().join(format!("compression_trash_top_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        std::fs::create_dir_all(&top).unwrap();
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        match trash_on_drive(top.clone()) {
+            DriveTrash::Own(root, found) => assert_eq!((root, found), (top.join(format!(".Trash-{uid}")), top.clone())),
+            _ => panic!("a trash folder can be made here"),
+        }
+        let locked = top.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(matches!(trash_on_drive(locked.clone()), DriveTrash::Unavailable));
+        crate::fs::ops::tests::unlock_and_remove(&top);
+    }
+
+    #[test]
+    fn undoing_a_creation_on_a_drive_without_a_trash_still_uses_the_home_trash() {
+        let Some((root, shm)) = crate::fs::ops::tests::two_file_systems("undo_no_drive_trash") else { return };
+        tests_refuse::no_drive_trash_for(&shm);
+        let made = shm.join("made.txt");
+        std::fs::write(&made, "x").unwrap();
+        let (inverse, error) = crate::fs::history::apply(crate::fs::history::UndoEntry::new("creation", vec![crate::fs::history::Edit::Trash(made.clone())]));
+        assert_eq!(error, None);
+        assert!(!made.exists());
+        let inverse = inverse.expect("the undo can be redone");
+        let [crate::fs::history::Edit::Restore(trashed)] = inverse.edits.as_slice() else { panic!("{:?}", inverse.edits) };
+        assert!(trashed.starts_with(files_dir().unwrap()));
+        forget_trashed(trashed);
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
+    }
+
     #[test]
     fn restoring_across_file_systems_whose_trashed_item_cannot_be_removed_keeps_the_record_and_says_so() {
         use std::os::unix::fs::PermissionsExt;
@@ -529,5 +663,16 @@ pub(crate) mod tests_refuse {
 
     pub(crate) fn refused(path: &Path) -> bool {
         REFUSED.lock().unwrap().iter().any(|p| path.starts_with(p))
+    }
+
+    static NO_DRIVE_TRASH: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Pretend that no trash folder can be made on the drive of `path` (a test cannot change a real mount point).
+    pub(crate) fn no_drive_trash_for(path: &Path) {
+        NO_DRIVE_TRASH.lock().unwrap().push(path.to_path_buf());
+    }
+
+    pub(crate) fn no_drive_trash(path: &Path) -> bool {
+        NO_DRIVE_TRASH.lock().unwrap().iter().any(|p| path.starts_with(p))
     }
 }
