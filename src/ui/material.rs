@@ -1446,12 +1446,13 @@ pub fn file_row(
         right -= (pill_w + 10.0) * cut_t;
     }
 
-    paint_label(ui, r.left() + ROW_NAME_X, r.center().y, item.display_name(), FONT_SUBTITLE, theme.text.gamma_multiply(fade), right - r.left() - ROW_NAME_X - 6.0);
+    let shortened = paint_label(ui, r.left() + ROW_NAME_X, r.center().y, item.display_name(), FONT_SUBTITLE, theme.text.gamma_multiply(fade), right - r.left() - ROW_NAME_X - 6.0);
 
     if selected && should_scroll {
         response.scroll_to_me(Some(egui::Align::Center));
     }
-    response
+    // A name that does not fit is whole in the tooltip
+    if shortened { response.on_hover_text(item.display_name()) } else { response }
 }
 
 /// Entry of a context menu. `hint` is the keyboard shortcut shown at the right edge.
@@ -1646,12 +1647,14 @@ pub fn file_tile(
     job.wrap = TextWrapping { max_width: max_text_w, max_rows: max_name_lines, break_anywhere: false, overflow_character: Some('…') };
     job.halign = egui::Align::Center;
     let galley = ui.painter().layout_job(job);
+    let shortened = galley.elided;
     ui.painter().galley(Pos2::new(rect.center().x, picture.bottom() + 8.0), galley, name_color);
 
     if selected && should_scroll {
         response.scroll_to_me(Some(egui::Align::Center));
     }
-    response
+    // A name that does not fit is whole in the tooltip
+    if shortened { response.on_hover_text(item.display_name()) } else { response }
 }
 
 /// Small round badges on a file's icon: a lock at `lock_at` when it is read-only for the user,

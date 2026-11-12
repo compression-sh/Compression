@@ -7577,6 +7577,29 @@ mod tests {
     }
 
     #[test]
+    fn a_file_name_that_is_cut_short_shows_whole_when_hovered_in_the_grid_and_in_the_list() {
+        let root = window_dir("nametip");
+        let long = format!("{}.txt", "a_very_long_file_name_".repeat(9));
+        std::fs::write(root.join(&long), b"x").unwrap();
+        std::fs::write(root.join("short.txt"), b"x").unwrap();
+        for mode in [ViewMode::Grid, ViewMode::List] {
+            let mut w = Window::new(root.clone());
+            w.app.view_mode = mode;
+            w.run(Vec::new(), 25);
+            let count = |w: &Window, text: &str| w.shapes.iter().filter(|(t, _)| t == text).count();
+            let (before_long, before_short) = (count(&w, &long), count(&w, "short.txt"));
+            assert!(before_long >= 1 && before_short >= 1, "{mode:?}: {:?}", w.last);
+            let (long_at, short_at) = (w.at(&long), w.at("short.txt"));
+            w.run(vec![egui::Event::PointerMoved(long_at)], 40);
+            assert_eq!(count(&w, &long), before_long + 1, "{mode:?}: no tooltip with the whole name: {:?}", w.last);
+            w.run(vec![egui::Event::PointerMoved(egui::pos2(900.0, 650.0))], 10);
+            w.run(vec![egui::Event::PointerMoved(short_at)], 40);
+            assert_eq!(count(&w, "short.txt"), before_short, "{mode:?}: a tooltip for a name that fits: {:?}", w.last);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_setting_whose_description_is_cut_short_has_the_whole_text_in_its_tooltip() {
         let theme = SerpantinumTheme::default();
         let long = "A description that is much too long for one line of a narrow settings window, it goes on and on";
