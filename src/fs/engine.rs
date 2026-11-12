@@ -1030,14 +1030,27 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
     w.shared.set_current(&name_of(src));
 
     if merge {
+        // One item that cannot be put in does not keep the others out: what went wrong is collected and said, a
+        // cancel ends it all
+        let mut failures = Vec::new();
         for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            transfer_one(w, op, &entry.path(), &target.join(entry.file_name()), None, rec)?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    failures.push(crate::fs::describe::io_error(&err));
+                    continue;
+                }
+            };
+            match transfer_one(w, op, &entry.path(), &target.join(entry.file_name()), None, rec) {
+                Ok(()) => {}
+                Err(err) if is_cancel(&err) => return Err(err),
+                Err(err) => failures.push(format!("{}: {}", name_of(&entry.path()), crate::fs::describe::io_error(&err))),
+            }
         }
         if op == Op::Move {
             let _ = std::fs::remove_dir(src);
         }
-        return Ok(());
+        return if failures.is_empty() { Ok(()) } else { Err(io::Error::other(failures.join(" · "))) };
     }
 
     #[cfg(test)]
@@ -1513,6 +1526,31 @@ mod tests {
         std::fs::write(base.join("src/more/d.txt"), "new").unwrap();
         let pairs = ["data", "more"].iter().map(|f| (base.join("src").join(f), base.join("dest").join(f))).collect();
         (base, pairs)
+    }
+
+    #[test]
+    fn an_item_that_cannot_be_merged_in_does_not_keep_the_others_out() {
+        use std::os::unix::fs::PermissionsExt;
+        if is_root() {
+            return;
+        }
+        let (base, pairs) = two_folders_that_clash("merge_one_fails");
+        // Several files only on the source side, and one of them cannot be read
+        for n in ["n1", "n2", "n3", "n4", "n5"] {
+            std::fs::write(base.join("src/data").join(n), "new").unwrap();
+        }
+        let locked = base.join("src/data/n3");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (outcome, _) = run_answering(Op::Copy, pairs, |r| if r.target_info.is_dir { (Decision::Merge, true) } else { (Decision::Skip, true) });
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!outcome.ok && !outcome.cancelled, "{}", outcome.message);
+        assert!(outcome.message.contains("n3"), "the item is named: {}", outcome.message);
+        for n in ["n1", "n2", "n4", "n5"] {
+            assert!(base.join("dest/data").join(n).exists(), "{n} was left out");
+        }
+        assert!(!base.join("dest/data/n3").exists(), "no half copy");
+        assert!(base.join("dest/more/d.txt").exists(), "the next folder is merged too");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
