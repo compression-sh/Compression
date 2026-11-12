@@ -11448,6 +11448,36 @@ mod tests {
     }
 
     #[test]
+    fn in_the_grid_all_four_arrows_walk_the_results_as_in_a_folder() {
+        let dir = window_dir("search_grid");
+        for n in 10..=21 {
+            std::fs::create_dir_all(dir.join(format!("alpha{n}"))).unwrap();
+        }
+        let mut w = Window::new(dir.clone());
+        w.app.view_mode = ViewMode::Grid;
+        w.app.show_search = true;
+        w.app.focus_search = true;
+        search_for(&mut w, "alpha");
+        finish_search(&mut w);
+        w.run(Vec::new(), 5);
+        assert_eq!(w.app.items.len(), 12);
+        let cols = w.app.grid_cols;
+        assert!((2..11).contains(&cols), "the test wants more than one row and more than one column: {cols}");
+        w.key(egui::Key::ArrowDown);
+        assert!(!w.ctx.egui_wants_keyboard_input(), "Down did not leave the field");
+        assert_eq!(w.app.selected_index, Some(0));
+        w.key(egui::Key::ArrowRight);
+        assert_eq!(w.app.selected_index, Some(1));
+        w.key(egui::Key::ArrowDown);
+        assert_eq!(w.app.selected_index, Some(1 + cols), "Down goes a row down, as in a folder");
+        w.key(egui::Key::ArrowLeft);
+        assert_eq!(w.app.selected_index, Some(cols));
+        w.key(egui::Key::ArrowUp);
+        assert_eq!(w.app.selected_index, Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn down_leaves_the_search_field_and_the_arrows_then_walk_the_results() {
         let (mut w, dir) = window_searching("search_down");
         assert_eq!(names(&w), ["alpha1", "alpha2"]);
