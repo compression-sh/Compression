@@ -4,6 +4,9 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
+
+use crate::fs::process;
 
 #[derive(Debug, Clone)]
 pub struct AppEntry {
@@ -285,15 +288,6 @@ pub fn category_defaults() -> Option<Vec<Option<String>>> {
     CATEGORY_DEFAULTS.read().ok().and_then(|d| d.clone())
 }
 
-/// Make `app_id` the system-wide default for `mime` (writes `~/.config/mimeapps.list`).
-pub fn set_default(mime: &str, app_id: &str) -> bool {
-    Command::new("xdg-mime")
-        .args(["default", app_id, mime])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 fn split_exec(exec: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut cur = String::new();
@@ -435,14 +429,109 @@ pub const CATEGORIES: [Category; 6] = [
     },
 ];
 
-/// Make `app_id` the default for every type of `category` without blocking the UI.
-pub fn set_category_default(category: &Category, app_id: &str) {
-    let app_id = app_id.to_owned();
-    let mimes = category.mimes;
-    std::thread::spawn(move || {
-        for mime in mimes {
-            set_default(mime, &app_id);
+/// How long one `xdg-mime` call may take, and how long all the calls for one category may take together.
+pub const CALL_LIMIT: Duration = Duration::from_secs(10);
+pub const CATEGORY_LIMIT: Duration = Duration::from_secs(20);
+
+/// Why a type did not become the application's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// `xdg-mime` is not installed.
+    Missing,
+    /// It did not answer within the time.
+    TimedOut,
+    /// It ended with an error, or printed too much.
+    Refused,
+    /// It said yes, but asking afterwards shows another default (or none).
+    NotKept,
+}
+
+/// What the default was set for: one category of the settings (by its place in `CATEGORIES`), or one type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultFor {
+    Category(usize),
+    Type(String),
+}
+
+/// What setting a default came to. `now` is what `xdg-mime` says for each type afterwards (in the order asked),
+/// `failed` the types that did not become `app_id`'s, with the reason.
+#[derive(Debug, Clone)]
+pub struct DefaultsReport {
+    pub target: DefaultFor,
+    pub app_id: String,
+    pub app_name: String,
+    pub failed: Vec<(String, Why)>,
+    pub now: Vec<Option<String>>,
+}
+
+/// `program` (a program and its leading arguments, `xdg-mime` outside tests) with `args`, within `timeout`.
+fn run_tool(program: &[String], args: &[&str], timeout: Duration) -> Result<process::Output, Why> {
+    let Some((first, leading)) = program.split_first() else { return Err(Why::Missing) };
+    let mut command = Command::new(first);
+    command.args(leading).args(args);
+    match process::run_capped(command, 64 * 1024, timeout) {
+        Ok(output) => Ok(output),
+        Err(process::Failure::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Err(Why::Missing),
+        Err(process::Failure::TimedOut) => Err(Why::TimedOut),
+        Err(_) => Err(Why::Refused),
+    }
+}
+
+/// Make `app_id` the default of every type in `mimes`, and ask afterwards what the system says: only an answer that
+/// is exactly `app_id` counts, an exit status of 0 alone does not. One call may take `call`, all of them `total`;
+/// what is not done by then is a failure, never a success.
+pub(crate) fn set_defaults_with(program: &[String], mimes: &[String], app_id: &str, call: Duration, total: Duration) -> (Vec<(String, Why)>, Vec<Option<String>>) {
+    let start = Instant::now();
+    let (mut failed, mut now) = (Vec::new(), Vec::new());
+    for (i, mime) in mimes.iter().enumerate() {
+        let left = total.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            failed.push((mime.clone(), Why::TimedOut));
+            now.push(None);
+            continue;
         }
+        let set = match run_tool(program, &["default", app_id, mime], call.min(left)) {
+            Ok(out) if out.success => None,
+            Ok(_) => Some(Why::Refused),
+            Err(why) => Some(why),
+        };
+        if set == Some(Why::Missing) {
+            // Nothing will work: the rest is not tried one by one
+            for rest in &mimes[i..] {
+                failed.push((rest.clone(), Why::Missing));
+                now.push(None);
+            }
+            break;
+        }
+        let left = total.saturating_sub(start.elapsed());
+        let readback = if left.is_zero() { Err(Why::TimedOut) } else { default_with(program, mime, call.min(left)) };
+        match (set, &readback) {
+            (Some(why), _) => failed.push((mime.clone(), why)),
+            (None, Ok(Some(found))) if found == app_id => {}
+            (None, Ok(_)) => failed.push((mime.clone(), Why::NotKept)),
+            (None, Err(why)) => failed.push((mime.clone(), *why)),
+        }
+        now.push(readback.ok().flatten());
+    }
+    (failed, now)
+}
+
+/// The default of `mime` as `xdg-mime query default` says: `Ok(None)` when it names none, `Err` when it could not be asked.
+fn default_with(program: &[String], mime: &str, timeout: Duration) -> Result<Option<String>, Why> {
+    let out = run_tool(program, &["query", "default", mime], timeout)?;
+    if !out.success {
+        return Err(Why::Refused);
+    }
+    Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_owned()).filter(|s| !s.is_empty()))
+}
+
+/// Set the default of `mimes` on a worker and send what came of it to `tx`; the window never waits for `xdg-mime`.
+pub fn set_defaults_in_background(program: Vec<String>, target: DefaultFor, mimes: Vec<String>, app: (String, String), tx: std::sync::mpsc::Sender<DefaultsReport>, ctx: eframe::egui::Context) {
+    std::thread::spawn(move || {
+        let (app_id, app_name) = app;
+        let (failed, now) = set_defaults_with(&program, &mimes, &app_id, CALL_LIMIT, CATEGORY_LIMIT);
+        let _ = tx.send(DefaultsReport { target, app_id, app_name, failed, now });
+        ctx.request_repaint();
     });
 }
 
@@ -521,8 +610,28 @@ pub fn name_is_mime(name: &str, pattern: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// An entry for tests of other modules.
+    pub(crate) fn entry(id: &str, name: &str) -> AppEntry {
+        AppEntry { id: id.into(), name: name.into(), exec: "true".into(), mimes: Vec::new(), icon: None }
+    }
+
+    /// A stand-in for `xdg-mime` that keeps its defaults in `dir/state` and logs each call in `dir/calls`. It sleeps `delay`
+    /// (seconds) first; `on_default` is the shell that runs for `default <app> <mime>` (`$2` app, `$3` type). Run through
+    /// `/bin/sh`, so that no freshly written program is executed (that races with other tests starting programs).
+    pub(crate) fn fake_tool(dir: &Path, delay: &str, on_default: &str) -> Vec<String> {
+        let script = dir.join("xdg-mime");
+        let body = format!(
+            "D='{}'\necho \"$1\" >> \"$D/calls\"\nsleep {delay}\ncase \"$1\" in\ndefault) {on_default}; exit 0;;\nquery) grep \"^$3=\" \"$D/state\" 2>/dev/null | tail -1 | cut -d= -f2-; exit 0;;\nesac\n",
+            dir.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        vec!["/bin/sh".to_owned(), script.display().to_string()]
+    }
+
+    pub(crate) const KEEPS: &str = "echo \"$3=$2\" >> \"$D/state\"";
 
     fn app(id: &str, mimes: &[&str]) -> AppEntry {
         AppEntry { id: id.into(), name: id.into(), exec: "true".into(), mimes: mimes.iter().map(|m| m.to_string()).collect(), icon: None }
@@ -539,4 +648,86 @@ mod tests {
         assert!(has_handler(&apps, "application/x-unknown-thing", Some("other.desktop")));
         assert!(has_handler(&[], "image/png", Some("viewer.desktop")));
     }
+
+    fn sandbox(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression_apps_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mimes(list: &[&str]) -> Vec<String> {
+        list.iter().map(|m| (*m).to_owned()).collect()
+    }
+
+    const SHORT: Duration = Duration::from_millis(400);
+
+    #[test]
+    fn a_default_that_the_system_confirms_for_every_type_is_set() {
+        let dir = sandbox("all");
+        let tool = fake_tool(&dir, "0", KEEPS);
+        let (failed, now) = set_defaults_with(&tool, &mimes(&["image/png", "image/gif"]), "v.desktop", CALL_LIMIT, CATEGORY_LIMIT);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(now, vec![Some("v.desktop".to_owned()), Some("v.desktop".to_owned())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_type_that_does_not_come_out_as_asked_is_a_failure_and_the_others_still_count() {
+        let dir = sandbox("part");
+        // `image/gif` is refused with an error; `image/bmp` is answered with another application afterwards
+        let on_default = "[ \"$3\" = image/gif ] && exit 1; if [ \"$3\" = image/bmp ]; then echo \"$3=other.desktop\" >> \"$D/state\"; else echo \"$3=$2\" >> \"$D/state\"; fi";
+        let tool = fake_tool(&dir, "0", on_default);
+        let (failed, now) = set_defaults_with(&tool, &mimes(&["image/png", "image/gif", "image/bmp"]), "v.desktop", CALL_LIMIT, CATEGORY_LIMIT);
+        assert_eq!(failed, vec![("image/gif".to_owned(), Why::Refused), ("image/bmp".to_owned(), Why::NotKept)]);
+        assert_eq!(now, vec![Some("v.desktop".to_owned()), None, Some("other.desktop".to_owned())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_exit_status_of_zero_without_the_change_is_no_success() {
+        let dir = sandbox("lie");
+        let tool = fake_tool(&dir, "0", ":");
+        let (failed, now) = set_defaults_with(&tool, &mimes(&["image/png"]), "v.desktop", CALL_LIMIT, CATEGORY_LIMIT);
+        assert_eq!(failed, vec![("image/png".to_owned(), Why::NotKept)]);
+        assert_eq!(now, vec![None]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_program_that_is_not_there_fails_every_type_at_once() {
+        let started = Instant::now();
+        let (failed, now) = set_defaults_with(&["/nonexistent/xdg-mime".to_owned()], &mimes(&["image/png", "image/gif", "image/bmp"]), "v.desktop", CALL_LIMIT, CATEGORY_LIMIT);
+        assert_eq!(failed.len(), 3);
+        assert!(failed.iter().all(|(_, why)| *why == Why::Missing), "{failed:?}");
+        assert_eq!(now, vec![None, None, None]);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_program_that_hangs_is_stopped_after_the_time_of_one_call() {
+        let dir = sandbox("hang");
+        let tool = fake_tool(&dir, "30", KEEPS);
+        let started = Instant::now();
+        let (failed, _) = set_defaults_with(&tool, &mimes(&["image/png"]), "v.desktop", SHORT, Duration::from_secs(10));
+        assert_eq!(failed, vec![("image/png".to_owned(), Why::TimedOut)]);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_is_not_done_when_the_time_of_the_whole_category_is_up_is_a_failure() {
+        let dir = sandbox("total");
+        // Each call takes 0.4 s; the category gets 1 s in all: the first type is done, the later ones are not
+        let tool = fake_tool(&dir, "0.4", KEEPS);
+        let started = Instant::now();
+        let (failed, now) = set_defaults_with(&tool, &mimes(&["a/1", "a/2", "a/3", "a/4", "a/5"]), "v.desktop", Duration::from_secs(5), Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+        assert!(failed.len() >= 3, "{failed:?}");
+        assert!(failed.iter().all(|(_, why)| *why == Why::TimedOut), "{failed:?}");
+        assert_eq!(now.len(), 5);
+        assert!(failed.iter().all(|(m, _)| m != "a/1"), "the first type was done in time: {failed:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

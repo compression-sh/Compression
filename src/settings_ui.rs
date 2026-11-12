@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::i18n::{self, tr, tr_dyn, trf, Language};
@@ -33,6 +34,8 @@ pub(crate) struct SettingsState {
     pub(crate) hex: String,
     picking: Option<usize>,
     defaults: Vec<Option<String>>,
+    /// Categories whose default is being set, or was set in part.
+    marks: HashMap<usize, DefaultMark>,
     keybind_search: String,
     capture: Option<(Action, Option<usize>)>,
     conflict_warning: Option<(String, Action, Action, Option<usize>)>,
@@ -76,6 +79,7 @@ impl CompressionApp {
             hex: self.settings.accent.clone().unwrap_or_default(),
             picking: None,
             defaults: Vec::new(),
+            marks: HashMap::new(),
             keybind_search: String::new(),
             capture: None,
             conflict_warning: None,
@@ -153,7 +157,7 @@ impl CompressionApp {
 
     /// The settings of the chosen category, in a column that stops growing with the window.
     pub(crate) fn settings_page(&mut self, ui: &mut egui::Ui, state: &mut SettingsState) {
-        let SettingsState { tab, font_query, hex, picking, defaults, keybind_search, capture, conflict_warning, theme_browser } = state;
+        let SettingsState { tab, font_query, hex, picking, defaults, marks, keybind_search, capture, conflict_warning, theme_browser } = state;
         let ctx = ui.ctx().clone();
 
         // Ctrl+PageUp / Ctrl+PageDown (or Ctrl+Tab) switch category from anywhere in the window
@@ -198,7 +202,7 @@ impl CompressionApp {
                             SIDEBAR_TAB => self.sidebar_tab(ui),
                             4 => self.behavior_tab(ui),
                             5 => self.keybindings_tab(ui, keybind_search, capture, conflict_warning),
-                            6 => self.applications_tab(ui, picking, defaults),
+                            6 => self.applications_tab(ui, picking, defaults, marks),
                             _ => self.plugins_tab(ui),
                         }
                         ui.add_space(8.0);
@@ -1285,7 +1289,7 @@ impl CompressionApp {
         }
     }
 
-    fn applications_tab(&mut self, ui: &mut egui::Ui, picking: &mut Option<usize>, defaults: &mut Vec<Option<String>>) {
+    fn applications_tab(&mut self, ui: &mut egui::Ui, picking: &mut Option<usize>, defaults: &mut Vec<Option<String>>, marks: &mut HashMap<usize, DefaultMark>) {
         let theme = self.theme;
         if defaults.is_empty() {
             match apps::category_defaults() {
@@ -1303,7 +1307,11 @@ impl CompressionApp {
         let installed = self.installed_apps();
         for (idx, category) in apps::CATEGORIES.iter().enumerate() {
             let current = defaults.get(idx).and_then(|d| d.as_deref()).and_then(|id| installed.iter().find(|a| a.id == id));
-            let value = current.map_or(tr("Not set"), |a| a.name.as_str());
+            let value = match marks.get(&idx) {
+                Some(DefaultMark::Setting) => tr("Setting…"),
+                Some(DefaultMark::Partial) => tr("Partly set"),
+                None => current.map_or(tr("Not set"), |a| a.name.as_str()),
+            };
             let is_open = *picking == Some(idx);
             if category_row(ui, ("cat_row", idx), category.icon, tr(category.label), value, &theme, is_open).clicked() {
                 *picking = if is_open { None } else { Some(idx) };
@@ -1323,15 +1331,91 @@ impl CompressionApp {
                 if candidates.is_empty() {
                     material::hint_label(ui, tr("No installed application handles these files"), &theme);
                 }
-                if let Some(app) = chosen {
-                    apps::set_category_default(category, &app.id);
-                    defaults[idx] = Some(app.id.clone());
-                    self.set_toast(trf("{} is now the default for {}", &[&app.name, &tr(category.label).to_lowercase()]));
+                // Nothing is shown as set before `xdg-mime` has said so; a category that is being set is not set twice
+                if let Some(app) = chosen
+                    && self.start_category_default(marks, idx, app)
+                {
                     *picking = None;
                 }
                 ui.add_space(4.0);
             });
         }
+    }
+}
+
+/// What the row of a category shows instead of its application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultMark {
+    /// A worker is asking `xdg-mime`.
+    Setting,
+    /// Some of the types of the category took the new application, some did not.
+    Partial,
+}
+
+impl CompressionApp {
+    /// Start making `app` the default for `mimes` on a worker; `apply_defaults` hears how it went.
+    pub(crate) fn set_default_application(&mut self, target: apps::DefaultFor, mimes: Vec<String>, app: &AppEntry) {
+        apps::set_defaults_in_background(self.mime_tool.clone(), target, mimes, (app.id.clone(), app.name.clone()), self.defaults_tx.clone(), self.ctx.clone());
+    }
+
+    /// The row of category `idx` shows "Setting…" and a worker makes `app` the default of its types; `false` (and
+    /// nothing started) while that category is already being set.
+    pub(crate) fn start_category_default(&mut self, marks: &mut HashMap<usize, DefaultMark>, idx: usize, app: &AppEntry) -> bool {
+        if marks.get(&idx) == Some(&DefaultMark::Setting) {
+            return false;
+        }
+        marks.insert(idx, DefaultMark::Setting);
+        self.set_default_application(apps::DefaultFor::Category(idx), apps::CATEGORIES[idx].mimes.iter().map(|m| (*m).to_owned()).collect(), app);
+        true
+    }
+
+    /// Take in what the workers that set default applications report.
+    pub(super) fn poll_defaults(&mut self) {
+        while let Ok(report) = self.defaults_rx.try_recv() {
+            self.apply_defaults(report);
+        }
+    }
+
+    /// Show how setting a default came out: the row of the category takes the new application only when every type
+    /// did, and is marked when only some did; a failure says which types and why.
+    pub(crate) fn apply_defaults(&mut self, report: apps::DefaultsReport) {
+        let apps::DefaultsReport { target, app_id, app_name, failed, now } = report;
+        let label = match &target {
+            apps::DefaultFor::Category(idx) => tr(apps::CATEGORIES[*idx].label).to_lowercase(),
+            apps::DefaultFor::Type(mime) => mime.clone(),
+        };
+        if let (apps::DefaultFor::Category(idx), Some(state)) = (&target, self.settings_win.as_mut()) {
+            if failed.is_empty() {
+                state.marks.remove(idx);
+                if let Some(slot) = state.defaults.get_mut(*idx) {
+                    *slot = Some(app_id.clone());
+                }
+            } else {
+                // What the system says is what the row shows: the old application when nothing took
+                if let Some(slot) = state.defaults.get_mut(*idx) {
+                    *slot = now.first().cloned().flatten();
+                }
+                if now.iter().any(|n| n.as_deref() == Some(app_id.as_str())) {
+                    state.marks.insert(*idx, DefaultMark::Partial);
+                } else {
+                    state.marks.remove(idx);
+                }
+            }
+        }
+        let Some((_, why)) = failed.first() else {
+            self.set_toast(trf("{} is now the default for {}", &[&app_name, &label]));
+            return;
+        };
+        let types: Vec<&str> = failed.iter().take(3).map(|(m, _)| m.as_str()).collect();
+        let more = failed.len().saturating_sub(3);
+        let extra = if more > 0 { format!(" +{more}") } else { String::new() };
+        let why = match why {
+            apps::Why::Missing => tr("xdg-mime is not installed"),
+            apps::Why::TimedOut => tr("xdg-mime did not answer in time"),
+            apps::Why::Refused => tr("xdg-mime reported an error"),
+            apps::Why::NotKept => tr("the system did not keep the change"),
+        };
+        self.set_toast(trf("Could not make {} the default for {}: {} ({})", &[&app_name, &label, &format!("{}{extra}", types.join(", ")), &why]));
     }
 }
 
@@ -1753,5 +1837,147 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+
+
+    // --- Default applications are set by a worker and shown only once the system confirms them
+
+    fn defaults_window(name: &str, tool: Vec<String>) -> (CompressionApp, SettingsState, std::path::PathBuf) {
+        crate::settings::NO_SAVE.with(|n| n.set(true));
+        let dir = std::env::temp_dir().join(format!("compression_defaults_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(dir.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.mime_tool = tool;
+        let state = SettingsState {
+            tab: 6,
+            font_query: String::new(),
+            hex: String::new(),
+            picking: None,
+            defaults: vec![Some("old.desktop".to_owned()); apps::CATEGORIES.len()],
+            marks: HashMap::new(),
+            keybind_search: String::new(),
+            capture: None,
+            conflict_warning: None,
+            theme_browser: None,
+        };
+        (app, state, dir)
+    }
+
+    /// The Applications page as it is drawn now.
+    fn applications_texts(app: &mut CompressionApp, state: &mut SettingsState) -> Vec<String> {
+        let ctx = app.ctx.clone();
+        let mut shown = Vec::new();
+        for n in 0..4 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 1400.0))), time: Some(n as f64 * 0.05), ..Default::default() };
+            let SettingsState { picking, defaults, marks, .. } = state;
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| app.applications_tab(ui, picking, defaults, marks));
+            });
+            out.textures_delta.clear();
+            shown = texts(&out).into_iter().map(|t| t.0).collect();
+        }
+        shown
+    }
+
+    /// Hands the reports of the workers to the window until `done` says enough (at most ~5 s).
+    fn take_reports(app: &mut CompressionApp, state: &mut SettingsState, done: impl Fn(&CompressionApp, &SettingsState) -> bool) {
+        for _ in 0..500 {
+            // The settings window is taken out of the app while it is drawn, and is back when reports are polled
+            app.settings_win = Some(std::mem::replace(state, SettingsState { tab: 6, font_query: String::new(), hex: String::new(), picking: None, defaults: Vec::new(), marks: HashMap::new(), keybind_search: String::new(), capture: None, conflict_warning: None, theme_browser: None }));
+            app.poll_defaults();
+            *state = app.settings_win.take().unwrap();
+            if done(app, state) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("no report arrived");
+    }
+
+    fn toast_text(app: &CompressionApp) -> String {
+        app.toast_message().unwrap_or_default().to_owned()
+    }
+
+    #[test]
+    fn a_default_is_shown_as_set_only_after_the_system_confirmed_every_type() {
+        let dir0 = std::env::temp_dir().join(format!("compression_defaults_tool_ok_{}", std::process::id()));
+        std::fs::create_dir_all(&dir0).unwrap();
+        let (mut app, mut state, dir) = defaults_window("ok", apps::tests::fake_tool(&dir0, "0.3", apps::tests::KEEPS));
+        let viewer = apps::tests::entry("viewer.desktop", "Viewer");
+        assert!(app.start_category_default(&mut state.marks, 0, &viewer));
+        // At once: the row says what is going on, the old application is still the recorded one, nothing is announced
+        assert_eq!(state.marks.get(&0), Some(&DefaultMark::Setting));
+        assert_eq!(state.defaults[0].as_deref(), Some("old.desktop"));
+        assert!(toast_text(&app).is_empty(), "{:?}", toast_text(&app));
+        assert!(applications_texts(&mut app, &mut state).iter().any(|t| t == "Setting…"));
+        // A second choice for the same category while it is being set starts nothing
+        assert!(!app.start_category_default(&mut state.marks, 0, &viewer));
+        take_reports(&mut app, &mut state, |_, s| s.marks.is_empty());
+        assert_eq!(state.defaults[0].as_deref(), Some("viewer.desktop"));
+        assert_eq!(toast_text(&app), "Viewer is now the default for images");
+        // The worker asked once per type, and asked again afterwards: `default` and `query` for each of the seven
+        let calls = std::fs::read_to_string(dir0.join("calls")).unwrap();
+        assert_eq!(calls.lines().filter(|l| *l == "default").count(), apps::CATEGORIES[0].mimes.len(), "{calls}");
+        assert_eq!(calls.lines().filter(|l| *l == "query").count(), apps::CATEGORIES[0].mimes.len(), "{calls}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir0);
+    }
+
+    #[test]
+    fn a_default_that_could_not_be_set_leaves_the_row_and_says_which_types_and_why() {
+        let (mut app, mut state, dir) = defaults_window("missing", vec!["/nonexistent/xdg-mime".to_owned()]);
+        let viewer = apps::tests::entry("viewer.desktop", "Viewer");
+        app.start_category_default(&mut state.marks, 0, &viewer);
+        take_reports(&mut app, &mut state, |_, s| s.marks.is_empty());
+        assert_eq!(state.defaults[0].as_deref(), None, "the row shows what the system says: nothing could be asked, so no application");
+        let toast = toast_text(&app);
+        assert!(toast.starts_with("Could not make Viewer the default for images: image/png, image/jpeg, image/gif +4"), "{toast}");
+        assert!(toast.ends_with("(xdg-mime is not installed)"), "{toast}");
+        assert!(!applications_texts(&mut app, &mut state).iter().any(|t| t == "Setting…" || t == "Partly set"));
+        // The mark is gone, so the category can be tried again
+        assert!(app.start_category_default(&mut state.marks, 0, &viewer));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_category_that_took_in_part_is_marked_and_names_the_types_that_did_not() {
+        let dir0 = std::env::temp_dir().join(format!("compression_defaults_tool_part_{}", std::process::id()));
+        std::fs::create_dir_all(&dir0).unwrap();
+        let refuse = format!("[ \"$3\" = image/gif ] && exit 1; {}", apps::tests::KEEPS);
+        let (mut app, mut state, dir) = defaults_window("partial", apps::tests::fake_tool(&dir0, "0", &refuse));
+        let viewer = apps::tests::entry("viewer.desktop", "Viewer");
+        app.start_category_default(&mut state.marks, 0, &viewer);
+        take_reports(&mut app, &mut state, |_, s| s.marks.get(&0) != Some(&DefaultMark::Setting));
+        assert_eq!(state.marks.get(&0), Some(&DefaultMark::Partial));
+        let toast = toast_text(&app);
+        assert_eq!(toast, "Could not make Viewer the default for images: image/gif (xdg-mime reported an error)");
+        assert!(!toast.contains("is now the default"));
+        let shown = applications_texts(&mut app, &mut state);
+        assert!(shown.iter().any(|t| t == "Partly set"), "{shown:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir0);
+    }
+
+    #[test]
+    fn a_default_for_one_type_is_set_on_a_worker_and_a_failure_is_reported_later() {
+        let dir0 = std::env::temp_dir().join(format!("compression_defaults_tool_type_{}", std::process::id()));
+        std::fs::create_dir_all(&dir0).unwrap();
+        // A program that hangs: the call returns at once, and nothing is announced meanwhile
+        let (mut app, mut state, dir) = defaults_window("one_type", apps::tests::fake_tool(&dir0, "30", apps::tests::KEEPS));
+        let viewer = apps::tests::entry("viewer.desktop", "Viewer");
+        let started = std::time::Instant::now();
+        app.set_default_application(apps::DefaultFor::Type("image/png".into()), vec!["image/png".into()], &viewer);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "the window waited for xdg-mime");
+        app.poll_defaults();
+        assert!(toast_text(&app).is_empty());
+        // One that is not there: the failure arrives as a message
+        app.mime_tool = vec!["/nonexistent/xdg-mime".to_owned()];
+        app.set_default_application(apps::DefaultFor::Type("image/png".into()), vec!["image/png".into()], &viewer);
+        take_reports(&mut app, &mut state, |app, _| !toast_text(app).is_empty());
+        assert_eq!(toast_text(&app), "Could not make Viewer the default for image/png: image/png (xdg-mime is not installed)");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir0);
+    }
 
 }

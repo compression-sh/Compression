@@ -417,6 +417,11 @@ pub struct CompressionApp {
     /// Where the thread that opens a file reports a type nothing is set up for, or a failure.
     open_tx: mpsc::Sender<OpenReport>,
     open_rx: mpsc::Receiver<OpenReport>,
+    /// What setting a default application came to, from the worker that asked `xdg-mime`.
+    pub(crate) defaults_tx: mpsc::Sender<apps::DefaultsReport>,
+    pub(crate) defaults_rx: mpsc::Receiver<apps::DefaultsReport>,
+    /// The program that sets default applications (and its leading arguments); `xdg-mime`, other only in tests.
+    pub(crate) mime_tool: Vec<String>,
     /// The folder is still being read, so there is nothing to show yet.
     loading: bool,
     /// What to select once the listing in the making arrives: the selected files, the focused one, and whether to scroll to it.
@@ -440,7 +445,7 @@ pub struct CompressionApp {
     drive_state: drives_ui::DriveState,
     net: network_ui::NetState,
     /// For work that reports back from other threads.
-    ctx: egui::Context,
+    pub(crate) ctx: egui::Context,
     /// Where each pinned row was drawn last frame, for reordering by dragging.
     pin_rects: Vec<egui::Rect>,
     /// The sidebar lists its hidden places too, faded, each with a box to tick it back in.
@@ -657,6 +662,7 @@ impl CompressionApp {
         crate::fs::file_item::set_show_extensions(settings.show_extensions);
         network::set_remote_previews(settings.remote_previews);
         let (open_tx, open_rx) = mpsc::channel();
+        let (defaults_tx, defaults_rx) = mpsc::channel();
         let (free_space_tx, free_space_rx) = mpsc::channel();
         let view_mode = if settings.remember_view_per_folder {
             settings.folder_views.get(&canonical_path).copied().unwrap_or(settings.view_mode)
@@ -680,6 +686,9 @@ impl CompressionApp {
             pending_reload: None,
             open_tx,
             open_rx,
+            defaults_tx,
+            defaults_rx,
+            mime_tool: vec!["xdg-mime".to_owned()],
             loading: false,
             restore_selection: None,
             watching: watching::Watching::new(ctx),
@@ -1919,6 +1928,12 @@ impl CompressionApp {
         apps::installed()
     }
 
+    /// The text of the toast that is showing, for the tests of other modules.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn toast_message(&self) -> Option<&str> {
+        self.status_toast.as_ref().map(|t| t.message.as_str())
+    }
+
     pub(crate) fn set_toast(&mut self, message: impl Into<String>) {
         self.status_toast = Some(Toast { message: message.into(), since: std::time::Instant::now(), action: None, leaving: false });
     }
@@ -2661,6 +2676,7 @@ impl eframe::App for CompressionApp {
         self.sync_selection(false);
         self.poll_jobs();
         self.poll_opened();
+        self.poll_defaults();
         self.poll_free_space();
         if self.poll_reload() {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
@@ -6532,11 +6548,8 @@ impl CompressionApp {
                             apps::save_overrides(&self.open_overrides);
                         }
                         if *for_type {
-                            if apps::set_default(mime, &app.id) {
-                                self.set_toast(trf("{} is now the default for {}", &[&app.name, &mime]));
-                            } else {
-                                self.set_toast(tr("Could not change the default application"));
-                            }
+                            // A worker asks `xdg-mime`; the answer comes as a message
+                            self.set_default_application(apps::DefaultFor::Type(mime.to_owned()), vec![mime.to_owned()], app);
                         }
                         close = true;
                     }
@@ -8006,6 +8019,24 @@ mod tests {
             assert_eq!(w.app.clipboard, original, "closing the notice by {way} changed the clipboard");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_window_takes_in_what_a_worker_reports_about_a_default_application() {
+        let dir = window_dir("defaults_report");
+        let mut w = Window::new(dir.clone());
+        w.app.defaults_tx
+            .send(apps::DefaultsReport {
+                target: apps::DefaultFor::Type("image/png".into()),
+                app_id: "v.desktop".into(),
+                app_name: "Viewer".into(),
+                failed: vec![("image/png".into(), apps::Why::NotKept)],
+                now: vec![None],
+            })
+            .unwrap();
+        w.run(Vec::new(), 3);
+        assert_eq!(w.app.toast_message(), Some("Could not make Viewer the default for image/png: image/png (the system did not keep the change)"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
