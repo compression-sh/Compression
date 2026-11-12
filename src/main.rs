@@ -48,8 +48,9 @@ Usage:
   compression -h, --help           print this help and exit
 
 --version and --help count only as the first argument. A name that starts with a dash is given as ./-name,
-or after --, which ends the options. Any other option is an error (exit code 2), and so is a name that is
-not valid UTF-8; --portal and --resident take no other argument.
+or after --, which ends the options. Any other option is an error (exit code 2); --portal and --resident
+take no other argument. A name may hold any bytes, as Linux allows. Without a display (WAYLAND_DISPLAY or
+DISPLAY) no window can open, which ends with exit code 2.
 ",
             env!("CARGO_PKG_VERSION")
         )),
@@ -58,7 +59,7 @@ not valid UTF-8; --portal and --resident take no other argument.
 }
 
 /// The arguments of this run, as the system gave them: a name that is not valid UTF-8 (Linux allows any bytes in
-/// one) must reach `parse_launch` as it is, to be refused there, not be turned into another name.
+/// one) is kept as it is, never turned into another name.
 fn arguments() -> Vec<OsString> {
     env::args_os().skip(1).collect()
 }
@@ -71,8 +72,8 @@ const MAX_TARGETS: usize = 50;
 /// What a launch was asked to open.
 #[derive(Debug, Clone, PartialEq)]
 enum Target {
-    /// A path, absolute or relative to where the launch was made.
-    Path(String),
+    /// A path, absolute or relative to where the launch was made, with the bytes it was given.
+    Path(OsString),
     /// A `file://` URI of this computer, as a launcher passes what was dropped on it.
     Uri(String),
     /// A server address (`sftp://…`).
@@ -107,15 +108,13 @@ fn parse_launch(args: &[OsString]) -> Launch {
     {
         return Launch::Info(text);
     }
-    let mut words = Vec::with_capacity(args.len());
-    for (n, arg) in args.iter().enumerate() {
-        match arg.to_str() {
-            Some(word) => words.push(word.to_owned()),
-            None => return Launch::Error(format!("argument {} ({:?}) is not valid UTF-8, so it cannot be told apart from another name; open it from its folder", n + 1, arg.to_string_lossy())),
-        }
-    }
-    let options = words.iter().position(|w| w == "--").unwrap_or(words.len());
-    if words[..options].iter().any(|w| w == "--chooser") {
+    // Options are text; a name may be any bytes and is kept as it is (`Target::Path`)
+    let text = |arg: &OsString| arg.to_str().map(str::to_owned);
+    let options = args.iter().position(|w| w == "--").unwrap_or(args.len());
+    if args[..options].iter().any(|w| w == "--chooser") {
+        let Some(words) = args.iter().map(text).collect::<Option<Vec<String>>>() else {
+            return Launch::Error("a file dialog request must be valid UTF-8".to_owned());
+        };
         if let Some(stray) = chooser::stray_argument(&words) {
             return Launch::Error(format!("a file dialog request takes no other argument than its options, not {stray:?}"));
         }
@@ -125,30 +124,41 @@ fn parse_launch(args: &[OsString]) -> Launch {
         };
     }
     for service in ["--portal", "--resident"] {
-        if words[..options].iter().any(|w| w == service) {
-            return if words.len() == 1 { if service == "--portal" { Launch::Portal } else { Launch::Resident } } else { Launch::Error(format!("{service} takes no other arguments")) };
+        if args[..options].iter().any(|w| w == service) {
+            return if args.len() == 1 { if service == "--portal" { Launch::Portal } else { Launch::Resident } } else { Launch::Error(format!("{service} takes no other arguments")) };
         }
     }
     let mut targets = Vec::new();
-    for (n, word) in words.iter().enumerate() {
-        if n < options && word.starts_with('-') {
+    for (n, arg) in args.iter().enumerate() {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = arg.as_bytes();
+        if n < options && bytes.starts_with(b"-") {
+            let word = arg.to_string_lossy();
             return Launch::Error(format!("unknown option {word:?} (a folder of that name is ./{word}, or put -- before the names); see --help"));
         }
         if n == options {
             continue;
         }
-        if word.is_empty() {
+        if bytes.is_empty() {
             return Launch::Error(format!("argument {} is empty", n + 1));
         }
+        let Some(word) = arg.to_str() else {
+            // Not text: it can only be a name; a URI or an address is text
+            if bytes.starts_with(b"file:") {
+                return Launch::Error(format!("{:?} is not a file of this computer", arg.to_string_lossy()));
+            }
+            targets.push(Target::Path(arg.clone()));
+            continue;
+        };
         targets.push(if word.starts_with("file://") || word.starts_with("file:/") {
             if chooser::from_uri(word).is_none() {
                 return Launch::Error(format!("{word:?} is not a file of this computer"));
             }
-            Target::Uri(word.clone())
+            Target::Uri(word.to_owned())
         } else if fs::network::Address::looks_like(word) {
-            Target::Address(word.clone())
+            Target::Address(word.to_owned())
         } else {
-            Target::Path(word.clone())
+            Target::Path(arg.clone())
         });
     }
     if targets.len() > MAX_TARGETS {
@@ -207,8 +217,7 @@ fn main() -> eframe::Result {
         _ => {}
     }
     let dialog = matches!(launch, Launch::Chooser(_));
-    // Every word is text here: `parse_launch` has refused the others
-    let request = instance::Request::current(args.iter().map(|a| a.to_string_lossy().into_owned()).collect());
+    let request = instance::Request::current(args.clone());
     // A file dialog belongs to its requester, and an administrator's window to its own process.
     // As a container's first process (the Docker image), leaving would stop the container.
     if !dialog && !fs::admin::is_admin() && std::process::id() != 1 {
@@ -218,13 +227,24 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     }
-    let result = open_window(request);
-    // A dialog that could not be opened must not end like a cancel, which is exit code 1
-    if dialog && let Err(err) = &result {
-        eprintln!("Error: {err}");
+    // Without a display there is no window to open: said in words, before the window system says it in its own.
+    // A dialog that could not be opened must not end like a cancel, which is exit code 1; 2 is a failure for both
+    if !has_display(|var| env::var_os(var)) {
+        eprintln!("compression: {NO_DISPLAY}");
         std::process::exit(chooser::EXIT_FAILED);
     }
-    result
+    if let Err(err) = open_window(request) {
+        eprintln!("compression: the window could not be opened: {err}");
+        std::process::exit(chooser::EXIT_FAILED);
+    }
+    Ok(())
+}
+
+const NO_DISPLAY: &str = "there is no Wayland or X11 display to open a window on (neither WAYLAND_DISPLAY nor DISPLAY is set)";
+
+/// Whether `var` (the environment) names a display a window can open on.
+fn has_display(var: impl Fn(&str) -> Option<OsString>) -> bool {
+    ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"].iter().any(|name| var(name).is_some_and(|v| !v.is_empty()))
 }
 
 /// The path a target stands for, relative ones resolved against where the launch was made (which a resident
@@ -232,7 +252,8 @@ fn main() -> eframe::Result {
 fn target_path(target: &Target, cwd: &Path) -> PathBuf {
     let path = match target {
         Target::Address(text) => return PathBuf::from(text),
-        Target::Uri(text) | Target::Path(text) => fs::places::normalize(chooser::from_uri(text).unwrap_or_else(|| PathBuf::from(text))),
+        Target::Uri(text) => fs::places::normalize(chooser::from_uri(text).unwrap_or_else(|| PathBuf::from(text))),
+        Target::Path(name) => fs::places::normalize(PathBuf::from(name)),
     };
     if fs::places::is_virtual(&path) { path } else { cwd.join(path) }
 }
@@ -257,7 +278,7 @@ struct Resolved {
     error: Option<String>,
     first: Option<First>,
     /// The targets that get a window of their own, as the words to start that window with.
-    windows: Vec<String>,
+    windows: Vec<OsString>,
     /// The targets that become tabs of this window, as paths.
     tabs: Vec<PathBuf>,
 }
@@ -288,7 +309,8 @@ fn resolve_launch(launch: Launch, cwd: &Path) -> Resolved {
         other => First::Path(target_path(other, cwd)),
     });
     resolved.windows = windows.iter().map(|t| match t {
-        Target::Path(w) | Target::Uri(w) | Target::Address(w) => w.clone(),
+        Target::Path(w) => w.clone(),
+        Target::Uri(w) | Target::Address(w) => OsString::from(w),
     }).collect();
     resolved.tabs = tabs.iter().map(|t| target_path(t, cwd)).collect();
     resolved
@@ -296,7 +318,7 @@ fn resolve_launch(launch: Launch, cwd: &Path) -> Resolved {
 
 /// The command that starts another window of this program for `word`, in the folder `cwd` the launch was made in.
 /// After `--`, so that a name that looks like an option is still a name there.
-fn window_command(exe: &Path, word: &str, cwd: &Path) -> std::process::Command {
+fn window_command(exe: &Path, word: &std::ffi::OsStr, cwd: &Path) -> std::process::Command {
     let mut command = std::process::Command::new(exe);
     command.arg("--").arg(word).current_dir(cwd);
     command
@@ -304,7 +326,7 @@ fn window_command(exe: &Path, word: &str, cwd: &Path) -> std::process::Command {
 
 /// Open a window for one launch and run it until it closes.
 fn open_window(mut request: instance::Request) -> eframe::Result {
-    let args: Vec<OsString> = std::mem::take(&mut request.args).into_iter().map(OsString::from).collect();
+    let args: Vec<OsString> = std::mem::take(&mut request.args);
     // A resident process reads what it was sent the same way: a request that makes no sense is told on stderr and
     // gets a plain window, not none, for the launch that handed it over is waiting for one
     let resolved = resolve_launch(parse_launch(&args), &request.cwd);
@@ -482,7 +504,7 @@ mod tests {
     }
 
     fn path(text: &str) -> Target {
-        Target::Path(text.to_owned())
+        Target::Path(OsString::from(text))
     }
 
     fn error_of(launch: Launch) -> String {
@@ -586,16 +608,33 @@ mod tests {
     }
 
     #[test]
-    fn a_name_that_is_not_utf8_is_refused_with_its_place_and_reason() {
+    fn a_name_that_is_not_utf8_is_kept_byte_for_byte_and_opened_like_any_other() {
+        use std::os::unix::ffi::OsStrExt;
         let bad = OsString::from(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9"));
-        let why = error_of(parse_launch(std::slice::from_ref(&bad)));
-        assert!(why.contains("argument 1") && why.contains("not valid UTF-8") && why.contains("caf"), "{why}");
-        let why = error_of(parse_launch(&[OsString::from("ok"), OsString::from("--"), bad.clone()]));
-        assert!(why.contains("argument 3"), "{why}");
-        // Not turned into another name, in a dialog request or after the dashes either
-        assert!(matches!(parse_launch(&[OsString::from("--chooser"), OsString::from("--title"), bad.clone()]), Launch::Error(_)));
+        assert_eq!(parse_launch(std::slice::from_ref(&bad)), Launch::Open(vec![Target::Path(bad.clone())]));
+        assert_eq!(parse_launch(&[OsString::from("ok"), OsString::from("--"), bad.clone()]), Launch::Open(vec![path("ok"), Target::Path(bad.clone())]));
+        // Where it goes, it goes with its bytes: the folder of this window, a tab, another window
+        let resolved = resolve_launch(parse_launch(std::slice::from_ref(&bad)), Path::new("/w"));
+        assert_eq!(resolved.first, Some(First::Path(PathBuf::from(&bad))));
+        let many: Vec<OsString> = std::iter::repeat_n(bad.clone(), 10).collect();
+        let resolved = resolve_launch(parse_launch(&many), Path::new("/w"));
+        assert!(resolved.windows.iter().all(|w| w == &bad) && resolved.tabs.iter().all(|t| t.as_os_str() == bad));
+        // Options are text: a dialog request that is not, and an option that is not, are refused
+        assert!(error_of(parse_launch(&[OsString::from("--chooser"), OsString::from("--title"), bad.clone()])).contains("valid UTF-8"));
+        assert!(error_of(parse_launch(&[OsString::from(std::ffi::OsStr::from_bytes(b"-\xff"))])).contains("unknown option"));
+        assert!(error_of(parse_launch(&[OsString::from(std::ffi::OsStr::from_bytes(b"file:///\xff"))])).contains("not a file of this computer"));
         // The information requests are answered before anything else is looked at
         assert!(matches!(parse_launch(&[OsString::from("--version"), bad]), Launch::Info(_)));
+    }
+
+    #[test]
+    fn a_display_is_one_that_is_named() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |var: &str| pairs.iter().find(|(k, _)| *k == var).map(|(_, v)| OsString::from(v));
+        assert!(!has_display(env(&[])));
+        assert!(!has_display(env(&[("WAYLAND_DISPLAY", ""), ("DISPLAY", "")])), "empty names no display");
+        assert!(has_display(env(&[("WAYLAND_DISPLAY", "wayland-1")])));
+        assert!(has_display(env(&[("WAYLAND_SOCKET", "3")])));
+        assert!(has_display(env(&[("DISPLAY", ":0")])));
     }
 
     #[test]
@@ -719,7 +758,7 @@ mod tests {
     #[test]
     fn another_window_is_started_after_two_dashes_in_the_folder_of_the_launch() {
         for word in ["/tmp/a", "-x", "--help", "file:///a%20b", "sftp://h/x", "with space"] {
-            let command = window_command(Path::new("/usr/bin/compression"), word, Path::new("/work/here"));
+            let command = window_command(Path::new("/usr/bin/compression"), std::ffi::OsStr::new(word), Path::new("/work/here"));
             assert_eq!(command.get_program(), "/usr/bin/compression");
             assert_eq!(command.get_args().collect::<Vec<_>>(), ["--", word], "a name like an option must stay a name: {word}");
             assert_eq!(command.get_current_dir(), Some(Path::new("/work/here")));
@@ -761,7 +800,8 @@ mod tests {
                     assert!(words[..options].iter().all(|w| !w.starts_with('-')), "{}", says("an option is no target"));
                     for target in targets {
                         match target {
-                            Target::Path(w) | Target::Address(w) => assert!(!w.is_empty(), "{}", says("no empty target")),
+                            Target::Path(w) => assert!(!w.is_empty(), "{}", says("no empty target")),
+                            Target::Address(w) => assert!(!w.is_empty(), "{}", says("no empty target")),
                             Target::Uri(w) => assert!(chooser::from_uri(w).is_some(), "{}", says("a uri is of this computer")),
                         }
                     }

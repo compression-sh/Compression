@@ -2,7 +2,7 @@
 //! only has to open a window: starting the process and loading the graphics driver are paid once.
 //! A launch hands its request to the resident process over a socket in `$XDG_RUNTIME_DIR`. While
 //! that process already shows a window, the launch opens its own as a separate process.
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt;
@@ -27,7 +27,7 @@ const BUSY: u8 = b'n';
 /// One launch: the folder it was started in, its arguments, and what it needs to open a window.
 pub struct Request {
     pub cwd: PathBuf,
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
     tokens: [String; 2],
     exe: PathBuf,
     reply: Option<UnixStream>,
@@ -35,7 +35,7 @@ pub struct Request {
 
 impl Request {
     /// The launch this process was started for.
-    pub fn current(args: Vec<String>) -> Self {
+    pub fn current(args: Vec<OsString>) -> Self {
         Self {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             args,
@@ -70,7 +70,8 @@ impl Request {
         let exe = path(fields.next()?);
         let cwd = path(fields.next()?);
         let tokens = [text(fields.next()?), text(fields.next()?)];
-        Some(Self { cwd, args: fields.map(text).collect(), tokens, exe, reply: None })
+        // The arguments as they were given, byte for byte: a name need not be UTF-8
+        Some(Self { cwd, args: fields.map(|f| OsStr::from_bytes(f).to_owned()).collect(), tokens, exe, reply: None })
     }
 
     /// Put the launcher's activation tokens where the window creation looks for them.
@@ -295,7 +296,7 @@ mod tests {
     fn requests_survive_the_wire() {
         let request = Request {
             cwd: PathBuf::from("/home/a b"),
-            args: vec!["dir".into(), String::new(), "--x".into()],
+            args: vec!["dir".into(), OsString::new(), "--x".into(), OsStr::from_bytes(b"caf\xe9").to_owned()],
             tokens: ["tok".into(), String::new()],
             exe: PathBuf::from("/usr/bin/compression"),
             reply: None,

@@ -189,11 +189,24 @@ fn an_empty_argument_is_refused() {
 }
 
 #[test]
-fn a_name_that_is_not_utf8_is_refused_and_not_taken_for_another_name() {
+fn a_folder_whose_name_is_not_utf8_is_taken_as_it_is_and_only_the_missing_display_stops_it() {
     let sandbox = Sandbox::new("utf8");
-    let bad = OsString::from_vec(b"/tmp/caf\xe9".to_vec());
-    refused(&sandbox, std::slice::from_ref(&bad), "not valid UTF-8");
-    refused(&sandbox, &[OsString::from("ok"), OsString::from("--"), bad], "argument 3");
+    let folder = sandbox.0.join(OsString::from_vec(b"caf\xe9".to_vec()));
+    std::fs::create_dir(&folder).unwrap();
+    let out = sandbox.run(&[folder.into_os_string()]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("no Wayland or X11 display") && !stderr.contains("UTF-8"), "{stderr:?}");
+}
+
+#[test]
+fn without_a_display_a_window_says_so_in_words_and_ends_with_exit_2() {
+    let sandbox = Sandbox::new("nodisplay_window");
+    let out = sandbox.run(&os(&["/tmp"]));
+    let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert_eq!(stderr, "compression: there is no Wayland or X11 display to open a window on (neither WAYLAND_DISPLAY nor DISPLAY is set)\n");
+    assert!(stdout.is_empty());
 }
 
 #[test]
@@ -228,7 +241,7 @@ fn a_dialog_that_cannot_open_its_window_ends_with_exit_2_which_is_not_the_exit_o
     let out = sandbox.run(&os(&["--chooser", "--mode", "open"]));
     let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
     assert_eq!(out.status.code(), Some(2), "{stderr}");
-    assert!(stderr.starts_with("Error:"), "{stderr:?}");
+    assert!(stderr.starts_with("compression: there is no Wayland or X11 display"), "{stderr:?}");
     assert!(stdout.is_empty(), "nothing chosen: {stdout:?}");
     // It got as far as a start for real: the old data was copied (and nothing else was made)
     sandbox.assert_only(&["compression", "ski"]);
