@@ -1194,6 +1194,7 @@ impl CompressionApp {
 
     /// `add_listed` for an item that has been read already.
     fn add_listed_item(&mut self, path: &Path, item: Option<FileItem>) {
+        self.net.known.forget(path);
         let fresh = item.filter(|item| self.listed(item));
         if fresh.is_some() && self.settings.show_thumbnails {
             self.thumbs.ensure(path);
@@ -1208,6 +1209,9 @@ impl CompressionApp {
 
     /// Take `paths` out of the open folder's listing without reading the folder again.
     fn remove_listed(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            self.net.known.forget_under(path);
+        }
         let paths: HashSet<&Path> = paths.iter().map(PathBuf::as_path).collect();
         self.edit_listing(|items| items.retain(|i| !paths.contains(i.path.as_path())));
         self.selected_index = None;
@@ -3479,7 +3483,11 @@ impl CompressionApp {
         if !network::is_remote(pin) {
             return pin.is_dir();
         }
-        network::is_disconnected(pin) || !matches!(self.net.known.get(pin, ctx), Some(network_ui::Kind::Other | network_ui::Kind::Missing))
+        // The listing of the folder that is shown says it for free, and is the freshest answer there is
+        if let Some(item) = self.items.iter().find(|i| i.path == pin) {
+            return item.is_dir;
+        }
+        network::is_disconnected(pin) || !matches!(self.net.kind_of(pin, ctx), Some(network_ui::Kind::Other | network_ui::Kind::Missing))
     }
 
     /// The folders leading to the current one, starting at Home, the trash or the root.
@@ -6013,6 +6021,9 @@ impl CompressionApp {
     fn retarget_path(&mut self, old: &Path, target: &Path) {
         self.plugins.file_op_done(&crate::plugins::FileOpEvent::Moved(vec![(old.to_path_buf(), target.to_path_buf())]));
         self.forget_sizes([old, target]);
+        // What a server said about either name is no longer so
+        self.net.known.forget_under(old);
+        self.net.known.forget_under(target);
         self.retarget_places(&[(old.to_path_buf(), target.to_path_buf())]);
     }
 

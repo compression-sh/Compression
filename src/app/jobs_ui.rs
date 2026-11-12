@@ -93,6 +93,8 @@ impl CompressionApp {
                 Event::LowSpace(request) => self.pending_space.push_back(request),
                 Event::Done { job, outcome } => {
                     changed = true;
+                    // A job may have made, moved or removed anything on a server: what was said about paths there is asked again
+                    self.net.known.clear();
                     if self.history_job == Some(job) {
                         self.history_job = None;
                     }

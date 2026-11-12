@@ -95,7 +95,7 @@ impl CompressionApp {
         if !network::is_remote(dest) {
             return dest.is_dir();
         }
-        !matches!(self.net.known.get(dest, &self.ctx), Some(network_ui::Kind::Other | network_ui::Kind::Missing))
+        !matches!(self.net.kind_of(dest, &self.ctx), Some(network_ui::Kind::Other | network_ui::Kind::Missing))
     }
 
     /// Dropping is pointless on the folder the items already sit in, and impossible into themselves.

@@ -106,6 +106,12 @@ impl NetState {
         *self.generations.entry(mount.to_path_buf()).or_insert(0) += 1;
     }
 
+    /// What `path` on a server is, as far as the window knows without asking in the frame (see `Known`).
+    pub(super) fn kind_of(&self, path: &Path, ctx: &egui::Context) -> Option<Kind> {
+        let mount = network::mount_root(path);
+        self.known.get(path, self.generation_of(&mount), ctx)
+    }
+
     pub(super) fn is_being_renamed(&self, path: &Path) -> bool {
         self.renaming.contains_key(path)
     }
@@ -190,7 +196,25 @@ pub(super) fn offers_reconnect(mount: &Mount, state: Option<LinkState>) -> bool 
 pub(super) enum Kind {
     Dir,
     Other,
+    /// The server said there is no such thing (`ENOENT`, `ENOTDIR`).
     Missing,
+    /// The question was asked and got no answer that says what it is: the connection broke, the server timed out,
+    /// the disk reported an error. Nothing is known, and it is not "missing".
+    Unsure,
+}
+
+/// What the file system says `path` is. Only "no such thing" is `Missing`: every other error (`ENOTCONN`, `EIO`,
+/// `ETIMEDOUT`, `ESTALE`, `EACCES` …) says the server could not tell.
+fn kind_on_disk(path: &Path) -> Kind {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => Kind::Dir,
+        Ok(_) => Kind::Other,
+        Err(err) => kind_of_error(&err),
+    }
+}
+
+fn kind_of_error(err: &std::io::Error) -> Kind {
+    if matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) { Kind::Missing } else { Kind::Unsure }
 }
 
 /// The most the window waits, right after a server connected, for it to say what its paths are.
@@ -202,13 +226,26 @@ const ANSWER_WAIT: Duration = Duration::from_millis(500);
 /// it learns then is used to refresh the sidebar, not to open anything the person has stopped waiting for.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long what a server said about a path is trusted before it is asked again (the old answer is still used meanwhile).
+/// How long an answer that says what a path is (a folder, something else, nothing) is fresh: it is not asked for again.
 const KNOWN_FOR: Duration = Duration::from_secs(30);
+/// How long an answer that could not say is fresh: asked again sooner, because the next try may well work.
+const UNSURE_FOR: Duration = Duration::from_secs(5);
+/// How long an answer that is no longer fresh is still shown while a new one is asked for. Older than this, nothing
+/// is claimed: a server that never answers does not keep an hour-old "folder" on the screen.
+const KNOWN_USABLE_FOR: Duration = Duration::from_secs(300);
+/// The most answers kept; the oldest go first.
+const KNOWN_LIMIT: usize = 256;
 
 /// What paths on servers are, for what the window draws every frame (the pinned folders, a drop target): a frame
-/// must not ask a server, which may hang. An answer is looked up here; if there is none, or it is old, one question
-/// goes out on a thread of its own and the window repaints when it comes back. At most one question is on its way
-/// per mount, so a server that hangs holds one thread, not one per frame.
+/// must not ask a server, which may hang. The answers come from, in this order: the listing of the folder that is
+/// shown (the caller looks there first; it is free and fresher than anything here), then this cache, which is filled
+/// by questions to the server. A question goes out on a thread of its own when an answer is missing or no longer
+/// fresh, and the window repaints when it comes back. There is one thread per mount, which takes the due paths of
+/// its mount one after the other, so a server that hangs holds one thread, not one per frame or per path.
+///
+/// An answer is tied to the connection it was given on (`NetState::generation_of`): a disconnect or a reconnect makes
+/// every answer of that mount void. What the window itself changes (rename, delete, create, move, any job) is
+/// `forget`-ten. Times: `KNOWN_FOR`, `UNSURE_FOR`, `KNOWN_USABLE_FOR`; size: `KNOWN_LIMIT`.
 #[cfg_attr(not(test), derive(Default))]
 pub(super) struct Known {
     state: Arc<Mutex<KnownState>>,
@@ -220,11 +257,7 @@ pub(super) struct Known {
 #[cfg(test)]
 impl Default for Known {
     fn default() -> Self {
-        Self::with_ask(|path| match std::fs::metadata(path) {
-            Ok(meta) if meta.is_dir() => Kind::Dir,
-            Ok(_) => Kind::Other,
-            Err(_) => Kind::Missing,
-        })
+        Self::with_ask(kind_on_disk)
     }
 }
 
@@ -235,57 +268,121 @@ impl Known {
     }
 }
 
+struct Answer {
+    kind: Kind,
+    at: Instant,
+    /// The connection of the mount it was given on.
+    generation: u64,
+}
+
 #[derive(Default)]
 struct KnownState {
-    kinds: HashMap<PathBuf, (Kind, Instant)>,
-    /// The mounts with a question on their way.
+    kinds: HashMap<PathBuf, Answer>,
+    /// The mounts with a thread asking.
     asking: HashSet<PathBuf>,
+    /// The paths due for a question, with the generation of their mount: the thread of the mount takes them one by one.
+    wanted: HashMap<PathBuf, u64>,
+    /// Counts what was forgotten: an answer to a question that went out before a `forget` is not kept.
+    epoch: u64,
+}
+
+impl KnownState {
+    fn insert(&mut self, path: PathBuf, answer: Answer) {
+        self.kinds.insert(path, answer);
+        while self.kinds.len() > KNOWN_LIMIT {
+            let Some(oldest) = self.kinds.iter().min_by_key(|(_, a)| a.at).map(|(p, _)| p.clone()) else { break };
+            self.kinds.remove(&oldest);
+        }
+    }
+}
+
+fn mount_of_path(path: &Path) -> PathBuf {
+    network::mount_root(path).unwrap_or_else(|| path.to_path_buf())
 }
 
 impl Known {
-    /// What `path` was last said to be, if it was; asks again in the background when that is old or missing.
-    pub(super) fn get(&self, path: &Path, ctx: &egui::Context) -> Option<Kind> {
-        let mount = network::mount_root(path).unwrap_or_else(|| path.to_path_buf());
+    /// What `path` was last said to be on this connection (`generation`), if that is not too old; asks (again) in the
+    /// background when the answer is missing or no longer fresh.
+    pub(super) fn get(&self, path: &Path, generation: u64, ctx: &egui::Context) -> Option<Kind> {
+        let mount = mount_of_path(path);
         let Ok(mut state) = self.state.lock() else { return None };
-        let known = state.kinds.get(path).copied();
-        if known.is_some_and(|(_, at)| at.elapsed() < KNOWN_FOR) || state.asking.contains(&mount) {
-            return known.map(|(kind, _)| kind);
+        let answer = state.kinds.get(path).filter(|a| a.generation == generation).map(|a| (a.kind, a.at.elapsed()));
+        let shown = answer.filter(|(_, age)| *age < KNOWN_USABLE_FOR).map(|(kind, _)| kind);
+        let fresh = answer.is_some_and(|(kind, age)| age < if kind == Kind::Unsure { UNSURE_FOR } else { KNOWN_FOR });
+        if fresh {
+            return shown;
         }
-        state.asking.insert(mount.clone());
-        let (shared, ctx, path) = (self.state.clone(), ctx.clone(), path.to_path_buf());
+        state.wanted.insert(path.to_path_buf(), generation);
+        if !state.asking.insert(mount.clone()) {
+            return shown;
+        }
+        let (shared, ctx) = (self.state.clone(), ctx.clone());
         #[cfg(test)]
         let ask = self.ask.clone();
+        let loop_mount = mount.clone();
         drop(state);
         let started = std::thread::Builder::new().name("known-kind".into()).spawn(move || {
-            #[cfg(test)]
-            let kind = ask(&path);
-            #[cfg(not(test))]
-            let kind = match std::fs::metadata(&path) {
-                Ok(meta) if meta.is_dir() => Kind::Dir,
-                Ok(_) => Kind::Other,
-                Err(_) => Kind::Missing,
-            };
-            if let Ok(mut state) = shared.lock() {
-                state.kinds.insert(path, (kind, Instant::now()));
-                state.asking.remove(&mount);
+            loop {
+                let (path, generation, epoch) = {
+                    let Ok(mut state) = shared.lock() else { return };
+                    let next = state.wanted.keys().find(|p| mount_of_path(p) == loop_mount).cloned();
+                    let Some(path) = next else {
+                        state.asking.remove(&loop_mount);
+                        return;
+                    };
+                    let generation = state.wanted.remove(&path).unwrap_or(0);
+                    (path, generation, state.epoch)
+                };
+                #[cfg(test)]
+                let kind = ask(&path);
+                #[cfg(not(test))]
+                let kind = kind_on_disk(&path);
+                if let Ok(mut state) = shared.lock()
+                    && state.epoch == epoch
+                {
+                    state.insert(path, Answer { kind, at: Instant::now(), generation });
+                }
+                ctx.request_repaint();
             }
-            ctx.request_repaint();
         });
         if started.is_err() && let Ok(mut state) = self.state.lock() {
-            state.asking.clear();
+            state.asking.remove(&mount);
         }
-        known.map(|(kind, _)| kind)
+        shown
+    }
+
+    /// `path` was changed (made, renamed, removed): what was said about it is no longer so.
+    pub(super) fn forget(&self, path: &Path) {
+        if let Ok(mut state) = self.state.lock() {
+            state.kinds.remove(path);
+            state.wanted.remove(path);
+            state.epoch += 1;
+        }
+    }
+
+    /// `prefix` and everything under it was changed.
+    pub(super) fn forget_under(&self, prefix: &Path) {
+        if let Ok(mut state) = self.state.lock() {
+            state.kinds.retain(|p, _| !p.starts_with(prefix));
+            state.wanted.retain(|p, _| !p.starts_with(prefix));
+            state.epoch += 1;
+        }
+    }
+
+    /// Everything: after a job, which may have changed anything.
+    pub(super) fn clear(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.kinds.clear();
+            state.wanted.clear();
+            state.epoch += 1;
+        }
     }
 }
 
 /// What each of `paths` is, or `None` where the server did not say within `wait`. The asking runs on a thread of
 /// its own: a server that hangs costs the window at most `wait`, not the whole time it hangs.
 fn kinds(paths: &[PathBuf], wait: Duration) -> Vec<Option<Kind>> {
-    kinds_with(paths, wait, |path| match std::fs::metadata(path) {
-        Ok(meta) if meta.is_dir() => Kind::Dir,
-        Ok(_) => Kind::Other,
-        Err(_) => Kind::Missing,
-    })
+    kinds_with(paths, wait, kind_on_disk)
 }
 
 fn kinds_with(paths: &[PathBuf], wait: Duration, ask: impl Fn(&Path) -> Kind + Send + 'static) -> Vec<Option<Kind>> {
@@ -2298,21 +2395,274 @@ mod tests {
         let (hold, calls) = (Mutex::new(hold), Arc::new(AtomicUsize::new(0)));
         let counted = calls.clone();
         let known = Known::with_ask(move |_| {
-            counted.fetch_add(1, Ordering::SeqCst);
-            let _ = hold.lock().unwrap().recv();
+            // The first question hangs until it is released; the thread then goes on with the other paths that are due
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = hold.lock().unwrap().recv();
+            }
             Kind::Dir
         });
         let (top, ctx) = (fake_server("hang"), egui::Context::default());
         let started = Instant::now();
         for i in 0..200 {
-            assert_eq!(known.get(&top.join(format!("p{}", i % 3)), &ctx), None);
+            assert_eq!(known.get(&top.join(format!("p{}", i % 3)), 0, &ctx), None);
         }
         assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
         wait_for(|| (calls.load(Ordering::SeqCst) > 0).then_some(()));
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one question per mount, however many frames ask");
         release.send(()).unwrap();
-        assert_eq!(wait_for(|| known.get(&top.join("p0"), &ctx)), Kind::Dir);
+        assert_eq!(wait_for(|| known.get(&top.join("p0"), 0, &ctx)), Kind::Dir);
+    }
+
+    fn answer(kind: Kind, age_secs: u64, generation: u64) -> Answer {
+        Answer { kind, at: Instant::now() - Duration::from_secs(age_secs), generation }
+    }
+
+    /// A `Known` whose questions are counted and answered with `kind`, and the count.
+    fn counting(kind: Kind) -> (Known, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        (Known::with_ask(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            kind
+        }), calls)
+    }
+
+    fn settled(known: &Known) {
+        wait_for(|| known.state.lock().unwrap().asking.is_empty().then_some(()));
+    }
+
+    #[test]
+    fn only_no_such_thing_is_missing_every_other_error_is_unsure() {
+        let kind = |code| kind_of_error(&std::io::Error::from_raw_os_error(code));
+        assert_eq!(kind(libc::ENOENT), Kind::Missing);
+        assert_eq!(kind(libc::ENOTDIR), Kind::Missing);
+        for code in [libc::ENOTCONN, libc::EIO, libc::ETIMEDOUT, libc::ESTALE, libc::EACCES, libc::ECONNRESET, libc::EHOSTUNREACH] {
+            assert_eq!(kind(code), Kind::Unsure, "{code}");
+        }
+        // And with the real file system
+        let dir = std::env::temp_dir().join(format!("compression_known_disk_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file"), "x").unwrap();
+        assert_eq!(kind_on_disk(&dir), Kind::Dir);
+        assert_eq!(kind_on_disk(&dir.join("file")), Kind::Other);
+        assert_eq!(kind_on_disk(&dir.join("nothing")), Kind::Missing);
+        assert_eq!(kind_on_disk(&dir.join("file/below")), Kind::Missing, "a file has nothing below it");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pin_and_a_drop_count_an_unsure_path_as_a_folder_and_a_missing_one_is_not() {
+        let (app, dir, ctx) = app_on_server_folder("unsure", &[]);
+        let generation = app.net.generation_of(&network::mount_root(&dir));
+        let (unsure, missing, other) = (dir.join("unsure"), dir.join("missing"), dir.join("other"));
+        {
+            let mut state = app.net.known.state.lock().unwrap();
+            state.kinds.insert(unsure.clone(), answer(Kind::Unsure, 0, generation));
+            state.kinds.insert(missing.clone(), answer(Kind::Missing, 0, generation));
+            state.kinds.insert(other.clone(), answer(Kind::Other, 0, generation));
+        }
+        assert!(app.pin_is_folder(&unsure, &ctx) && app.is_folder(&unsure));
+        assert!(!app.pin_is_folder(&missing, &ctx) && !app.is_folder(&missing));
+        assert!(!app.pin_is_folder(&other, &ctx) && !app.is_folder(&other));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_is_fresh_is_not_asked_again_and_what_is_not_is_asked_when_unsure_after_five_seconds_and_otherwise_after_thirty() {
+        let path = fake_server("times").join("a");
+        let ctx = egui::Context::default();
+        // (kind, age in seconds, is a question asked?)
+        for (kind, age, asked) in [
+            (Kind::Unsure, 1, false),
+            (Kind::Unsure, 6, true),
+            (Kind::Dir, 29, false),
+            (Kind::Dir, 31, true),
+            (Kind::Missing, 29, false),
+            (Kind::Missing, 31, true),
+            (Kind::Other, 31, true),
+        ] {
+            let (known, calls) = counting(Kind::Dir);
+            known.state.lock().unwrap().kinds.insert(path.clone(), answer(kind, age, 0));
+            let shown = known.get(&path, 0, &ctx);
+            settled(&known);
+            assert_eq!(shown, Some(kind), "{kind:?} at {age} s is still shown at once");
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(asked), "{kind:?} at {age} s");
+        }
+    }
+
+    #[test]
+    fn an_answer_older_than_five_minutes_is_no_longer_claimed() {
+        let path = fake_server("usable").join("a");
+        let ctx = egui::Context::default();
+        let (known, calls) = counting(Kind::Dir);
+        known.state.lock().unwrap().kinds.insert(path.clone(), answer(Kind::Dir, 299, 0));
+        assert_eq!(known.get(&path, 0, &ctx), Some(Kind::Dir), "still shown while it is asked for again");
+        settled(&known);
+        let (known, calls_old) = counting(Kind::Dir);
+        known.state.lock().unwrap().kinds.insert(path.clone(), answer(Kind::Dir, 301, 0));
+        assert_eq!(known.get(&path, 0, &ctx), None, "too old: nothing is claimed");
+        settled(&known);
+        assert_eq!((calls.load(Ordering::SeqCst), calls_old.load(Ordering::SeqCst)), (1, 1));
+        assert_eq!(known.get(&path, 0, &ctx), Some(Kind::Dir), "and the new answer is there");
+    }
+
+    #[test]
+    fn a_connection_that_changed_voids_what_was_said_on_the_old_one() {
+        let (mut app, dir, ctx) = app_on_server_folder("generation", &[]);
+        let (known, calls) = counting(Kind::Missing);
+        app.net.known = known;
+        let path = dir.join("pinned");
+        let generation = app.net.generation_of(&network::mount_root(&path));
+        app.net.known.state.lock().unwrap().kinds.insert(path.clone(), answer(Kind::Dir, 0, generation));
+        assert_eq!(app.net.kind_of(&path, &ctx), Some(Kind::Dir));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // The server was let go of and connected again: the old answer says nothing about the new connection
+        app.net.connection_changed(&dir);
+        assert_eq!(app.net.kind_of(&path, &ctx), None, "the old answer must not be shown");
+        settled(&app.net.known);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "it is asked for again");
+        assert_eq!(app.net.kind_of(&path, &ctx), Some(Kind::Missing));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn forgetting_a_path_or_what_is_under_it_drops_its_answers_and_one_on_its_way() {
+        let base = fake_server("forget");
+        let ctx = egui::Context::default();
+        let (known, _) = counting(Kind::Dir);
+        {
+            let mut state = known.state.lock().unwrap();
+            for name in ["a", "a/b", "ab", "c"] {
+                state.kinds.insert(base.join(name), answer(Kind::Dir, 0, 0));
+            }
+        }
+        let names = |known: &Known| {
+            let mut found: Vec<String> = known.state.lock().unwrap().kinds.keys().map(|p| p.strip_prefix(&base).unwrap().to_string_lossy().into_owned()).collect();
+            found.sort();
+            found
+        };
+        known.forget(&base.join("a"));
+        assert_eq!(names(&known), ["a/b", "ab", "c"], "only the path itself");
+        known.forget_under(&base.join("a"));
+        assert_eq!(names(&known), ["ab", "c"], "what is under it, but not a name that only starts alike");
+        known.clear();
+        assert!(names(&known).is_empty());
+
+        // A question that went out before the change is not kept when its answer comes
+        let (release, hold) = mpsc::channel::<()>();
+        let hold = Mutex::new(hold);
+        let known = Known::with_ask(move |_| {
+            let _ = hold.lock().unwrap().recv_timeout(Duration::from_secs(5));
+            Kind::Dir
+        });
+        let path = base.join("moving");
+        assert_eq!(known.get(&path, 0, &ctx), None);
+        wait_for(|| (known.state.lock().unwrap().wanted.is_empty()).then_some(()));
+        known.forget(&path);
+        release.send(()).unwrap();
+        settled(&known);
+        assert!(names(&known).is_empty(), "an answer to an old question was kept");
+    }
+
+    #[test]
+    fn a_rename_a_creation_a_removal_and_a_job_make_the_window_forget_what_a_server_said() {
+        let (mut app, dir, ctx) = app_on_server_folder("hooks", &["a.txt"]);
+        let put = |app: &CompressionApp, paths: &[PathBuf]| {
+            let mut state = app.net.known.state.lock().unwrap();
+            state.kinds.clear();
+            for path in paths {
+                state.kinds.insert(path.clone(), answer(Kind::Dir, 0, 0));
+            }
+        };
+        let has = |app: &CompressionApp, path: &Path| app.net.known.state.lock().unwrap().kinds.contains_key(path);
+        // A rename: both names
+        put(&app, &[dir.join("a.txt"), dir.join("a.txt/inside"), dir.join("b.txt"), dir.join("other")]);
+        app.net.tx.send(NetMsg::Renamed { path: dir.join("a.txt"), target: dir.join("b.txt"), new_name: "b.txt".into(), item: None, result: Ok(()) }).unwrap();
+        app.poll_network(&ctx);
+        assert!(!has(&app, &dir.join("a.txt")) && !has(&app, &dir.join("a.txt/inside")) && !has(&app, &dir.join("b.txt")));
+        assert!(has(&app, &dir.join("other")), "what was not touched stays");
+        // A creation
+        put(&app, &[dir.join("new.txt"), dir.join("other")]);
+        app.add_listed(&dir.join("new.txt"));
+        assert!(!has(&app, &dir.join("new.txt")) && has(&app, &dir.join("other")));
+        // A removal
+        put(&app, &[dir.join("gone"), dir.join("gone/below"), dir.join("other")]);
+        app.remove_listed(&[dir.join("gone")]);
+        assert!(!has(&app, &dir.join("gone")) && !has(&app, &dir.join("gone/below")) && has(&app, &dir.join("other")));
+        // Any job that ends
+        put(&app, &[dir.join("other")]);
+        app.engine.spawn(JobKind::Other, "test".to_owned(), String::new(), |_| Outcome::done("done".to_owned()));
+        wait_for(|| {
+            app.poll_jobs();
+            (!has(&app, &dir.join("other"))).then_some(())
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_cache_keeps_at_most_two_hundred_and_fifty_six_answers_and_the_oldest_go_first() {
+        let known = Known::with_ask(|_| Kind::Dir);
+        let base = fake_server("limit");
+        {
+            let mut state = known.state.lock().unwrap();
+            for n in 0..300u64 {
+                // The larger n, the younger
+                state.insert(base.join(format!("p{n}")), answer(Kind::Dir, 1000 - n, 0));
+            }
+            assert_eq!(state.kinds.len(), KNOWN_LIMIT);
+            assert!(!state.kinds.contains_key(&base.join("p0")) && !state.kinds.contains_key(&base.join("p43")), "the oldest are gone");
+            assert!(state.kinds.contains_key(&base.join("p44")) && state.kinds.contains_key(&base.join("p299")), "the youngest stay");
+        }
+    }
+
+    #[test]
+    fn the_paths_of_a_mount_that_are_due_are_asked_one_after_the_other_by_one_thread() {
+        let threads = Arc::new(Mutex::new(HashSet::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, hold) = mpsc::channel::<()>();
+        let hold = Mutex::new(hold);
+        let (seen, counted) = (threads.clone(), calls.clone());
+        let known = Known::with_ask(move |_| {
+            seen.lock().unwrap().insert(std::thread::current().id());
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = hold.lock().unwrap().recv_timeout(Duration::from_secs(5));
+            }
+            Kind::Dir
+        });
+        let (base, ctx) = (fake_server("batch"), egui::Context::default());
+        for name in ["p0", "p1", "p2"] {
+            known.get(&base.join(name), 0, &ctx);
+        }
+        // The first is being asked; the others wait for their turn on the same thread
+        wait_for(|| (calls.load(Ordering::SeqCst) == 1).then_some(()));
+        release.send(()).unwrap();
+        settled(&known);
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "every due path was asked");
+        assert_eq!(threads.lock().unwrap().len(), 1, "by a single thread");
+        for name in ["p0", "p1", "p2"] {
+            assert_eq!(known.get(&base.join(name), 0, &ctx), Some(Kind::Dir));
+        }
+    }
+
+    #[test]
+    fn a_pin_is_what_the_listing_of_the_shown_folder_says_before_the_cache_is_looked_at() {
+        let (mut app, dir, ctx) = app_on_server_folder("listing", &["file.txt"]);
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        app.reload_items();
+        wait_for(|| (!app.poll_reload()).then_some(()));
+        // The cache says the opposite of the listing
+        {
+            let mut state = app.net.known.state.lock().unwrap();
+            state.kinds.insert(dir.join("folder"), answer(Kind::Missing, 0, 0));
+            state.kinds.insert(dir.join("file.txt"), answer(Kind::Dir, 0, 0));
+        }
+        assert!(app.pin_is_folder(&dir.join("folder"), &ctx), "the listing says folder");
+        assert!(!app.pin_is_folder(&dir.join("file.txt"), &ctx), "the listing says file");
+        // Not in the listing: the cache decides
+        app.net.known.state.lock().unwrap().kinds.insert(dir.join("elsewhere"), answer(Kind::Other, 0, app.net.generation_of(&network::mount_root(&dir))));
+        assert!(!app.pin_is_folder(&dir.join("elsewhere"), &ctx));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2324,11 +2674,11 @@ mod tests {
             Kind::Missing
         });
         let (path, ctx) = (fake_server("old").join("a"), egui::Context::default());
-        known.state.lock().unwrap().kinds.insert(path.clone(), (Kind::Dir, Instant::now() - KNOWN_FOR * 2));
-        assert_eq!(known.get(&path, &ctx), Some(Kind::Dir), "the old answer, at once");
-        assert_eq!(wait_for(|| known.get(&path, &ctx).filter(|k| *k == Kind::Missing)), Kind::Missing);
+        known.state.lock().unwrap().kinds.insert(path.clone(), Answer { kind: Kind::Dir, at: Instant::now() - KNOWN_FOR * 2, generation: 0 });
+        assert_eq!(known.get(&path, 0, &ctx), Some(Kind::Dir), "the old answer, at once");
+        assert_eq!(wait_for(|| known.get(&path, 0, &ctx).filter(|k| *k == Kind::Missing)), Kind::Missing);
         for _ in 0..50 {
-            known.get(&path, &ctx);
+            known.get(&path, 0, &ctx);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a fresh answer is not asked for again");
     }

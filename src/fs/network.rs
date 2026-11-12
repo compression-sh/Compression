@@ -416,7 +416,18 @@ pub fn previews_allowed(path: &Path) -> bool {
 /// Mount folders known to belong to servers, refreshed by every `list_mounts`.
 static REMOTE_ROOTS: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 static MOUNTS: RwLock<Vec<Mount>> = RwLock::new(Vec::new());
-static LISTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// When `MOUNTS` was last filled; `None` until a listing has run (on a thread of its own: nothing here waits for one).
+static LISTED_AT: RwLock<Option<std::time::Instant>> = RwLock::new(None);
+
+/// How long ago the list of mounts was made; `None` if it never was.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn listing_age() -> Option<std::time::Duration> {
+    LISTED_AT.read().ok().and_then(|at| *at).map(|at| at.elapsed())
+}
+
+fn listed() -> bool {
+    LISTED_AT.read().is_ok_and(|at| at.is_some())
+}
 
 /// The folders the person chose to treat as servers (`Settings::remote_folders`). In a test they are the test's own:
 /// tests run side by side and must not change each other's.
@@ -499,7 +510,9 @@ pub fn list_mounts() -> Vec<Mount> {
     if let Ok(mut mounts) = MOUNTS.write() {
         mounts.clone_from(&found);
     }
-    LISTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut at) = LISTED_AT.write() {
+        *at = Some(std::time::Instant::now());
+    }
     found
 }
 
@@ -643,6 +656,13 @@ fn device_name(name: &str) -> String {
 
 /// The mount `path` belongs to, from the last listing; GVfs mounts are found even before one ran.
 pub fn mount_of(path: &Path) -> Option<Mount> {
+    let mounts = MOUNTS.read().ok()?;
+    mount_in(path, &mounts, &read_record)
+}
+
+/// `mount_of` over a given list of mounts and a way to read a mount's record. The record of one of Compression's
+/// own mounts is read from the disk only when the listing does not have the mount (it read the record itself).
+fn mount_in(path: &Path, mounts: &[Mount], record: &dyn Fn(&str) -> Option<Address>) -> Option<Mount> {
     if let Ok(rest) = path.strip_prefix(gvfs_root())
         && let Some(first) = rest.components().next()
     {
@@ -655,12 +675,16 @@ pub fn mount_of(path: &Path) -> Option<Mount> {
     if let Ok(rest) = path.strip_prefix(helper_root())
         && let Some(first) = rest.components().next()
     {
+        let local = helper_root().join(first);
+        if let Some(listed) = mounts.iter().find(|m| m.local == local) {
+            return Some(listed.clone());
+        }
         let id = first.as_os_str().to_string_lossy();
-        let address = read_record(&id);
+        let address = record(&id);
         let name = address.as_ref().map(Address::name).unwrap_or_else(|| id.clone().into_owned());
-        return Some(Mount { name, address, local: helper_root().join(first), kind: MountKind::Helper });
+        return Some(Mount { name, address, local, kind: MountKind::Helper });
     }
-    MOUNTS.read().ok()?.iter().filter(|m| path.starts_with(&m.local)).max_by_key(|m| m.local.as_os_str().len()).cloned()
+    mounts.iter().filter(|m| path.starts_with(&m.local)).max_by_key(|m| m.local.as_os_str().len()).cloned()
 }
 
 /// The server address of a folder that lies on a server, whether or not it is connected now.
@@ -678,14 +702,19 @@ pub fn display_path(path: &Path) -> Option<String> {
 /// Whether `path` is on a server that is not connected, so opening it should connect first. Goes
 /// by the last listing: FUSE keeps answering for a folder for a moment after its mount went away.
 pub fn is_disconnected(path: &Path) -> bool {
-    let Some(mount) = mount_of(path) else { return false };
-    if mount.kind == MountKind::System || mount.address.is_none() {
+    let Ok(mounts) = MOUNTS.read() else { return false };
+    disconnected_in(mount_in(path, &mounts, &read_record).as_ref(), listed(), &mounts)
+}
+
+/// `is_disconnected` for the mount of a path and the list of mounts, `listed` being whether that list was ever made.
+/// Before the first listing (which a thread makes, never the one that asks) nothing is known of what is connected,
+/// and the careful answer is "connected": the window must not take a mount for gone because it has not looked yet.
+fn disconnected_in(mount: Option<&Mount>, listed: bool, mounts: &[Mount]) -> bool {
+    let Some(mount) = mount else { return false };
+    if mount.kind == MountKind::System || mount.address.is_none() || !listed {
         return false;
     }
-    if !LISTED.load(std::sync::atomic::Ordering::Relaxed) {
-        list_mounts();
-    }
-    MOUNTS.read().is_ok_and(|mounts| !mounts.iter().any(|m| m.local == mount.local))
+    !mounts.iter().any(|m| m.local == mount.local)
 }
 
 /// Where a connected server shows `address`, without asking the server.
@@ -2223,5 +2252,55 @@ mod tests {
         assert_eq!(said(Stopped::Io(std::io::Error::from_raw_os_error(libc::ENOENT))), "Not found");
         assert_eq!(said(Stopped::Io(std::io::Error::from_raw_os_error(libc::ECONNREFUSED))), "The connection was refused");
         assert_eq!(said(Stopped::Io(std::io::Error::from_raw_os_error(libc::ENOTBLK))), "System error 15");
+    }
+
+    fn listed_mount(name: &str, kind: MountKind, address: bool) -> Mount {
+        let local = match kind {
+            MountKind::Helper => helper_root().join(name),
+            _ => PathBuf::from(format!("/run/user/1000/gvfs/{name}")),
+        };
+        Mount { name: name.to_owned(), address: address.then(|| Address::parse("sftp://me@host/srv").unwrap()), local, kind }
+    }
+
+    #[test]
+    fn a_mount_is_taken_for_gone_only_after_a_listing_has_said_so() {
+        let there = listed_mount("sftp:host=a", MountKind::Gvfs, true);
+        let gone = listed_mount("sftp:host=b", MountKind::Gvfs, true);
+        let list = [there.clone()];
+        // Before the first listing nothing is known, and the careful answer is "connected": nothing is listed here
+        assert!(!disconnected_in(Some(&gone), false, &[]));
+        assert!(!disconnected_in(Some(&gone), false, &list));
+        // After it, a mount that is not in the list is gone, and one that is, is not
+        assert!(disconnected_in(Some(&gone), true, &list));
+        assert!(!disconnected_in(Some(&there), true, &list));
+        // The system's own mounts and paths on no mount are never "gone"
+        assert!(!disconnected_in(Some(&listed_mount("nfs", MountKind::System, true)), true, &[]));
+        assert!(!disconnected_in(Some(&listed_mount("phone", MountKind::Gvfs, false)), true, &[]));
+        assert!(!disconnected_in(None, true, &[]));
+    }
+
+    #[test]
+    fn the_record_of_a_mount_is_read_from_the_disk_only_when_the_listing_does_not_have_the_mount() {
+        let reads = std::cell::Cell::new(0);
+        let record = |_: &str| {
+            reads.set(reads.get() + 1);
+            Address::parse("sftp://me@host/srv")
+        };
+        let listed = listed_mount("sftp-me@host-0123456789abcdef", MountKind::Helper, true);
+        let path = listed.local.join("sub/dir");
+        // The listing has it: it has read the record already
+        let found = mount_in(&path, std::slice::from_ref(&listed), &record).unwrap();
+        assert_eq!((found.local.clone(), reads.get()), (listed.local.clone(), 0));
+        // It does not (a mount made a moment ago): the record is read, once
+        let found = mount_in(&path, &[], &record).unwrap();
+        assert_eq!((found.local, found.kind, reads.get()), (listed.local, MountKind::Helper, 1));
+        assert!(found.address.is_some());
+    }
+
+    #[test]
+    fn the_list_of_mounts_says_when_it_was_made() {
+        list_mounts();
+        assert!(listed());
+        assert!(listing_age().is_some_and(|age| age < std::time::Duration::from_secs(60)));
     }
 }
