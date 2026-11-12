@@ -290,10 +290,11 @@ pub(crate) enum Dialog {
 
 impl Dialog {
     /// Whether a click beside the dialog leaves it open. The dialogs that take what a person types (a name, a pattern,
-    /// an address, a password) and the question of a conflict are modal: they close with Esc or a button, so that no one
-    /// loses what was typed, or a connection that was being made, by a click that missed. Questions and information
-    /// (Confirm, Alert, Properties, Open with…, Quick Look, a plugin's window, a server's question) go with a click
-    /// beside them: nothing is lost.
+    /// an address, a password), the question of a conflict and the security question of a server (trust this key?)
+    /// are modal: they close with Esc or a button, so that no one loses what was typed, or a connection that was being
+    /// made, by a click that missed, and an answer is always given on purpose. Questions with a harmless "no" and
+    /// information (Confirm, Alert, Properties, Open with…, Quick Look, a plugin's window) go with a click beside them:
+    /// nothing is lost.
     fn survives_outside_click(&self) -> bool {
         matches!(
             self,
@@ -305,6 +306,7 @@ impl Dialog {
                 | Dialog::Connect { .. }
                 | Dialog::Login { .. }
                 | Dialog::EditServer { .. }
+                | Dialog::NetQuestion { .. }
                 | Dialog::Conflict { .. }
         )
     }

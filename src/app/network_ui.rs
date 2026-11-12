@@ -2578,7 +2578,15 @@ mod tests {
     }
 
     /// Runs `n` frames of the window with the events given in the first one.
-    fn frames(app: &mut CompressionApp, ctx: &egui::Context, frame: &mut eframe::Frame, time: &mut f64, events: Vec<egui::Event>, n: usize) {
+    fn frames(app: &mut CompressionApp, ctx: &egui::Context, frame: &mut eframe::Frame, time: &mut f64, events: Vec<egui::Event>, n: usize) -> Vec<(String, egui::Rect)> {
+        fn texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let mut seen = Vec::new();
         for i in 0..n {
             *time += 0.05;
             let raw = egui::RawInput {
@@ -2589,7 +2597,12 @@ mod tests {
             };
             let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, frame));
             out.textures_delta.clear();
+            seen.clear();
+            for clipped in &out.shapes {
+                texts(&clipped.shape, &mut seen);
+            }
         }
+        seen
     }
 
     #[test]
@@ -2629,5 +2642,60 @@ mod tests {
         assert!(matches!(answers.try_recv(), Ok(Reply::Cancel)), "Esc must cancel the connection");
         assert!(!app.net.pending[0].asking);
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Opens the question of a server whose key was never seen, and runs it for a few frames.
+    fn question_on_screen(name: &str) -> (CompressionApp, PathBuf, egui::Context, eframe::Frame, f64, mpsc::Receiver<Reply>) {
+        let (mut app, base) = local_app(name);
+        let ctx = app.ctx.clone();
+        let (mut frame, mut time) = (eframe::Frame::_new_kittest(), 0.0);
+        let answers = waiting_connection(&mut app, 7);
+        let choices = vec!["Trust and connect".to_owned(), "Do not connect".to_owned()];
+        app.show_prompt(7, Prompt::Question { message: "The key of this server was never seen before.".into(), choices });
+        frames(&mut app, &ctx, &mut frame, &mut time, Vec::new(), 15);
+        assert!(matches!(app.dialog, Some(Dialog::NetQuestion { id: 7, .. })) && app.net.pending[0].asking);
+        (app, base, ctx, frame, time, answers)
+    }
+
+    fn click(app: &mut CompressionApp, ctx: &egui::Context, frame: &mut eframe::Frame, time: &mut f64, pos: egui::Pos2) {
+        let none = egui::Modifiers::NONE;
+        frames(app, ctx, frame, time, vec![egui::Event::PointerMoved(pos)], 3);
+        frames(app, ctx, frame, time, vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: none }], 2);
+        frames(app, ctx, frame, time, vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: none }], 8);
+    }
+
+    #[test]
+    fn the_security_question_of_a_server_is_modal_a_click_beside_it_answers_nothing_and_esc_declines() {
+        let (mut app, base, ctx, mut frame, mut time, answers) = question_on_screen("question_modal");
+        click(&mut app, &ctx, &mut frame, &mut time, egui::pos2(1090.0, 690.0));
+        for _ in 0..3 {
+            app.poll_network(&ctx);
+        }
+        assert!(matches!(app.dialog, Some(Dialog::NetQuestion { id: 7, .. })), "the question closed by a click beside it");
+        assert!(app.net.pending[0].asking, "the connection is no longer waiting for an answer");
+        assert!(answers.try_recv().is_err(), "an answer was sent for a click that missed");
+        // Esc declines, and the connection is told
+        let key = |pressed| egui::Event::Key { key: egui::Key::Escape, physical_key: Some(egui::Key::Escape), pressed, repeat: false, modifiers: egui::Modifiers::NONE };
+        frames(&mut app, &ctx, &mut frame, &mut time, vec![key(true)], 1);
+        frames(&mut app, &ctx, &mut frame, &mut time, vec![key(false)], 5);
+        app.poll_network(&ctx);
+        assert!(app.dialog.is_none());
+        assert!(matches!(answers.try_recv(), Ok(Reply::Cancel)), "Esc must decline");
+        assert!(!app.net.pending[0].asking);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn the_buttons_of_the_security_question_still_accept_and_decline() {
+        for (label, expected) in [("Trust and connect", 0), ("Do not connect", 1)] {
+            let (mut app, base, ctx, mut frame, mut time, answers) = question_on_screen("question_buttons");
+            let shown = frames(&mut app, &ctx, &mut frame, &mut time, Vec::new(), 2);
+            let at = shown.iter().find(|(t, _)| t == label).unwrap_or_else(|| panic!("{label} is not shown: {shown:?}")).1.center();
+            click(&mut app, &ctx, &mut frame, &mut time, at);
+            app.poll_network(&ctx);
+            assert!(app.dialog.is_none(), "{label}: the question stays");
+            assert!(matches!(answers.try_recv(), Ok(Reply::Choice(i)) if i == expected), "{label}");
+            std::fs::remove_dir_all(&base).unwrap();
+        }
     }
 }
