@@ -878,5 +878,14 @@
   "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "Không thay thế: mục mới không thể thế chỗ mục cũ ({}); nó được giữ lại với tên “{}”",
   "The list of servers could not be read. The file was kept as “{}” and a new list is used.": "Không thể đọc danh sách máy chủ. Tệp được giữ lại với tên “{}” và dùng danh sách mới.",
   "The list of servers could not be read, and the file could not be put aside. It is left as it is and not written over.": "Không thể đọc danh sách máy chủ và không thể cất tệp đi. Tệp được giữ nguyên và sẽ không bị ghi đè.",
-  "Nothing is replaced on a server: there is no trash there, and the old item would be lost for good.": "Không thay thế gì trên máy chủ: ở đó không có thùng rác và mục cũ sẽ mất vĩnh viễn."
+  "Nothing is replaced on a server: there is no trash there, and the old item would be lost for good.": "Không thay thế gì trên máy chủ: ở đó không có thùng rác và mục cũ sẽ mất vĩnh viễn.",
+  "Could not load these theme files: {}": "Không thể tải các tệp giao diện này: {}",
+  "The selected theme was not found – system colors are used": "Không tìm thấy giao diện đã chọn – đang dùng màu của hệ thống",
+  "not valid JSON (line {})": "JSON không hợp lệ (dòng {})",
+  "a value has the wrong type (line {})": "một giá trị sai kiểu (dòng {})",
+  "its name cannot be used": "không thể dùng tên tệp này",
+  "Themes cannot be changed in administrator mode": "Không thể thay đổi giao diện ở chế độ quản trị viên",
+  "There is no folder for the themes": "Không có thư mục cho giao diện",
+  "Could not save the theme: {}": "Không thể lưu giao diện: {}",
+  "Could not delete the theme: {}": "Không thể xóa giao diện: {}"
 }

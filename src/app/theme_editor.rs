@@ -24,6 +24,8 @@ pub(crate) struct ThemeDraft {
     name: String,
     pub(crate) colors: ThemeColors,
     focus_name: bool,
+    /// Why the last Save or Delete did not happen, shown in the card until the next try.
+    error: Option<String>,
 }
 
 /// The space between the name, the buttons and the close button in the top row.
@@ -41,10 +43,10 @@ impl CompressionApp {
     pub(crate) fn open_theme_editor(&mut self, id: Option<&str>) {
         let saved = id.and_then(|id| theme::user_themes().into_iter().find(|c| c.id == id));
         self.theme_draft = Some(match saved {
-            Some(c) => ThemeDraft { id: Some(c.id), name: c.name, colors: c.colors, focus_name: false },
+            Some(c) => ThemeDraft { id: Some(c.id), name: c.name, colors: c.colors, focus_name: false, error: None },
             None => {
                 let current = if self.settings.theme == "system" { self.system_theme } else { SerpantinumTheme::from_settings(&self.settings) };
-                ThemeDraft { id: None, name: String::new(), colors: ThemeColors::from_theme(&current), focus_name: true }
+                ThemeDraft { id: None, name: String::new(), colors: ThemeColors::from_theme(&current), focus_name: true, error: None }
             }
         });
         self.theme_picker = None;
@@ -66,7 +68,11 @@ impl CompressionApp {
             return;
         }
         let id = draft.id.unwrap_or_else(|| unique_id(&name, &theme::user_themes()));
-        theme::save_user_theme(&CustomTheme { id: id.clone(), name, colors: draft.colors });
+        // Only a theme that is on disk counts as saved: otherwise the card stays open with the reason
+        if let Err(err) = theme::save_user_theme(&CustomTheme { id: id.clone(), name, colors: draft.colors }) {
+            self.theme_draft_error(trf("Could not save the theme: {}", &[&crate::fs::describe::io_error(&err)]));
+            return;
+        }
         theme::reload_user_themes();
         self.settings.theme = format!("custom:{id}");
         self.close_theme_editor();
@@ -75,13 +81,22 @@ impl CompressionApp {
 
     fn delete_theme_draft(&mut self) {
         let Some(id) = self.theme_draft.as_ref().and_then(|d| d.id.clone()) else { return };
-        theme::delete_user_theme(&id);
+        if let Err(err) = theme::delete_user_theme(&id) {
+            self.theme_draft_error(trf("Could not delete the theme: {}", &[&crate::fs::describe::io_error(&err)]));
+            return;
+        }
         theme::reload_user_themes();
         if self.settings.theme == format!("custom:{id}") {
             self.settings.theme = "system".to_owned();
         }
         self.close_theme_editor();
         self.persist_settings();
+    }
+
+    fn theme_draft_error(&mut self, message: String) {
+        if let Some(draft) = &mut self.theme_draft {
+            draft.error = Some(message);
+        }
     }
 
     /// Drawn inside the Settings window, which holds its state out of `settings_win` while it
@@ -214,6 +229,10 @@ impl CompressionApp {
         }
         if name.lost_focus() && named && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             exit = Exit::Save;
+        }
+
+        if let Some(error) = &draft.error {
+            material::hint_label_inset(ui, error, &SerpantinumTheme { subtext1: theme.red, ..theme }, 4);
         }
 
         let mut changed = false;
@@ -605,5 +624,94 @@ mod tests {
         assert_eq!(unique_id("My Theme!", &[]), "my-theme");
         assert_eq!(unique_id("???", &[]), "theme");
         assert_eq!(unique_id("Mine", &[taken("mine"), taken("mine-2")]), "mine-3");
+    }
+
+    use crate::settings::Settings;
+    use crate::ui::theme::tests::Reading;
+    use crate::ui::theme::THEMES_DIR_FOR_TESTS;
+
+    fn app_in(dir: &std::path::Path) -> CompressionApp {
+        crate::settings::NO_SAVE.with(|n| n.set(true));
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(dir.to_path_buf(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.settings_watch = None;
+        app
+    }
+
+    /// Every text the editor draws, after a few frames.
+    fn card_texts(app: &mut CompressionApp) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = app.ctx.clone();
+        let mut found = Vec::new();
+        for n in 0..6 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0))), time: Some(n as f64 * 0.05), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| app.render_theme_editor(ui.ctx()));
+            out.textures_delta.clear();
+            found.clear();
+            out.shapes.iter().for_each(|c| walk(&c.shape, &mut found));
+        }
+        found
+    }
+
+    fn naming(app: &mut CompressionApp, name: &str) {
+        app.open_theme_editor(None);
+        app.theme_draft.as_mut().unwrap().name = name.to_owned();
+    }
+
+    #[test]
+    fn a_theme_that_could_not_be_written_is_not_called_saved() {
+        let reading = Reading::new("editor_save");
+        let blocker = reading.0.put("blocker", "a file is in the way");
+        THEMES_DIR_FOR_TESTS.with(|d| *d.borrow_mut() = Some(blocker.join("themes")));
+        let mut app = app_in(&reading.0 .0);
+        naming(&mut app, "Mine");
+        app.save_theme_draft();
+        // The card stays, with the reason on it; the choice of theme is what it was
+        assert!(app.theme_editor, "the editor must stay open");
+        assert_eq!(app.settings.theme, "system");
+        let error = app.theme_draft.as_ref().unwrap().error.clone().expect("a reason");
+        assert!(error.starts_with("Could not save the theme: "), "{error}");
+        assert!(card_texts(&mut app).contains(&error), "the reason is on the card");
+        assert!(crate::ui::theme::user_themes().iter().all(|t| t.id != "mine"));
+
+        // Once the folder can be made, the same card saves, and the reason is gone
+        THEMES_DIR_FOR_TESTS.with(|d| *d.borrow_mut() = Some(reading.0 .0.join("themes")));
+        app.save_theme_draft();
+        assert!(!app.theme_editor);
+        assert_eq!(app.settings.theme, "custom:mine");
+        assert!(reading.0 .0.join("themes/mine.json").is_file());
+    }
+
+    #[test]
+    fn a_theme_that_could_not_be_deleted_stays_and_says_why() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let reading = Reading::new("editor_delete");
+        let file = reading.0.put("mine.json", r##"{ "name": "Mine", "base": "#102030" }"##);
+        crate::ui::theme::reload_user_themes();
+        let mut app = app_in(&reading.0 .0);
+        app.settings.theme = "custom:mine".to_owned();
+        app.open_theme_editor(Some("mine"));
+        std::fs::set_permissions(&reading.0 .0, std::os::unix::fs::PermissionsExt::from_mode(0o555)).unwrap();
+        app.delete_theme_draft();
+        assert!(file.exists());
+        assert!(app.theme_editor, "the editor must stay open");
+        assert_eq!(app.settings.theme, "custom:mine", "the theme is still chosen: it is still there");
+        let error = app.theme_draft.as_ref().unwrap().error.clone().expect("a reason");
+        assert_eq!(error, "Could not delete the theme: Permission denied");
+        assert!(card_texts(&mut app).contains(&error));
+        // Once it can be removed, it goes, and the choice falls back to the system theme
+        std::fs::set_permissions(&reading.0 .0, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        app.delete_theme_draft();
+        assert!(!file.exists());
+        assert!(!app.theme_editor);
+        assert_eq!(app.settings.theme, "system");
     }
 }

@@ -878,5 +878,14 @@
   "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "Не заменено: новый элемент не смог занять место старого ({}); он сохранён как «{}»",
   "The list of servers could not be read. The file was kept as “{}” and a new list is used.": "Не удалось прочитать список серверов. Файл сохранён как «{}», используется новый список.",
   "The list of servers could not be read, and the file could not be put aside. It is left as it is and not written over.": "Не удалось прочитать список серверов, и файл нельзя отложить. Он остаётся как есть и не будет перезаписан.",
-  "Nothing is replaced on a server: there is no trash there, and the old item would be lost for good.": "На сервере ничего не заменяется: там нет корзины, и старый элемент был бы потерян навсегда."
+  "Nothing is replaced on a server: there is no trash there, and the old item would be lost for good.": "На сервере ничего не заменяется: там нет корзины, и старый элемент был бы потерян навсегда.",
+  "Could not load these theme files: {}": "Не удалось загрузить эти файлы тем: {}",
+  "The selected theme was not found – system colors are used": "Выбранная тема не найдена — используются цвета системы",
+  "not valid JSON (line {})": "недопустимый JSON (строка {})",
+  "a value has the wrong type (line {})": "значение имеет неверный тип (строка {})",
+  "its name cannot be used": "имя файла нельзя использовать",
+  "Themes cannot be changed in administrator mode": "В режиме администратора темы изменять нельзя",
+  "There is no folder for the themes": "Нет папки для тем",
+  "Could not save the theme: {}": "Не удалось сохранить тему: {}",
+  "Could not delete the theme: {}": "Не удалось удалить тему: {}"
 }

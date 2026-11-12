@@ -878,5 +878,14 @@
   "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "Non remplacé : le nouvel élément n'a pas pu prendre la place de l'ancien ({}) ; il est conservé sous « {} »",
   "The list of servers could not be read. The file was kept as “{}” and a new list is used.": "La liste des serveurs n'a pas pu être lue. Le fichier a été conservé sous « {} » et une nouvelle liste est utilisée.",
   "The list of servers could not be read, and the file could not be put aside. It is left as it is and not written over.": "La liste des serveurs n'a pas pu être lue et le fichier n'a pas pu être mis de côté. Il reste tel quel et n'est pas écrasé.",
-  "Nothing is replaced on a server: there is no trash there, and the old item would be lost for good.": "Rien n'est remplacé sur un serveur : il n'y a pas de corbeille et l'ancien élément serait perdu définitivement."
+  "Nothing is replaced on a server: there is no trash there, and the old item would be lost for good.": "Rien n'est remplacé sur un serveur : il n'y a pas de corbeille et l'ancien élément serait perdu définitivement.",
+  "Could not load these theme files: {}": "Impossible de charger ces fichiers de thème : {}",
+  "The selected theme was not found – system colors are used": "Le thème choisi est introuvable : les couleurs du système sont utilisées",
+  "not valid JSON (line {})": "JSON non valide (ligne {})",
+  "a value has the wrong type (line {})": "une valeur n’a pas le bon type (ligne {})",
+  "its name cannot be used": "son nom est inutilisable",
+  "Themes cannot be changed in administrator mode": "Les thèmes ne peuvent pas être modifiés en mode administrateur",
+  "There is no folder for the themes": "Il n’y a pas de dossier pour les thèmes",
+  "Could not save the theme: {}": "Impossible d’enregistrer le thème : {}",
+  "Could not delete the theme: {}": "Impossible de supprimer le thème : {}"
 }

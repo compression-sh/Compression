@@ -534,6 +534,8 @@ pub struct CompressionApp {
     pub(crate) system_theme: SerpantinumTheme,
     /// Follows the files a theme comes from; `None` when none could be watched.
     theme_watch: Option<crate::theme_watch::ThemeWatch>,
+    /// The theme file problems the toast has told about already (see `tell_about_theme_problems`).
+    theme_problems_told: Vec<String>,
     /// Follows `settings.json`, so an edit by hand applies at once; `None` when it could not be watched.
     settings_watch: Option<crate::settings_watch::SettingsWatch>,
     from_theme: SerpantinumTheme,
@@ -755,6 +757,7 @@ impl CompressionApp {
             settings,
             system_theme: SerpantinumTheme::load(),
             theme_watch: crate::theme_watch::ThemeWatch::new(ctx),
+            theme_problems_told: Vec::new(),
             settings_watch: crate::settings_watch::SettingsWatch::new(ctx),
             from_theme: faded,
             target_theme: faded,
@@ -1624,7 +1627,20 @@ impl CompressionApp {
     fn reload_external_theme(&mut self) {
         self.system_theme = SerpantinumTheme::load();
         crate::ui::theme::reload_user_themes();
+        self.tell_about_theme_problems();
         self.rebuild_theme();
+    }
+
+    /// Says once that theme files could not be loaded, and again only when that is a different set of
+    /// files or reasons; the Settings page keeps showing them either way.
+    pub(crate) fn tell_about_theme_problems(&mut self) {
+        let now: Vec<String> = crate::ui::theme::problems().iter().map(|p| p.describe()).collect();
+        if now != self.theme_problems_told {
+            if let Some(notice) = crate::ui::theme::problems_notice(&crate::ui::theme::problems()) {
+                self.set_toast(notice);
+            }
+            self.theme_problems_told = now;
+        }
     }
 
     /// Takes up what `settings.json` says after it was written from outside (an edit by hand or
@@ -8987,6 +9003,31 @@ mod tests {
         let (_, r) = w.shapes.iter().find(|(t, _)| t == "Refreshed").unwrap();
         assert!(r.height() < 24.0, "{r:?}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_theme_file_that_breaks_while_the_window_runs_is_told_once() {
+        use crate::ui::theme;
+        let reading = theme::tests::Reading::new("watched_break");
+        crate::settings::NO_SAVE.with(|n| n.set(true));
+        let file = reading.0.put("mine.json", "{ \"name\": \"Mine\" }");
+        let mut app = CompressionApp::new(reading.0 .0.clone(), SerpantinumTheme::default(), Settings::default(), &egui::Context::default());
+        app.settings_watch = None;
+        app.set_toast(String::new());
+        // The file is rewritten with a typo: the watcher's report reloads, the real folder is read, the toast says so
+        std::fs::write(&file, "{ oops").unwrap();
+        app.reload_external_theme();
+        assert_eq!(app.toast_message(), Some("Could not load these theme files: mine.json (not valid JSON (line 1))"));
+        // Another reload with the file as broken as before is quiet
+        app.set_toast(String::new());
+        app.reload_external_theme();
+        assert_eq!(app.toast_message(), Some(""));
+        // Repaired and broken again: told again
+        std::fs::write(&file, "{ \"name\": \"Mine\" }").unwrap();
+        app.reload_external_theme();
+        std::fs::write(&file, "[").unwrap();
+        app.reload_external_theme();
+        assert!(app.toast_message().unwrap().contains("mine.json"));
     }
 
     #[test]

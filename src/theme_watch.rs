@@ -57,9 +57,6 @@ impl ThemeWatch {
 }
 
 fn folders() -> Vec<PathBuf> {
-    let home = dirs::home_dir();
-    let state = home.as_ref().map(|h| h.join(".local/state/serpantinum"));
-    let config = home.as_ref().map(|h| h.join(".config/serpantinum"));
     let themes = crate::ui::theme::user_themes_dir();
     // The themes folder may not exist before the first theme is saved
     if let Some(dir) = &themes
@@ -67,7 +64,57 @@ fn folders() -> Vec<PathBuf> {
     {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut out: Vec<PathBuf> = themes.into_iter().chain(state).chain(config).collect();
+    folders_of(themes, &crate::ui::theme::serpantinum_dirs())
+}
+
+/// The folders that exist among the themes folder and Serpantinum's.
+fn folders_of(themes: Option<PathBuf>, serpantinum: &crate::ui::theme::SerpantinumDirs) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = themes.into_iter().chain(serpantinum.all().cloned()).collect();
     out.retain(|d| Path::new(d).is_dir());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::theme::{serpantinum_dirs, SerpantinumDirs};
+
+    #[test]
+    fn the_watched_folders_are_the_ones_serpantinum_is_read_from() {
+        let base = std::env::temp_dir().join(format!("compression_watch_folders_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (themes, xdg, fixed, absent) = (base.join("themes"), base.join("xdg/serpantinum"), base.join("home/.config/serpantinum"), base.join("nope"));
+        for dir in [&themes, &xdg, &fixed] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let dirs = SerpantinumDirs { state: vec![absent.clone()], config: vec![xdg.clone(), fixed.clone()] };
+        assert_eq!(folders_of(Some(themes.clone()), &dirs), vec![themes.clone(), xdg, fixed]);
+        // A folder that is not there is not watched, and no themes folder is fine
+        assert_eq!(folders_of(None, &SerpantinumDirs { state: vec![absent], config: Vec::new() }), Vec::<PathBuf>::new());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn serpantinums_folders_follow_the_xdg_variables_of_the_environment() {
+        // The tests run with these set (see the isolated environment); the fixed folders come after
+        let dirs = serpantinum_dirs();
+        for (var, list) in [("XDG_STATE_HOME", &dirs.state), ("XDG_CONFIG_HOME", &dirs.config)] {
+            if let Some(value) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+                assert_eq!(list.first(), Some(&Path::new(&value).join("serpantinum")), "{var}");
+            }
+        }
+    }
+
+    #[test]
+    fn folders_watches_the_themes_folder_and_the_folders_serpantinum_is_read_from() {
+        use crate::ui::theme::{tests::Reading, SERPANTINUM_DIRS_FOR_TESTS};
+        let reading = Reading::new("watch_wiring");
+        let serpantinum = reading.0.0.join("serpantinum");
+        std::fs::create_dir_all(&serpantinum).unwrap();
+        SERPANTINUM_DIRS_FOR_TESTS.with(|d| *d.borrow_mut() = Some(SerpantinumDirs { state: Vec::new(), config: vec![serpantinum.clone()] }));
+        let watched = folders();
+        SERPANTINUM_DIRS_FOR_TESTS.with(|d| *d.borrow_mut() = None);
+        assert!(watched.contains(&serpantinum), "{watched:?}");
+        assert!(watched.contains(&reading.0.0), "{watched:?}");
+    }
 }

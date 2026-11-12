@@ -878,5 +878,14 @@
   "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "No reemplazado: el elemento nuevo no pudo ocupar el lugar del antiguo ({}); se conserva como «{}»",
   "The list of servers could not be read. The file was kept as “{}” and a new list is used.": "No se pudo leer la lista de servidores. El archivo se conservó como «{}» y se usa una lista nueva.",
   "The list of servers could not be read, and the file could not be put aside. It is left as it is and not written over.": "No se pudo leer la lista de servidores y el archivo no se pudo apartar. Se deja como está y no se sobrescribe.",
-  "Nothing is replaced on a server: there is no trash there, and the old item would be lost for good.": "En un servidor no se reemplaza nada: allí no hay papelera y el elemento antiguo se perdería para siempre."
+  "Nothing is replaced on a server: there is no trash there, and the old item would be lost for good.": "En un servidor no se reemplaza nada: allí no hay papelera y el elemento antiguo se perdería para siempre.",
+  "Could not load these theme files: {}": "No se pudieron cargar estos archivos de tema: {}",
+  "The selected theme was not found – system colors are used": "No se encontró el tema elegido: se usan los colores del sistema",
+  "not valid JSON (line {})": "JSON no válido (línea {})",
+  "a value has the wrong type (line {})": "un valor tiene el tipo incorrecto (línea {})",
+  "its name cannot be used": "su nombre no se puede usar",
+  "Themes cannot be changed in administrator mode": "Los temas no se pueden cambiar en modo administrador",
+  "There is no folder for the themes": "No hay una carpeta para los temas",
+  "Could not save the theme: {}": "No se pudo guardar el tema: {}",
+  "Could not delete the theme: {}": "No se pudo eliminar el tema: {}"
 }

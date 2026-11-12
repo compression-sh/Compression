@@ -878,5 +878,14 @@
   "Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”": "Nicht ersetzt: Das neue Element konnte den Platz des alten nicht einnehmen ({}); es bleibt als „{}“ erhalten",
   "The list of servers could not be read. The file was kept as “{}” and a new list is used.": "Die Serverliste konnte nicht gelesen werden. Die Datei wurde als „{}“ aufbewahrt, und es wird eine neue Liste verwendet.",
   "The list of servers could not be read, and the file could not be put aside. It is left as it is and not written over.": "Die Serverliste konnte nicht gelesen werden, und die Datei ließ sich nicht beiseitelegen. Sie bleibt unverändert und wird nicht überschrieben.",
-  "Nothing is replaced on a server: there is no trash there, and the old item would be lost for good.": "Auf einem Server wird nichts ersetzt: Dort gibt es keinen Papierkorb, und das alte Element wäre endgültig verloren."
+  "Nothing is replaced on a server: there is no trash there, and the old item would be lost for good.": "Auf einem Server wird nichts ersetzt: Dort gibt es keinen Papierkorb, und das alte Element wäre endgültig verloren.",
+  "Could not load these theme files: {}": "Diese Theme-Dateien konnten nicht geladen werden: {}",
+  "The selected theme was not found – system colors are used": "Gewähltes Theme nicht gefunden – System-Farben werden benutzt",
+  "not valid JSON (line {})": "kein gültiges JSON (Zeile {})",
+  "a value has the wrong type (line {})": "ein Wert hat den falschen Typ (Zeile {})",
+  "its name cannot be used": "der Dateiname ist nicht verwendbar",
+  "Themes cannot be changed in administrator mode": "Themes lassen sich im Administratormodus nicht ändern",
+  "There is no folder for the themes": "Es gibt keinen Ordner für die Themes",
+  "Could not save the theme: {}": "Das Theme konnte nicht gespeichert werden: {}",
+  "Could not delete the theme: {}": "Das Theme konnte nicht gelöscht werden: {}"
 }

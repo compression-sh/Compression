@@ -1,6 +1,7 @@
 use std::fs;
 use eframe::egui::{self, Color32};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use crate::i18n::{tr, trf};
 use std::sync::{OnceLock, RwLock};
 use serde::{Deserialize, Serialize};
 
@@ -181,11 +182,78 @@ pub struct CustomTheme {
     pub colors: ThemeColors,
 }
 
+/// Why a theme file could not be used.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Why {
+    /// The folder or the file could not be read: the system's error number, and its text when it has none of ours.
+    Unreadable(Option<i32>, String),
+    /// Not JSON at all (a typo); the line where it stopped making sense.
+    NotJson(usize),
+    /// JSON, but a value of the wrong kind; the line.
+    WrongValue(usize),
+    /// A `.json` file whose name cannot be an id.
+    Name,
+}
+
+/// A theme file that was there but could not be loaded, so it is missing from the list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThemeProblem {
+    pub file: String,
+    pub why: Why,
+}
+
+impl ThemeProblem {
+    fn unreadable(file: String, err: &std::io::Error) -> Self {
+        Self { file, why: Why::Unreadable(err.raw_os_error(), err.to_string()) }
+    }
+
+    fn broken(file: String, err: &serde_json::Error) -> Self {
+        let why = if err.is_data() { Why::WrongValue(err.line()) } else { Why::NotJson(err.line()) };
+        Self { file, why }
+    }
+
+    /// `name.json (reason)`, in the language of the window.
+    pub fn describe(&self) -> String {
+        let reason = match &self.why {
+            Why::Unreadable(Some(errno), _) => crate::fs::describe::io_error(&std::io::Error::from_raw_os_error(*errno)),
+            Why::Unreadable(None, text) => text.clone(),
+            Why::NotJson(line) => trf("not valid JSON (line {})", &[line]),
+            Why::WrongValue(line) => trf("a value has the wrong type (line {})", &[line]),
+            Why::Name => tr("its name cannot be used").to_owned(),
+        };
+        format!("{} ({reason})", self.file)
+    }
+}
+
 /// The user's themes as last read from their folder, for `from_settings` and the settings page.
 static USER_THEMES: RwLock<Vec<CustomTheme>> = RwLock::new(Vec::new());
+/// The files of that folder that could not be loaded, as of the same reading.
+static USER_THEME_PROBLEMS: RwLock<Vec<ThemeProblem>> = RwLock::new(Vec::new());
+/// What was wrong with the Serpantinum files at the last `SerpantinumTheme::load`.
+static SERPANTINUM_PROBLEMS: RwLock<Vec<ThemeProblem>> = RwLock::new(Vec::new());
+
+thread_local! {
+    /// Lets a test name the themes folder without touching the environment, which the other tests share.
+    /// (Not behind `cfg(test)`: the translation scan reads a source file only up to its first one.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) static THEMES_DIR_FOR_TESTS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    /// What `problems` reports in a test, which then needs no files and no shared state.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) static PROBLEMS_FOR_TESTS: std::cell::RefCell<Option<Vec<ThemeProblem>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Held by the tests that read or replace `USER_THEMES`, which every test shares.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Where the user's themes are kept, a JSON file each: `~/.local/state/compression/themes`.
 pub fn user_themes_dir() -> Option<PathBuf> {
+    if let Some(dir) = THEMES_DIR_FOR_TESTS.with(|d| d.borrow().clone()) {
+        return Some(dir);
+    }
     let state = match crate::fs::admin::config_override() {
         // As administrator: the state folder next to the config folder of whoever started Compression
         Some(config) => config.parent().map(|home| home.join(".local/state")),
@@ -194,36 +262,72 @@ pub fn user_themes_dir() -> Option<PathBuf> {
     state.map(|dir| dir.join("compression").join("themes"))
 }
 
-fn read_user_themes() -> Vec<CustomTheme> {
-    let Some(dir) = user_themes_dir() else { return Vec::new() };
-    let mut themes: Vec<CustomTheme> = fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            let id = path.file_stem()?.to_str()?.to_owned();
-            if path.extension()? != "json" {
-                return None;
+/// The themes in `dir` and the files in it that could not be loaded. A folder that is not there is
+/// no problem (nothing was saved yet), and neither is a file that is gone by the time it is read;
+/// a file that does not end in `.json` is not a theme. Everything else that goes wrong is reported.
+fn read_themes_in(dir: &Path) -> (Vec<CustomTheme>, Vec<ThemeProblem>) {
+    let mut themes = Vec::new();
+    let mut problems = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (themes, problems),
+        Err(err) => {
+            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            return (themes, vec![ThemeProblem::unreadable(name, &err)]);
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                problems.push(ThemeProblem::unreadable(String::new(), &err));
+                continue;
             }
-            let mut theme: CustomTheme = serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
-            if theme.name.trim().is_empty() {
-                theme.name = id.clone();
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") || path.is_dir() {
+            continue;
+        }
+        let file = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+            problems.push(ThemeProblem { file, why: Why::Name });
+            continue;
+        };
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                problems.push(ThemeProblem::unreadable(file, &err));
+                continue;
             }
-            theme.id = id;
-            Some(theme)
-        })
-        .collect();
+        };
+        match serde_json::from_slice::<CustomTheme>(&bytes) {
+            Ok(mut theme) => {
+                if theme.name.trim().is_empty() {
+                    theme.name = id.clone();
+                }
+                theme.id = id;
+                themes.push(theme);
+            }
+            Err(err) => problems.push(ThemeProblem::broken(file, &err)),
+        }
+    }
     themes.sort_by_key(|t| (t.name.to_lowercase(), t.id.clone()));
-    themes
+    problems.sort_by(|a, b| a.file.cmp(&b.file));
+    (themes, problems)
 }
 
-/// Reads the folder again; true when the themes are not what they were.
+/// Reads the folder again; true when the themes (or what is wrong with the files) are not what they were.
 pub fn reload_user_themes() -> bool {
-    let read = read_user_themes();
+    let (read, problems) = match user_themes_dir() {
+        Some(dir) => read_themes_in(&dir),
+        None => (Vec::new(), Vec::new()),
+    };
     let mut current = USER_THEMES.write().unwrap_or_else(|e| e.into_inner());
-    let changed = *current != read;
+    let mut known = USER_THEME_PROBLEMS.write().unwrap_or_else(|e| e.into_inner());
+    let changed = *current != read || *known != problems;
     *current = read;
+    *known = problems;
     changed
 }
 
@@ -231,29 +335,63 @@ pub fn user_themes() -> Vec<CustomTheme> {
     USER_THEMES.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Writes the theme to its file, whole or not at all.
-pub fn save_user_theme(theme: &CustomTheme) {
-    // As administrator the folder belongs to someone else
-    if crate::fs::admin::is_admin() {
-        return;
+/// Everything that is wrong with the files themes come from, as of the last reading.
+pub fn problems() -> Vec<ThemeProblem> {
+    if let Some(forced) = PROBLEMS_FOR_TESTS.with(|p| p.borrow().clone()) {
+        return forced;
     }
-    let Some(dir) = user_themes_dir() else { return };
-    let _ = fs::create_dir_all(&dir);
-    if let Ok(json) = serde_json::to_string_pretty(theme) {
-        let file = dir.join(format!("{}.json", theme.id));
-        let partial = dir.join(format!("{}.json.tmp", theme.id));
-        if fs::write(&partial, json).is_ok() {
-            let _ = fs::rename(partial, file);
-        }
-    }
+    let mut all = USER_THEME_PROBLEMS.read().unwrap_or_else(|e| e.into_inner()).clone();
+    all.extend(SERPANTINUM_PROBLEMS.read().unwrap_or_else(|e| e.into_inner()).iter().cloned());
+    all
 }
 
-pub fn delete_user_theme(id: &str) {
-    if crate::fs::admin::is_admin() {
-        return;
+/// One line for the settings page and the toast: the first three files with the reason, then `+N`.
+pub fn problems_notice(problems: &[ThemeProblem]) -> Option<String> {
+    if problems.is_empty() {
+        return None;
     }
-    if let Some(dir) = user_themes_dir() {
-        let _ = fs::remove_file(dir.join(format!("{id}.json")));
+    let mut files: Vec<String> = problems.iter().take(3).map(ThemeProblem::describe).collect();
+    if problems.len() > 3 {
+        files.push(format!("+{}", problems.len() - 3));
+    }
+    Some(trf("Could not load these theme files: {}", &[&files.join(", ")]))
+}
+
+/// True when the chosen theme is neither one of the user's, nor a bundled one, nor "system":
+/// the window then shows the system colors, and the page says so.
+pub fn selected_is_missing(id: &str) -> bool {
+    id != "system" && preset(id).is_none() && !id.strip_prefix("custom:").is_some_and(|c| user_themes().iter().any(|t| t.id == c))
+}
+
+fn theme_file(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.json"))
+}
+
+fn not_as_administrator() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, tr("Themes cannot be changed in administrator mode"))
+}
+
+/// Writes the theme to its file, whole or not at all; the old file stays as it was when this fails.
+pub fn save_user_theme(theme: &CustomTheme) -> std::io::Result<()> {
+    // As administrator the folder belongs to someone else
+    if crate::fs::admin::is_admin() {
+        return Err(not_as_administrator());
+    }
+    let dir = user_themes_dir().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, tr("There is no folder for the themes")))?;
+    fs::create_dir_all(&dir)?;
+    let json = serde_json::to_string_pretty(theme).map_err(std::io::Error::other)?;
+    crate::fs::atomic::write(&theme_file(&dir, &theme.id), json)
+}
+
+/// Removes the theme's file. A file that is gone already is what was asked for.
+pub fn delete_user_theme(id: &str) -> std::io::Result<()> {
+    if crate::fs::admin::is_admin() {
+        return Err(not_as_administrator());
+    }
+    let Some(dir) = user_themes_dir() else { return Ok(()) };
+    match fs::remove_file(theme_file(&dir, id)) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
     }
 }
 
@@ -454,34 +592,37 @@ impl SerpantinumTheme {
         self.light = luminance(self.base) > luminance(self.text);
     }
 
+    /// The palette Serpantinum wrote, and the plain default where there is none. A file that is
+    /// there but cannot be used is not silent: it is kept for `problems`.
     pub fn load() -> Self {
-        let mut theme = Self::default();
-
-        // 1. Try to load colors from ~/.local/state/serpantinum/qs_colors.json
-        let candidate_paths = [
-            dirs::home_dir().map(|h| h.join(".local/state/serpantinum/qs_colors.json")),
-            dirs::home_dir().map(|h| h.join(".config/serpantinum/qs_colors.json")),
-        ];
-
-        for path in candidate_paths.into_iter().flatten() {
-            if let Ok(content) = fs::read_to_string(&path)
-                && let Ok(raw) = serde_json::from_str::<SerpantinumColorsRaw>(&content) {
-                    theme.take_colors(raw);
-                    break;
-                }
-        }
-
-        // 2. Try to read borderRadius from ~/.config/serpantinum/settings.json
-        if let Some(home) = dirs::home_dir() {
-            let settings_path = home.join(".config/serpantinum/settings.json");
-            if let Ok(content) = fs::read_to_string(settings_path)
-                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
-                    && let Some(r) = val.get("theme").and_then(|t| t.get("borderRadius")).and_then(|b| b.as_f64()) {
-                        theme.border_radius = r as f32;
-                    }
-        }
-
+        let (theme, problems) = Self::load_from(&serpantinum_dirs());
+        *SERPANTINUM_PROBLEMS.write().unwrap_or_else(|e| e.into_inner()) = problems;
         theme
+    }
+
+    fn load_from(dirs: &SerpantinumDirs) -> (Self, Vec<ThemeProblem>) {
+        let mut theme = Self::default();
+        let mut problems = Vec::new();
+
+        // The colors: the first `qs_colors.json` that can be used, in the state folders and then the config folders
+        for dir in dirs.state.iter().chain(&dirs.config) {
+            if let Some(raw) = read_serpantinum_file::<SerpantinumColorsRaw>(&dir.join("qs_colors.json"), &mut problems) {
+                theme.take_colors(raw);
+                break;
+            }
+        }
+
+        // The corner radius: from `settings.json` of the first config folder that has a usable one
+        for dir in &dirs.config {
+            if let Some(val) = read_serpantinum_file::<serde_json::Value>(&dir.join("settings.json"), &mut problems) {
+                if let Some(r) = val.get("theme").and_then(|t| t.get("borderRadius")).and_then(|b| b.as_f64()) {
+                    theme.border_radius = r as f32;
+                }
+                break;
+            }
+        }
+
+        (theme, problems)
     }
 
     /// The accent softened toward the text color, for the selection, focus and hover tints: the
@@ -531,6 +672,78 @@ impl SerpantinumTheme {
             yellow: lerp_color(self.yellow, other.yellow, t),
             border_radius: lerp(self.border_radius, other.border_radius, t),
             light: if t < 0.5 { self.light } else { other.light },
+        }
+    }
+}
+
+/// The folders Serpantinum keeps its files in, the ones the desktop's settings name first and the
+/// fixed `~/.local/state` and `~/.config` after them (where older setups put them).
+#[derive(Debug, Default, PartialEq)]
+pub struct SerpantinumDirs {
+    pub state: Vec<PathBuf>,
+    pub config: Vec<PathBuf>,
+}
+
+impl SerpantinumDirs {
+    /// Every folder, for watching.
+    pub fn all(&self) -> impl Iterator<Item = &PathBuf> {
+        self.state.iter().chain(&self.config)
+    }
+}
+
+fn serpantinum_dirs_from(state: Option<PathBuf>, config: Option<PathBuf>, home: Option<PathBuf>) -> SerpantinumDirs {
+    let list = |named: Option<PathBuf>, fixed: Option<PathBuf>| {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for dir in named.into_iter().chain(fixed).map(|d| d.join("serpantinum")) {
+            if !out.contains(&dir) {
+                out.push(dir);
+            }
+        }
+        out
+    };
+    SerpantinumDirs {
+        state: list(state, home.as_ref().map(|h| h.join(".local/state"))),
+        config: list(config, home.map(|h| h.join(".config"))),
+    }
+}
+
+thread_local! {
+    /// Lets a test name Serpantinum's folders without touching the environment.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) static SERPANTINUM_DIRS_FOR_TESTS: std::cell::RefCell<Option<SerpantinumDirs>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Where Serpantinum's files are, for loading them and for watching them.
+pub fn serpantinum_dirs() -> SerpantinumDirs {
+    if let Some(dirs) = SERPANTINUM_DIRS_FOR_TESTS.with(|d| d.borrow().as_ref().map(|d| SerpantinumDirs { state: d.state.clone(), config: d.config.clone() })) {
+        return dirs;
+    }
+    match crate::fs::admin::config_override() {
+        // As administrator the home folder is root's: what counts is the folder of whoever started Compression
+        Some(config) => {
+            let state = config.parent().map(|home| home.join(".local/state"));
+            serpantinum_dirs_from(state, Some(config), None)
+        }
+        None => serpantinum_dirs_from(dirs::state_dir(), dirs::config_dir(), dirs::home_dir()),
+    }
+}
+
+/// Reads and parses one of Serpantinum's files. A file that is not there is normal and says nothing;
+/// one that is there and cannot be used is added to `problems`.
+fn read_serpantinum_file<T: serde::de::DeserializeOwned>(path: &Path, problems: &mut Vec<ThemeProblem>) -> Option<T> {
+    let name = format!("serpantinum/{}", path.file_name()?.to_string_lossy());
+    match fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                problems.push(ThemeProblem::broken(name, &err));
+                None
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            problems.push(ThemeProblem::unreadable(name, &err));
+            None
         }
     }
 }
@@ -624,7 +837,7 @@ pub fn apply(ctx: &egui::Context, theme: &SerpantinumTheme, popup: &SerpantinumT
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -657,6 +870,7 @@ mod tests {
 
     #[test]
     fn a_custom_theme_is_picked_by_its_id() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let file: CustomTheme = serde_json::from_str(r##"{ "name": "Mine", "base": "#102030" }"##).unwrap();
         USER_THEMES.write().unwrap().push(CustomTheme { id: "test-mine".to_owned(), ..file });
         let settings = crate::settings::Settings { theme: "custom:test-mine".to_owned(), ..Default::default() };
@@ -679,5 +893,345 @@ mod tests {
                 assert!(parse_hex(hex).is_some(), "{} {key}", p.id);
             }
         }
+    }
+
+    /// A folder of the test's own that is given back, whatever the test did to its rights.
+    pub(crate) struct Scratch(pub(crate) PathBuf);
+
+    impl Scratch {
+        pub(crate) fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("compression_theme_{name}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        pub(crate) fn put(&self, name: &str, text: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("chmod").arg("-R").arg("u+rwx").arg(&self.0).status();
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn can_ignore_rights() -> bool {
+        // As root a file with no rights can be read anyway, so nothing could be shown
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    const GOOD: &str = r##"{ "name": "Good", "base": "#102030" }"##;
+
+    #[test]
+    fn a_broken_theme_file_is_reported_and_the_others_still_load() {
+        let dir = Scratch::new("broken");
+        dir.put("good.json", GOOD);
+        dir.put("typo.json", r##"{ "name": "Typo", "base": "#102030", "##);
+        dir.put("wrong.json", r##"{ "name": 5 }"##);
+        let (themes, problems) = read_themes_in(&dir.0);
+        assert_eq!(themes.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["good"]);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert_eq!(problems[0].file, "typo.json");
+        assert!(matches!(problems[0].why, Why::NotJson(_)), "{:?}", problems[0].why);
+        assert_eq!(problems[1].file, "wrong.json");
+        assert!(matches!(problems[1].why, Why::WrongValue(1)), "{:?}", problems[1].why);
+        assert!(problems[0].describe().starts_with("typo.json (not valid JSON (line "), "{}", problems[0].describe());
+        assert_eq!(problems[1].describe(), "wrong.json (a value has the wrong type (line 1))");
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_reported_with_the_systems_reason() {
+        if can_ignore_rights() {
+            return;
+        }
+        let dir = Scratch::new("unreadable");
+        dir.put("good.json", GOOD);
+        let secret = dir.put("secret.json", GOOD);
+        std::fs::set_permissions(&secret, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        let (themes, problems) = read_themes_in(&dir.0);
+        assert_eq!(themes.len(), 1);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].why, Why::Unreadable(Some(libc::EACCES), "Permission denied (os error 13)".to_owned()));
+        assert_eq!(problems[0].describe(), "secret.json (Permission denied)");
+    }
+
+    #[test]
+    fn a_folder_that_is_not_there_and_a_file_that_is_gone_are_no_problem() {
+        let dir = Scratch::new("absent");
+        let (themes, problems) = read_themes_in(&dir.0.join("not-made-yet"));
+        assert!((themes.is_empty(), problems.is_empty()) == (true, true));
+        // A link to nothing: listed, but gone when it is read
+        std::os::unix::fs::symlink(dir.0.join("nowhere.json"), dir.0.join("vanished.json")).unwrap();
+        let (themes, problems) = read_themes_in(&dir.0);
+        assert!(themes.is_empty() && problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_listed_is_reported() {
+        if can_ignore_rights() {
+            return;
+        }
+        let dir = Scratch::new("unlistable");
+        let themes = dir.0.join("themes");
+        std::fs::create_dir(&themes).unwrap();
+        std::fs::set_permissions(&themes, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        let (found, problems) = read_themes_in(&themes);
+        assert!(found.is_empty());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].describe(), "themes (Permission denied)");
+    }
+
+    #[test]
+    fn what_is_not_a_theme_file_is_ignored_without_a_word() {
+        let dir = Scratch::new("ignored");
+        dir.put("notes.txt", "not json");
+        dir.put("half.json.tmp", "{ ");
+        dir.put("README", "{ ");
+        std::fs::create_dir(dir.0.join("folder.json")).unwrap();
+        let (themes, problems) = read_themes_in(&dir.0);
+        assert!(themes.is_empty() && problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_json_file_whose_name_cannot_be_an_id_is_reported() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = Scratch::new("name");
+        let odd = dir.0.join(std::ffi::OsStr::from_bytes(b"\xff.json"));
+        std::fs::write(odd, GOOD).unwrap();
+        let (themes, problems) = read_themes_in(&dir.0);
+        assert!(themes.is_empty());
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].why, Why::Name);
+        assert!(problems[0].describe().ends_with(".json (its name cannot be used)"), "{}", problems[0].describe());
+    }
+
+    #[test]
+    fn a_repaired_file_is_a_theme_again_at_the_next_reading() {
+        let dir = Scratch::new("repaired");
+        let file = dir.put("mine.json", "{ oops");
+        let (themes, problems) = read_themes_in(&dir.0);
+        assert!(themes.is_empty() && problems.len() == 1);
+        std::fs::write(&file, GOOD).unwrap();
+        let (themes, problems) = read_themes_in(&dir.0);
+        assert_eq!(themes.len(), 1);
+        assert!(problems.is_empty());
+    }
+
+    /// Takes the themes folder of this test, and gives it back empty so that no other test sees these themes.
+    pub(crate) struct Reading(pub(crate) Scratch, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Reading {
+        pub(crate) fn new(name: &str) -> Self {
+            let lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = Scratch::new(name);
+            THEMES_DIR_FOR_TESTS.with(|d| *d.borrow_mut() = Some(dir.0.clone()));
+            Self(dir, lock)
+        }
+    }
+
+    impl Drop for Reading {
+        fn drop(&mut self) {
+            let empty = std::env::temp_dir().join(format!("compression_theme_none_{}", std::process::id()));
+            THEMES_DIR_FOR_TESTS.with(|d| *d.borrow_mut() = Some(empty));
+            reload_user_themes();
+            THEMES_DIR_FOR_TESTS.with(|d| *d.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    fn reloading_keeps_the_problems_for_the_page_and_drops_them_once_repaired() {
+        let reading = Reading::new("reload");
+        let file = reading.0.put("mine.json", "{ oops");
+        assert!(reload_user_themes(), "a new problem is a change");
+        assert_eq!(problems().iter().filter(|p| p.file == "mine.json").count(), 1);
+        assert!(!reload_user_themes(), "the same reading is no change");
+        std::fs::write(&file, GOOD).unwrap();
+        assert!(reload_user_themes());
+        assert!(problems().iter().all(|p| p.file != "mine.json"));
+        assert!(user_themes().iter().any(|t| t.id == "mine"));
+    }
+
+    #[test]
+    fn the_notice_names_three_files_and_counts_the_rest() {
+        let problem = |n: usize| ThemeProblem { file: format!("t{n}.json"), why: Why::Name };
+        assert_eq!(problems_notice(&[]), None);
+        assert_eq!(problems_notice(&[problem(1)]).unwrap(), "Could not load these theme files: t1.json (its name cannot be used)");
+        let five: Vec<_> = (1..=5).map(problem).collect();
+        let notice = problems_notice(&five).unwrap();
+        assert!(notice.contains("t3.json") && !notice.contains("t4.json"), "{notice}");
+        assert!(notice.ends_with(", +2"), "{notice}");
+        let four = problems_notice(&five[..4]).unwrap();
+        assert!(four.ends_with(", +1"), "{four}");
+        assert!(!problems_notice(&five[..3]).unwrap().contains('+'));
+    }
+
+    #[test]
+    fn a_chosen_theme_that_is_gone_is_told_apart_from_one_that_is_there() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        USER_THEMES.write().unwrap().push(CustomTheme { id: "test-there".to_owned(), name: "There".to_owned(), colors: ThemeColors::default() });
+        assert!(selected_is_missing("custom:test-gone"));
+        assert!(!selected_is_missing("custom:test-there"));
+        assert!(!selected_is_missing("system"));
+        assert!(!selected_is_missing("nord"));
+        assert!(selected_is_missing("no-such-preset"));
+        // The choice itself is not touched: the settings still say custom:test-gone, and the colors are the system ones
+        let settings = crate::settings::Settings { theme: "custom:test-gone".to_owned(), ..Default::default() };
+        assert_eq!(settings.theme, "custom:test-gone");
+    }
+
+    #[test]
+    fn the_folders_of_the_desktop_come_before_the_fixed_ones_and_are_not_listed_twice() {
+        let p = |s: &str| Some(PathBuf::from(s));
+        let dirs = serpantinum_dirs_from(p("/x/state"), p("/x/config"), p("/home/me"));
+        let list = |v: &[&str]| v.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(dirs.state, list(&["/x/state/serpantinum", "/home/me/.local/state/serpantinum"]));
+        assert_eq!(dirs.config, list(&["/x/config/serpantinum", "/home/me/.config/serpantinum"]));
+        // The usual setup: the desktop's folders are the fixed ones
+        let same = serpantinum_dirs_from(p("/home/me/.local/state"), p("/home/me/.config"), p("/home/me"));
+        assert_eq!((same.state.len(), same.config.len()), (1, 1));
+        // No home folder, no desktop folders: nothing to look in
+        assert_eq!(serpantinum_dirs_from(None, None, None), SerpantinumDirs::default());
+        assert_eq!(serpantinum_dirs_from(None, p("/c"), None).config, list(&["/c/serpantinum"]));
+    }
+
+    const COLORS: &str = r##"{"base":"#010203"}"##;
+    const OTHER_COLORS: &str = r##"{"base":"#0a0b0c"}"##;
+
+    fn serpantinum_in(state: &Scratch, config: &Scratch, home: &Scratch) -> SerpantinumDirs {
+        for dir in [state, config, home] {
+            std::fs::create_dir_all(dir.0.join("serpantinum")).unwrap();
+        }
+        let fixed_state = home.0.join(".local/state/serpantinum");
+        let fixed_config = home.0.join(".config/serpantinum");
+        std::fs::create_dir_all(&fixed_state).unwrap();
+        std::fs::create_dir_all(&fixed_config).unwrap();
+        serpantinum_dirs_from(Some(state.0.clone()), Some(config.0.clone()), Some(home.0.clone()))
+    }
+
+    #[test]
+    fn serpantinums_files_are_found_in_the_desktops_folders() {
+        let (state, config, home) = (Scratch::new("sx_state"), Scratch::new("sx_config"), Scratch::new("sx_home"));
+        let dirs = serpantinum_in(&state, &config, &home);
+        std::fs::write(state.0.join("serpantinum/qs_colors.json"), COLORS).unwrap();
+        std::fs::write(config.0.join("serpantinum/settings.json"), r#"{"theme":{"borderRadius":9}}"#).unwrap();
+        let (theme, problems) = SerpantinumTheme::load_from(&dirs);
+        assert_eq!(theme.base, parse_hex("#010203").unwrap());
+        assert_eq!(theme.border_radius, 9.0);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn the_fixed_folders_still_work_when_the_desktops_have_nothing() {
+        let (state, config, home) = (Scratch::new("sf_state"), Scratch::new("sf_config"), Scratch::new("sf_home"));
+        let dirs = serpantinum_in(&state, &config, &home);
+        std::fs::write(home.0.join(".config/serpantinum/qs_colors.json"), COLORS).unwrap();
+        std::fs::write(home.0.join(".config/serpantinum/settings.json"), r#"{"theme":{"borderRadius":7}}"#).unwrap();
+        let (theme, problems) = SerpantinumTheme::load_from(&dirs);
+        assert_eq!(theme.base, parse_hex("#010203").unwrap());
+        assert_eq!(theme.border_radius, 7.0);
+        assert!(problems.is_empty());
+    }
+
+    #[test]
+    fn the_desktops_folder_wins_over_the_fixed_one() {
+        let (state, config, home) = (Scratch::new("sw_state"), Scratch::new("sw_config"), Scratch::new("sw_home"));
+        let dirs = serpantinum_in(&state, &config, &home);
+        std::fs::write(state.0.join("serpantinum/qs_colors.json"), COLORS).unwrap();
+        std::fs::write(home.0.join(".local/state/serpantinum/qs_colors.json"), OTHER_COLORS).unwrap();
+        std::fs::write(config.0.join("serpantinum/settings.json"), r#"{"theme":{"borderRadius":9}}"#).unwrap();
+        std::fs::write(home.0.join(".config/serpantinum/settings.json"), r#"{"theme":{"borderRadius":3}}"#).unwrap();
+        let (theme, _) = SerpantinumTheme::load_from(&dirs);
+        assert_eq!(theme.base, parse_hex("#010203").unwrap());
+        assert_eq!(theme.border_radius, 9.0);
+    }
+
+    #[test]
+    fn a_broken_colors_file_is_reported_and_the_next_one_is_still_used() {
+        let (state, config, home) = (Scratch::new("sb_state"), Scratch::new("sb_config"), Scratch::new("sb_home"));
+        let dirs = serpantinum_in(&state, &config, &home);
+        std::fs::write(state.0.join("serpantinum/qs_colors.json"), "{ oops").unwrap();
+        std::fs::write(home.0.join(".local/state/serpantinum/qs_colors.json"), OTHER_COLORS).unwrap();
+        let (theme, problems) = SerpantinumTheme::load_from(&dirs);
+        assert_eq!(theme.base, parse_hex("#0a0b0c").unwrap());
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].file, "serpantinum/qs_colors.json");
+        assert!(matches!(problems[0].why, Why::NotJson(1)));
+        // Alone, the broken file leaves the default palette and still says so
+        std::fs::remove_file(home.0.join(".local/state/serpantinum/qs_colors.json")).unwrap();
+        let (theme, problems) = SerpantinumTheme::load_from(&dirs);
+        assert_eq!(theme.base, SerpantinumTheme::default().base);
+        assert_eq!(problems.len(), 1);
+        // And a broken settings.json is reported too
+        std::fs::write(config.0.join("serpantinum/settings.json"), "[").unwrap();
+        let (_, problems) = SerpantinumTheme::load_from(&dirs);
+        assert!(problems.iter().any(|p| p.file == "serpantinum/settings.json"), "{problems:?}");
+    }
+
+    #[test]
+    fn missing_serpantinum_files_say_nothing() {
+        let (state, config, home) = (Scratch::new("sm_state"), Scratch::new("sm_config"), Scratch::new("sm_home"));
+        let dirs = serpantinum_in(&state, &config, &home);
+        let (theme, problems) = SerpantinumTheme::load_from(&dirs);
+        assert_eq!(theme.base, SerpantinumTheme::default().base);
+        assert!(problems.is_empty(), "{problems:?}");
+        // No folders at all
+        assert!(SerpantinumTheme::load_from(&SerpantinumDirs::default()).1.is_empty());
+    }
+
+    #[test]
+    fn saving_and_deleting_report_what_went_wrong() {
+        let reading = Reading::new("write");
+        let theme = CustomTheme { id: "mine".to_owned(), name: "Mine".to_owned(), colors: ThemeColors::default() };
+        save_user_theme(&theme).unwrap();
+        let file = reading.0 .0.join("mine.json");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("\"name\": \"Mine\""));
+        // Nothing half-written is left beside it
+        assert_eq!(std::fs::read_dir(&reading.0 .0).unwrap().count(), 1);
+        delete_user_theme("mine").unwrap();
+        assert!(!file.exists());
+        delete_user_theme("mine").unwrap();
+
+        // A folder that cannot be made: something that is not a folder is in the way
+        let blocker = reading.0.put("blocker", "a file");
+        THEMES_DIR_FOR_TESTS.with(|d| *d.borrow_mut() = Some(blocker.join("themes")));
+        assert!(save_user_theme(&theme).is_err());
+        assert!(!blocker.join("themes").exists());
+    }
+
+    #[test]
+    fn a_theme_file_that_cannot_be_removed_is_an_error_and_stays() {
+        if can_ignore_rights() {
+            return;
+        }
+        let reading = Reading::new("remove");
+        let file = reading.0.put("mine.json", GOOD);
+        std::fs::set_permissions(&reading.0 .0, std::os::unix::fs::PermissionsExt::from_mode(0o555)).unwrap();
+        let err = delete_user_theme("mine").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES));
+        assert!(file.exists());
+        // A write that cannot happen leaves the old file as it was
+        let theme = CustomTheme { id: "mine".to_owned(), name: "Changed".to_owned(), colors: ThemeColors::default() };
+        assert!(save_user_theme(&theme).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), GOOD);
+    }
+
+    #[test]
+    fn load_keeps_what_was_wrong_for_the_page_and_forgets_it_once_repaired() {
+        let reading = Reading::new("load_wiring");
+        let dir = reading.0.0.join("serpantinum");
+        std::fs::create_dir_all(&dir).unwrap();
+        SERPANTINUM_DIRS_FOR_TESTS.with(|d| *d.borrow_mut() = Some(SerpantinumDirs { state: vec![dir.clone()], config: Vec::new() }));
+        std::fs::write(dir.join("qs_colors.json"), "{ oops").unwrap();
+        SerpantinumTheme::load();
+        assert!(problems().iter().any(|p| p.file == "serpantinum/qs_colors.json"), "{:?}", problems());
+        std::fs::write(dir.join("qs_colors.json"), COLORS).unwrap();
+        assert_eq!(SerpantinumTheme::load().base, parse_hex("#010203").unwrap());
+        assert!(problems().iter().all(|p| p.file != "serpantinum/qs_colors.json"));
+        SERPANTINUM_DIRS_FOR_TESTS.with(|d| *d.borrow_mut() = None);
     }
 }

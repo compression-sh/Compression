@@ -450,6 +450,14 @@ impl CompressionApp {
             others.push((p.id.to_owned(), tr(p.name).to_owned(), preset_preview(p.id)));
         }
         self.theme_cards(ui, others);
+        // What is wrong stays on the page for as long as it is wrong; nothing is changed in the settings for it
+        let alarm = SerpantinumTheme { subtext1: theme.red, ..theme };
+        if let Some(notice) = theme::problems_notice(&theme::problems()) {
+            material::hint_label(ui, &notice, &alarm);
+        }
+        if theme::selected_is_missing(&self.settings.theme) {
+            material::hint_label(ui, tr("The selected theme was not found – system colors are used"), &alarm);
+        }
         ui.add_space(2.0);
         if material::button(ui, "theme_browse", Some(icons::PALETTE), tr("Browse more themes"), &theme, material::ButtonKind::Tonal, true).clicked() {
             *theme_browser = Some(String::new());
@@ -1980,4 +1988,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir0);
     }
 
+
+    fn appearance_texts(app: &mut CompressionApp) -> Vec<String> {
+        let ctx = app.ctx.clone();
+        let mut shown = Vec::new();
+        for n in 0..4 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 1600.0))), time: Some(n as f64 * 0.05), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| app.appearance_tab(ui, &mut String::new(), &mut String::new(), &mut None));
+            });
+            out.textures_delta.clear();
+            shown = texts(&out).into_iter().map(|t| t.0).collect();
+        }
+        shown
+    }
+
+    fn themes_app(name: &str) -> (CompressionApp, std::path::PathBuf) {
+        crate::settings::NO_SAVE.with(|n| n.set(true));
+        let dir = std::env::temp_dir().join(format!("compression_themes_page_{name}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = egui::Context::default();
+        (CompressionApp::new(dir.clone(), SerpantinumTheme::default(), Settings::default(), &ctx), dir)
+    }
+
+    fn broken(n: usize) -> theme::ThemeProblem {
+        theme::ThemeProblem { file: format!("t{n}.json"), why: theme::Why::NotJson(1) }
+    }
+
+    #[test]
+    fn the_page_names_theme_files_that_did_not_load_for_as_long_as_they_are_wrong() {
+        let (mut app, dir) = themes_app("problems");
+        let notice = |shown: &[String]| shown.iter().find(|t| t.starts_with("Could not load these theme files")).cloned();
+        assert_eq!(notice(&appearance_texts(&mut app)), None, "nothing wrong, nothing said");
+
+        theme::PROBLEMS_FOR_TESTS.with(|p| *p.borrow_mut() = Some((1..=5).map(broken).collect()));
+        let shown = notice(&appearance_texts(&mut app)).expect("the page says what is wrong");
+        assert_eq!(shown, "Could not load these theme files: t1.json (not valid JSON (line 1)), t2.json (not valid JSON (line 1)), t3.json (not valid JSON (line 1)), +2");
+        // Still there on the next look, and on the one after: it is a state of the page, not a one-time message
+        assert!(notice(&appearance_texts(&mut app)).is_some());
+
+        theme::PROBLEMS_FOR_TESTS.with(|p| *p.borrow_mut() = Some(Vec::new()));
+        assert_eq!(notice(&appearance_texts(&mut app)), None, "repaired, so gone");
+        theme::PROBLEMS_FOR_TESTS.with(|p| *p.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_chosen_theme_that_is_missing_is_said_on_the_page_and_stays_chosen() {
+        let (mut app, dir) = themes_app("missing");
+        let words = "The selected theme was not found – system colors are used";
+        assert!(!appearance_texts(&mut app).iter().any(|t| t == words));
+        app.settings.theme = "custom:page-test-gone".to_owned();
+        assert!(appearance_texts(&mut app).iter().any(|t| t == words));
+        assert_eq!(app.settings.theme, "custom:page-test-gone", "the choice is not thrown away");
+        app.settings.theme = "nord".to_owned();
+        assert!(!appearance_texts(&mut app).iter().any(|t| t == words));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_toast_comes_once_for_a_set_of_problems_and_again_only_when_it_changes() {
+        let (mut app, dir) = themes_app("toast");
+        let set = |n: usize| theme::PROBLEMS_FOR_TESTS.with(|p| *p.borrow_mut() = Some((1..=n).map(broken).collect()));
+        let said = |app: &mut CompressionApp| {
+            app.set_toast(String::new());
+            app.tell_about_theme_problems();
+            app.toast_message().filter(|t| !t.is_empty()).map(str::to_owned)
+        };
+        set(0);
+        assert_eq!(said(&mut app), None);
+        set(1);
+        assert_eq!(said(&mut app).as_deref(), Some("Could not load these theme files: t1.json (not valid JSON (line 1))"));
+        // Every reload that finds the same file broken says nothing more
+        assert_eq!(said(&mut app), None);
+        assert_eq!(said(&mut app), None);
+        // Another file, or one fewer: a different set
+        set(2);
+        assert!(said(&mut app).unwrap().contains("t2.json"));
+        assert_eq!(said(&mut app), None);
+        // Repaired, and broken again later: that is news again
+        set(0);
+        assert_eq!(said(&mut app), None);
+        set(2);
+        assert!(said(&mut app).is_some());
+        theme::PROBLEMS_FOR_TESTS.with(|p| *p.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
