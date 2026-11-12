@@ -4589,12 +4589,14 @@ impl CompressionApp {
     }
 
     fn delete_forever(&mut self, paths: Vec<PathBuf>) {
-        self.plugins.file_op_done(&crate::plugins::FileOpEvent::Removed(paths.clone()));
-        self.forget_sizes(&paths);
         let label = Self::describe_count(&paths);
         self.selected_index = None;
         let title = trf("Deleting {}", &[&label]);
-        self.engine.spawn(JobKind::Delete, title, String::new(), move |w| engine::delete_forever(w, paths));
+        let doomed = paths.clone();
+        let job = self.engine.spawn(JobKind::Delete, title, String::new(), move |w| engine::delete_forever(w, paths));
+        // Plugins and the sizes hear of what is gone when the job has run (`report_removals`), not of what was only
+        // asked for: a deletion that fails or is cancelled leaves them as they were
+        self.job_removals.insert(job, doomed);
     }
 
     fn empty_trash(&mut self) {
@@ -6911,6 +6913,65 @@ mod tests {
         assert!(app.can_modify_here());
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Runs the jobs of `app` to the end.
+    fn finish_jobs(app: &mut CompressionApp) {
+        for _ in 0..300 {
+            app.poll_jobs();
+            if !app.engine.running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.poll_jobs();
+    }
+
+    #[test]
+    fn plugins_hear_of_a_deletion_for_good_when_it_has_happened_and_only_of_what_is_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("compression_delete_report_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let locked = base.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let (free, stuck) = (base.join("free.txt"), locked.join("stuck.txt"));
+        std::fs::write(&free, "x").unwrap();
+        std::fs::write(&stuck, "x").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let events = app.plugins.record_file_ops();
+
+        // Asked for, not yet done: nothing is reported
+        app.delete_forever(vec![free.clone()]);
+        assert!(events.borrow().is_empty(), "reported before the job ran: {:?}", events.borrow());
+        finish_jobs(&mut app);
+        assert!(!free.exists());
+        assert_eq!(events.borrow().len(), 1);
+        assert!(matches!(&events.borrow()[0], crate::plugins::FileOpEvent::Removed(gone) if *gone == [free.clone()]));
+
+        // A deletion that fails reports nothing: the file is still there. (Root can delete it anyway.)
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            events.borrow_mut().clear();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+            app.delete_forever(vec![stuck.clone()]);
+            finish_jobs(&mut app);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(stuck.exists(), "the test needs a file that cannot be deleted");
+            assert!(events.borrow().is_empty(), "reported a file that is still there: {:?}", events.borrow());
+        }
+
+        // Of two, only the one that is gone is reported
+        events.borrow_mut().clear();
+        let (gone, kept) = (base.join("gone.txt"), base.join("kept.txt"));
+        std::fs::write(&gone, "x").unwrap();
+        std::fs::write(&kept, "x").unwrap();
+        let job = app.engine.spawn(JobKind::Other, "x".into(), String::new(), |_| Outcome::done(String::new()));
+        app.job_removals.insert(job, vec![gone.clone(), kept.clone()]);
+        std::fs::remove_file(&gone).unwrap();
+        finish_jobs(&mut app);
+        assert!(matches!(&events.borrow()[..], [crate::plugins::FileOpEvent::Removed(g)] if *g == [gone.clone()]), "{:?}", events.borrow());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

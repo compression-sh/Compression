@@ -245,7 +245,42 @@ pub struct Plugins {
     enabled: BTreeMap<String, bool>,
 }
 
+/// A plugin that only writes down the file operations it is told of, for tests of the app that must
+/// know what plugins were told (and when).
+#[cfg(test)]
+struct Recorder(std::rc::Rc<std::cell::RefCell<Vec<FileOpEvent>>>);
+
+#[cfg(test)]
+impl Plugin for Recorder {
+    fn id(&self) -> &'static str {
+        "recorder"
+    }
+    fn name(&self) -> &'static str {
+        "Recorder"
+    }
+    fn description(&self) -> &'static str {
+        ""
+    }
+    fn icon(&self) -> &'static str {
+        ""
+    }
+    fn default_enabled(&self) -> bool {
+        true
+    }
+    fn file_op_done(&mut self, op: &FileOpEvent) {
+        self.0.borrow_mut().push(op.clone());
+    }
+}
+
 impl Plugins {
+    /// Adds a plugin that records every file operation it is told of.
+    #[cfg(test)]
+    pub(crate) fn record_file_ops(&mut self) -> std::rc::Rc<std::cell::RefCell<Vec<FileOpEvent>>> {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        self.list.push(Box::new(Recorder(events.clone())));
+        events
+    }
+
     pub fn bundled(enabled: &BTreeMap<String, bool>) -> Self {
         Self {
             list: vec![

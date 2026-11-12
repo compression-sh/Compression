@@ -105,7 +105,8 @@ impl CompressionApp {
     /// A job that was to remove files has finished: tell plugins which are gone and drop their sizes.
     pub(super) fn report_removals(&mut self, job: u64) {
         let Some(paths) = self.job_removals.remove(&job) else { return };
-        let gone: Vec<std::path::PathBuf> = paths.into_iter().filter(|p| p.symlink_metadata().is_err()).collect();
+        // A server is not asked in the frame (it may hang), so what was on one is not reported
+        let gone: Vec<std::path::PathBuf> = paths.into_iter().filter(|p| !crate::fs::network::is_remote(p) && p.symlink_metadata().is_err()).collect();
         if gone.is_empty() {
             return;
         }
