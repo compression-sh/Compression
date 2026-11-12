@@ -444,6 +444,8 @@ enum OpenReport {
     NoApp(PathBuf),
     /// `xdg-mime` could not say what opens the file: nothing is opened, and the person is told why.
     Unknown(apps::Why),
+    /// The thread that saved a pasted picture: the folder it was pasted into, and the file or why it is not there.
+    PastedImage(PathBuf, Result<PathBuf, String>),
     /// What the thread that read the properties of a file found: `None` when it could not be read.
     Properties(PathBuf, Option<Box<Properties>>),
 }
@@ -1371,6 +1373,8 @@ impl CompressionApp {
                         None => self.set_toast(tr("Could not read properties")),
                     }
                 }
+                OpenReport::PastedImage(dir, Ok(path)) => self.pasted_image(&dir, path),
+                OpenReport::PastedImage(_, Err(why)) => self.set_toast(why),
                 OpenReport::Unknown(why) => self.set_toast(trf("Could not find out what opens this file ({})", &[&why.text()])),
             }
         }
@@ -1461,16 +1465,27 @@ impl CompressionApp {
         self.set_toast(message);
     }
 
-    /// Saves an image from the clipboard into the current folder as `Pasted image.png`.
-    fn paste_image(&mut self, png: &[u8]) {
-        let path = match ops::write_new(&self.current_path, std::ffi::OsStr::new("Pasted image.png"), "copy", png) {
-            Ok(path) => path,
-            Err(err) => {
-                self.set_toast(crate::fs::describe::io_error(&err));
-                return;
-            }
-        };
+    /// Saves an image from the clipboard into the current folder as `Pasted image.png`. The file is written on a thread
+    /// of its own (the folder may be on a slow disk or a server); `pasted_image` takes the answer in.
+    fn paste_image(&mut self, png: Vec<u8>) {
+        let (dir, tx, ctx) = (self.current_path.clone(), self.open_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let saved = ops::write_new(&dir, std::ffi::OsStr::new("Pasted image.png"), "copy", &png).map_err(|err| crate::fs::describe::io_error(&err));
+            let _ = tx.send(OpenReport::PastedImage(dir, saved));
+            ctx.request_repaint();
+        });
+    }
+
+    /// The picture is in `dir` as `path`: it can be undone wherever the window is now, and it is shown and selected
+    /// when `dir` is still the folder on screen; otherwise the message says where it went.
+    fn pasted_image(&mut self, dir: &Path, path: PathBuf) {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.history.record(UndoEntry::new(trf("Creation of {}", &[&name]), vec![Edit::Trash(path.clone())]));
+        if dir != self.current_path {
+            let folder = dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned());
+            self.set_toast_action(trf("Pasted {} into {}", &[&name, &folder]), ToastAction::Undo);
+            return;
+        }
         self.add_listed(&path);
         if let Some(idx) = self.items.iter().position(|i| i.name == name) {
             self.selection = std::iter::once(idx).collect();
@@ -1479,7 +1494,6 @@ impl CompressionApp {
             self.last_cursor = Some(idx);
             self.scroll_to_selected = true;
         }
-        self.history.record(UndoEntry::new(trf("Creation of {}", &[&name]), vec![Edit::Trash(path)]));
         self.set_toast_action(trf("Pasted {}", &[&name]), ToastAction::Undo);
     }
 
@@ -1579,7 +1593,7 @@ impl CompressionApp {
             (None, Some(own)) => (own.paths, own.cut, true),
             (None, None) => {
                 if self.can_modify_here() && let Some(png) = image {
-                    self.paste_image(&png);
+                    self.paste_image(png);
                 } else {
                     self.set_toast(tr("Nothing to paste"));
                 }
@@ -10209,6 +10223,49 @@ mod tests {
         w.app.paste();
         w.until("the message", |w| w.app.toast_message() == Some("Nothing to paste"));
         crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn a_picture_is_written_on_a_thread_and_lands_in_the_folder_it_was_pasted_into_with_undo() {
+        let base = window_dir("paste_picture_thread");
+        let (here, there) = (base.join("here"), base.join("there"));
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&there).unwrap();
+        let mut w = Window::new(here.clone());
+        w.run(Vec::new(), 5);
+        w.app.paste_image(b"one".to_vec());
+        w.until("the first picture", |w| {
+            w.app.poll_opened();
+            w.app.toast_message() == Some("Pasted Pasted image.png")
+        });
+        assert!(w.app.items.iter().any(|i| i.name == "Pasted image.png"), "not shown in the folder it went to");
+        // The window has moved on when the answer for a picture comes: it stays where it was pasted, can be undone,
+        // and the message says where it went
+        w.app.navigate_to(there.clone());
+        w.until("the other folder", |w| w.app.current_path == there);
+        let second = here.join("Pasted image (copy).png");
+        std::fs::write(&second, b"two").unwrap();
+        w.app.open_tx.send(OpenReport::PastedImage(here.clone(), Ok(second.clone()))).unwrap();
+        w.app.poll_opened();
+        assert_eq!(w.app.toast_message(), Some("Pasted Pasted image (copy).png into here"));
+        assert!(!w.app.items.iter().any(|i| i.name.starts_with("Pasted image")), "a file of another folder in the list");
+        assert!(w.app.history.undo_label().is_some_and(|l| l.contains("Pasted image (copy).png")), "{:?}", w.app.history.undo_label());
+        assert_eq!(std::fs::read(here.join("Pasted image.png")).unwrap(), b"one");
+        // A folder that cannot take it: the reason is told, nothing is recorded
+        let locked = base.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o555)).unwrap();
+        w.app.navigate_to(locked.clone());
+        w.until("the locked folder", |w| w.app.current_path == locked);
+        let before = w.app.history.undo_label().map(str::to_owned);
+        w.app.paste_image(b"three".to_vec());
+        w.until("the refusal", |w| {
+            w.app.poll_opened();
+            w.app.toast_message().is_some_and(|t| !t.starts_with("Pasted"))
+        });
+        assert_eq!(w.app.history.undo_label().map(str::to_owned), before);
+        std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The raw input of a frame of `viewport` that holds Ctrl+V, as the window's hook sees it.
