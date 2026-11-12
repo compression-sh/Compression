@@ -7,16 +7,33 @@ use eframe::egui::{self, Color32};
 use zbus::zvariant::{OwnedValue, Value};
 
 /// What the desktop prefers; `None` where it says nothing.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Appearance {
     pub light: Option<bool>,
     pub accent: Option<Color32>,
+    /// The icon theme of the desktop, as GNOME keeps it (`org.gnome.desktop.interface icon-theme`), which the portal
+    /// passes on and GTK itself follows under Wayland.
+    pub icon_theme: Option<String>,
 }
 
 const NAMESPACE: &str = "org.freedesktop.appearance";
+const GNOME: &str = "org.gnome.desktop.interface";
+/// The settings of the portal that are asked for, by namespace and key.
+const ASKED: [(&str, &str); 3] = [(NAMESPACE, "color-scheme"), (NAMESPACE, "accent-color"), (GNOME, "icon-theme")];
 
 impl Appearance {
-    /// Takes in one setting of the portal (`color-scheme` or `accent-color`); others are left alone.
+    /// Takes in one setting of the portal (`color-scheme`, `accent-color`, GNOME's `icon-theme`); others are left alone.
+    pub fn take_from(&mut self, namespace: &str, key: &str, value: &Value<'_>) {
+        if namespace == GNOME {
+            if key == "icon-theme" {
+                self.icon_theme = <&str>::try_from(unwrap(value)).ok().filter(|t| !t.is_empty()).map(str::to_owned);
+            }
+        } else if namespace == NAMESPACE {
+            self.take(key, value);
+        }
+    }
+
+    /// Takes in one setting of `org.freedesktop.appearance`.
     pub fn take(&mut self, key: &str, value: &Value<'_>) {
         let value = unwrap(value);
         match key {
@@ -55,37 +72,76 @@ pub fn watch(ctx: &egui::Context) -> mpsc::Receiver<Appearance> {
     rx
 }
 
-fn follow(tx: &mpsc::Sender<Appearance>, ctx: &egui::Context) -> zbus::Result<()> {
-    use zbus::blocking::{Connection, Proxy};
-    let connection = Connection::session()?;
-    let portal = Proxy::new(&connection, "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.Settings")?;
-    // Listening first, so a change made while the first answers come is not missed
-    let changes = portal.receive_signal("SettingChanged")?;
+/// The portal's answers to what is asked (`ASKED`), as they are now.
+fn read(portal: &zbus::blocking::Proxy<'_>) -> Appearance {
     let mut now = Appearance::default();
-    for key in ["color-scheme", "accent-color"] {
-        let value: zbus::Result<OwnedValue> = portal.call("ReadOne", &(NAMESPACE, key)).or_else(|_| portal.call("Read", &(NAMESPACE, key)));
+    for (namespace, key) in ASKED {
+        let value: zbus::Result<OwnedValue> = portal.call("ReadOne", &(namespace, key)).or_else(|_| portal.call("Read", &(namespace, key)));
         if let Ok(value) = value {
-            now.take(key, &value);
+            now.take_from(namespace, key, &value);
         }
     }
-    let send = |appearance: Appearance| {
-        let sent = tx.send(appearance).is_ok();
+    now
+}
+
+fn portal(connection: &zbus::blocking::Connection) -> zbus::Result<zbus::blocking::Proxy<'_>> {
+    zbus::blocking::Proxy::new(connection, "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.Settings")
+}
+
+fn follow(tx: &mpsc::Sender<Appearance>, ctx: &egui::Context) -> zbus::Result<()> {
+    let connection = zbus::blocking::Connection::session()?;
+    let portal = portal(&connection)?;
+    // Listening first, so a change made while the first answers come is not missed
+    let changes = portal.receive_signal("SettingChanged")?;
+    let mut now = read(&portal);
+    let send = |appearance: &Appearance| {
+        let sent = tx.send(appearance.clone()).is_ok();
         ctx.request_repaint();
         sent
     };
-    if !send(now) {
+    if !send(&now) {
         return Ok(());
     }
     for message in changes {
         let Ok((namespace, key, value)) = message.body().deserialize::<(String, String, OwnedValue)>() else { continue };
-        if namespace == NAMESPACE {
-            now.take(&key, &value);
-            if !send(now) {
+        if ASKED.iter().any(|(n, k)| *n == namespace && *k == key) {
+            now.take_from(&namespace, &key, &value);
+            if !send(&now) {
                 break;
             }
         }
     }
     Ok(())
+}
+
+/// What the desktop prefers, asked once and waited for at most `wait`: for the first frame, so a light desktop does not
+/// see a dark window flash first. Without an answer in time, nothing is known (and the window takes the answer in later).
+pub fn read_within(wait: std::time::Duration) -> Appearance {
+    answer_within(wait, || {
+        let connection = zbus::blocking::Connection::session().ok()?;
+        Some(read(&portal(&connection).ok()?))
+    })
+}
+
+/// `read_within` with the asking given, so the wait can be checked on its own.
+fn answer_within(wait: std::time::Duration, ask: impl FnOnce() -> Option<Appearance> + Send + 'static) -> Appearance {
+    let (tx, rx) = mpsc::channel();
+    let _ = std::thread::Builder::new().name("compression-appearance-start".into()).spawn(move || {
+        let _ = tx.send(ask());
+    });
+    rx.recv_timeout(wait).ok().flatten().unwrap_or_default()
+}
+
+static INITIAL: std::sync::RwLock<Option<Appearance>> = std::sync::RwLock::new(None);
+
+/// Keeps what the desktop said at the start (see `read_within`), for the first theme and the first window.
+pub fn set_initial(appearance: Appearance) {
+    *INITIAL.write().unwrap_or_else(|e| e.into_inner()) = Some(appearance);
+}
+
+/// What the desktop said at the start; nothing known when it was not asked (tests, the portal service).
+pub fn initial() -> Appearance {
+    INITIAL.read().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -110,5 +166,27 @@ mod tests {
         assert_eq!(a.accent, None, "out of range is no accent");
         a.take("contrast", &Value::U32(1));
         assert_eq!(a.light, Some(true), "other keys change nothing");
+        // GNOME's icon theme, in its own namespace
+        a.take_from("org.gnome.desktop.interface", "icon-theme", &Value::from("Papirus-Dark"));
+        assert_eq!(a.icon_theme.as_deref(), Some("Papirus-Dark"));
+        a.take_from("org.freedesktop.appearance", "icon-theme", &Value::from("Other"));
+        assert_eq!(a.icon_theme.as_deref(), Some("Papirus-Dark"), "only from GNOME's namespace");
+        a.take_from("org.gnome.desktop.interface", "icon-theme", &Value::from(""));
+        assert_eq!(a.icon_theme, None);
+    }
+
+    #[test]
+    fn the_start_waits_for_the_desktop_only_a_moment() {
+        let light = Appearance { light: Some(true), ..Appearance::default() };
+        let quick = light.clone();
+        assert_eq!(answer_within(std::time::Duration::from_secs(2), move || Some(quick)), light);
+        let started = std::time::Instant::now();
+        let slow = answer_within(std::time::Duration::from_millis(100), || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            Some(Appearance { light: Some(true), ..Appearance::default() })
+        });
+        assert_eq!(slow, Appearance::default(), "no answer in time: nothing known");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+        assert_eq!(answer_within(std::time::Duration::from_secs(1), || None), Appearance::default(), "no portal");
     }
 }

@@ -35,18 +35,32 @@ fn base_dirs() -> Vec<PathBuf> {
     out
 }
 
-/// The name of the icon theme the desktop uses: GTK's setting, else KDE's, else Adwaita where it is installed.
+static DESKTOP_THEME: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// The icon theme the desktop names through the portal (GNOME's setting, see `ui::appearance`); `None` where it names none.
+pub fn set_desktop_icon_theme(name: Option<String>) {
+    *DESKTOP_THEME.write().unwrap_or_else(|e| e.into_inner()) = name;
+}
+
+/// The name of the icon theme the desktop uses, as GTK finds it: what the portal says (GNOME's dconf setting), else
+/// GTK's own `settings.ini`, else KDE's, else Adwaita.
 pub fn theme_name() -> String {
     let config = dirs::config_dir();
-    for file in ["gtk-4.0/settings.ini", "gtk-3.0/settings.ini"] {
-        if let Some(name) = config.as_ref().and_then(|c| std::fs::read_to_string(c.join(file)).ok()).and_then(|t| ini_value(&t, "Settings", "gtk-icon-theme-name")) {
-            return name;
-        }
-    }
-    if let Some(name) = config.and_then(|c| std::fs::read_to_string(c.join("kdeglobals")).ok()).and_then(|t| ini_value(&t, "Icons", "Theme")) {
-        return name;
-    }
-    "Adwaita".to_owned()
+    let read = |file: &str| config.as_ref().and_then(|c| std::fs::read_to_string(c.join(file)).ok());
+    theme_name_from(
+        DESKTOP_THEME.read().unwrap_or_else(|e| e.into_inner()).clone(),
+        &[read("gtk-4.0/settings.ini"), read("gtk-3.0/settings.ini")],
+        read("kdeglobals"),
+    )
+}
+
+/// `theme_name` from what each source says: the portal's name, the texts of GTK's settings files and of `kdeglobals`.
+fn theme_name_from(portal: Option<String>, gtk: &[Option<String>], kde: Option<String>) -> String {
+    portal
+        .filter(|n| !n.is_empty())
+        .or_else(|| gtk.iter().flatten().find_map(|t| ini_value(t, "Settings", "gtk-icon-theme-name")))
+        .or_else(|| kde.and_then(|t| ini_value(&t, "Icons", "Theme")))
+        .unwrap_or_else(|| "Adwaita".to_owned())
 }
 
 /// The value of `key` in the `[section]` of an ini text, unquoted.
@@ -149,22 +163,32 @@ fn find_in(themes: &[Theme], names: &[String], size: u32) -> Option<PathBuf> {
     None
 }
 
-/// The themes of the desktop, read once.
-fn installed() -> &'static [Theme] {
-    static THEMES: OnceLock<Vec<Theme>> = OnceLock::new();
-    THEMES.get_or_init(|| chain(&theme_name(), &base_dirs()))
+/// The themes of the desktop, read once for each theme name (the desktop may switch to another while Compression runs).
+fn installed() -> (String, std::sync::Arc<Vec<Theme>>) {
+    static THEMES: Mutex<Option<(String, std::sync::Arc<Vec<Theme>>)>> = Mutex::new(None);
+    let name = theme_name();
+    let mut themes = THEMES.lock().unwrap_or_else(|e| e.into_inner());
+    match themes.as_ref() {
+        Some((read, chain)) if *read == name => (name, chain.clone()),
+        _ => {
+            let chain = std::sync::Arc::new(chain(&name, &base_dirs()));
+            *themes = Some((name.clone(), chain.clone()));
+            (name, chain)
+        }
+    }
 }
 
-/// `find_in` the desktop's themes, remembered per names and size.
+/// `find_in` the desktop's themes, remembered per theme, names and size.
 fn find(names: &[String], size: u32) -> Option<PathBuf> {
-    type Found = HashMap<(Vec<String>, u32), Option<PathBuf>>;
+    type Found = HashMap<(String, Vec<String>, u32), Option<PathBuf>>;
     static FOUND: OnceLock<Mutex<Found>> = OnceLock::new();
     let found = FOUND.get_or_init(Mutex::default);
-    let key = (names.to_vec(), size);
+    let (theme, themes) = installed();
+    let key = (theme, names.to_vec(), size);
     if let Some(hit) = found.lock().ok()?.get(&key) {
         return hit.clone();
     }
-    let hit = find_in(installed(), names, size);
+    let hit = find_in(&themes, names, size);
     if let Ok(mut map) = found.lock() {
         map.insert(key, hit.clone());
     }
@@ -319,6 +343,16 @@ mod tests {
         std::fs::write(base.join("broken.svg"), "not svg").unwrap();
         assert!(rasterize(&base.join("broken.svg"), 48).is_none());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn the_portal_names_the_theme_before_gtk_and_kde_as_gtk_itself_does() {
+        let gtk = Some("[Settings]\ngtk-icon-theme-name=Papirus\n".to_owned());
+        let kde = Some("[Icons]\nTheme=breeze\n".to_owned());
+        assert_eq!(theme_name_from(Some("Yaru".into()), std::slice::from_ref(&gtk), kde.clone()), "Yaru", "GNOME's setting, through the portal");
+        assert_eq!(theme_name_from(None, &[None, gtk.clone()], kde.clone()), "Papirus", "then GTK's settings.ini, 4.0 or 3.0");
+        assert_eq!(theme_name_from(Some(String::new()), &[None, None], kde), "breeze", "then KDE's");
+        assert_eq!(theme_name_from(None, &[], None), "Adwaita");
     }
 
     #[test]

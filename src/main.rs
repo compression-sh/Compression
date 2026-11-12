@@ -342,6 +342,12 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
     let settings = settings::Settings::load();
     i18n::set_language(i18n::resolve(&settings.language));
     ui::theme::reload_user_themes();
+    // What the desktop prefers, for a "System" theme or icon style in the first frame: asked now, waited for a moment
+    if settings.theme == "system" || settings.icon_style == ui::icon_style::IconStyle::System {
+        let appearance = ui::appearance::read_within(std::time::Duration::from_millis(150));
+        ui::system_icons::set_desktop_icon_theme(appearance.icon_theme.clone());
+        ui::appearance::set_initial(appearance);
+    }
     let theme = SerpantinumTheme::from_settings(&settings);
 
     // A file given instead of a folder (a browser's "Show in folder") opens its folder with the file selected

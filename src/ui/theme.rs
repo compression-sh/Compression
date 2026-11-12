@@ -525,14 +525,18 @@ impl SerpantinumTheme {
 
     /// Palette picked in the settings (`system` follows Serpantinum, `custom:<id>` is one of the user's own), with the accent applied.
     pub fn from_settings(settings: &crate::settings::Settings) -> Self {
+        Self::from_settings_with(settings, &super::appearance::initial())
+    }
+
+    /// `from_settings`, with what the desktop prefers for the "System" theme.
+    pub fn from_settings_with(settings: &crate::settings::Settings, appearance: &super::appearance::Appearance) -> Self {
         let custom = settings.theme.strip_prefix("custom:").and_then(|id| user_themes().into_iter().find(|c| c.id == id));
         let mut theme = if let Some(custom) = &custom {
             custom.colors.to_theme()
         } else if let Some(preset) = preset(&settings.theme) {
             preset.colors.to_theme()
         } else {
-            // "System": what the desktop prefers is not known yet at the start; the window takes it in when it comes
-            Self::system(&super::appearance::Appearance::default())
+            Self::system(appearance)
         };
         if let Some(accent) = settings.accent.as_deref().and_then(parse_hex) {
             theme.mauve = accent;
@@ -879,19 +883,26 @@ pub(crate) mod tests {
         let dark = preset("dark").unwrap().colors.to_theme();
         // No Serpantinum: the bundled palette for what the desktop prefers, dark when it says nothing
         assert_eq!(SerpantinumTheme::system(&Appearance::default()).base, dark.base);
-        let day = SerpantinumTheme::system(&Appearance { light: Some(true), accent: None });
+        let day = SerpantinumTheme::system(&Appearance { light: Some(true), accent: None, ..Default::default() });
         assert!(day.light && day.base == light.base);
-        assert_eq!(SerpantinumTheme::system(&Appearance { light: Some(false), accent: None }).base, dark.base);
+        assert_eq!(SerpantinumTheme::system(&Appearance { light: Some(false), accent: None, ..Default::default() }).base, dark.base);
         // In the desktop's accent
         let orange = Color32::from_rgb(230, 120, 20);
-        let accented = SerpantinumTheme::system(&Appearance { light: Some(true), accent: Some(orange) });
+        let accented = SerpantinumTheme::system(&Appearance { light: Some(true), accent: Some(orange), ..Default::default() });
         assert_eq!(accented.base, light.base);
         assert_ne!(accented.mauve, light.mauve, "the accent is the desktop's");
         // With Serpantinum installed, its palette is the system's, whatever the portal says
         std::fs::create_dir_all(empty.join("state")).unwrap();
         std::fs::write(empty.join("state/qs_colors.json"), r##"{ "base": "#010203", "text": "#f0f0f0" }"##).unwrap();
         SERPANTINUM_DIRS_FOR_TESTS.with(|d| *d.borrow_mut() = Some(SerpantinumDirs { state: vec![empty.join("state")], config: vec![empty.join("config")] }));
-        assert_eq!(SerpantinumTheme::system(&Appearance { light: Some(true), accent: None }).base, parse_hex("#010203").unwrap());
+        assert_eq!(SerpantinumTheme::system(&Appearance { light: Some(true), accent: None, ..Default::default() }).base, parse_hex("#010203").unwrap());
+        // The theme of the first frame is made from what the desktop said at the start: light from the first frame
+        std::fs::remove_file(empty.join("state/qs_colors.json")).unwrap();
+        SERPANTINUM_DIRS_FOR_TESTS.with(|d| *d.borrow_mut() = Some(SerpantinumDirs { state: vec![empty.join("state")], config: vec![empty.join("config")] }));
+        let settings = crate::settings::Settings::default();
+        assert_eq!(settings.theme, "system");
+        let first = SerpantinumTheme::from_settings_with(&settings, &Appearance { light: Some(true), ..Default::default() });
+        assert!(first.light && first.base == light.base, "the first frame would be dark on a light desktop");
         SERPANTINUM_DIRS_FOR_TESTS.with(|d| *d.borrow_mut() = None);
         std::fs::remove_dir_all(&empty).unwrap();
     }
