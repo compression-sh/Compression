@@ -921,5 +921,6 @@
   "Too many files are open": "Открыто слишком много файлов",
   "The selected items are in different folders. Open the folder first to compress them": "Выбранные элементы находятся в разных папках. Сначала откройте папку, чтобы сжать их",
   "Not included, because they are in other folders ({}): {}{}": "Не включены, так как они в других папках ({}): {}{}",
-  "Created “{}” · {} not included, because they are in other folders": "«{}» создан · не включено {}: они в других папках"
+  "Created “{}” · {} not included, because they are in other folders": "«{}» создан · не включено {}: они в других папках",
+  "Cancelled after {}": "Отменено после {}"
 }

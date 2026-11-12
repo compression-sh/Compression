@@ -281,42 +281,111 @@ pub fn problem(entries: &[Entry], names: &[String]) -> Option<String> {
     None
 }
 
-/// Applies the names. Goes through temporary names so files can swap names. Returns the paths
-/// that were renamed (old, new) and the first error, if any.
+/// An item to rename: where it is, and the path it is to get.
+type Change = (PathBuf, PathBuf);
+
+/// What `apply_with` did.
+#[derive(Debug, Default)]
+pub struct Applied {
+    /// The paths that were renamed (old, new).
+    pub done: Vec<(PathBuf, PathBuf)>,
+    /// The first error, in words.
+    pub error: Option<String>,
+    /// The batch was called off (see `apply_with` for what that leaves).
+    pub cancelled: bool,
+}
+
+/// Applies the names where they are: the paths that were renamed (old, new) and the first error, if any.
 pub fn apply(entries: &[Entry], names: &[String]) -> (Vec<(PathBuf, PathBuf)>, Option<String>) {
-    let changes: Vec<(&Entry, &String)> = entries
+    let applied = apply_with(entries, names, &crate::compat::rename_noreplace, &|| false, &|_, _| {});
+    (applied.done, applied.error)
+}
+
+/// Applies the names, one `rename` for an item, except where names overlap: an item whose new name is the old name
+/// of another item of the batch (or the other way round: names that swap, or follow each other in a chain) goes by a
+/// temporary name in between, so that no name is ever taken, or replaced, on the way.
+///
+/// 1. The overlapping items are moved aside to temporary names. Called off here (`cancelled`) or failed, all of
+///    them are put back and nothing has changed.
+/// 2. The temporary names are given their new names. This is not called off: it runs to the end, so that no
+///    temporary name is left. An item that cannot take its new name (it was taken meanwhile) gets its old name back;
+///    the others stay renamed.
+/// 3. The other items are renamed. Called off between two of them, the rest stays as it was.
+///
+/// `progress` is told how many of the items have their new name, and how many there are, after each one.
+pub fn apply_with(
+    entries: &[Entry],
+    names: &[String],
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+    progress: &dyn Fn(usize, usize),
+) -> Applied {
+    use std::collections::HashSet;
+    let changes: Vec<(PathBuf, PathBuf)> = entries
         .iter()
         .zip(names)
         .filter(|(e, n)| e.path.file_name().is_some_and(|old| old.to_string_lossy() != n.as_str()))
+        .map(|(e, n)| (e.path.clone(), e.path.with_file_name(n.as_str())))
         .collect();
+    let olds: HashSet<&Path> = changes.iter().map(|(old, _)| old.as_path()).collect();
+    let targets: HashSet<&Path> = changes.iter().map(|(_, target)| target.as_path()).collect();
+    let (overlapping, alone): (Vec<&Change>, Vec<&Change>) = changes.iter().partition(|(old, target)| olds.contains(target.as_path()) || targets.contains(old.as_path()));
+    let total = changes.len();
+    let mut out = Applied::default();
 
-    let mut staged: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new(); // old, temp, final
-    let mut done: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for (i, (entry, new)) in changes.iter().enumerate() {
-        let temp = entry.path.with_file_name(format!(".compression-rename-{}-{i}", std::process::id()));
-        if let Err(err) = std::fs::rename(&entry.path, &temp) {
-            // Put back what was already moved aside
-            for (old, temp, _) in staged.into_iter().rev() {
-                let _ = std::fs::rename(&temp, &old);
-            }
-            return (done, Some(crate::fs::describe::io_error(&err)));
+    // Stage 1: aside
+    let mut parked: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new(); // old, temporary, new
+    let put_back = |parked: Vec<(PathBuf, PathBuf, PathBuf)>| {
+        for (old, temp, _) in parked.into_iter().rev() {
+            let _ = crate::compat::rename_noreplace(&temp, &old);
         }
-        staged.push((entry.path.clone(), temp, entry.path.with_file_name(new.as_str())));
+    };
+    for (i, (old, target)) in overlapping.iter().enumerate() {
+        if cancelled() {
+            put_back(parked);
+            out.cancelled = true;
+            return out;
+        }
+        let temp = old.with_file_name(format!(".compression-rename-{}-{i}", std::process::id()));
+        if let Err(err) = rename(old, &temp) {
+            put_back(parked);
+            out.error = Some(crate::fs::describe::io_error(&err));
+            return out;
+        }
+        parked.push((old.clone(), temp, target.clone()));
     }
-    let mut failure = None;
-    for (old, temp, target) in staged {
-        // A name taken since the check must not be replaced
-        match crate::compat::rename_noreplace(&temp, &target) {
-            Ok(()) => done.push((old, target)),
+    // Stage 2: to the end
+    for (old, temp, target) in parked {
+        match rename(&temp, &target) {
+            Ok(()) => out.done.push((old, target)),
             Err(err) => {
-                let _ = std::fs::rename(&temp, &old);
-                failure.get_or_insert(crate::fs::describe::io_error(&err));
+                // Back to its old name, if that is still free: another item of the batch may have taken it by now, and
+                // what is there is never replaced. Then the item stays under its temporary name, and the error says so.
+                let why = match crate::compat::rename_noreplace(&temp, &old) {
+                    Ok(()) => crate::fs::describe::io_error(&err),
+                    Err(_) => crate::fs::describe::failed(&temp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), &err),
+                };
+                out.error.get_or_insert(why);
             }
         }
+        progress(out.done.len(), total);
     }
-    (done, failure)
+    // The items that overlap with nobody
+    for (old, target) in alone {
+        if cancelled() {
+            out.cancelled = true;
+            break;
+        }
+        match rename(old, target) {
+            Ok(()) => out.done.push((old.clone(), target.clone())),
+            Err(err) => {
+                out.error.get_or_insert(crate::fs::describe::io_error(&err));
+            }
+        }
+        progress(out.done.len(), total);
+    }
+    out
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -501,6 +570,184 @@ mod tests {
         let (done, failure) = apply(&[entry], &["c.txt".to_owned()]);
         assert!(done.is_empty());
         assert_eq!(failure.as_deref(), Some("Already exists"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- apply_with: which renames are made, and what is left when one fails or the batch is called off
+
+    use std::cell::{Cell, RefCell};
+
+    /// A folder with the files `names` (each holding its own name as content), and entries for them.
+    fn rig(name: &str, names: &[&str]) -> (PathBuf, Vec<Entry>) {
+        let dir = std::env::temp_dir().join(format!("compression_batch_with_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in names {
+            std::fs::write(dir.join(n), n.to_uppercase()).unwrap();
+        }
+        let entries = names.iter().map(|n| Entry { path: dir.join(n), is_dir: false, date: String::new() }).collect();
+        (dir, entries)
+    }
+
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    fn words(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    fn is_temp(path: &Path) -> bool {
+        path.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".compression-rename-"))
+    }
+
+    /// `apply_with` with the system's rename, a record of every rename asked for, and a way to make some fail.
+    fn run(entries: &[Entry], names: &[&str], fails: impl Fn(&Path, &Path) -> bool, cancelled: &dyn Fn() -> bool) -> (Applied, Vec<(PathBuf, PathBuf)>) {
+        let log = RefCell::new(Vec::new());
+        let rename = |from: &Path, to: &Path| {
+            log.borrow_mut().push((from.to_path_buf(), to.to_path_buf()));
+            if fails(from, to) { Err(std::io::Error::from_raw_os_error(libc::EIO)) } else { crate::compat::rename_noreplace(from, to) }
+        };
+        let applied = apply_with(entries, &words(names), &rename, cancelled, &|_, _| {});
+        (applied, log.into_inner())
+    }
+
+    #[test]
+    fn two_items_that_swap_names_go_by_temporary_names_and_nothing_is_left_of_them() {
+        let (dir, entries) = rig("swap", &["a", "b"]);
+        let (applied, log) = run(&entries, &["b", "a"], |_, _| false, &|| false);
+        assert_eq!(applied.error, None);
+        assert_eq!(applied.done.len(), 2);
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "B");
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "A");
+        assert_eq!(log.len(), 4, "two to a temporary name, two to the new name: {log:?}");
+        assert_eq!(listing(&dir), ["a", "b"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_chain_of_names_goes_by_temporary_names_too() {
+        let (dir, entries) = rig("chain", &["a", "b"]);
+        // a becomes b while b becomes c
+        let (applied, log) = run(&entries, &["b", "c"], |_, _| false, &|| false);
+        assert_eq!(applied.error, None);
+        assert_eq!((std::fs::read_to_string(dir.join("b")).unwrap(), std::fs::read_to_string(dir.join("c")).unwrap()), ("A".into(), "B".into()));
+        assert!(!dir.join("a").exists());
+        assert_eq!(log.iter().filter(|(_, to)| is_temp(to)).count(), 2, "both went aside: {log:?}");
+        assert_eq!(listing(&dir), ["b", "c"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn items_whose_names_overlap_with_nobody_are_renamed_once_each_and_never_by_a_temporary_name() {
+        let (dir, entries) = rig("alone", &["a", "b", "c"]);
+        let (applied, log) = run(&entries, &["x", "y", "c"], |_, _| false, &|| false);
+        assert_eq!(applied.error, None);
+        assert_eq!(applied.done, vec![(dir.join("a"), dir.join("x")), (dir.join("b"), dir.join("y"))], "c keeps its name and is not touched");
+        assert_eq!(log, vec![(dir.join("a"), dir.join("x")), (dir.join("b"), dir.join("y"))], "exactly one rename for each");
+        assert_eq!(listing(&dir), ["c", "x", "y"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failure_while_moving_aside_puts_everything_back_and_leaves_no_temporary_name() {
+        let (dir, entries) = rig("stage1", &["a", "b", "c"]);
+        // a→b, b→a: the second one cannot be moved aside; c (alone) must not have been touched either
+        let (applied, _) = run(&entries, &["b", "a", "z"], |from, to| from == dir.join("b") && is_temp(to), &|| false);
+        assert!(applied.done.is_empty(), "{:?}", applied.done);
+        assert_eq!(applied.error.as_deref(), Some("The disk or the connection reported an error"));
+        assert!(!applied.cancelled);
+        assert_eq!(listing(&dir), ["a", "b", "c"]);
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "A");
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "B");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_item_that_cannot_take_its_new_name_gets_its_old_one_back_and_the_others_stay_renamed() {
+        let (dir, entries) = rig("stage2", &["a", "b"]);
+        // a→b cannot be done; b→c can. a goes back to a, b is renamed to c.
+        let (applied, _) = run(&entries, &["b", "c"], |_, to| to == dir.join("b"), &|| false);
+        assert_eq!(applied.done, vec![(dir.join("b"), dir.join("c"))]);
+        assert!(applied.error.is_some());
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "A");
+        assert_eq!(std::fs::read_to_string(dir.join("c")).unwrap(), "B");
+        assert_eq!(listing(&dir), ["a", "c"], "no temporary name is left");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_item_that_cannot_go_back_is_never_put_over_another_file_and_is_named_in_the_error() {
+        let (dir, entries) = rig("stage2_taken", &["a", "b"]);
+        // a→b is done (b is free once b went aside); b→c cannot be done, and b's old name now holds a's content
+        let (applied, _) = run(&entries, &["b", "c"], |_, to| to == dir.join("c"), &|| false);
+        assert_eq!(applied.done, vec![(dir.join("a"), dir.join("b"))]);
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "A", "what is at b must not be replaced");
+        let left: Vec<String> = listing(&dir).into_iter().filter(|n| n.starts_with(".compression-rename-")).collect();
+        assert_eq!(left.len(), 1, "{:?}", listing(&dir));
+        assert_eq!(std::fs::read_to_string(dir.join(&left[0])).unwrap(), "B", "the file is kept, under a name the error gives");
+        assert!(applied.error.as_deref().is_some_and(|e| e.contains(&left[0])), "{:?}", applied.error);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn called_off_while_moving_aside_everything_is_back_as_it_was() {
+        let (dir, entries) = rig("cancel1", &["a", "b", "c"]);
+        let asked = Cell::new(0);
+        // Called off at the second item that is to be moved aside
+        let (applied, log) = run(&entries, &["b", "c", "a"], |_, _| false, &|| {
+            asked.set(asked.get() + 1);
+            asked.get() == 2
+        });
+        assert!(applied.cancelled && applied.done.is_empty() && applied.error.is_none());
+        assert_eq!(log.iter().filter(|(_, to)| is_temp(to)).count(), 1, "one had been moved aside");
+        assert_eq!(listing(&dir), ["a", "b", "c"]);
+        for n in ["a", "b", "c"] {
+            assert_eq!(std::fs::read_to_string(dir.join(n)).unwrap(), n.to_uppercase());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn called_off_after_moving_aside_the_names_are_given_out_to_the_end_and_the_rest_waits() {
+        let (dir, entries) = rig("cancel2", &["a", "b", "c", "d"]);
+        let asked = Cell::new(0);
+        // a and b swap; c and d are alone. The batch is called off from the third question on: the two that go aside
+        // are asked about first (and let through), then the swap must be completed, then c is asked about
+        let (applied, _) = run(&entries, &["b", "a", "x", "y"], |_, _| false, &|| {
+            asked.set(asked.get() + 1);
+            asked.get() > 2
+        });
+        assert!(applied.cancelled);
+        assert_eq!(applied.done.len(), 2, "the swap is completed: {:?}", applied.done);
+        assert_eq!((std::fs::read_to_string(dir.join("a")).unwrap(), std::fs::read_to_string(dir.join("b")).unwrap()), ("B".into(), "A".into()));
+        assert_eq!(listing(&dir), ["a", "b", "c", "d"], "no temporary name, and c and d are as they were");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn called_off_between_two_items_that_overlap_with_nobody_the_rest_stays_as_it_was() {
+        let (dir, entries) = rig("cancel3", &["a", "b", "c"]);
+        let asked = Cell::new(0);
+        let (applied, _) = run(&entries, &["x", "y", "z"], |_, _| false, &|| {
+            asked.set(asked.get() + 1);
+            asked.get() == 2
+        });
+        assert!(applied.cancelled);
+        assert_eq!(applied.done, vec![(dir.join("a"), dir.join("x"))]);
+        assert_eq!(listing(&dir), ["b", "c", "x"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_progress_counts_the_items_that_have_their_new_name() {
+        let (dir, entries) = rig("progress", &["a", "b", "c"]);
+        let seen = RefCell::new(Vec::new());
+        let applied = apply_with(&entries, &words(&["b", "a", "z"]), &crate::compat::rename_noreplace, &|| false, &|done, total| seen.borrow_mut().push((done, total)));
+        assert_eq!(applied.done.len(), 3);
+        assert_eq!(seen.into_inner(), vec![(1, 3), (2, 3), (3, 3)]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

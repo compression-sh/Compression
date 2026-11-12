@@ -921,5 +921,6 @@
   "Too many files are open": "Hay demasiados archivos abiertos",
   "The selected items are in different folders. Open the folder first to compress them": "Los elementos elegidos están en carpetas distintas. Abre primero la carpeta para comprimirlos",
   "Not included, because they are in other folders ({}): {}{}": "No incluidos, porque están en otras carpetas ({}): {}{}",
-  "Created “{}” · {} not included, because they are in other folders": "«{}» creado · {} no incluidos, porque están en otras carpetas"
+  "Created “{}” · {} not included, because they are in other folders": "«{}» creado · {} no incluidos, porque están en otras carpetas",
+  "Cancelled after {}": "Cancelado tras {}"
 }

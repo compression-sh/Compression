@@ -38,6 +38,9 @@ pub(super) enum NetMsg {
     /// An item on a server was renamed (or not): `path` is the old path.
     /// `item` is the renamed item as the thread read it, so that the window need not look at the server.
     Renamed { path: PathBuf, target: PathBuf, new_name: String, item: Option<FileItem>, result: Result<(), String> },
+    /// A job that renamed several items on a server has ended: the items that were part of it (their marks go), and
+    /// the ones that got a new name, with what each looks like.
+    BatchRenamed { all: Vec<PathBuf>, items: Vec<(PathBuf, PathBuf, Option<FileItem>)> },
     Reconnect { local: PathBuf, name: String, address: Address, back: Option<PathBuf>, tabs: Vec<(u64, PathBuf)>, left: Left, result: Result<(), String> },
 }
 
@@ -64,7 +67,6 @@ struct Pending {
 }
 
 /// How an item on a server is renamed; the tests put a slow one here.
-#[cfg(test)]
 type Renamer = Arc<dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync>;
 
 pub(super) struct NetState {
@@ -104,6 +106,14 @@ pub(super) struct NetState {
 impl NetState {
     pub(super) fn connection_changed(&mut self, mount: &Path) {
         *self.generations.entry(mount.to_path_buf()).or_insert(0) += 1;
+    }
+
+    /// What renames a path: the system's, or a test's.
+    pub(super) fn renamer(&self) -> Renamer {
+        #[cfg(test)]
+        return self.rename.clone();
+        #[cfg(not(test))]
+        Arc::new(crate::compat::rename_noreplace)
     }
 
     /// What `path` on a server is, as far as the window knows without asking in the frame (see `Known`).
@@ -668,6 +678,12 @@ impl CompressionApp {
                             _ => self.set_toast(message),
                         },
                     }
+                }
+                NetMsg::BatchRenamed { all, items } => {
+                    for old in &all {
+                        self.net.renaming.remove(old);
+                    }
+                    self.show_batch_renamed(items);
                 }
                 NetMsg::Forgot { name, result } => match result {
                     Ok(()) => self.set_toast(trf("Forgot the password of “{}”", &[&name])),
@@ -3088,6 +3104,164 @@ mod tests {
             });
             assert_eq!(name_color(&mut app, &mut frame, &mut time, to), normal, "{mode:?}: the renamed item stays dimmed");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The batch rename dialog for `files`, with a template that puts `new_` before every name, drawn.
+    fn open_batch(app: &mut CompressionApp, ctx: &egui::Context, frame: &mut eframe::Frame, time: &mut f64, files: &[PathBuf]) {
+        app.reload_items();
+        wait_for(|| (!app.poll_reload()).then_some(()));
+        app.open_batch_rename(files.to_vec());
+        if let Some(Dialog::BatchRename { rules, .. }) = &mut app.dialog {
+            rules.template = format!("new_{}", crate::fs::batch_rename::TOKEN_NAME);
+        }
+        frames(app, ctx, frame, time, Vec::new(), 8);
+    }
+
+    /// Presses the button of the batch rename dialog.
+    fn click_rename(app: &mut CompressionApp, ctx: &egui::Context, frame: &mut eframe::Frame, time: &mut f64) -> Vec<(String, egui::Rect)> {
+        let shown = frames(app, ctx, frame, time, Vec::new(), 2);
+        let button = shown.iter().filter(|(t, _)| t == "Rename").map(|(_, r)| r.center()).max_by(|a, b| a.x.total_cmp(&b.x)).expect("a Rename button");
+        let (m, primary) = (egui::Modifiers::NONE, egui::PointerButton::Primary);
+        frames(app, ctx, frame, time, vec![egui::Event::PointerMoved(button)], 3);
+        frames(app, ctx, frame, time, vec![egui::Event::PointerButton { pos: button, button: primary, pressed: true, modifiers: m }], 2);
+        frames(app, ctx, frame, time, vec![egui::Event::PointerButton { pos: button, button: primary, pressed: false, modifiers: m }], 6)
+    }
+
+    /// Runs the window until the rename job on a server has ended and its messages were taken in.
+    fn finish_batch(app: &mut CompressionApp, ctx: &egui::Context) {
+        wait_for(|| {
+            app.poll_network(ctx);
+            app.poll_jobs();
+            (app.net.renaming.is_empty() && !app.engine.running()).then_some(())
+        });
+    }
+
+    #[test]
+    fn several_items_renamed_on_a_server_are_a_job_that_does_not_block_marks_the_items_and_ends_in_the_list_the_history_and_the_pins() {
+        let (mut app, dir, ctx) = app_on_server_folder("batch_job", &["a.txt", "b.txt", "c.txt"]);
+        let (mut frame, mut time) = (eframe::Frame::_new_kittest(), 0.0);
+        let files: Vec<PathBuf> = ["a.txt", "b.txt", "c.txt"].iter().map(|n| dir.join(n)).collect();
+        app.pins.push(dir.join("a.txt"));
+        // The server is slow: the first rename waits to be let through
+        let (calls, answer) = gated_rename(&mut app);
+        open_batch(&mut app, &ctx, &mut frame, &mut time, &files);
+        let started = Instant::now();
+        click_rename(&mut app, &ctx, &mut frame, &mut time);
+        assert!(started.elapsed() < Duration::from_secs(5), "the window waited for the server");
+        wait_for(|| (calls.load(Ordering::SeqCst) == 1).then_some(()));
+        assert!(app.dialog.is_none(), "the dialog closes with the job");
+        assert_eq!(app.engine.jobs.len(), 1);
+        assert_eq!(app.engine.jobs[0].kind, JobKind::Rename);
+        assert!(dir.join("a.txt").exists() && !dir.join("new_a.txt").exists(), "nothing has happened yet");
+        // The items are marked, and another batch with one of them is refused, in its dialog
+        assert!(files.iter().all(|f| app.net.is_being_renamed(f)));
+        open_batch(&mut app, &ctx, &mut frame, &mut time, &files[..2]);
+        let shown = click_rename(&mut app, &ctx, &mut frame, &mut time);
+        assert!(matches!(&app.dialog, Some(Dialog::BatchRename { error: Some(_), .. })), "the dialog must stay");
+        assert!(shown.iter().any(|(t, _)| t == "“a.txt” is already being renamed"), "{:?}", shown.iter().map(|s| &s.0).collect::<Vec<_>>());
+        assert_eq!((app.engine.jobs.len(), calls.load(Ordering::SeqCst)), (1, 1), "no second job, no second rename");
+        app.dialog = None;
+
+        // The server answers: everything is renamed
+        for _ in 0..3 {
+            answer.send(None).unwrap();
+        }
+        finish_batch(&mut app, &ctx);
+        for name in ["new_a.txt", "new_b.txt", "new_c.txt"] {
+            assert!(dir.join(name).exists(), "{name}");
+        }
+        assert_eq!(names(&app), ["new_a.txt", "new_b.txt", "new_c.txt"], "the list shows the new names");
+        assert_eq!(app.selection.len(), 3, "and has them selected");
+        assert!(app.net.renaming.is_empty(), "the marks are gone");
+        assert_eq!(app.toast_message(), Some("Renamed 3 items"));
+        assert_eq!(app.pins, vec![dir.join("new_a.txt")], "the pin follows");
+        let entry = app.history.pop_undo().expect("an undo entry");
+        assert_eq!(entry.label, "Renaming of 3 items");
+        match &entry.edits[..] {
+            [Edit::Renames(back)] => {
+                let mut pairs: Vec<(String, String)> = back.iter().map(|(new, old)| (new.file_name().unwrap().to_string_lossy().into_owned(), old.file_name().unwrap().to_string_lossy().into_owned())).collect();
+                pairs.sort();
+                assert_eq!(pairs, vec![("new_a.txt".into(), "a.txt".into()), ("new_b.txt".into(), "b.txt".into()), ("new_c.txt".into(), "c.txt".into())]);
+            }
+            other => panic!("the entry is not the renames: {}", other.len()),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_rename_job_that_is_called_off_keeps_what_it_did_and_says_so_and_the_marks_all_go() {
+        let (mut app, dir, ctx) = app_on_server_folder("batch_cancel", &["a.txt", "b.txt", "c.txt"]);
+        let (mut frame, mut time) = (eframe::Frame::_new_kittest(), 0.0);
+        let files: Vec<PathBuf> = ["a.txt", "b.txt", "c.txt"].iter().map(|n| dir.join(n)).collect();
+        // The second rename waits until it is let through
+        let (hold_tx, hold) = mpsc::channel::<()>();
+        let hold = Mutex::new(hold);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        app.net.rename = Arc::new(move |from, to| {
+            if counted.fetch_add(1, Ordering::SeqCst) == 1 {
+                let _ = hold.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            }
+            crate::compat::rename_noreplace(from, to)
+        });
+        open_batch(&mut app, &ctx, &mut frame, &mut time, &files);
+        click_rename(&mut app, &ctx, &mut frame, &mut time);
+        wait_for(|| (calls.load(Ordering::SeqCst) == 2).then_some(()));
+        let job = app.engine.jobs[0].id;
+        app.engine.cancel(job);
+        hold_tx.send(()).unwrap();
+        finish_batch(&mut app, &ctx);
+        // The two that were done stay done; the third was not touched
+        assert!(dir.join("new_a.txt").exists() && dir.join("new_b.txt").exists() && dir.join("c.txt").exists() && !dir.join("new_c.txt").exists());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(app.toast_message(), Some("Cancelled after 2 items"));
+        assert_eq!(names(&app), ["c.txt", "new_a.txt", "new_b.txt"]);
+        assert!(app.net.renaming.is_empty(), "the mark of the item that was not renamed goes too");
+        let entry = app.history.pop_undo().expect("what was done can be taken back");
+        assert!(matches!(&entry.edits[..], [Edit::Renames(back)] if back.len() == 2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_rename_that_fails_in_a_job_is_told_with_the_number_that_were_done_and_the_marks_go() {
+        let (mut app, dir, ctx) = app_on_server_folder("batch_error", &["a.txt", "b.txt", "c.txt"]);
+        let (mut frame, mut time) = (eframe::Frame::_new_kittest(), 0.0);
+        let files: Vec<PathBuf> = ["a.txt", "b.txt", "c.txt"].iter().map(|n| dir.join(n)).collect();
+        app.net.rename = Arc::new(|from, to| {
+            if from.ends_with("b.txt") { Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT)) } else { crate::compat::rename_noreplace(from, to) }
+        });
+        open_batch(&mut app, &ctx, &mut frame, &mut time, &files);
+        click_rename(&mut app, &ctx, &mut frame, &mut time);
+        finish_batch(&mut app, &ctx);
+        assert!(dir.join("new_a.txt").exists() && dir.join("b.txt").exists() && dir.join("new_c.txt").exists());
+        assert_eq!(app.toast_message(), Some("Failed: Renamed 2 items, then: The connection timed out"));
+        assert_eq!(names(&app), ["b.txt", "new_a.txt", "new_c.txt"]);
+        assert!(app.net.renaming.is_empty());
+        let entry = app.history.pop_undo().expect("an undo entry");
+        assert!(matches!(&entry.edits[..], [Edit::Renames(back)] if back.len() == 2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn several_items_renamed_in_a_local_folder_are_renamed_at_once_without_a_job() {
+        let dir = std::env::temp_dir().join(format!("compression_batch_local_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["a.txt", "b.txt"] {
+            std::fs::write(dir.join(n), n).unwrap();
+        }
+        let dir = dir.canonicalize().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(dir.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let (mut frame, mut time) = (eframe::Frame::_new_kittest(), 0.0);
+        open_batch(&mut app, &ctx, &mut frame, &mut time, &[dir.join("a.txt"), dir.join("b.txt")]);
+        click_rename(&mut app, &ctx, &mut frame, &mut time);
+        assert!(app.dialog.is_none());
+        assert!(app.engine.jobs.is_empty(), "a local rename is not a job");
+        assert!(dir.join("new_a.txt").exists() && dir.join("new_b.txt").exists() && !dir.join("a.txt").exists());
+        assert_eq!(app.toast_message(), Some("Renamed 2 items"));
+        assert!(app.net.renaming.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -23,6 +23,8 @@ pub enum JobKind {
     Delete,
     /// New permissions for everything inside a folder.
     Permissions,
+    /// Several items renamed on a server.
+    Rename,
     Other,
 }
 
@@ -254,7 +256,7 @@ pub struct Job {
 impl Job {
     /// Pausing and cancelling make sense where the work moves through files one at a time.
     pub fn controllable(&self) -> bool {
-        matches!(self.kind, JobKind::Copy | JobKind::Move | JobKind::Delete | JobKind::Extract | JobKind::Compress | JobKind::Permissions)
+        matches!(self.kind, JobKind::Copy | JobKind::Move | JobKind::Delete | JobKind::Extract | JobKind::Compress | JobKind::Permissions | JobKind::Rename)
     }
 
     pub fn paused(&self) -> bool {
@@ -2684,7 +2686,7 @@ mod tests {
     /// is never a success: `ok` and `cancelled` do not hold together, for every kind of job.
     #[test]
     fn a_cancelled_job_is_never_ok_whatever_its_own_code_reports() {
-        for kind in [JobKind::Copy, JobKind::Move, JobKind::Extract, JobKind::Compress, JobKind::Delete, JobKind::Permissions, JobKind::Other] {
+        for kind in [JobKind::Copy, JobKind::Move, JobKind::Extract, JobKind::Compress, JobKind::Delete, JobKind::Permissions, JobKind::Rename, JobKind::Other] {
             let mut e = engine();
             let id = e.spawn(kind, "t".into(), String::new(), |w| {
                 while w.shared.checkpoint().is_ok() {

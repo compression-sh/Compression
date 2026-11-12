@@ -40,6 +40,7 @@ fn job_icon(kind: JobKind) -> &'static str {
         JobKind::Compress => icons::COMPRESS,
         JobKind::Delete => icons::DELETE_FOREVER,
         JobKind::Permissions => icons::LOCK,
+        JobKind::Rename => icons::RENAME,
         JobKind::Other => icons::HISTORY,
     }
 }

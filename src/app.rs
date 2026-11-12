@@ -251,7 +251,8 @@ pub(crate) enum Dialog {
         for_file: bool,
         for_type: bool,
     },
-    BatchRename { entries: Vec<RenameEntry>, rules: RenameRules, first_frame: bool },
+    /// `error`: why a rename on a server was not started (an item of it is already being renamed).
+    BatchRename { entries: Vec<RenameEntry>, rules: RenameRules, first_frame: bool, error: Option<String> },
     Compress {
         sources: Vec<PathBuf>,
         /// Selected items that lie in other folders than this one: not in the archive, and the dialog says so.
@@ -5983,7 +5984,7 @@ impl CompressionApp {
                 RenameEntry { is_dir: self.item_is_dir(&path).unwrap_or(false), path, date }
             })
             .collect();
-        self.dialog = Some(Dialog::BatchRename { entries, rules: RenameRules::new(), first_frame: true });
+        self.dialog = Some(Dialog::BatchRename { entries, rules: RenameRules::new(), first_frame: true, error: None });
     }
 
     /// Say what treating a folder as a server means, and set it only when the person agrees.
@@ -6066,6 +6067,82 @@ impl CompressionApp {
     }
 
     /// Refresh the listing after a batch rename and keep the renamed items selected.
+    /// Renames the items of `entries` on a server as a job: the items are marked as being renamed (dimmed, and not to be
+    /// renamed again) until the job has ended, and the window is told on its own channel what was done and how the
+    /// renamed items look (read by the job, not here).
+    fn start_batch_rename_job(&mut self, entries: &[RenameEntry], names: &[String]) -> Result<(), String> {
+        let changes: Vec<(PathBuf, PathBuf)> = entries
+            .iter()
+            .zip(names)
+            .filter(|(e, n)| e.path.file_name().is_some_and(|old| old.to_string_lossy() != n.as_str()))
+            .map(|(e, n)| (e.path.clone(), e.path.with_file_name(n.as_str())))
+            .collect();
+        if let Some((busy, _)) = changes.iter().find(|(old, _)| self.net.is_being_renamed(old)) {
+            let name = busy.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            return Err(trf("“{}” is already being renamed", &[&name]));
+        }
+        for (old, target) in &changes {
+            self.net.renaming.insert(old.clone(), target.clone());
+        }
+        let (entries, names) = (entries.to_vec(), names.to_vec());
+        let (tx, ctx) = (self.net.tx.clone(), self.ctx.clone());
+        let rename = self.net.renamer();
+        let title = trn(changes.len(), "Renaming of {} item", "Renaming of {} items");
+        self.engine.spawn(JobKind::Rename, title, String::new(), move |w| {
+            use std::sync::atomic::Ordering::Relaxed;
+            w.shared.files_total.store(changes.len() as u64, Relaxed);
+            let shared = w.shared.clone();
+            let applied = batch_rename::apply_with(&entries, &names, &*rename, &|| shared.cancel.load(Relaxed), &|done, total| {
+                shared.files_done.store(done as u64, Relaxed);
+                shared.files_total.store(total as u64, Relaxed);
+            });
+            // What the renamed items look like, read here where waiting for a server does no harm
+            let items: Vec<(PathBuf, PathBuf, Option<FileItem>)> = applied.done.iter().map(|(old, new)| (old.clone(), new.clone(), FileItem::from_path(new))).collect();
+            let _ = tx.send(network_ui::NetMsg::BatchRenamed { all: changes.into_iter().map(|(old, _)| old).collect(), items });
+            ctx.request_repaint();
+            let count = applied.done.len();
+            let back: Vec<(PathBuf, PathBuf)> = applied.done.iter().map(|(old, new)| (new.clone(), old.clone())).collect();
+            let effect = if count > 0 { Effect::Record(UndoEntry::new(trn(count, "Renaming of {} item", "Renaming of {} items"), vec![Edit::Renames(back)])) } else { Effect::None };
+            let outcome = if applied.cancelled {
+                let mut stopped = Outcome::stopped();
+                stopped.message = trf("Cancelled after {}", &[&trn(count, "{} item", "{} items")]);
+                stopped
+            } else if let Some(err) = applied.error {
+                Outcome::failed(if count > 0 { trf("Renamed {} items, then: {}", &[&count, &err]) } else { err })
+            } else {
+                Outcome::done(trn(count, "Renamed {} item", "Renamed {} items"))
+            };
+            outcome.with(effect)
+        });
+        Ok(())
+    }
+
+    /// The items a rename job on a server renamed show under their new names, selected, in the folder that is shown (or
+    /// in place, in a list of results). Nothing here looks at the server: the job read the items. Pins, history and
+    /// plugins follow when the job ends (`finish_job`).
+    pub(super) fn show_batch_renamed(&mut self, items: Vec<(PathBuf, PathBuf, Option<FileItem>)>) {
+        let mixed = self.is_mixed_listing();
+        let mut shown = Vec::new();
+        for (old, new, item) in items {
+            if mixed {
+                if let Some(idx) = self.items.iter().position(|i| i.path == old)
+                    && let Some(item) = item
+                {
+                    self.items[idx] = item;
+                    shown.push(new);
+                }
+            } else if new.parent() == Some(self.current_path.as_path()) {
+                self.items.retain(|i| i.path != old);
+                self.add_listed_item(&new, item);
+                shown.push(new);
+            }
+        }
+        self.selection = shown.iter().filter_map(|new| self.items.iter().position(|i| &i.path == new)).collect();
+        self.selected_index = self.selection.iter().next().copied();
+        self.anchor = self.selected_index;
+        self.last_cursor = self.selected_index;
+    }
+
     fn finish_batch_rename(&mut self, done: &[(PathBuf, PathBuf)]) {
         for (old, new) in done {
             self.retarget_path(old, new);
@@ -6091,7 +6168,7 @@ impl CompressionApp {
     }
 
     fn batch_rename_contents(&mut self, ui: &mut egui::Ui, dialog: &mut Dialog) -> bool {
-        let Dialog::BatchRename { entries, rules, first_frame } = dialog else { return false };
+        let Dialog::BatchRename { entries, rules, first_frame, error } = dialog else { return false };
         let theme = self.theme;
         let names = batch_rename::preview(entries, rules);
         let problem = batch_rename::problem(entries, &names);
@@ -6233,19 +6310,27 @@ impl CompressionApp {
                 }
             });
         });
-        if let Some(err) = &problem {
+        if let Some(err) = problem.as_ref().or(error.as_ref()) {
             ui.label(egui::RichText::new(err).size(material::FONT_CAPTION).color(theme.red));
         }
 
         if submit && problem.is_none() && changed {
-            let (done, error) = batch_rename::apply(entries, &names);
-            let count = done.len();
-            self.finish_batch_rename(&done);
-            match error {
-                None => self.set_toast(trn(count, "Renamed {} item", "Renamed {} items")),
-                Some(err) => self.set_toast(trf("Renamed {} items, then: {}", &[&count, &err])),
+            if entries.iter().any(|e| network::is_remote(&e.path)) {
+                // A server may take its time: the renaming is a job, with progress and a way to stop it
+                match self.start_batch_rename_job(entries, &names) {
+                    Ok(()) => close = true,
+                    Err(why) => *error = Some(why),
+                }
+            } else {
+                let (done, failure) = batch_rename::apply(entries, &names);
+                let count = done.len();
+                self.finish_batch_rename(&done);
+                match failure {
+                    None => self.set_toast(trn(count, "Renamed {} item", "Renamed {} items")),
+                    Some(err) => self.set_toast(trf("Renamed {} items, then: {}", &[&count, &err])),
+                }
+                close = true;
             }
-            close = true;
         }
         close
     }
