@@ -377,11 +377,12 @@ pub fn unique_path_where(dir: &Path, name: &std::ffi::OsStr, suffix: &str, reser
     if free(&direct) {
         return direct;
     }
-    let name = name.to_string_lossy();
-    let (stem, ext) = split_name(&name);
+    // Made of the bytes of the name, so a name that is not UTF-8 keeps them
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let (stem, ext) = split_bytes(name.as_bytes());
     for n in 1.. {
         let tag = if n == 1 { format!(" ({suffix})") } else { format!(" ({suffix} {n})") };
-        let candidate = dir.join(format!("{stem}{tag}{ext}"));
+        let candidate = dir.join(std::ffi::OsString::from_vec([stem, tag.as_bytes(), ext].concat()));
         if free(&candidate) {
             return candidate;
         }
@@ -391,15 +392,22 @@ pub fn unique_path_where(dir: &Path, name: &std::ffi::OsStr, suffix: &str, reser
 
 /// `("archive", ".tar.gz")` / `("photo", ".png")` / `("Makefile", "")`.
 fn split_name(name: &str) -> (&str, &str) {
+    // The split is at an ASCII dot, so both halves are whole UTF-8
+    let stem = split_bytes(name.as_bytes()).0.len();
+    (&name[..stem], &name[stem..])
+}
+
+/// `split_name` for the bytes of a name, which need not be UTF-8.
+fn split_bytes(name: &[u8]) -> (&[u8], &[u8]) {
     for double in [".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst"] {
-        if let Some(stem) = name.strip_suffix(double)
+        if let Some(stem) = name.strip_suffix(double.as_bytes())
             && !stem.is_empty() {
                 return (stem, &name[stem.len()..]);
             }
     }
-    match name.rfind('.') {
+    match name.iter().rposition(|&b| b == b'.') {
         Some(i) if i > 0 => (&name[..i], &name[i..]),
-        _ => (name, ""),
+        _ => (name, &[]),
     }
 }
 
@@ -1099,6 +1107,28 @@ pub fn extract_beside(archive: &Path, control: &Control) -> io::Result<PathBuf> 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_free_name_for_a_name_that_is_not_utf8_keeps_its_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let dir = dir("unique_bytes");
+        // A name in Latin-1, and one with a double extension
+        for (name, first, second) in [
+            (&b"Bericht-\xe4.txt"[..], &b"Bericht-\xe4 (copy).txt"[..], &b"Bericht-\xe4 (copy 2).txt"[..]),
+            (b"\xff\xfe.tar.gz", b"\xff\xfe (copy).tar.gz", b"\xff\xfe (copy 2).tar.gz"),
+        ] {
+            let name = std::ffi::OsString::from_vec(name.to_vec());
+            std::fs::write(dir.join(&name), "x").unwrap();
+            let free = unique_path(&dir, &name, "copy");
+            assert_eq!(free.file_name().unwrap().as_bytes(), first);
+            std::fs::write(&free, "x").unwrap();
+            assert_eq!(unique_path(&dir, &name, "copy").file_name().unwrap().as_bytes(), second);
+        }
+        assert_eq!(split_name("photo.png"), ("photo", ".png"));
+        assert_eq!(split_name("ä.tar.gz"), ("ä", ".tar.gz"));
+        assert_eq!(split_name(".bashrc"), (".bashrc", ""));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("compression_ops_{name}_{}", std::process::id()));
