@@ -69,6 +69,25 @@ pub struct Spec {
     pub choices: Vec<Choice>,
 }
 
+/// The options of a file dialog request that stand alone, and those that take the next argument as their value.
+/// What the portal builds (`portal.rs`) uses these and no others.
+const FLAG_OPTIONS: &[&str] = &["--chooser", "--multiple"];
+const VALUE_OPTIONS: &[&str] = &["--mode", "--title", "--accept", "--folder", "--name", "--file", "--parent", "--app-id", "--choice", "--current-filter", "--filter"];
+
+/// The first argument of a dialog request that is not one of its options or the value of one: a folder or a stray
+/// word, which a dialog has no use for.
+pub fn stray_argument(args: &[String]) -> Option<&String> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if VALUE_OPTIONS.contains(&arg.as_str()) {
+            it.next();
+        } else if !FLAG_OPTIONS.contains(&arg.as_str()) {
+            return Some(arg);
+        }
+    }
+    None
+}
+
 impl Spec {
     /// Reads the arguments after `--chooser`; `None` when they are not a chooser request.
     pub fn parse(args: &[String]) -> Option<Self> {
@@ -465,5 +484,19 @@ mod tests {
         assert_eq!(spec.mode, Mode::Save);
         assert_eq!(spec.name.as_deref(), Some("a.txt"));
         assert_eq!(spec.filters[0].patterns.len(), 2);
+    }
+
+    #[test]
+    fn the_words_of_a_dialog_request_are_its_options_and_their_values() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for option in VALUE_OPTIONS {
+            assert_eq!(stray_argument(&words(&["--chooser", option, "any value"])), None, "{option}");
+            // A value that looks like an option is a value
+            assert_eq!(stray_argument(&words(&["--chooser", option, "--chooser"])), None, "{option}");
+        }
+        assert_eq!(stray_argument(&words(&["--chooser", "--multiple"])), None);
+        assert_eq!(stray_argument(&words(&["--chooser", "--mode"])), None, "a missing value is for `Spec::parse` to refuse");
+        assert_eq!(stray_argument(&words(&["--chooser", "--bogus", "--mode", "open", "/tmp"])), Some(&"--bogus".to_owned()));
+        assert_eq!(stray_argument(&words(&["--chooser", "--mode", "open", "/tmp"])), Some(&"/tmp".to_owned()));
     }
 }

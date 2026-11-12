@@ -221,6 +221,14 @@ impl CompressionApp {
         self.switch_tab(0);
     }
 
+    /// Open the targets of a launch that did not fit in windows of their own as tabs after the first, and show the first.
+    pub fn open_launch_tabs(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            self.new_tab(path.clone());
+        }
+        self.switch_tab(0);
+    }
+
     pub(super) fn tab_index(&self, id: u64) -> Option<usize> {
         self.tabs.iter().position(|t| t.id == id)
     }
