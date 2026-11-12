@@ -485,7 +485,9 @@ impl Engine {
         std::thread::spawn(move || {
             let mut outcome = work(&mut worker);
             if worker.shared.cancel.load(Relaxed) {
+                // A job that was stopped is never a success, whatever its own code said (it may have failed nothing before the stop)
                 outcome.cancelled = true;
+                outcome.ok = false;
             }
             let _ = tx.send(Event::Done { job: id, outcome });
             ctx.request_repaint();
@@ -2676,6 +2678,53 @@ mod tests {
             let _ = std::fs::remove_dir_all(&trash);
         }
         let _ = std::fs::remove_dir_all(&to);
+    }
+
+    /// A job whose own code reports success even though it was stopped (it had failed nothing when the stop came)
+    /// is never a success: `ok` and `cancelled` do not hold together, for every kind of job.
+    #[test]
+    fn a_cancelled_job_is_never_ok_whatever_its_own_code_reports() {
+        for kind in [JobKind::Copy, JobKind::Move, JobKind::Extract, JobKind::Compress, JobKind::Delete, JobKind::Permissions, JobKind::Other] {
+            let mut e = engine();
+            let id = e.spawn(kind, "t".into(), String::new(), |w| {
+                while w.shared.checkpoint().is_ok() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Outcome::done("looks fine".into())
+            });
+            e.cancel(id);
+            let outcome = wait(&mut e).into_iter().find_map(|ev| if let Event::Done { outcome, .. } = ev { Some(outcome) } else { None }).expect("the job ended");
+            assert!(outcome.cancelled && !outcome.ok, "{kind:?}: cancelled={} ok={}", outcome.cancelled, outcome.ok);
+            assert_eq!(e.jobs.iter().find(|j| j.id == id).map(|j| j.state), Some(JobState::Cancelled), "{kind:?}");
+        }
+    }
+
+    /// The real jobs that end with `done` when stopped (deleting for good, a copy that failed nothing) say not ok either.
+    #[test]
+    fn a_stopped_delete_and_a_stopped_copy_are_not_ok() {
+        let dir = sandbox("cancel_ok");
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        let files: Vec<PathBuf> = (0..3).map(|i| dir.join(format!("f{i}"))).collect();
+        for f in &files {
+            std::fs::write(f, "x").unwrap();
+        }
+        let mut e = engine();
+        let delete = files.clone();
+        e.spawn(JobKind::Delete, "d".into(), String::new(), move |w| {
+            w.shared.cancel.store(true, Relaxed);
+            delete_forever(w, delete)
+        });
+        let outcome = wait(&mut e).into_iter().find_map(|ev| if let Event::Done { outcome, .. } = ev { Some(outcome) } else { None }).unwrap();
+        assert!(outcome.cancelled && !outcome.ok, "delete: ok={}", outcome.ok);
+        assert!(files.iter().all(|f| f.exists()), "nothing was deleted");
+        let pairs: Vec<(PathBuf, PathBuf)> = files.iter().map(|f| (f.clone(), dir.join("dst").join(f.file_name().unwrap()))).collect();
+        e.spawn(JobKind::Copy, "c".into(), String::new(), move |w| {
+            w.shared.cancel.store(true, Relaxed);
+            transfer(w, Op::Copy, pairs)
+        });
+        let outcome = wait(&mut e).into_iter().find_map(|ev| if let Event::Done { outcome, .. } = ev { Some(outcome) } else { None }).unwrap();
+        assert!(outcome.cancelled && !outcome.ok, "copy: ok={}", outcome.ok);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn wait(engine: &mut Engine) -> Vec<Event> {

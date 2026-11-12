@@ -97,8 +97,8 @@ impl CompressionApp {
                         self.history_job = None;
                     }
                     // What a move did move (not what the file system says now: a server may not answer)
-                    // A cancelled job can still say ok (nothing failed before it stopped): the cut is done with only when everything was moved
-                    let (moved, ok) = (moved_sources(&outcome), outcome.ok && !outcome.cancelled);
+                    // `ok` is never true for a job that was cancelled (the engine sees to it): the cut is done with only when everything was moved
+                    let (moved, ok) = (moved_sources(&outcome), outcome.ok);
                     self.paste_finished(job, &moved, ok);
                     self.finish_job(outcome);
                     self.report_removals(job);
