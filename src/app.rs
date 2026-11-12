@@ -558,7 +558,10 @@ pub struct CompressionApp {
     path_input: String,
     /// Folders that continue the typed path, with the one picked by the arrow keys.
     path_suggestions: Vec<String>,
+    /// The text the last search for suggestions was started for.
     path_suggestions_for: String,
+    /// The search for suggestions under way, and the text it is for (see `update_path_suggestions`).
+    path_suggesting: Option<(String, mpsc::Receiver<Vec<String>>)>,
     path_suggestion_sel: Option<usize>,
     /// Where the suggestion list was drawn last frame, so a click on it doesn't end editing.
     path_popup_rect: Option<egui::Rect>,
@@ -857,6 +860,7 @@ impl CompressionApp {
             path_field_open: false,
             path_suggestions: Vec::new(),
             path_suggestions_for: String::new(),
+            path_suggesting: None,
             path_suggestion_sel: None,
             path_popup_rect: None,
             path_input: canonical_path.to_string_lossy().to_string(),
@@ -3608,15 +3612,7 @@ impl CompressionApp {
             }
             resp.request_focus();
         }
-        if self.path_suggestions_for != self.path_input {
-            self.path_suggestions_for.clone_from(&self.path_input);
-            self.path_suggestions = network::completions(&self.path_input).unwrap_or_else(|| crate::fs::complete::dir_completions(&self.path_input));
-            // Nothing left to complete once the typed folder is the only match
-            if self.path_suggestions.len() == 1 && self.path_suggestions[0] == self.path_input {
-                self.path_suggestions.clear();
-            }
-            self.path_suggestion_sel = None;
-        }
+        self.update_path_suggestions(ui.ctx());
         if !resp.has_focus() && !resp.lost_focus() {
             resp.request_focus();
         }
@@ -3645,9 +3641,49 @@ impl CompressionApp {
         if !self.is_editing_path {
             self.path_suggestions.clear();
             self.path_suggestions_for.clear();
+            self.path_suggesting = None;
             self.path_suggestion_sel = None;
             self.path_popup_rect = None;
         }
+    }
+
+    /// Keeps the folders suggested under the path field in step with what is typed. They are looked for on a thread (a
+    /// folder on a server, or on a drive that hangs, would hold the window up), one search at a time, so a drive that
+    /// hangs holds one thread and no more; a result is taken only when it was made for what the field says now. Until
+    /// then the suggestions that still fit the text stay.
+    fn update_path_suggestions(&mut self, ctx: &egui::Context) {
+        if let Some((text, rx)) = &self.path_suggesting {
+            match rx.try_recv() {
+                Ok(found) => {
+                    if *text == self.path_input {
+                        self.path_suggestions = found;
+                        // Nothing left to complete once the typed folder is the only match
+                        if self.path_suggestions.len() == 1 && self.path_suggestions[0] == self.path_input {
+                            self.path_suggestions.clear();
+                        }
+                    }
+                    self.path_suggesting = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => self.path_suggesting = None,
+            }
+        }
+        if self.path_suggestions_for == self.path_input {
+            return;
+        }
+        self.path_suggestions_for.clone_from(&self.path_input);
+        let typed = self.path_input.to_lowercase();
+        self.path_suggestions.retain(|s| s.to_lowercase().starts_with(&typed) && s.len() > typed.len());
+        self.path_suggestion_sel = None;
+        let (tx, rx) = mpsc::channel();
+        let (text, ctx) = (self.path_input.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let found = network::completions(&text).unwrap_or_else(|| crate::fs::complete::dir_completions(&text));
+            if tx.send(found).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+        self.path_suggesting = Some((self.path_input.clone(), rx));
     }
 
     /// The list of folders under the path field; returns the one clicked.
@@ -7811,6 +7847,44 @@ mod tests {
         assert!(!fine.join("b.txt").exists(), "the rest went to the trash");
         let said = app.toast_message().unwrap_or_default().to_owned();
         assert_eq!(said, "Moved “b.txt” to trash · Not moved to the trash, its drive does not answer: a.txt");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn suggestions_for_the_path_field_are_looked_for_on_a_thread_and_only_taken_for_the_text_they_were_made_for() {
+        let base = window_dir("path_suggest");
+        for f in ["sub", "south", "other"] {
+            std::fs::create_dir_all(base.join(f)).unwrap();
+        }
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let wait_for = |app: &mut CompressionApp, done: &dyn Fn(&CompressionApp) -> bool| {
+            for _ in 0..300 {
+                app.update_path_suggestions(&ctx);
+                // What was found for "s" is never shown for "su"
+                assert!(!app.path_suggestions.iter().any(|s| s.ends_with("/south")), "{:?}", app.path_suggestions);
+                if done(app) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        };
+        // A drive that hangs: the window goes on at once, with nothing to suggest yet
+        crate::fs::mount_health::tests::hang_under(&base);
+        app.path_input = format!("{}/s", base.display());
+        let start = std::time::Instant::now();
+        app.update_path_suggestions(&ctx);
+        assert!(start.elapsed() < std::time::Duration::from_millis(500), "{:?}", start.elapsed());
+        assert!(app.path_suggestions.is_empty() && app.path_suggesting.is_some());
+        // More typing while it hangs starts no second search
+        app.path_input = format!("{}/su", base.display());
+        app.update_path_suggestions(&ctx);
+        assert_eq!(app.path_suggesting.as_ref().map(|(t, _)| t.clone()), Some(format!("{}/s", base.display())));
+        // Once it answers, the result for "s" is not taken for "su": "su" is asked for, and that is taken
+        crate::fs::mount_health::tests::answer_again(&base);
+        assert!(wait_for(&mut app, &|a| a.path_suggesting.is_none() && !a.path_suggestions.is_empty()), "{:?}", app.path_suggestions);
+        assert_eq!(app.path_suggestions, [format!("{}/sub", base.display())]);
         let _ = std::fs::remove_dir_all(&base);
     }
 

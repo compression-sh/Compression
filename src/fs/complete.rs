@@ -10,6 +10,12 @@ pub fn dir_completions(input: &str) -> Vec<String> {
     let Some(slash) = input.rfind('/') else { return Vec::new() };
     let (head, prefix) = input.split_at(slash + 1);
     let dir = if head == "/" { Path::new("/") } else { Path::new(&head[..slash]) };
+    // A folder on a server is not read unless the settings allow looking there (as for previews and the search)
+    if !super::network::previews_allowed(dir) {
+        return Vec::new();
+    }
+    #[cfg(test)]
+    super::mount_health::tests::hang_if_asked_to(dir);
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let prefix_lower = prefix.to_lowercase();
     let show_hidden = prefix.starts_with('.');
@@ -47,4 +53,21 @@ pub fn extend(input: &str, suggestions: &[String]) -> Option<String> {
     }
     let common = &first[..common];
     (common.len() > input.len()).then(|| common.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_on_a_server_is_not_read_for_suggestions_unless_previews_are_allowed_there() {
+        let dir = std::env::temp_dir().join(format!("compression_complete_remote_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("abc")).unwrap();
+        let typed = format!("{}/a", dir.display());
+        assert_eq!(dir_completions(&typed), [format!("{}/abc", dir.display())]);
+        crate::fs::network::declare_remote_for_tests(&dir);
+        assert!(dir_completions(&typed).is_empty(), "the server's folder was read");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

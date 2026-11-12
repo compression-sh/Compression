@@ -136,7 +136,7 @@ pub(crate) mod tests {
         HANGING.lock().unwrap().push(dir.to_path_buf());
     }
 
-    pub(super) fn hang_if_asked_to(dir: &Path) {
+    pub(crate) fn hang_if_asked_to(dir: &Path) {
         while HANGING.lock().unwrap().iter().any(|h| dir.starts_with(h)) {
             std::thread::sleep(Duration::from_millis(50));
         }
