@@ -360,7 +360,8 @@ fn record_of(root: &Path, trashed: &Path) -> PathBuf {
     root.join("info").join(format!("{}.trashinfo", trashed.file_name().unwrap_or_default().to_string_lossy()))
 }
 
-fn now() -> String {
+/// The local time, as `.trashinfo` records write it: `2026-11-12T10:15:00`.
+pub(crate) fn now() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as libc::time_t)

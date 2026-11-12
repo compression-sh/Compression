@@ -378,10 +378,12 @@ impl Settings {
 
     /// Writes the settings file. An error means the file was not written (full disk, no rights, a folder in the way);
     /// the caller must not count the settings as saved then.
-    pub fn save(&self) -> std::io::Result<()> {
+    /// Writes the settings. `Some` when the file that was there could not be read and was first kept aside, under
+    /// the name given (see `set_aside_if_broken`).
+    pub fn save(&self) -> std::io::Result<Option<PathBuf>> {
         // As administrator the settings belong to someone else's home
         if crate::fs::admin::is_admin() {
-            return Ok(());
+            return Ok(None);
         }
         #[cfg(test)]
         #[allow(clippy::needless_return)]
@@ -392,22 +394,52 @@ impl Settings {
             }
             // A test never writes the settings of whoever runs it (`NO_SAVE` stays for the tests that set it)
             let _ = NO_SAVE.with(std::cell::Cell::get);
-            return Ok(());
+            return Ok(None);
         }
         #[cfg(not(test))]
         {
-            let Some(file) = file() else { return Ok(()) };
+            let Some(file) = file() else { return Ok(None) };
             self.save_to(&file)
         }
     }
 
-    pub(crate) fn save_to(&self, file: &std::path::Path) -> std::io::Result<()> {
+    /// Writes the settings to `file`. A file there that cannot be read is never written over: it is kept aside
+    /// first, and when that fails nothing is written.
+    pub(crate) fn save_to(&self, file: &std::path::Path) -> std::io::Result<Option<PathBuf>> {
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        let kept = set_aside_if_broken(file)?.map(|(kept, _)| kept);
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        crate::fs::atomic::write(file, json)
+        crate::fs::atomic::write(file, json)?;
+        Ok(kept)
     }
+}
+
+/// A settings file that is there but cannot be read (not valid JSON, a value of the wrong type, not UTF-8) is moved to
+/// `settings.json.broken-<time>` beside it, so that a slip in an edit by hand costs no settings: what would be written
+/// next goes to a file of its own. Returns where it went and why it could not be read; `None` when there is no file or
+/// it reads well.
+pub(crate) fn set_aside_if_broken(file: &std::path::Path) -> std::io::Result<Option<(PathBuf, String)>> {
+    let bytes = match std::fs::read(file) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Err(err) = serde_json::from_slice::<Settings>(&bytes) else { return Ok(None) };
+    let why = crate::fs::describe::json_error(&err);
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let stamp = crate::fs::trash::now().replace(':', "");
+    for n in 1..100 {
+        let tag = if n == 1 { stamp.clone() } else { format!("{stamp}-{n}") };
+        let kept = file.with_file_name(format!("{name}.broken-{tag}"));
+        match crate::compat::rename_noreplace(file, &kept) {
+            Ok(()) => return Ok(Some((kept, why))),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
 }
 
 
@@ -485,6 +517,54 @@ mod tests {
         let good = base.join("new").join("compression").join("settings.json");
         settings.save_to(&good).unwrap();
         assert!(Settings::parse(&std::fs::read_to_string(&good).unwrap()).unwrap().show_hidden);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn broken_kept(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut kept: Vec<PathBuf> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().contains("settings.json.broken-")).collect();
+        kept.sort();
+        kept
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_read_is_kept_aside_and_one_that_can_is_left_alone() {
+        let base = std::env::temp_dir().join(format!("compression_settings_broken_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("settings.json");
+        // No file, and a good one: nothing to do
+        assert!(set_aside_if_broken(&file).unwrap().is_none());
+        std::fs::write(&file, r#"{ "show_hidden": true }"#).unwrap();
+        assert!(set_aside_if_broken(&file).unwrap().is_none());
+        assert!(file.exists() && broken_kept(&base).is_empty());
+        // Not valid JSON, a value of the wrong type, not UTF-8: each is kept whole under a name of its own
+        let mut seen = Vec::new();
+        for bytes in [&b"{ \"show_hidden\": tru"[..], br#"{ "show_hidden": "yes" }"#, b"\xff\xfe{}"] {
+            std::fs::write(&file, bytes).unwrap();
+            let (kept, why) = set_aside_if_broken(&file).unwrap().expect("kept aside");
+            assert!(!file.exists(), "the broken file is moved, not copied");
+            assert_eq!(std::fs::read(&kept).unwrap(), bytes, "kept as it was");
+            assert!(kept.file_name().unwrap().to_string_lossy().starts_with("settings.json.broken-"), "{kept:?}");
+            assert!(!why.is_empty());
+            seen.push(kept);
+        }
+        assert_eq!(broken_kept(&base), { let mut s = seen.clone(); s.sort(); s }, "three files, none written over");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn saving_over_a_file_that_cannot_be_read_keeps_it_first() {
+        let base = std::env::temp_dir().join(format!("compression_settings_save_broken_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("settings.json");
+        std::fs::write(&file, "{ \"language\": \"de\", oops").unwrap();
+        let kept = Settings { show_hidden: true, ..Settings::default() }.save_to(&file).unwrap().expect("kept aside");
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "{ \"language\": \"de\", oops");
+        assert!(Settings::parse(&std::fs::read_to_string(&file).unwrap()).unwrap().show_hidden, "the new file is whole");
+        // A good file is simply written over
+        assert!(Settings::default().save_to(&file).unwrap().is_none());
+        assert_eq!(broken_kept(&base), [kept]);
         std::fs::remove_dir_all(&base).unwrap();
     }
 }

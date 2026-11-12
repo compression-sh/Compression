@@ -1886,6 +1886,24 @@ impl CompressionApp {
         }
     }
 
+    /// At the start: a settings file that cannot be read is kept aside (the defaults are in use, and the next save would
+    /// write them over it) and the person is told where it went. `file` is `settings::file()`; nothing is done as
+    /// administrator, whose window never writes the settings.
+    pub(crate) fn tell_about_broken_settings(&mut self, file: Option<&Path>) {
+        let Some(file) = file.filter(|_| !crate::fs::admin::is_admin()) else { return };
+        match crate::settings::set_aside_if_broken(file) {
+            Ok(Some((kept, why))) => self.tell_settings_kept(&kept, Some(&why)),
+            Ok(None) => {}
+            Err(err) => self.set_toast(trf("The settings file could not be read, and could not be kept aside: {}", &[&crate::fs::describe::io_error(&err)])),
+        }
+    }
+
+    fn tell_settings_kept(&mut self, kept: &Path, why: Option<&str>) {
+        let name = kept.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let why = why.map_or_else(|| tr("it has an error").to_owned(), str::to_owned);
+        self.set_toast(trf("The settings file could not be read ({}). It was kept as “{}”, and the default settings are used.", &[&why, &name]));
+    }
+
     pub(crate) fn tell_about_theme_problems(&mut self) {
         let now: Vec<String> = crate::ui::theme::problems().iter().map(|p| p.describe()).collect();
         if now != self.theme_problems_told {
@@ -2142,7 +2160,10 @@ impl CompressionApp {
             return false;
         }
         match settings.save() {
-            Ok(()) => {
+            Ok(kept) => {
+                if let Some(kept) = kept {
+                    self.tell_settings_kept(&kept, None);
+                }
                 self.saved_settings = settings;
                 self.settings_retry = None;
                 self.settings_error = None;
@@ -2883,7 +2904,7 @@ impl Drop for CompressionApp {
         recent::flush();
         let current = self.current_settings();
         if current != self.saved_settings {
-            save_on_close(|| current.save(), unsaved_note().as_deref());
+            save_on_close(|| current.save().map(drop), unsaved_note().as_deref());
         }
     }
 }
@@ -7701,6 +7722,32 @@ mod tests {
         drop(app);
         assert!(!note.exists());
         UNSAVED_NOTE_FOR_TESTS.with(|n| *n.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_read_is_kept_aside_at_the_start_and_the_person_is_told() {
+        let base = window_dir("broken_settings");
+        let file = base.join("config/compression/settings.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "{ \"show_hidden\": true,, }").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.tell_about_broken_settings(Some(&file));
+        assert!(!file.exists(), "nothing is left there for the next save to write over");
+        let kept: Vec<PathBuf> = std::fs::read_dir(file.parent().unwrap()).unwrap().flatten().map(|e| e.path()).collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "{ \"show_hidden\": true,, }");
+        let name = kept[0].file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("settings.json.broken-"), "{name}");
+        let toast = app.toast_message().unwrap_or_default().to_owned();
+        assert!(toast.contains(&name) && toast.contains("line 1") && toast.contains("default settings"), "{toast}");
+        // A good file, or none, is no news
+        app.status_toast = None;
+        app.tell_about_broken_settings(Some(&file));
+        std::fs::write(&file, "{}").unwrap();
+        app.tell_about_broken_settings(Some(&file));
+        assert!(app.status_toast.is_none() && file.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

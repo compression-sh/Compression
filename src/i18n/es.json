@@ -934,5 +934,8 @@
   "The archive could not be listed": "No se pudo listar el contenido del archivo",
   "“{}” could not get its name back and is now called “{}”": "«{}» no pudo recuperar su nombre y ahora se llama «{}»",
   "The settings could not be saved when Compression was last closed: {}": "No se pudieron guardar los ajustes la última vez que se cerró Compression: {}",
+  "The settings file could not be read ({}). It was kept as “{}”, and the default settings are used.": "No se pudo leer el archivo de ajustes ({}). Se guardó como “{}” y se usan los ajustes predeterminados.",
+  "it has an error": "tiene un error",
+  "The settings file could not be read, and could not be kept aside: {}": "No se pudo leer el archivo de ajustes ni apartarlo: {}",
   "Pasted {} into {}": "{} pegado en {}"
 }
