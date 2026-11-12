@@ -80,7 +80,7 @@ pub fn list_capped(path: &Path, cap: usize, limit: Duration, cancel: &AtomicBool
     let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     let ends = |exts: &[&str]| exts.iter().any(|e| name.ends_with(e));
     let deadline = Instant::now() + limit;
-    let fail = |e: io::Error| Failure::Other(e.to_string());
+    let fail = |e: io::Error| Failure::Other(crate::fs::describe::io_error(&e));
     let mut listing = if ends(&[".zip", ".jar", ".apk"]) {
         list_zip(path, cap).map_err(fail)?
     } else if ends(&[".tar.gz", ".tgz"]) {
@@ -93,7 +93,7 @@ pub fn list_capped(path: &Path, cap: usize, limit: Duration, cancel: &AtomicBool
             return Err(Failure::NoTool(tool));
         }
         let mut child = Command::new(tool).arg("-dc").arg("--").arg(path).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(fail)?;
-        let out = child.stdout.take().ok_or_else(|| Failure::Other("no output".into()))?;
+        let out = child.stdout.take().ok_or_else(|| Failure::Other(crate::i18n::tr("The program gave no output").to_owned()))?;
         let result = list_tar(out, cap, deadline, cancel);
         let _ = child.kill();
         let _ = child.wait();
@@ -210,8 +210,8 @@ fn list_7z(path: &Path, cap: usize, deadline: Instant, cancel: &AtomicBool) -> R
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| Failure::Other(e.to_string()))?;
-    let out = child.stdout.take().ok_or_else(|| Failure::Other("no output".into()))?;
+        .map_err(|e| Failure::Other(crate::fs::describe::io_error(&e)))?;
+    let out = child.stdout.take().ok_or_else(|| Failure::Other(crate::i18n::tr("The program gave no output").to_owned()))?;
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         for line in BufReader::new(out).split(b'\n').map_while(Result::ok) {

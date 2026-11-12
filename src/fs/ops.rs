@@ -586,7 +586,7 @@ fn run_tool(command: Command, control: &Control) -> io::Result<()> {
         Ok(output) if output.success => Ok(()),
         Ok(output) => {
             let text = String::from_utf8_lossy(if output.stderr.is_empty() { &output.stdout } else { &output.stderr });
-            Err(io::Error::other(text.lines().last().unwrap_or("command failed").to_owned()))
+            Err(io::Error::other(text.lines().last().unwrap_or(tr("The program failed")).to_owned()))
         }
         Err(Failure::Cancelled) => Err(stopped()),
         Err(Failure::TimedOut) => Err(timed_out()),
@@ -707,7 +707,7 @@ pub fn write_new(dir: &Path, name: &std::ffi::OsStr, suffix: &str, bytes: &[u8])
             Err(err) => return Err(err),
         }
     }
-    Err(last.unwrap_or_else(|| io::Error::other("no free name")))
+    Err(last.unwrap_or_else(|| io::Error::other(tr("No free name was found"))))
 }
 
 fn write_zip(base: &Path, names: &[std::ffi::OsString], file: std::fs::File, control: &Control) -> io::Result<()> {
@@ -838,7 +838,7 @@ pub fn extract_staged(archive: &Path, dest: &Path, control: &Control) -> io::Res
 
 /// Extract into a fresh folder next to the archive (`<archive stem>`), returning that folder.
 pub fn extract_beside(archive: &Path, control: &Control) -> io::Result<PathBuf> {
-    let parent = archive.parent().ok_or_else(|| io::Error::other("no parent folder"))?;
+    let parent = archive.parent().ok_or_else(|| io::Error::other(tr("It has no folder to go in")))?;
     let dest = unique_path(parent, std::ffi::OsStr::new(&archive_stem(archive)), "extracted");
     std::fs::create_dir(&dest)?;
     match extract(archive, &dest, control) {
@@ -1646,5 +1646,12 @@ pub(crate) mod tests {
         // A folder that is not there is an error of its own, and leaves nothing behind
         assert_eq!(write_new(&root.join("nope"), name, "copy", b"x").unwrap_err().kind(), io::ErrorKind::NotFound);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_errors_ops_makes_itself_are_in_words() {
+        let control = Control::unlimited();
+        let err = extract_beside(Path::new("/"), &control).unwrap_err();
+        assert_eq!(crate::fs::describe::io_error(&err), "It has no folder to go in");
     }
 }

@@ -961,7 +961,7 @@ impl Session {
             .stderr(Stdio::piped())
             .process_group(0)
             .spawn()
-            .map_err(|e| Failure::Message(e.to_string()))?;
+            .map_err(|e| Failure::Message(super::describe::io_error(&e)))?;
         self.drive_gio(child, address, CONNECT_TIMEOUT)
     }
 
@@ -969,7 +969,7 @@ impl Session {
     /// `timeout` (the time the person takes to answer does not count), and when the window gives up.
     fn drive_gio(&mut self, mut child: std::process::Child, address: &Address, timeout: std::time::Duration) -> Result<Attempt, Failure> {
         let mut stdin = child.stdin.take();
-        let mut stdout = child.stdout.take().ok_or_else(|| Failure::Message("gio".into()))?;
+        let mut stdout = child.stdout.take().ok_or_else(|| Failure::Message(tr("The connection program gave no output").to_owned()))?;
         let errors = child.stderr.take().map(|mut err| {
             std::thread::spawn(move || {
                 let mut text = String::new();
@@ -1081,7 +1081,7 @@ impl Session {
         }
         // Closing its input makes gio give up on a question it still waits for
         drop(stdin);
-        let status = child.wait().map_err(|e| Failure::Message(e.to_string()))?;
+        let status = child.wait().map_err(|e| Failure::Message(super::describe::io_error(&e)))?;
         let errors = errors.and_then(|t| t.join().ok()).unwrap_or_default();
         if let Some(outcome) = outcome {
             return outcome;
@@ -1108,7 +1108,7 @@ impl Session {
         let id = helper_id(&root);
         let point = helper_root().join(&id);
         if !is_mount_point(&point) {
-            std::fs::create_dir_all(&point).map_err(|e| Failure::Message(e.to_string()))?;
+            std::fs::create_dir_all(&point).map_err(|e| Failure::Message(super::describe::io_error(&e)))?;
             let mounted = if address.scheme == Scheme::Sftp && find_program("sshfs").is_some() {
                 self.sshfs(&root, &point)
             } else if find_program("rclone").is_some() && rclone_backend(address.scheme).is_some() {
@@ -1228,7 +1228,7 @@ impl Session {
         if known || find_program("ssh-keyscan").is_none() {
             return Ok(());
         }
-        let scan = Command::new("ssh-keyscan").args(["-T", "10", "-p", &port.to_string(), &root.host]).stderr(Stdio::null()).output().map_err(|e| Failure::Message(e.to_string()))?;
+        let scan = Command::new("ssh-keyscan").args(["-T", "10", "-p", &port.to_string(), &root.host]).stderr(Stdio::null()).output().map_err(|e| Failure::Message(super::describe::io_error(&e)))?;
         let keys = String::from_utf8_lossy(&scan.stdout).into_owned();
         if keys.trim().is_empty() {
             return Err(Failure::Message(trf("Could not reach {}", &[&root.host])));
@@ -1245,8 +1245,8 @@ impl Session {
                     use std::os::unix::fs::DirBuilderExt;
                     let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
                 }
-                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("known_hosts")).map_err(|e| Failure::Message(e.to_string()))?;
-                file.write_all(keys.as_bytes()).map_err(|e| Failure::Message(e.to_string()))?;
+                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("known_hosts")).map_err(|e| Failure::Message(super::describe::io_error(&e)))?;
+                file.write_all(keys.as_bytes()).map_err(|e| Failure::Message(super::describe::io_error(&e)))?;
                 Ok(())
             }
             _ => Err(Failure::Cancelled),
@@ -1457,7 +1457,7 @@ fn failure_of(failure: super::process::Failure) -> Failure {
         Stopped::TimedOut => Failure::Message(tr("The server did not answer within 30 seconds").to_owned()),
         Stopped::TooMuchOutput => Failure::Message(tr("The connection program printed too much").to_owned()),
         Stopped::Cancelled => Failure::Cancelled,
-        Stopped::Io(e) => Failure::Message(e.to_string()),
+        Stopped::Io(e) => Failure::Message(super::describe::io_error(&e)),
     }
 }
 
@@ -2211,5 +2211,17 @@ mod tests {
         let own = vec![row("me@host:/", "/run/user/1000/compression-net/sftp-me@host-1234", "fuse.sshfs")];
         let roots = remote_roots(&table_mounts(&own, Path::new("/run/user/1000/compression-net")), &own);
         assert_eq!(roots, vec![PathBuf::from("/run/user/1000/compression-net/sftp-me@host-1234")]);
+    }
+
+    #[test]
+    fn a_program_that_could_not_run_is_told_in_words_and_never_as_the_systems_english() {
+        use super::super::process::Failure as Stopped;
+        let said = |failure| match failure_of(failure) {
+            Failure::Message(text) => text,
+            _ => panic!("not a message"),
+        };
+        assert_eq!(said(Stopped::Io(std::io::Error::from_raw_os_error(libc::ENOENT))), "Not found");
+        assert_eq!(said(Stopped::Io(std::io::Error::from_raw_os_error(libc::ECONNREFUSED))), "The connection was refused");
+        assert_eq!(said(Stopped::Io(std::io::Error::from_raw_os_error(libc::ENOTBLK))), "System error 15");
     }
 }

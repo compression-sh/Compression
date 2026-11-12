@@ -74,7 +74,7 @@ fn describe(err: &std::io::Error, name: &str) -> String {
     match err.raw_os_error() {
         Some(libc::EPERM) => trf("Tags can't be set on {} (links and special files can't carry them)", &[&name]),
         Some(libc::EACCES) | Some(libc::EROFS) => trf("{} is read-only, so its tags can't change", &[&name]),
-        _ => trf("Tags of {} failed: {}", &[&name, &err]),
+        _ => trf("Tags of {} failed: {}", &[&name, &crate::fs::describe::io_error(err)]),
     }
 }
 
@@ -874,5 +874,12 @@ mod tests {
         link.is_symlink = true;
         assert!(tags.menu_items(&[link]).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_tag_error_with_no_words_of_ours_says_only_its_number() {
+        let text = describe(&std::io::Error::from_raw_os_error(libc::ENOTBLK), "photo.png");
+        assert_eq!(text, "Tags of photo.png failed: System error 15");
+        assert_eq!(describe(&std::io::Error::from_raw_os_error(libc::EIO), "a"), "Tags of a failed: The disk or the connection reported an error");
     }
 }

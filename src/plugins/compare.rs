@@ -116,7 +116,7 @@ struct Node {
 /// the other side as missing here, or two unreadable folders as identical.
 fn read_nodes(dir: &Path) -> io::Result<BTreeMap<OsString, Node>> {
     let mut nodes = BTreeMap::new();
-    let entries = std::fs::read_dir(dir).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dir.display())))?;
+    let entries = std::fs::read_dir(dir).map_err(|e| io::Error::new(e.kind(), crate::fs::describe::failed(&dir.display().to_string(), &e)))?;
     for entry in entries.flatten() {
         let (Ok(kind), Ok(meta)) = (entry.file_type(), entry.metadata()) else { continue };
         let node = if kind.is_symlink() {
@@ -385,9 +385,9 @@ impl Compare {
             let outcome = match &result {
                 Ok(()) => Outcome::done(tr("Comparison finished").to_owned()),
                 Err(_) if cancelled => Outcome::done(tr("Cancelled").to_owned()),
-                Err(e) => Outcome::failed(e.to_string()),
+                Err(e) => Outcome::failed(crate::fs::describe::io_error(e)),
             };
-            let _ = tx.send(Msg::Finished { generation, result: result.map_err(|e| e.to_string()), cancelled });
+            let _ = tx.send(Msg::Finished { generation, result: result.map_err(|e| crate::fs::describe::io_error(&e)), cancelled });
             outcome
         }));
     }
@@ -879,5 +879,14 @@ mod tests {
         compare_plugin.poll();
         assert!(matches!(compare_plugin.reaction(), Reaction::Job(_)));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_read_is_named_with_the_reason_in_words() {
+        let Err(err) = read_nodes(Path::new("/nonexistent/folder-for-test")) else { panic!("it was read") };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let text = crate::fs::describe::io_error(&err);
+        assert_eq!(text, "/nonexistent/folder-for-test: Not found");
+        assert!(!text.contains("os error"));
     }
 }

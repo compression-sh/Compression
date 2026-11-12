@@ -351,7 +351,7 @@ pub fn launch(app: &AppEntry, file: &Path) -> std::io::Result<()> {
         args.push(file.into_owned());
     }
     let Some((program, rest)) = args.split_first() else {
-        return Err(std::io::Error::other("empty Exec line"));
+        return Err(std::io::Error::other(crate::i18n::tr("The launcher has no command")));
     };
     let mut child = Command::new(program)
         .args(rest)

@@ -129,9 +129,9 @@ fn message_for(label: &str, result: Result<Output, process::Failure>, limits: Li
         }
         Err(process::Failure::TooMuchOutput) => trf("{} failed: {}", &[&label, &trf("it printed more than {} MiB", &[&shown(limits.output as f64 / (1 << 20) as f64)])]),
         Err(process::Failure::TimedOut) => trf("{} failed: {}", &[&label, &trf("it took longer than {} s", &[&shown(limits.run.as_secs_f64())])]),
-        Err(process::Failure::Io(e)) => trf("{} failed: {}", &[&label, &e]),
+        Err(process::Failure::Io(e)) => trf("{} failed: {}", &[&label, &crate::fs::describe::io_error(&e)]),
         // Actions are never called off while they run
-        Err(process::Failure::Cancelled) => trf("{} failed: {}", &[&label, &"cancelled"]),
+        Err(process::Failure::Cancelled) => trf("{} failed: {}", &[&label, &tr("Cancelled")]),
     }
 }
 
@@ -193,7 +193,7 @@ impl Actions {
 
     /// Writes a starting point into the folder and returns its path.
     fn create_template(&mut self) -> std::io::Result<PathBuf> {
-        let dir = self.dir.clone().ok_or_else(|| std::io::Error::other("no config folder"))?;
+        let dir = self.dir.clone().ok_or_else(|| std::io::Error::other(tr("There is no folder for your actions")))?;
         std::fs::create_dir_all(&dir)?;
         let path = (1..).map(|n| dir.join(if n == 1 { "new-action.json".to_owned() } else { format!("new-action-{n}.json") })).find(|p| !p.exists()).expect("endless range");
         std::fs::write(&path, TEMPLATE)?;
@@ -239,8 +239,8 @@ fn read_entry(path: &Path) -> Result<Option<Entry>, String> {
     let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else { return Ok(None) };
     let is_json = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
     let (def, script) = if is_json {
-        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let def: Definition = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let text = std::fs::read_to_string(path).map_err(|e| crate::fs::describe::io_error(&e))?;
+        let def: Definition = serde_json::from_str(&text).map_err(|e| crate::fs::describe::json_error(&e))?;
         if def.command.trim().is_empty() {
             return Err(tr("\"command\" is empty").to_owned());
         }
@@ -344,7 +344,7 @@ impl Plugin for Actions {
         if create {
             match self.create_template() {
                 Ok(path) => self.messages.push(trf("Created {}", &[&path.display()])),
-                Err(e) => self.messages.push(trf("Couldn't create the action: {}", &[&e])),
+                Err(e) => self.messages.push(trf("Couldn't create the action: {}", &[&crate::fs::describe::io_error(&e)])),
             }
         }
         ui.add_space(4.0);
@@ -663,5 +663,29 @@ mod tests {
         let def = Definition { extensions: vec!["jpg".into(), ".png".into()], single: true, ..Default::default() };
         assert_eq!(def.filters(), ".jpg .png, one item");
         assert_eq!(Definition::default().filters(), "any selection");
+    }
+
+    #[test]
+    fn an_action_that_could_not_run_or_was_stopped_is_told_in_words() {
+        let limits = Limits { run: std::time::Duration::from_secs(30), output: 1 << 20 };
+        let io = |code| message_for("Backup", Err(process::Failure::Io(std::io::Error::from_raw_os_error(code))), limits);
+        assert_eq!(io(libc::EACCES), "Backup failed: Permission denied");
+        assert_eq!(io(libc::ENOTBLK), "Backup failed: System error 15");
+        assert_eq!(message_for("Backup", Err(process::Failure::Cancelled), limits), "Backup failed: Cancelled");
+        // What the script itself printed stays as it printed it
+        let out = Output { success: false, stdout: Vec::new(), stderr: b"cannot open the thing\n".to_vec() };
+        assert_eq!(message_for("Backup", Ok(out), limits), "Backup failed: cannot open the thing");
+    }
+
+    #[test]
+    fn an_action_file_with_a_typo_is_told_by_its_line_and_not_in_serdes_english() {
+        let dir = std::env::temp_dir().join(format!("compression_actions_json_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("broken.json");
+        std::fs::write(&file, "{\n  \"command\": \"ls\",\n  oops\n}").unwrap();
+        assert_eq!(read_entry(&file).err().as_deref(), Some("not valid JSON (line 3)"));
+        std::fs::write(&file, "{ \"command\": 5 }").unwrap();
+        assert_eq!(read_entry(&file).err().as_deref(), Some("a value has the wrong type (line 1)"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

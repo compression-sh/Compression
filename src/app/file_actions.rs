@@ -43,7 +43,7 @@ impl CompressionApp {
             let target = path.canonicalize().unwrap_or_else(|_| path.clone());
             match std::os::unix::fs::symlink(&target, &link) {
                 Ok(()) => made.push(link),
-                Err(err) => failed.push(format!("{}: {err}", name.to_string_lossy())),
+                Err(err) => failed.push(crate::fs::describe::failed(&name.to_string_lossy(), &err)),
             }
         }
         if made.is_empty() {
@@ -71,13 +71,13 @@ impl CompressionApp {
             let command = crate::fs::terminal::ssh_command(address.user.as_deref(), &address.host, address.port, &address.path);
             if let Some(started) = crate::fs::terminal::run(&command, self.settings.terminal.trim()) {
                 if let Err(err) = started {
-                    self.set_toast(err.to_string());
+                    self.set_toast(crate::fs::describe::io_error(&err));
                 }
                 return;
             }
         }
         if let Err(err) = crate::fs::terminal::open_in(&dir, self.settings.terminal.trim()) {
-            self.set_toast(err.to_string());
+            self.set_toast(crate::fs::describe::io_error(&err));
         }
     }
 
@@ -93,7 +93,7 @@ impl CompressionApp {
         let dir = if dir.is_dir() { dir.to_path_buf() } else { dir.parent().map(Path::to_path_buf).unwrap_or_else(|| self.current_path.clone()) };
         match crate::fs::admin::open_folder(&dir) {
             Ok(rx) => self.admin_launch = Some(rx),
-            Err(err) => self.set_toast(err.to_string()),
+            Err(err) => self.set_toast(crate::fs::describe::io_error(&err)),
         }
     }
 

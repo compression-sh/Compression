@@ -170,12 +170,12 @@ fn from_mount_roots() -> Vec<Place> {
 }
 
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(program).args(args).output().map_err(|e| format!("{program}: {e}"))?;
+    let out = Command::new(program).args(args).output().map_err(|e| trf("{} could not be started: {}", &[&program, &super::describe::io_error(&e)]))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
     } else {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-        Err(if err.is_empty() { format!("{program} failed") } else { err })
+        Err(if err.is_empty() { trf("{} failed", &[&program]) } else { err })
     }
 }
 
@@ -294,5 +294,14 @@ mod tests {
     fn space_of_the_root() {
         let space = Space::of(Path::new("/")).unwrap();
         assert!(space.total > 0 && space.used <= space.total && space.free <= space.total);
+    }
+
+    #[test]
+    fn a_program_that_cannot_be_started_is_told_in_words_and_with_its_name() {
+        let err = run("/nonexistent/program-for-test", &[]).unwrap_err();
+        assert_eq!(err, "/nonexistent/program-for-test could not be started: Not found");
+        assert!(!err.contains("os error"));
+        // One that runs and fails without a word says so in ours
+        assert_eq!(run("false", &[]).unwrap_err(), "false failed");
     }
 }

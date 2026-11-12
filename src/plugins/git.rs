@@ -352,13 +352,13 @@ fn run_within(command: Command, timeout: Duration) -> Result<Vec<u8>, String> {
         Ok(out) if out.success => Ok(out.stdout),
         Ok(out) => {
             let error = String::from_utf8_lossy(&out.stderr);
-            Err(error.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("git failed").trim().to_owned())
+            Err(error.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(tr("git failed")).trim().to_owned())
         }
         Err(process::Failure::TimedOut) => Err(tr("git took longer than 10 seconds").to_owned()),
         Err(process::Failure::TooMuchOutput) => Err(tr("git printed more than 64 MiB").to_owned()),
-        Err(process::Failure::Io(e)) => Err(e.to_string()),
+        Err(process::Failure::Io(e)) => Err(crate::fs::describe::io_error(&e)),
         // git is never called off while it runs
-        Err(process::Failure::Cancelled) => Err("cancelled".to_owned()),
+        Err(process::Failure::Cancelled) => Err(tr("Cancelled").to_owned()),
     }
 }
 
@@ -756,5 +756,14 @@ mod tests {
         plugin.close_window();
         assert_eq!(plugin.window_title(), None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_git_that_cannot_be_started_or_says_nothing_is_told_in_words() {
+        let err = run_within(Command::new("/nonexistent/git-for-test"), Duration::from_secs(5)).unwrap_err();
+        assert_eq!(err, "Not found");
+        let mut silent = Command::new("sh");
+        silent.args(["-c", "exit 1"]);
+        assert_eq!(run_within(silent, Duration::from_secs(5)).unwrap_err(), "git failed");
     }
 }

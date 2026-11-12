@@ -620,7 +620,7 @@ fn verify(w: &mut Worker, dir: &Path, source: String, entries: Vec<Entry>, repor
                 result.cancelled = true;
                 break;
             }
-            Err(e) => result.failed.push(format!("{name}: {e}")),
+            Err(e) => result.failed.push(crate::fs::describe::failed(&name, &e)),
         }
         w.file_done();
     }
@@ -653,7 +653,7 @@ impl Job {
 }
 
 fn run_job(path: &Path, job: &Job) -> Result<Hashes, String> {
-    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut file = std::fs::File::open(path).map_err(|e| crate::fs::describe::io_error(&e))?;
     let (mut md5, mut sha1, mut sha256, mut sha512) = (Md5::new(), Sha1::new(), Sha256::new(), Sha512::new());
     let mut buf = vec![0u8; 1 << 20];
     loop {
@@ -661,7 +661,7 @@ fn run_job(path: &Path, job: &Job) -> Result<Hashes, String> {
             job.cancelled.store(true, Ordering::Relaxed);
             return Err(String::new());
         }
-        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        let n = file.read(&mut buf).map_err(|e| crate::fs::describe::io_error(&e))?;
         if n == 0 {
             break;
         }
@@ -733,7 +733,7 @@ impl Plugin for Checksum {
         let mut entries = match std::fs::read_to_string(file) {
             Ok(text) => parse_checksums(&text),
             Err(e) => {
-                self.report = Some(Report { source, failed: vec![e.to_string()], ..Report::default() });
+                self.report = Some(Report { source, failed: vec![crate::fs::describe::io_error(&e)], ..Report::default() });
                 return Reaction::None;
             }
         };

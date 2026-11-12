@@ -126,7 +126,7 @@ fn trash_by(path: &Path, fallback: bool) -> io::Result<PathBuf> {
     if tests_refuse::refused(path) {
         return Err(io::Error::from_raw_os_error(libc::EACCES));
     }
-    let home = root().ok_or_else(|| io::Error::other("no trash folder"))?;
+    let home = root().ok_or_else(|| io::Error::other(tr("There is no trash folder")))?;
     let original = absolute(path)?;
     match drive_trash(&home, &original) {
         DriveTrash::Own(root, topdir) => trash_in(&root, Some(&topdir), &original),
@@ -239,7 +239,7 @@ fn trash_in(root: &Path, topdir: Option<&Path>, original: &Path) -> io::Result<P
     std::fs::create_dir_all(&files)?;
     std::fs::create_dir_all(&info)?;
 
-    let name = original.file_name().ok_or_else(|| io::Error::other("no file name"))?;
+    let name = original.file_name().ok_or_else(|| io::Error::other(tr("It has no name")))?;
     // The record is made first and exclusively: it is what reserves the name, so two items with the
     // same name, trashed at the same moment (by two windows), cannot end up with one record or
     // replace each other in `files`.
@@ -275,7 +275,7 @@ pub fn restore(trashed: &Path) -> io::Result<PathBuf> {
     if trashed.parent().and_then(Path::file_name).is_none_or(|n| n != "files") {
         return Err(io::Error::other(tr("The trash has no record of where this came from")));
     }
-    let root = trashed.parent().and_then(Path::parent).ok_or_else(|| io::Error::other("not in the trash"))?;
+    let root = trashed.parent().and_then(Path::parent).ok_or_else(|| io::Error::other(tr("It is not in the trash")))?;
     let record = record_of(root, trashed);
     let text = std::fs::read_to_string(&record).map_err(|_| io::Error::other(tr("The trash has no record of where this came from")))?;
     let original = text
@@ -288,7 +288,7 @@ pub fn restore(trashed: &Path) -> io::Result<PathBuf> {
         Some(topdir) if original.is_relative() => topdir.join(original),
         _ => original,
     };
-    let folder = original.parent().ok_or_else(|| io::Error::other("invalid original location"))?;
+    let folder = original.parent().ok_or_else(|| io::Error::other(tr("Its original place is not valid")))?;
     std::fs::create_dir_all(folder)?;
     let target = unique_path(folder, original.file_name().unwrap_or_default(), "restored");
     // When the copy is whole but the trashed item cannot be removed, the record stays with what is left of it

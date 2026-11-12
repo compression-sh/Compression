@@ -436,9 +436,9 @@ impl Duplicates {
             let (cancelled, outcome) = match &result {
                 Ok(groups) => (false, Outcome::done(trn(groups.len(), "Found {} group of duplicates", "Found {} groups of duplicates"))),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => (true, Outcome::done(tr("Cancelled").to_owned())),
-                Err(e) => (false, Outcome::failed(e.to_string())),
+                Err(e) => (false, Outcome::failed(crate::fs::describe::io_error(e))),
             };
-            let _ = tx.send(Msg::Found { generation, result: result.map_err(|e| e.to_string()), cancelled });
+            let _ = tx.send(Msg::Found { generation, result: result.map_err(|e| crate::fs::describe::io_error(&e)), cancelled });
             outcome
         }))
     }

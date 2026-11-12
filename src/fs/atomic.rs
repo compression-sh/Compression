@@ -16,7 +16,7 @@ pub fn write(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
 pub fn write_with(path: &Path, fill: impl FnOnce(&mut std::fs::File) -> io::Result<()>) -> io::Result<()> {
     // A file that is a link (a dotfile manager's) stays a link: the link's target is replaced
     let target: PathBuf = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let name = target.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    let name = target.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, crate::i18n::tr("It has no name")))?;
     let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     // A name of its own for every call of every process, so writers never share a temporary file
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -173,5 +173,12 @@ mod tests {
         assert!(reader.join().unwrap() > 0);
         assert_eq!(files_in(&dir), ["shared.json"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_path_without_a_name_is_refused_in_words() {
+        let err = write(Path::new("/"), "x").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(crate::fs::describe::io_error(&err), "It has no name");
     }
 }

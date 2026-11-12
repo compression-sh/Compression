@@ -1664,7 +1664,7 @@ impl CompressionApp {
         let started = std::env::current_exe()
             .and_then(|exe| crate::instance::spawn_reaped(std::process::Command::new(exe).arg(path)));
         if let Err(err) = started {
-            self.set_toast(trf("Could not open a new window: {}", &[&err]));
+            self.set_toast(trf("Could not open a new window: {}", &[&crate::fs::describe::io_error(&err)]));
         }
     }
 
@@ -1706,7 +1706,7 @@ impl CompressionApp {
             Some(Ok(new)) => {
                 self.apply_settings_file(new);
             }
-            Some(Err(err)) => self.set_toast(trf("Settings file has an error: {}", &[&err])),
+            Some(Err(err)) => self.set_toast(trf("Settings file has an error: {}", &[&crate::fs::describe::json_error(&err)])),
             None => {}
         }
     }
@@ -2729,7 +2729,7 @@ impl eframe::App for CompressionApp {
             match rx.try_recv() {
                 Ok(err) => {
                     self.admin_launch = None;
-                    self.set_toast(err.to_string());
+                    self.set_toast(crate::fs::describe::io_error(&err));
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.admin_launch = None,
                 Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(300)),
@@ -3792,7 +3792,7 @@ impl CompressionApp {
                 let started = std::env::current_exe()
                     .and_then(|exe| crate::instance::spawn_reaped(std::process::Command::new(exe).arg(&item.path)));
                 if let Err(err) = started {
-                    self.set_toast(trf("Could not open a new window: {}", &[&err]));
+                    self.set_toast(trf("Could not open a new window: {}", &[&crate::fs::describe::io_error(&err)]));
                 }
             } else {
                 // A link is followed on a thread; a folder that is not one is known to be what the listing says
@@ -9239,6 +9239,38 @@ mod tests {
         drop(tx);
         w.app.take_clipboard_offer();
         assert!(paste_is_usable(&w.app) && w.app.clipboard_probe_rx.is_none());
+    }
+
+    #[test]
+    fn a_link_that_could_not_be_made_a_terminal_that_could_not_start_and_an_admin_start_that_failed_are_told_in_words() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = window_dir("words_in_messages");
+        let mut app = CompressionApp::new(root.clone(), SerpantinumTheme::default(), Settings::default(), &egui::Context::default());
+        // A link in a folder nobody can write to
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("a.txt"), "x").unwrap();
+        let _unlock = Unlock(locked.clone());
+        std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o555)).unwrap();
+        app.make_links(vec![locked.join("a.txt")]);
+        assert_eq!(app.toast_message(), Some("Could not create link: a.txt: Permission denied"));
+
+        // A terminal that does not exist
+        app.set_toast(String::new());
+        app.settings.terminal = "/nonexistent/terminal-for-test".to_owned();
+        app.open_terminal(&root);
+        assert_eq!(app.toast_message(), Some("Not found"));
+
+        // What the elevated start sends back is told the same way
+        app.set_toast(String::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(std::io::Error::from_raw_os_error(libc::EACCES)).unwrap();
+        app.admin_launch = Some(rx);
+        let mut w = Window { app, ctx: egui::Context::default(), frame: eframe::Frame::_new_kittest(), time: 0.0, last: Vec::new(), shapes: Vec::new(), circles: Vec::new() };
+        w.run(Vec::new(), 3);
+        assert_eq!(w.app.toast_message(), Some("Permission denied"));
     }
 
     #[test]

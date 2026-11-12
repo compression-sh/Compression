@@ -217,8 +217,8 @@ impl ThemeProblem {
         let reason = match &self.why {
             Why::Unreadable(Some(errno), _) => crate::fs::describe::io_error(&std::io::Error::from_raw_os_error(*errno)),
             Why::Unreadable(None, text) => text.clone(),
-            Why::NotJson(line) => trf("not valid JSON (line {})", &[line]),
-            Why::WrongValue(line) => trf("a value has the wrong type (line {})", &[line]),
+            Why::NotJson(line) => crate::fs::describe::json_words(false, *line),
+            Why::WrongValue(line) => crate::fs::describe::json_words(true, *line),
             Why::Name => tr("its name cannot be used").to_owned(),
         };
         format!("{} ({reason})", self.file)

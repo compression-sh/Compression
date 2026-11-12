@@ -897,7 +897,7 @@ fn replace_target(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Opti
     if crate::fs::network::is_remote(target) {
         return Err(io::Error::other(tr("Not replaced: items on a server have no trash, and the old item would be lost for good")));
     }
-    let parent = target.parent().ok_or_else(|| io::Error::other("no folder"))?;
+    let parent = target.parent().ok_or_else(|| io::Error::other(tr("It has no folder to go in")))?;
 
     // 1. The new item, complete, under a name of its own
     let staged = (0..1000u32)
@@ -980,8 +980,8 @@ fn replace_target(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Opti
 
 fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option<(u64, u64)>, rec: &mut Record) -> io::Result<()> {
     w.shared.checkpoint()?;
-    let parent = target.parent().ok_or_else(|| io::Error::other("no folder"))?;
-    let name = target.file_name().ok_or_else(|| io::Error::other("no file name"))?.to_owned();
+    let parent = target.parent().ok_or_else(|| io::Error::other(tr("It has no folder to go in")))?;
+    let name = target.file_name().ok_or_else(|| io::Error::other(tr("It has no name")))?.to_owned();
     if src.is_dir() && !src.is_symlink() && parent.canonicalize().is_ok_and(|p| src.canonicalize().is_ok_and(|s| p.starts_with(s))) {
         return Err(io::Error::other(trf("Cannot put {} inside itself", &[&name_of(src)])));
     }
@@ -1128,7 +1128,7 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
             .filter(|((src, target), _)| op == Op::Copy || target.parent().is_none_or(|parent| !same_device(src, parent)))
             .fold(0u64, |sum, ((src, target), size)| sum.saturating_add(room_for(src, target.parent(), size.1)));
         if let Err(err) = w.ensure_space(dest, needed, free) {
-            return if is_cancel(&err) { Outcome::stopped() } else { Outcome::failed(err.to_string()) };
+            return if is_cancel(&err) { Outcome::stopped() } else { Outcome::failed(crate::fs::describe::io_error(&err)) };
         }
     }
 
