@@ -316,6 +316,7 @@
   "Renaming of {}": "Renommage de {}",
   "Renamed to “{}”": "Renommé en « {} »",
   "Could not move to trash: {}": "Impossible de mettre à la corbeille : {}",
+  "Not moved to the trash, its drive does not answer: {}": "Non déplacé dans la corbeille, son lecteur ne répond pas : {}",
   "Moved {} to trash": "{} mis à la corbeille",
   "{} failed": "Échec : {}",
   "Move of {} to trash": "Mise à la corbeille de {}",

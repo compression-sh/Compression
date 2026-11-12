@@ -753,6 +753,9 @@ fn restore_job(w: &mut engine::Worker, paths: &[PathBuf]) -> engine::Outcome {
     outcome.with(effect)
 }
 
+/// How long the folder of an item to be trashed may take to answer before its drive counts as not answering.
+const TRASH_LOOK: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn rename_error(err: &std::io::Error, new_name: &str) -> String {
     match err.kind() {
         std::io::ErrorKind::AlreadyExists => trf("“{}” already exists", &[&new_name]),
@@ -5128,6 +5131,27 @@ impl CompressionApp {
         // Servers have no trash: what is on one is deleted for good, after asking, as Nautilus does. So is what is on a
         // drive that has none and cannot be given one: a copy into the home trash would hold the window up
         let (remote, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| network::is_remote(p));
+        // A drive that has stopped answering (a mount not known as a server) would hold the window in the move: its
+        // folders are asked first, each once, on a thread, and what is in one that does not answer is left alone
+        let mut silent_dirs: Vec<PathBuf> = Vec::new();
+        let mut asked: Vec<PathBuf> = Vec::new();
+        for dir in paths.iter().filter_map(|p| p.parent()) {
+            if !asked.iter().any(|a| a == dir) {
+                asked.push(dir.to_path_buf());
+                if !crate::fs::mount_health::answers_within(dir, TRASH_LOOK) {
+                    silent_dirs.push(dir.to_path_buf());
+                }
+            }
+        }
+        let (silent, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| p.parent().is_some_and(|d| silent_dirs.iter().any(|s| s == d)));
+        let silent_note = (!silent.is_empty()).then(|| {
+            let names: Vec<String> = silent.iter().map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+            trf("Not moved to the trash, its drive does not answer: {}", &[&names.join(", ")])
+        });
+        if let Some(note) = &silent_note {
+            // Said now; what else happens adds its own words to it below
+            self.set_toast(note.clone());
+        }
         let (mut trashed, mut failed, mut removed, mut no_trash) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for path in &paths {
             match trash::trash_without_fallback(path) {
@@ -5173,13 +5197,16 @@ impl CompressionApp {
         self.forget_sizes(&removed);
         self.plugins.file_op_done(&crate::plugins::FileOpEvent::Removed(removed));
         if trashed.is_empty() {
-            self.set_toast(trf("Could not move to trash: {}", &[&failed.join(" · ")]));
+            let mut message = trf("Could not move to trash: {}", &[&failed.join(" · ")]);
+            message.extend(silent_note.map(|n| format!(" · {n}")));
+            self.set_toast(message);
             return;
         }
         let mut message = trf("Moved {} to trash", &[&label]);
         if !failed.is_empty() {
             message.push_str(&format!(" · {}: {}", trf("{} failed", &[&failed.len()]), failed.join(" · ")));
         }
+        message.extend(silent_note.map(|n| format!(" · {n}")));
         self.history.record(UndoEntry::new(trf("Move of {} to trash", &[&label]), trashed.into_iter().map(Edit::Restore).collect()));
         self.set_toast_action(message, ToastAction::Undo);
     }
@@ -7761,6 +7788,29 @@ mod tests {
         app.rename_entry(&base.join(" padded.txt"), "  report.txt ").unwrap();
         assert!(base.join("report.txt").exists() && !base.join(" padded.txt").exists());
         assert_eq!(app.rename_entry(&base.join("report.txt"), "   "), Err("Enter a valid name".to_owned()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn what_is_on_a_drive_that_does_not_answer_is_not_trashed_and_the_window_goes_on() {
+        let base = window_dir("trash_silent");
+        let (stuck, fine) = (base.join("stuck"), base.join("fine"));
+        std::fs::create_dir_all(&stuck).unwrap();
+        std::fs::create_dir_all(&fine).unwrap();
+        std::fs::write(stuck.join("a.txt"), "x").unwrap();
+        std::fs::write(fine.join("b.txt"), "x").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        crate::fs::mount_health::tests::hang_under(&stuck);
+        let start = std::time::Instant::now();
+        app.trash_paths(vec![stuck.join("a.txt"), fine.join("b.txt")]);
+        let took = start.elapsed();
+        crate::fs::mount_health::tests::answer_again(&stuck);
+        assert!(took < std::time::Duration::from_secs(3), "the window waited {took:?}");
+        assert!(stuck.join("a.txt").exists(), "nothing on the silent drive was touched");
+        assert!(!fine.join("b.txt").exists(), "the rest went to the trash");
+        let said = app.toast_message().unwrap_or_default().to_owned();
+        assert_eq!(said, "Moved “b.txt” to trash · Not moved to the trash, its drive does not answer: a.txt");
         let _ = std::fs::remove_dir_all(&base);
     }
 

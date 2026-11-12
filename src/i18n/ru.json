@@ -316,6 +316,7 @@
   "Renaming of {}": "Переименование {}",
   "Renamed to “{}”": "Переименовано в «{}»",
   "Could not move to trash: {}": "Не удалось переместить в корзину: {}",
+  "Not moved to the trash, its drive does not answer: {}": "Не перемещено в корзину, диск не отвечает: {}",
   "Moved {} to trash": "{} перемещено в корзину",
   "{} failed": "Не удалось: {}",
   "Move of {} to trash": "Перемещение {} в корзину",

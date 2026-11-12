@@ -110,9 +110,55 @@ fn statvfs(local: &Path) -> std::io::Result<()> {
     if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
+/// Whether the folder `dir` answers a plain look (`lstat`) within `wait`, asked on a thread of its own: on a mount that has
+/// stopped answering that look blocks, and so would every change made there from the window. Any answer counts, an error
+/// too: then the change itself says what is wrong. A thread left blocked ends when the mount answers or goes.
+pub fn answers_within(dir: &Path, wait: Duration) -> bool {
+    let (tx, rx) = mpsc::channel();
+    let dir = dir.to_path_buf();
+    let started = std::thread::Builder::new().name("compression-look".into()).spawn(move || {
+        #[cfg(test)]
+        tests::hang_if_asked_to(&dir);
+        let _ = dir.symlink_metadata();
+        let _ = tx.send(());
+    });
+    started.is_ok() && rx.recv_timeout(wait).is_ok()
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Folders whose look hangs, in the tests that say so: a mount that has stopped answering.
+    static HANGING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    pub(crate) fn hang_under(dir: &Path) {
+        HANGING.lock().unwrap().push(dir.to_path_buf());
+    }
+
+    pub(super) fn hang_if_asked_to(dir: &Path) {
+        while HANGING.lock().unwrap().iter().any(|h| dir.starts_with(h)) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub(crate) fn answer_again(dir: &Path) {
+        HANGING.lock().unwrap().retain(|h| h != dir);
+    }
+
+    #[test]
+    fn a_folder_that_answers_does_so_in_time_and_one_that_hangs_does_not_hold_the_caller() {
+        let dir = std::env::temp_dir().join(format!("compression_answers_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(answers_within(&dir, Duration::from_secs(2)));
+        assert!(answers_within(&dir.join("not-there"), Duration::from_secs(2)), "an error is an answer");
+        hang_under(&dir);
+        let start = Instant::now();
+        assert!(!answers_within(&dir, Duration::from_millis(200)));
+        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        answer_again(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use std::cell::RefCell;
 
     fn mount(name: &str) -> PathBuf {

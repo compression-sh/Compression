@@ -316,6 +316,7 @@
   "Renaming of {}": "Umbenennen von {}",
   "Renamed to “{}”": "Umbenannt in „{}“",
   "Could not move to trash: {}": "Verschieben in den Papierkorb fehlgeschlagen: {}",
+  "Not moved to the trash, its drive does not answer: {}": "Nicht in den Papierkorb verschoben, das Laufwerk antwortet nicht: {}",
   "Moved {} to trash": "{} in den Papierkorb verschoben",
   "{} failed": "{} fehlgeschlagen",
   "Move of {} to trash": "Verschieben von {} in den Papierkorb",

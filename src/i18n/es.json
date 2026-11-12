@@ -316,6 +316,7 @@
   "Renaming of {}": "Renombrado de {}",
   "Renamed to “{}”": "Renombrado a «{}»",
   "Could not move to trash: {}": "No se pudo mover a la papelera: {}",
+  "Not moved to the trash, its drive does not answer: {}": "No se movió a la papelera, su unidad no responde: {}",
   "Moved {} to trash": "{} movido a la papelera",
   "{} failed": "Error en {}",
   "Move of {} to trash": "Movimiento de {} a la papelera",
