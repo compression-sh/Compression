@@ -1,6 +1,5 @@
 //! Folder-name completion for the address bar.
 
-use std::path::Path;
 
 const MAX_SUGGESTIONS: usize = 50;
 
@@ -9,7 +8,9 @@ const MAX_SUGGESTIONS: usize = 50;
 pub fn dir_completions(input: &str) -> Vec<String> {
     let Some(slash) = input.rfind('/') else { return Vec::new() };
     let (head, prefix) = input.split_at(slash + 1);
-    let dir = if head == "/" { Path::new("/") } else { Path::new(&head[..slash]) };
+    // `~/` is the home folder; the suggestions keep the spelling that was typed
+    let dir = if head == "/" { std::path::PathBuf::from("/") } else { super::places::expand_home(&head[..slash]) };
+    let dir = dir.as_path();
     // A folder on a server is not read unless the settings allow looking there (as for previews and the search)
     if !super::network::previews_allowed(dir) {
         return Vec::new();
@@ -58,6 +59,19 @@ pub fn extend(input: &str, suggestions: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suggestions_under_the_home_folder_keep_the_tilde_that_was_typed() {
+        let name = format!("compression_complete_tilde_{}", std::process::id());
+        let dir = dirs::home_dir().unwrap().join(&name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("abc")).unwrap();
+        std::fs::create_dir_all(dir.join("abd")).unwrap();
+        let typed = format!("~/{name}/a");
+        assert_eq!(dir_completions(&typed), [format!("~/{name}/abc"), format!("~/{name}/abd")]);
+        assert_eq!(extend(&typed, &dir_completions(&typed)).as_deref(), Some(format!("~/{name}/ab").as_str()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_folder_on_a_server_is_not_read_for_suggestions_unless_previews_are_allowed_there() {

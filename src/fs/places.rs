@@ -12,6 +12,16 @@ const LEGACY_RECENT_PATH: &str = "ski:recent";
 const LEGACY_BOOKMARKS_PATH: &str = "ski:bookmarks";
 
 /// `path` with a legacy Ski view name replaced by the current one.
+/// What a path typed into the path field stands for: `~` and `~/…` are the home folder, as in a shell; anything else
+/// (`~user` too) is as typed.
+pub fn expand_home(text: &str) -> PathBuf {
+    match (text.strip_prefix('~'), dirs::home_dir()) {
+        (Some(""), Some(home)) => home,
+        (Some(rest), Some(home)) if rest.starts_with('/') => home.join(rest.trim_start_matches('/')),
+        _ => PathBuf::from(text),
+    }
+}
+
 pub fn normalize(path: PathBuf) -> PathBuf {
     match path.to_str() {
         Some(LEGACY_RECENT_PATH) => PathBuf::from(RECENT_PATH),
@@ -300,6 +310,18 @@ fn config_file_to_write(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tilde_typed_into_the_path_field_is_the_home_folder() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("~/"), home);
+        assert_eq!(expand_home("~/Music/a b"), home.join("Music/a b"));
+        // Not a home of its own: as typed
+        assert_eq!(expand_home("~bob/x"), PathBuf::from("~bob/x"));
+        assert_eq!(expand_home("/tmp/~"), PathBuf::from("/tmp/~"));
+        assert_eq!(expand_home("rel/~"), PathBuf::from("rel/~"));
+    }
 
     #[test]
     fn a_path_moves_with_the_closest_folder_above_it_that_moved_and_only_by_whole_names() {

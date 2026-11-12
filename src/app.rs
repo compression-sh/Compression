@@ -3590,16 +3590,25 @@ impl CompressionApp {
                 };
             }
         }
-        let resp = material::put_over(
-            ui,
-            edit_rect,
+        let font = egui::FontId::proportional(material::FONT_BODY);
+        let output = {
+            let builder = egui::UiBuilder::new().max_rect(edit_rect).layout(egui::Layout::centered_and_justified(egui::Direction::TopDown));
+            let mut child = ui.new_child(builder);
             egui::TextEdit::singleline(&mut self.path_input)
                 .frame(egui::Frame::NONE)
                 .align(egui::Align2::LEFT_CENTER)
-                .font(egui::FontId::proportional(material::FONT_BODY))
-                .hint_text(tr("Type a path and press Enter")),
-        );
-        if let Some(clicked) = self.path_suggestion_popup(ui.ctx(), edit_rect) {
+                .font(font.clone())
+                .hint_text(tr("Type a path and press Enter"))
+                .show(&mut child)
+        };
+        let resp = output.response.clone();
+        // What Tab would fill in, faint after the text, while the cursor is at its end
+        let at_end = output.cursor_range.is_some_and(|r| r.is_empty() && r.primary.index.0 == self.path_input.chars().count());
+        if resp.has_focus() && at_end && let Some(rest) = self.path_completion_ahead() {
+            let end = output.galley_pos + egui::vec2(output.galley.rect.right(), output.galley.rect.center().y);
+            ui.painter().with_clip_rect(edit_rect).text(end, egui::Align2::LEFT_CENTER, rest, font, self.theme.with_alpha(self.theme.subtext0, 140));
+        }
+        if let Some(clicked) = self.path_suggestion_popup(ui.ctx(), rect) {
             accepted = Some(format!("{clicked}/"));
         }
         if let Some(text) = accepted {
@@ -3629,8 +3638,8 @@ impl CompressionApp {
             let on_popup = self.path_popup_rect.zip(ui.input(|i| i.pointer.interact_pos())).is_some_and(|(r, p)| r.contains(p));
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 let target = match self.path_suggestion_sel {
-                    Some(i) => PathBuf::from(&self.path_suggestions[i]),
-                    None => PathBuf::from(&self.path_input),
+                    Some(i) => crate::fs::places::expand_home(&self.path_suggestions[i]),
+                    None => crate::fs::places::expand_home(&self.path_input),
                 };
                 self.is_editing_path = false;
                 self.navigate_to(target);
@@ -3686,7 +3695,17 @@ impl CompressionApp {
         self.path_suggesting = Some((self.path_input.clone(), rx));
     }
 
-    /// The list of folders under the path field; returns the one clicked.
+    /// The text Tab would add to what is typed in the path field: the rest of the picked suggestion, or what all of them
+    /// share; `None` when there is nothing to add.
+    fn path_completion_ahead(&self) -> Option<String> {
+        let full = match self.path_suggestion_sel {
+            Some(i) => format!("{}/", self.path_suggestions.get(i)?),
+            None => crate::fs::complete::extend(&self.path_input, &self.path_suggestions)?,
+        };
+        full.strip_prefix(self.path_input.as_str()).filter(|rest| !rest.is_empty()).map(str::to_owned)
+    }
+
+    /// The list of folders under the path field, exactly as wide as the field `field`; returns the one clicked.
     fn path_suggestion_popup(&mut self, ctx: &egui::Context, field: egui::Rect) -> Option<String> {
         if self.path_suggestions.is_empty() {
             self.path_popup_rect = None;
@@ -3696,7 +3715,7 @@ impl CompressionApp {
         let mut clicked = None;
         let area = egui::Area::new(egui::Id::unique("path_suggestions"))
             .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(field.left() - 8.0, field.bottom() + 8.0))
+            .fixed_pos(egui::pos2(field.left(), field.bottom() + 8.0))
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(theme.surface1)
@@ -3704,7 +3723,8 @@ impl CompressionApp {
                     .shadow(ctx.global_style().visuals.popup_shadow)
                     .inner_margin(egui::Margin::symmetric(6, 6))
                     .show(ui, |ui| {
-                        ui.set_width((field.width() - 16.0).max(200.0));
+                        // The frame's margin of 6 on either side makes up the rest of the field's width
+                        ui.set_width(field.width() - 12.0);
                         egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                             for (i, full) in self.path_suggestions.iter().enumerate() {
                                 let name = full.rsplit('/').next().unwrap_or(full);
@@ -11277,6 +11297,49 @@ mod tests {
         w.click(egui::pos2(5.0, 5.0), egui::PointerButton::Primary);
         assert!(w.app.dialog.is_none());
         assert_eq!(std::fs::read_to_string(dir.join("report.txt")).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_path_field_shows_what_tab_adds_lists_folders_as_wide_as_itself_and_takes_a_tilde_home() {
+        let dir = window_dir("path_field");
+        std::fs::create_dir_all(dir.join("alpha")).unwrap();
+        std::fs::create_dir_all(dir.join("beta")).unwrap();
+        let mut w = Window::new(dir.clone());
+        w.app.is_editing_path = true;
+        w.run(Vec::new(), 3);
+        // Typed, so the cursor is at the end (the field starts with all of the path selected)
+        w.run(vec![egui::Event::Text(format!("{}/al", dir.display()))], 3);
+        assert_eq!(w.app.path_input, format!("{}/al", dir.display()));
+        w.until("the suggestion", |w| w.app.path_suggestions.len() == 1);
+        w.run(Vec::new(), 3);
+        // What Tab would fill in is drawn after the text
+        assert!(w.shows("pha/"), "{:?}", w.last);
+        w.key(egui::Key::Tab);
+        assert_eq!(w.app.path_input, format!("{}/alpha/", dir.display()));
+        // The list is exactly as wide as the field it belongs to
+        let field = egui::Rect::from_min_size(egui::pos2(100.0, 40.0), egui::vec2(530.0, 36.0));
+        w.app.path_suggestions = vec!["/x/one".into(), "/x/two".into()];
+        let ctx = w.ctx.clone();
+        let app = &mut w.app;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.path_suggestion_popup(ui.ctx(), field);
+        })
+        .textures_delta
+        .clear();
+        let popup = w.app.path_popup_rect.expect("the list was drawn");
+        assert_eq!((popup.left(), popup.width()), (field.left(), field.width()), "{popup:?}");
+        // ~ is the home folder when going there
+        w.app.path_suggestions.clear();
+        w.app.is_editing_path = false;
+        w.run(Vec::new(), 3);
+        w.app.is_editing_path = true;
+        w.run(Vec::new(), 3);
+        w.run(vec![egui::Event::Text("~".into())], 3);
+        assert_eq!(w.app.path_input, "~");
+        w.key(egui::Key::Enter);
+        let home = dirs::home_dir().unwrap();
+        w.until("home", |w| w.app.current_path == home);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
