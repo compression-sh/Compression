@@ -472,6 +472,8 @@ pub struct CompressionApp {
     open_rx: mpsc::Receiver<OpenReport>,
     /// The properties of a file are being read on a worker; asking again meanwhile starts nothing.
     properties_pending: bool,
+    /// Reads the properties of a file on the worker; other only in tests (one that fails on purpose).
+    properties_loader: fn(&Path, &[String], std::time::Duration) -> Option<Properties>,
     /// What setting a default application came to, from the worker that asked `xdg-mime`.
     pub(crate) defaults_tx: mpsc::Sender<apps::DefaultsReport>,
     pub(crate) defaults_rx: mpsc::Receiver<apps::DefaultsReport>,
@@ -767,6 +769,7 @@ impl CompressionApp {
             open_tx,
             open_rx,
             properties_pending: false,
+            properties_loader: Properties::load,
             defaults_tx,
             defaults_rx,
             mime_tool: vec!["xdg-mime".to_owned()],
@@ -4874,9 +4877,10 @@ impl CompressionApp {
         if std::mem::replace(&mut self.properties_pending, true) {
             return;
         }
-        let (path, tx, ctx, tool, limit) = (path.to_path_buf(), self.open_tx.clone(), self.ctx.clone(), self.mime_tool.clone(), self.mime_limit);
+        let (path, tx, ctx, tool, limit, load) = (path.to_path_buf(), self.open_tx.clone(), self.ctx.clone(), self.mime_tool.clone(), self.mime_limit, self.properties_loader);
         std::thread::spawn(move || {
-            let props = Properties::load(&path, &tool, limit).map(Box::new);
+            // A worker that fails must still answer: otherwise the properties could never be opened again
+            let props = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&path, &tool, limit))).ok().flatten().map(Box::new);
             let _ = tx.send(OpenReport::Properties(path, props));
             ctx.request_repaint();
         });
@@ -7580,6 +7584,29 @@ mod tests {
         });
         assert!(matches!(w.app.dialog, Some(Dialog::Alert { .. })), "the dialog the person had was replaced");
         assert_eq!(w.app.status_toast.as_ref().unwrap().message, "Another window is open. Open the properties again.");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn properties_whose_worker_fails_are_told_and_can_be_asked_for_again() {
+        let (mut w, work, file) = lookup_window("props_panic", "exit 1", 10_000);
+        w.app.properties_loader = |_, _, _| panic!("a reader that fails on purpose");
+        w.app.open_properties(&file);
+        w.until("the answer of the failed worker", |w| {
+            w.app.poll_opened();
+            !w.app.properties_pending
+        });
+        assert!(w.app.dialog.is_none());
+        assert_eq!(w.app.status_toast.as_ref().unwrap().message, "Could not read properties");
+        // Asking again starts a new worker, which answers as usual
+        w.app.properties_loader = Properties::load;
+        w.app.open_properties(&file);
+        assert!(w.app.properties_pending);
+        w.until("the properties", |w| {
+            w.app.poll_opened();
+            w.app.dialog.is_some()
+        });
+        assert!(matches!(w.app.dialog, Some(Dialog::Properties { .. })));
         let _ = std::fs::remove_dir_all(&work);
     }
 
