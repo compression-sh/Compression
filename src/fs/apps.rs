@@ -385,7 +385,8 @@ pub fn load_overrides() -> HashMap<PathBuf, String> {
 }
 
 pub fn save_overrides(map: &HashMap<PathBuf, String>) {
-    let Some(file) = overrides_file() else { return };
+    // A test must never write the person's own file
+    let Some(file) = overrides_file().filter(|_| !cfg!(test)) else { return };
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }

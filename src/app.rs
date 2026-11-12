@@ -5691,21 +5691,43 @@ impl CompressionApp {
     fn retarget_path(&mut self, old: &Path, target: &Path) {
         self.plugins.file_op_done(&crate::plugins::FileOpEvent::Moved(vec![(old.to_path_buf(), target.to_path_buf())]));
         self.forget_sizes([old, target]);
-        if let Some(idx) = self.pins.iter().position(|p| p.as_path() == old) {
-            self.pins[idx] = target.to_path_buf();
+        self.retarget_places(&[(old.to_path_buf(), target.to_path_buf())]);
+    }
+
+    /// Pins, bookmarks, folder icons and glyphs and the applications chosen for a file follow items that were moved or
+    /// renamed (`moves`: where each was, where it is). What is inside a folder that moved goes with it. Every stored
+    /// path is looked up in the original pairs, so items that swapped names do not undo each other.
+    pub(super) fn retarget_places(&mut self, moves: &[(PathBuf, PathBuf)]) {
+        use crate::fs::places::moved_to;
+        let mut pins_changed = false;
+        for pin in &mut self.pins {
+            if let Some(now) = moved_to(moves, pin) {
+                *pin = now;
+                pins_changed = true;
+            }
+        }
+        if pins_changed {
             Place::save_pins(&self.pins);
         }
-        if let Some(idx) = self.bookmarks.iter().position(|p| p.as_path() == old) {
-            self.bookmarks[idx] = target.to_path_buf();
+        let mut bookmarks_changed = false;
+        for bookmark in &mut self.bookmarks {
+            if let Some(now) = moved_to(moves, bookmark) {
+                *bookmark = now;
+                bookmarks_changed = true;
+            }
+        }
+        if bookmarks_changed {
             Place::save_bookmarks(&self.bookmarks);
         }
-        if let Some(icon) = self.folder_icons.remove(old) {
-            self.folder_icons.insert(target.to_path_buf(), icon);
+        let icons: HashMap<PathBuf, PathBuf> = self.folder_icons.iter().map(|(folder, icon)| (moved_to(moves, folder).unwrap_or_else(|| folder.clone()), icon.clone())).collect();
+        if icons != self.folder_icons {
+            self.folder_icons = icons;
             save_folder_icons(&self.folder_icons);
         }
-        crate::fs::places::move_folder_glyph(old, target);
-        if let Some(app) = self.open_overrides.remove(old) {
-            self.open_overrides.insert(target.to_path_buf(), app);
+        crate::fs::places::move_folder_glyphs(moves);
+        let chosen: HashMap<PathBuf, String> = self.open_overrides.iter().map(|(file, app)| (moved_to(moves, file).unwrap_or_else(|| file.clone()), app.clone())).collect();
+        if chosen != self.open_overrides {
+            self.open_overrides = chosen;
             apps::save_overrides(&self.open_overrides);
         }
     }
@@ -7033,6 +7055,116 @@ mod tests {
         // Nothing restored: the failure alone, with its name
         app.restore_paths(vec![nowhere]);
         assert_eq!(said(&app), "Could not restore: not-in-the-trash.txt: The trash has no record of where this came from");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn moved_events(events: &std::rc::Rc<std::cell::RefCell<Vec<crate::plugins::FileOpEvent>>>) -> Vec<Vec<(PathBuf, PathBuf)>> {
+        events.borrow().iter().filter_map(|e| if let crate::plugins::FileOpEvent::Moved(pairs) = e { Some(pairs.clone()) } else { None }).collect()
+    }
+
+    #[test]
+    fn pins_bookmarks_icons_and_chosen_apps_follow_a_move_and_its_undo_and_redo() {
+        let base = std::env::temp_dir().join(format!("compression_places_follow_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (pinned, inner, other, lookalike, dest) = (base.join("pinned"), base.join("pinned/inner"), base.join("other"), base.join("pinned2"), base.join("dest"));
+        for dir in [&inner, &other, &lookalike, &dest] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(pinned.join("note.txt"), "x").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let events = app.plugins.record_file_ops();
+        let note = pinned.join("note.txt");
+        let (moved_pinned, moved_inner, moved_note) = (dest.join("pinned"), dest.join("pinned/inner"), dest.join("pinned/note.txt"));
+        let start = |app: &mut CompressionApp| {
+            app.pins = vec![pinned.clone(), inner.clone(), other.clone(), lookalike.clone()];
+            app.bookmarks = vec![note.clone(), other.join("kept")];
+            app.folder_icons = HashMap::from([(pinned.clone(), PathBuf::from("/icon.png"))]);
+            app.open_overrides = HashMap::from([(note.clone(), "viewer.desktop".to_owned())]);
+        };
+        let state = |app: &CompressionApp| (app.pins.clone(), app.bookmarks.clone(), app.folder_icons.keys().cloned().collect::<Vec<_>>(), app.open_overrides.keys().cloned().collect::<Vec<_>>());
+        start(&mut app);
+        crate::fs::places::set_folder_glyph(&pinned, Some('★'));
+        let before = state(&app);
+
+        // The folder is moved: what is in it goes with it, what only starts with the same letters stays
+        app.transfer(TransferOp::Move, vec![pinned.clone()], dest.clone());
+        finish_jobs(&mut app);
+        assert!(moved_pinned.is_dir() && !pinned.exists());
+        assert_eq!(
+            state(&app),
+            (
+                vec![moved_pinned.clone(), moved_inner.clone(), other.clone(), lookalike.clone()],
+                vec![moved_note.clone(), other.join("kept")],
+                vec![moved_pinned.clone()],
+                vec![moved_note.clone()]
+            )
+        );
+        assert_eq!(moved_events(&events), vec![vec![(pinned.clone(), moved_pinned.clone())]]);
+        assert_eq!((crate::fs::places::folder_glyph(&pinned), crate::fs::places::folder_glyph(&moved_pinned)), (None, Some('★')));
+
+        // Undone: back where they were; redone: moved again
+        app.undo();
+        finish_jobs(&mut app);
+        assert!(pinned.is_dir());
+        assert_eq!(state(&app), before);
+        assert_eq!((crate::fs::places::folder_glyph(&pinned), crate::fs::places::folder_glyph(&moved_pinned)), (Some('★'), None));
+        assert_eq!(moved_events(&events).last(), Some(&vec![(moved_pinned.clone(), pinned.clone())]));
+        app.redo();
+        finish_jobs(&mut app);
+        assert!(moved_pinned.is_dir());
+        assert_eq!(app.pins[0], moved_pinned);
+        assert_eq!(moved_events(&events).last(), Some(&vec![(pinned.clone(), moved_pinned.clone())]));
+        assert_eq!(moved_events(&events).len(), 3, "each change tells the plugins once");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn undoing_a_rename_takes_the_pin_back_to_the_old_name() {
+        let base = std::env::temp_dir().join(format!("compression_places_rename_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (old, new) = (base.join("old"), base.join("new"));
+        std::fs::create_dir_all(old.join("sub")).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let events = app.plugins.record_file_ops();
+        app.pins = vec![old.clone(), old.join("sub")];
+        app.rename_entry(&old, "new").unwrap();
+        assert_eq!(app.pins, vec![new.clone(), new.join("sub")], "a rename takes what is below along");
+        app.undo();
+        finish_jobs(&mut app);
+        assert!(old.is_dir());
+        assert_eq!(app.pins, vec![old.clone(), old.join("sub")]);
+        app.redo();
+        finish_jobs(&mut app);
+        assert_eq!(app.pins, vec![new.clone(), new.join("sub")]);
+        assert_eq!(moved_events(&events).len(), 3);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn items_that_swap_places_do_not_undo_each_others_pins_and_the_trash_leaves_pins_alone() {
+        let (a, b, c) = (PathBuf::from("/x/a"), PathBuf::from("/x/b"), PathBuf::from("/x/c"));
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(std::env::temp_dir(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.pins = vec![a.clone(), b.clone(), c.clone(), a.join("in")];
+        app.retarget_places(&[(a.clone(), b.clone()), (b.clone(), a.clone())]);
+        assert_eq!(app.pins, vec![b.clone(), a.clone(), c, b.join("in")]);
+
+        // Moving to the trash is not a move to somewhere else: the pin stays where the folder was, before and after
+        let base = std::env::temp_dir().join(format!("compression_places_trash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pinned = base.join("pinned");
+        std::fs::create_dir_all(&pinned).unwrap();
+        app.pins = vec![pinned.clone()];
+        let events = app.plugins.record_file_ops();
+        app.trash_paths(vec![pinned.clone()]);
+        assert_eq!(app.pins, vec![pinned.clone()]);
+        app.undo();
+        finish_jobs(&mut app);
+        assert!(pinned.is_dir());
+        assert_eq!(app.pins, vec![pinned.clone()]);
+        assert!(moved_events(&events).is_empty(), "{:?}", events.borrow());
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -175,8 +175,13 @@ fn load_paths_from(file: &std::path::Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// Where the person's own list is written: nowhere in a test, which must never touch the files of whoever runs it.
+fn user_file_to_write(name: &str) -> Option<PathBuf> {
+    config_file_to_write(name).filter(|_| !cfg!(test))
+}
+
 fn save_paths(name: &str, paths: &[PathBuf]) {
-    if let Some(file) = config_file_to_write(name) {
+    if let Some(file) = user_file_to_write(name) {
         save_paths_to(&file, paths);
     }
 }
@@ -199,7 +204,7 @@ pub fn load_folder_icons() -> HashMap<PathBuf, PathBuf> {
 }
 
 pub fn save_folder_icons(icons: &HashMap<PathBuf, PathBuf>) {
-    let Some(file) = config_file_to_write("folder_icons.json") else { return };
+    let Some(file) = user_file_to_write("folder_icons.json") else { return };
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -235,7 +240,7 @@ pub fn set_folder_glyph(folder: &std::path::Path, glyph: Option<char>) -> bool {
             Some(c) => m.insert(folder.to_path_buf(), c) != Some(c),
             None => m.remove(folder).is_some(),
         };
-        if changed && let Some(file) = config_file_to_write("folder_glyphs.json") {
+        if changed && let Some(file) = user_file_to_write("folder_glyphs.json") {
             if let Some(dir) = file.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
@@ -247,12 +252,34 @@ pub fn set_folder_glyph(folder: &std::path::Path, glyph: Option<char>) -> bool {
     })
 }
 
-/// A folder that was renamed or moved keeps its glyph.
-pub fn move_folder_glyph(old: &std::path::Path, new: &std::path::Path) {
-    if let Some(c) = folder_glyph(old) {
-        set_folder_glyph(old, None);
-        set_folder_glyph(new, Some(c));
-    }
+/// Where `path` is after `moves` (pairs of where an item was and where it is): the pair whose old path is the closest
+/// one above `path` (or `path` itself) decides, so a folder that moved takes what is below it along. `None` when `path`
+/// did not move. Every path is looked up in the original pairs, so items that swapped places do not undo each other.
+pub fn moved_to(moves: &[(PathBuf, PathBuf)], path: &std::path::Path) -> Option<PathBuf> {
+    moves
+        .iter()
+        .filter(|(old, _)| path.starts_with(old))
+        .max_by_key(|(old, _)| old.components().count())
+        .map(|(old, new)| new.join(path.strip_prefix(old).unwrap_or(std::path::Path::new(""))))
+}
+
+/// Folders that were renamed or moved keep their glyph.
+pub fn move_folder_glyphs(moves: &[(PathBuf, PathBuf)]) {
+    with_glyphs(|m| {
+        let moved: HashMap<PathBuf, char> = m.iter().map(|(folder, glyph)| (moved_to(moves, folder).unwrap_or_else(|| folder.clone()), *glyph)).collect();
+        if moved == *m {
+            return;
+        }
+        *m = moved;
+        if let Some(file) = user_file_to_write("folder_glyphs.json") {
+            if let Some(dir) = file.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(json) = serde_json::to_string_pretty(&*m) {
+                let _ = crate::fs::atomic::write(&file, json);
+            }
+        }
+    });
 }
 
 /// A file of the settings folder, to read. An administrator window reads the folder of the person who
@@ -273,6 +300,23 @@ fn config_file_to_write(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_moves_with_the_closest_folder_above_it_that_moved_and_only_by_whole_names() {
+        let pair = |a: &str, b: &str| (PathBuf::from(a), PathBuf::from(b));
+        let moves = [pair("/a/dir", "/b/dir"), pair("/a/dir/inner", "/c/inner")];
+        let to = |p: &str| moved_to(&moves, std::path::Path::new(p));
+        assert_eq!(to("/a/dir"), Some(PathBuf::from("/b/dir")));
+        assert_eq!(to("/a/dir/file"), Some(PathBuf::from("/b/dir/file")));
+        // The closer pair decides
+        assert_eq!(to("/a/dir/inner"), Some(PathBuf::from("/c/inner")));
+        assert_eq!(to("/a/dir/inner/deep/x"), Some(PathBuf::from("/c/inner/deep/x")));
+        // Letters alone do not make a path inside; what did not move stays
+        assert_eq!(to("/a/dir2"), None);
+        assert_eq!(to("/a"), None);
+        assert_eq!(to("/z"), None);
+        assert_eq!(moved_to(&[], std::path::Path::new("/a")), None);
+    }
     use std::path::Path;
 
     #[test]

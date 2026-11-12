@@ -136,11 +136,15 @@ impl CompressionApp {
                 self.forget_entry_sizes(&entry);
                 self.history.record(entry);
             }
+            // What the entry holds are the steps that take back what an undo or redo did: `report_moves` reads them as
+            // it does for a change, and so tells where the items went
             Effect::Undone(entry) => {
+                self.report_moves(&entry);
                 self.forget_entry_sizes(&entry);
                 self.history.push_redo(entry);
             }
             Effect::Redone(entry) => {
+                self.report_moves(&entry);
                 self.forget_entry_sizes(&entry);
                 self.history.push_undo(entry);
             }

@@ -141,6 +141,8 @@ impl CompressionApp {
             }
         }
         if !moved.is_empty() {
+            // Pins, bookmarks and the like follow, as plugins do
+            self.retarget_places(&moved);
             self.plugins.file_op_done(&FileOpEvent::Moved(moved));
         }
         if !created.is_empty() {
