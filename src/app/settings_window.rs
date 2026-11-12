@@ -12,8 +12,23 @@ const SETTINGS_MIN_SIZE: egui::Vec2 = egui::vec2(420.0, 400.0);
 /// The trace log is rotated once it reaches this size, so it stays at about twice this at most.
 const TRACE_LIMIT: u64 = 1 << 20;
 
-/// Appends a line to `~/.cache/compression/settings.log`, so a run started from anywhere leaves its trace.
+/// Whether the trace of the Settings window is written: only when `COMPRESSION_SETTINGS_TRACE` is set (to anything but
+/// empty), for chasing a problem with the window. Read once.
+fn tracing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| trace_asked(std::env::var_os("COMPRESSION_SETTINGS_TRACE")))
+}
+
+fn trace_asked(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|v| !v.is_empty())
+}
+
+/// Appends a line to `~/.cache/compression/settings.log`, so a run started from anywhere leaves its trace; nothing unless
+/// the trace was asked for (see `tracing`).
 pub(crate) fn settings_trace(line: &str) {
+    if !tracing() {
+        return;
+    }
     let Some(dir) = std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))) else { return };
     let dir = dir.join("compression");
     let _ = std::fs::create_dir_all(&dir);
@@ -33,9 +48,12 @@ fn append_capped(file: &std::path::Path, line: &str, limit: u64) {
     }
 }
 
-/// Frame-by-frame trace of the Settings window on stderr, for chasing resize trouble: a line
+/// Frame-by-frame trace of the Settings window in its log (when asked for, see `tracing`), for chasing resize trouble: a line
 /// whenever the width or the sidebar's slide changes, and for every frame slower than 30ms.
 fn settings_log(ctx: &egui::Context, width: f32, visible: bool, t: f32) {
+    if !tracing() {
+        return;
+    }
     use std::sync::Mutex;
     static LAST: Mutex<(f32, f32, u64)> = Mutex::new((0.0, 0.0, 0));
     let pass = ctx.cumulative_pass_nr();
@@ -232,6 +250,15 @@ impl CompressionApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_trace_is_written_only_when_asked_for() {
+        assert!(!trace_asked(None));
+        assert!(!trace_asked(Some("".into())));
+        assert!(trace_asked(Some("1".into())));
+        // The test run does not ask for it: a trace line goes nowhere
+        assert!(std::env::var_os("COMPRESSION_SETTINGS_TRACE").is_none() && !tracing());
+    }
 
     #[test]
     fn the_trace_log_stays_small_and_keeps_working() {
