@@ -795,16 +795,17 @@ fn unpack(archive: &Path, dest: &Path, control: &Control) -> io::Result<()> {
     let source = || -> io::Result<Watched<std::fs::File>> { Ok(Watched::new(std::fs::File::open(archive)?, control)) };
     if ends(&[".zip", ".jar", ".apk"]) {
         let mut zip = zip::ZipArchive::new(source()?).map_err(zip_error)?;
+        check_zip(&mut zip)?;
         zip.extract(dest).map_err(zip_error)
     } else if ends(&[".tar.gz", ".tgz"]) {
-        tar::Archive::new(flate2::read::GzDecoder::new(source()?)).unpack(dest)
+        unpack_tar(flate2::read::GzDecoder::new(source()?), dest)
     } else if ends(&[".tar"]) {
-        tar::Archive::new(source()?).unpack(dest)
-    } else if ends(&[".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tar.zst", ".tzst"]) && have("tar") {
-        let mut cmd = Command::new("tar");
-        cmd.arg("-xf").arg(archive).arg("-C").arg(dest);
-        run_tool(cmd, control)
+        unpack_tar(source()?, dest)
+    } else if let Some(program) = decompressor(&name).filter(|p| have(p)) {
+        // The program only turns the file back into a tar stream; what lands where is decided here, entry by entry
+        unpack_compressed_tar(program, archive, dest, control)
     } else if have("7z") || have("7za") {
+        check_listing(&seven_zip_listing(archive, control)?)?;
         let mut cmd = Command::new(seven_zip());
         let mut out = std::ffi::OsString::from("-o");
         out.push(dest);
@@ -813,6 +814,209 @@ fn unpack(archive: &Path, dest: &Path, control: &Control) -> io::Result<()> {
     } else {
         Err(io::Error::other(tr("No tool installed to unpack this kind of archive (install 7z)")))
     }
+}
+
+/// The entry `name` of an archive would be written outside the folder it is unpacked into.
+fn outside(name: &Path) -> io::Error {
+    io::Error::other(trf("The archive has an entry that would land outside the folder: {}", &[&name.display()]))
+}
+
+/// `name` without `.` parts, as the entries of an archive are compared.
+fn plain(name: &Path) -> PathBuf {
+    name.components().filter(|c| matches!(c, std::path::Component::Normal(_))).collect()
+}
+
+/// Whether an entry `name` of an archive stays inside the folder it is unpacked into: it is not absolute, it has no
+/// `..`, and it does not lie under an entry of the same archive that is a link (`links`): a file written through a
+/// link could land anywhere. Checked before the entry is written, so nothing outside is ever touched.
+fn check_member(name: &Path, links: &std::collections::HashSet<PathBuf>) -> io::Result<()> {
+    let mut so_far = PathBuf::new();
+    for part in name.components() {
+        match part {
+            std::path::Component::Normal(part) => {
+                if !so_far.as_os_str().is_empty() && links.contains(&so_far) {
+                    return Err(outside(name));
+                }
+                so_far.push(part);
+            }
+            std::path::Component::CurDir => {}
+            _ => return Err(outside(name)),
+        }
+    }
+    Ok(())
+}
+
+/// Unpack a tar stream into `dest`, checking every entry before it is written (see `check_member`); a hard link must
+/// point inside too. A refused entry ends the unpacking with an error, and the caller takes the folder away. Like
+/// `tar::Archive::unpack`, folders are made last, so that their permissions do not keep out what is in them.
+fn unpack_tar<R: Read>(reader: R, dest: &Path) -> io::Result<()> {
+    let dest = dest.canonicalize()?;
+    let mut archive = tar::Archive::new(reader);
+    let mut links = std::collections::HashSet::new();
+    let mut folders = Vec::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let name = entry.path()?.into_owned();
+        check_member(&name, &links)?;
+        let kind = entry.header().entry_type();
+        if kind.is_hard_link() {
+            let target = entry.link_name()?.map(|t| t.into_owned()).unwrap_or_default();
+            check_member(&target, &links)?;
+        }
+        if kind.is_symlink() {
+            links.insert(plain(&name));
+        }
+        if kind == tar::EntryType::Directory {
+            folders.push(entry);
+        } else if !entry.unpack_in(&dest)? {
+            return Err(outside(&name));
+        }
+    }
+    folders.sort_by(|a, b| b.path_bytes().cmp(&a.path_bytes()));
+    for mut folder in folders {
+        let name = folder.path()?.into_owned();
+        if !folder.unpack_in(&dest)? {
+            return Err(outside(&name));
+        }
+    }
+    Ok(())
+}
+
+/// Every entry of a zip archive checked before anything is written: `enclosed_name` refuses absolute names and `..`,
+/// and nothing may lie under an entry that is a link.
+fn check_zip<R: Read + Seek>(zip: &mut zip::ZipArchive<R>) -> io::Result<()> {
+    let mut links = std::collections::HashSet::new();
+    for i in 0..zip.len() {
+        let entry = zip.by_index_raw(i).map_err(zip_error)?;
+        let Some(name) = entry.enclosed_name() else { return Err(outside(Path::new(&*entry.name().map_err(zip_error)?))) };
+        check_member(&name, &links)?;
+        if entry.is_symlink() {
+            links.insert(plain(&name));
+        }
+    }
+    Ok(())
+}
+
+/// The program that turns a compressed tar file back into a tar stream (`-dc` for all of them), by the file's name.
+fn decompressor(name: &str) -> Option<&'static str> {
+    let ends = |exts: &[&str]| exts.iter().any(|e| name.ends_with(e));
+    if ends(&[".tar.xz", ".txz"]) {
+        Some("xz")
+    } else if ends(&[".tar.bz2", ".tbz2"]) {
+        Some("bzip2")
+    } else if ends(&[".tar.zst", ".tzst"]) {
+        Some("zstd")
+    } else {
+        None
+    }
+}
+
+/// The output of a program, read in turns of at most 50 ms, so that a stop or the end of the time is noticed even while
+/// the program says nothing.
+struct Polled<'a, T> {
+    inner: T,
+    control: &'a Control<'a>,
+}
+
+impl<T: Read + std::os::fd::AsRawFd> Read for Polled<'_, T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            self.control.check().map_err(io::Error::other)?;
+            let mut pfd = libc::pollfd { fd: self.inner.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: one valid pollfd for the duration of the call
+            let ready = unsafe { libc::poll(&mut pfd, 1, 50) };
+            if ready < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if ready > 0 {
+                return self.inner.read(buf);
+            }
+        }
+    }
+}
+
+/// Unpack a compressed tar file: `program -dc` writes the tar stream, and `unpack_tar` puts the entries in place. The
+/// program runs in a process group of its own and is killed when the unpacking ends early (a stop, the time, a refused
+/// entry); its error message is the reason when it fails.
+fn unpack_compressed_tar(program: &str, archive: &Path, dest: &Path, control: &Control) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut child = Command::new(program)
+        .arg("-dc")
+        .arg(archive)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or_else(|| io::Error::other(tr("The program failed")))?;
+    let mut stderr = child.stderr.take().ok_or_else(|| io::Error::other(tr("The program failed")))?;
+    let said = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = (&mut stderr).take(64 * 1024).read_to_end(&mut text);
+        String::from_utf8_lossy(&text).into_owned()
+    });
+    let mut reader = Watched::new(Polled { inner: stdout, control }, control);
+    let mut result = unpack_tar(&mut reader, dest);
+    if result.is_ok() {
+        // The program writes on after the end of the archive (padding, and its own check of the data at the very end):
+        // what follows is read to the end, so that it finishes and says whether the data were whole
+        result = io::copy(&mut reader, &mut io::sink()).map(|_| ());
+    }
+    drop(reader);
+    if result.is_err() {
+        // SAFETY: a signal to the program's own process group
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    }
+    let status = child.wait()?;
+    let said = said.join().unwrap_or_default();
+    match result {
+        Err(err) if status.success() || control.check().is_err() => Err(err),
+        // A program that failed explains a broken stream better than the tar reader does
+        Err(_) | Ok(()) if !status.success() => Err(io::Error::other(said.lines().last().map_or_else(|| tr("The program failed").to_owned(), str::to_owned))),
+        other => other,
+    }
+}
+
+/// The listing of an archive by 7z (`l -slt`), within the time of the job.
+fn seven_zip_listing(archive: &Path, control: &Control) -> io::Result<String> {
+    let mut cmd = Command::new(seven_zip());
+    cmd.arg("l").arg("-slt").arg("--").arg(archive);
+    let left = control.deadline.saturating_duration_since(Instant::now());
+    match process::run_capped_with(cmd, None, TOOL_OUTPUT_LIMIT, left, &|| (control.cancelled)()) {
+        Ok(output) if output.success => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
+        Ok(output) => Err(io::Error::other(String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or(tr("The program failed")).to_owned())),
+        Err(Failure::Cancelled) => Err(stopped()),
+        Err(Failure::TimedOut) => Err(timed_out()),
+        Err(Failure::TooMuchOutput) => Err(io::Error::other(tr("The archive program printed too much"))),
+        Err(Failure::Io(e)) => Err(e),
+    }
+}
+
+/// The entries of a 7z listing (`l -slt`), each checked like the entries of a tar stream: the part after the line of
+/// dashes has a block per entry with `Path = `, and `Symbolic Link = ` / `Hard Link = ` for links. A listing without
+/// that line is not understood and refused.
+fn check_listing(listing: &str) -> io::Result<()> {
+    let Some((_, entries)) = listing.split_once("\n----------\n") else {
+        return Err(io::Error::other(tr("The archive could not be listed")));
+    };
+    let mut links = std::collections::HashSet::new();
+    for block in entries.split("\n\n") {
+        let field = |key: &str| block.lines().find_map(|l| l.strip_prefix(key)).map(str::trim_end).filter(|v| !v.is_empty());
+        let Some(name) = field("Path = ") else { continue };
+        let name = Path::new(name);
+        check_member(name, &links)?;
+        if let Some(target) = field("Hard Link = ") {
+            check_member(Path::new(target), &links)?;
+        }
+        if field("Symbolic Link = ").is_some() {
+            links.insert(plain(name));
+        }
+    }
+    Ok(())
 }
 
 /// Unpack `archive` into a new folder of its own inside `dest` and return it. Nothing that is in `dest` can be written
@@ -1688,4 +1892,216 @@ pub(crate) mod tests {
         }
         std::fs::remove_dir_all(&root).unwrap();
     }
+
+    // --- Unpacking never writes outside the folder it unpacks into
+
+    /// A tar archive whose entries are written as given, without the checks of `tar::Builder` (that is the point):
+    /// `kind` is 'f' (file "x"), 'd' (folder), 'l' (symlink to `target`) or 'h' (hard link to `target`).
+    fn raw_tar(entries: &[(&str, char, &str)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, kind, target) in entries {
+            let mut header = tar::Header::new_gnu();
+            let gnu = header.as_gnu_mut().unwrap();
+            gnu.name[..name.len()].copy_from_slice(name.as_bytes());
+            gnu.linkname[..target.len()].copy_from_slice(target.as_bytes());
+            header.set_mode(if *kind == 'd' { 0o755 } else { 0o644 });
+            let (kind, data): (tar::EntryType, &[u8]) = match kind {
+                'f' => (tar::EntryType::Regular, b"x"),
+                'd' => (tar::EntryType::Directory, b""),
+                'l' => (tar::EntryType::Symlink, b""),
+                _ => (tar::EntryType::Link, b""),
+            };
+            header.set_entry_type(kind);
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            builder.append(&header, data).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    /// A folder with `in/` (where the archive lies and is unpacked) and `outside/` (with a file `secret`).
+    fn evil_root(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = dir(name);
+        let (inside, outside) = (root.join("in"), root.join("outside"));
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "secret").unwrap();
+        (root, inside, outside)
+    }
+
+    /// Writes `tar` as `name` in `inside`, compressed as the name says (with the system's program for xz).
+    fn archive_as(inside: &Path, name: &str, tar: &[u8]) -> Option<PathBuf> {
+        let path = inside.join(name);
+        if name.ends_with(".tar.gz") {
+            let mut gz = flate2::write::GzEncoder::new(std::fs::File::create(&path).unwrap(), flate2::Compression::fast());
+            gz.write_all(tar).unwrap();
+            gz.finish().unwrap();
+        } else if name.ends_with(".tar.xz") {
+            if !have("xz") {
+                return None;
+            }
+            let mut child = Command::new("xz").arg("-c").stdin(std::process::Stdio::piped()).stdout(std::fs::File::create(&path).unwrap()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(tar).unwrap();
+            assert!(child.wait().unwrap().success());
+        } else {
+            // `.tar`, and a tar under another name for 7z (it tells the format by the content)
+            if !name.ends_with(".tar") && !(have("7z") || have("7za")) {
+                return None;
+            }
+            std::fs::write(&path, tar).unwrap();
+        }
+        Some(path)
+    }
+
+    /// What is in `dir`, by name.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// An entry for `raw_tar`, owned: name, kind, target.
+    type Entry = (String, char, String);
+
+    #[test]
+    fn an_archive_with_an_entry_that_would_land_outside_is_refused_and_nothing_is_written() {
+        for format in ["evil.tar", "evil.tar.gz", "evil.tar.xz", "evil.cb7"] {
+            let cases: Vec<(&str, Vec<Entry>)> = vec![
+                ("dot-dot", vec![("ok".into(), 'f', String::new()), ("../../outside/escape".into(), 'f', String::new())]),
+                ("absolute", vec![("ok".into(), 'f', String::new()), ("{outside}/escape".into(), 'f', String::new())]),
+                ("through a link", vec![("ok".into(), 'f', String::new()), ("l".into(), 'l', "{outside}".into()), ("l/escape".into(), 'f', String::new())]),
+                ("hard link out", vec![("ok".into(), 'f', String::new()), ("h".into(), 'h', "../../outside/secret".into())]),
+            ];
+            for (case, entries) in cases {
+                let (root, inside, outside) = evil_root(&format!("evil_{}_{}", format.replace('.', "_"), case.replace(' ', "_")));
+                let fill = |s: &str| s.replace("{outside}", &outside.display().to_string());
+                let entries: Vec<Entry> = entries.iter().map(|(n, k, t)| (fill(n), *k, fill(t))).collect();
+                let borrowed: Vec<(&str, char, &str)> = entries.iter().map(|(n, k, t)| (n.as_str(), *k, t.as_str())).collect();
+                let Some(archive) = archive_as(&inside, format, &raw_tar(&borrowed)) else { continue };
+                let result = extract_beside(&archive, &Control::unlimited());
+                let err = result.expect_err(&format!("{format}, {case}: unpacked"));
+                assert!(err.to_string().contains("outside the folder") || format == "evil.cb7" && case == "hard link out", "{format}, {case}: {err}");
+                // Nothing outside changed, and no half-unpacked folder is left
+                assert_eq!(names(&outside), ["secret"], "{format}, {case}");
+                assert_eq!(std::fs::read_to_string(outside.join("secret")).unwrap(), "secret", "{format}, {case}");
+                assert_eq!(names(&inside), [format], "{format}, {case}");
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+    }
+
+    #[test]
+    fn a_zip_with_an_entry_that_would_land_outside_is_refused_and_nothing_is_written() {
+        use zip::write::SimpleFileOptions;
+        for case in ["dot-dot", "through a link"] {
+            let (root, inside, outside) = evil_root(&format!("evil_zip_{}", case.replace(' ', "_")));
+            let archive = inside.join("evil.zip");
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            zip.start_file("ok", SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"x").unwrap();
+            if case == "dot-dot" {
+                zip.start_file("../../outside/escape", SimpleFileOptions::default()).unwrap();
+                zip.write_all(b"x").unwrap();
+            } else {
+                zip.add_symlink("l", outside.display().to_string(), SimpleFileOptions::default()).unwrap();
+                zip.start_file("l/escape", SimpleFileOptions::default()).unwrap();
+                zip.write_all(b"x").unwrap();
+            }
+            zip.finish().unwrap();
+            let err = extract_beside(&archive, &Control::unlimited()).expect_err(case);
+            assert!(err.to_string().contains("outside the folder"), "{case}: {err}");
+            assert_eq!(names(&outside), ["secret"], "{case}");
+            assert_eq!(names(&inside), ["evil.zip"], "{case}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn links_that_stay_inside_or_point_to_a_system_file_are_unpacked_as_they_are() {
+        for format in ["good.tar", "good.tar.gz", "good.tar.xz", "good.cb7"] {
+            let (root, inside, outside) = evil_root(&format!("good_{}", format.replace('.', "_")));
+            let tar = raw_tar(&[("d/", 'd', ""), ("d/a", 'f', ""), ("rel", 'l', "d/a"), ("abs", 'l', "/etc/hostname"), ("h", 'h', "d/a")]);
+            let Some(archive) = archive_as(&inside, format, &tar) else { continue };
+            let out = extract_beside(&archive, &Control::unlimited()).unwrap_or_else(|e| panic!("{format}: {e}"));
+            assert_eq!(std::fs::read_to_string(out.join("d/a")).unwrap(), "x", "{format}");
+            assert_eq!(std::fs::read_link(out.join("rel")).unwrap(), Path::new("d/a"), "{format}");
+            assert_eq!(std::fs::read_to_string(out.join("h")).unwrap(), "x", "{format}");
+            // A link to a file of the system is kept as a link (as every unpacker does); it is not followed while unpacking
+            assert!(std::fs::symlink_metadata(out.join("abs")).unwrap().file_type().is_symlink(), "{format}");
+            assert_eq!(names(&outside), ["secret"], "{format}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn a_compressed_tar_that_is_broken_or_stopped_leaves_nothing_and_says_why() {
+        if !have("xz") {
+            return;
+        }
+        let (root, inside, _) = evil_root("xz_broken");
+        let broken = inside.join("broken.tar.xz");
+        std::fs::write(&broken, b"this is not xz").unwrap();
+        let err = extract_beside(&broken, &Control::unlimited()).unwrap_err();
+        assert!(!err.to_string().is_empty() && !err.to_string().contains("outside"), "{err}");
+        assert_eq!(names(&inside), ["broken.tar.xz"]);
+        // A stop while the program writes: the job ends as a stop and the folder goes
+        let good = archive_as(&inside, "big.tar.xz", &raw_tar(&[("a", 'f', ""), ("b", 'f', "")])).unwrap();
+        let err = extract_beside(&good, &Control::new(&|| true, &|_| {}, Duration::from_secs(60))).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted, "{err}");
+        assert_eq!(names(&inside), ["big.tar.xz", "broken.tar.xz"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_7z_listing_is_read_entry_by_entry_and_one_it_cannot_read_is_refused() {
+        let listing = |entries: &str| format!("7-Zip\n\nPath = /tmp/a.7z\nType = 7z\n\n----------\n{entries}");
+        assert!(check_listing(&listing("Path = a\nSymbolic Link = \n\nPath = d/b\nHard Link = \n")).is_ok());
+        assert!(check_listing(&listing("Path = ../x\n")).is_err());
+        assert!(check_listing(&listing("Path = /etc/x\n")).is_err());
+        assert!(check_listing(&listing("Path = l\nSymbolic Link = /etc\n\nPath = l/x\n")).is_err());
+        assert!(check_listing(&listing("Path = h\nHard Link = ../../x\n")).is_err());
+        // The archive's own (absolute) path in the head is not an entry
+        assert!(check_listing(&listing("")).is_ok());
+        assert_eq!(check_listing("Path = a\n").unwrap_err().to_string(), "The archive could not be listed");
+    }
+
+
+    #[test]
+    fn the_output_of_a_program_that_says_nothing_still_notices_the_end_of_the_time() {
+        let mut child = Command::new("sleep").arg("30").stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let control = Control::new(&|| false, &|_| {}, Duration::from_millis(300));
+        let started = Instant::now();
+        let mut polled = Polled { inner: child.stdout.take().unwrap(), control: &control };
+        let err = polled.read(&mut [0u8; 16]).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert!(err.to_string().contains("minutes"), "{err}");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+
+    #[test]
+    fn a_compressed_tar_is_read_to_its_end_so_padding_does_not_fail_it_and_a_broken_end_is_told() {
+        if !have("xz") {
+            return;
+        }
+        let (root, inside, _) = evil_root("xz_tail");
+        // Far more after the end of the archive than a pipe holds: the program is still writing when the tar ends
+        let mut tar = raw_tar(&[("a", 'f', "")]);
+        tar.extend(std::iter::repeat_n(0u8, 512 * 1024));
+        let padded = archive_as(&inside, "padded.tar.xz", &tar).unwrap();
+        let out = extract_beside(&padded, &Control::unlimited()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(std::fs::read_to_string(out.join("a")).unwrap(), "x");
+        // The data are whole up to the archive's end, but the program's own check at the very end fails: that is told
+        let mut bytes = std::fs::read(&padded).unwrap();
+        let at = bytes.len() - 20;
+        bytes[at] ^= 0xff;
+        let broken = inside.join("broken-end.tar.xz");
+        std::fs::write(&broken, bytes).unwrap();
+        let before = names(&inside);
+        assert!(extract_beside(&broken, &Control::unlimited()).is_err(), "a broken stream counts as unpacked");
+        assert_eq!(names(&inside), before, "the half-unpacked folder is left");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 }

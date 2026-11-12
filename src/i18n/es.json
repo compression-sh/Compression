@@ -929,5 +929,7 @@
   "Could not find out the type and the default application ({})": "No se pudo averiguar el tipo ni la aplicación predeterminada ({})",
   "The type of this file is not known, so no default can be set for it": "No se conoce el tipo de este archivo, así que no se puede fijar un valor predeterminado",
   "Another window is open. Open the properties again.": "Hay otra ventana abierta. Abre las propiedades de nuevo.",
-  "Not available ({})": "No disponible ({})"
+  "Not available ({})": "No disponible ({})",
+  "The archive has an entry that would land outside the folder: {}": "El archivo contiene una entrada que quedaría fuera de la carpeta: {}",
+  "The archive could not be listed": "No se pudo listar el contenido del archivo"
 }

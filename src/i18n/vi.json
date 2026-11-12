@@ -929,5 +929,7 @@
   "Could not find out the type and the default application ({})": "Không xác định được loại tệp và ứng dụng mặc định ({})",
   "The type of this file is not known, so no default can be set for it": "Chưa biết loại của tệp này nên không thể đặt mặc định cho nó",
   "Another window is open. Open the properties again.": "Đang mở một cửa sổ khác. Hãy mở lại thuộc tính.",
-  "Not available ({})": "Không khả dụng ({})"
+  "Not available ({})": "Không khả dụng ({})",
+  "The archive has an entry that would land outside the folder: {}": "Tệp nén có một mục sẽ nằm ngoài thư mục: {}",
+  "The archive could not be listed": "Không thể liệt kê nội dung tệp nén"
 }

@@ -929,5 +929,7 @@
   "Could not find out the type and the default application ({})": "Не удалось определить тип и приложение по умолчанию ({})",
   "The type of this file is not known, so no default can be set for it": "Тип файла неизвестен, поэтому для него нельзя задать приложение по умолчанию",
   "Another window is open. Open the properties again.": "Открыто другое окно. Откройте свойства ещё раз.",
-  "Not available ({})": "Недоступно ({})"
+  "Not available ({})": "Недоступно ({})",
+  "The archive has an entry that would land outside the folder: {}": "В архиве есть запись, которая оказалась бы вне папки: {}",
+  "The archive could not be listed": "Не удалось получить список содержимого архива"
 }
