@@ -420,6 +420,7 @@
   "“{}” is treated as a server": "“{}” được coi là máy chủ",
   "“{}” is treated as a local folder": "“{}” được coi là thư mục cục bộ",
   "{} items could not be removed": "Không thể xóa {} mục",
+  "{} items were deleted for good before the stop": "{} mục đã bị xóa vĩnh viễn trước khi dừng",
   "Nothing to compress": "Không có gì để nén",
   "No tool installed to unpack this kind of archive (install 7z)": "Chưa cài công cụ nào để giải nén loại tệp này (hãy cài 7z)",
   "Unknown": "Không rõ",

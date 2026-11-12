@@ -1382,24 +1382,34 @@ fn empty_trash_folders(w: &mut Worker, roots: Vec<PathBuf>) -> Outcome {
 
 pub fn delete_forever(w: &mut Worker, paths: Vec<PathBuf>) -> Outcome {
     w.shared.files_total.store(paths.len() as u64, Relaxed);
-    let mut failures = Vec::new();
-    let mut was_cancelled = false;
+    let (mut deleted, mut failures, mut was_cancelled) = (0, Vec::new(), false);
     for path in &paths {
         if w.shared.checkpoint().is_err() {
             was_cancelled = true;
             break;
         }
         w.shared.set_current(&name_of(path));
-        if let Err(err) = trash::delete_forever(path) {
-            failures.push(format!("{}: {}", name_of(path), crate::fs::describe::io_error(&err)));
+        match trash::delete_forever(path) {
+            Ok(()) => deleted += 1,
+            Err(err) => failures.push(format!("{}: {}", name_of(path), crate::fs::describe::io_error(&err))),
         }
         w.file_done();
     }
+    deletion_outcome(&paths, deleted, failures, was_cancelled)
+}
+
+/// How a deletion for good ended. A stop says what is gone already: an undo cannot bring it back.
+fn deletion_outcome(paths: &[PathBuf], deleted: usize, failures: Vec<String>, was_cancelled: bool) -> Outcome {
     let label = if paths.len() == 1 { format!("“{}”", name_of(&paths[0])) } else { trn(paths.len(), "{} item", "{} items") };
+    let gone = (was_cancelled && deleted > 0).then(|| trn(deleted, "{} item was deleted for good before the stop", "{} items were deleted for good before the stop"));
     let mut outcome = if !failures.is_empty() {
-        Outcome::failed(failures.join(" · "))
+        let mut text = failures.join(" · ");
+        text.extend(gone.map(|g| format!(" · {g}")));
+        Outcome::failed(text)
     } else if was_cancelled {
-        Outcome::done(tr("Cancelled").to_owned())
+        let mut stopped = Outcome::stopped();
+        stopped.message.extend(gone.map(|g| format!(" · {g}")));
+        stopped
     } else {
         Outcome::done(trf("Deleted {}", &[&label]))
     };
@@ -2788,6 +2798,20 @@ mod tests {
             assert!(outcome.cancelled && !outcome.ok, "{kind:?}: cancelled={} ok={}", outcome.cancelled, outcome.ok);
             assert_eq!(e.jobs.iter().find(|j| j.id == id).map(|j| j.state), Some(JobState::Cancelled), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn a_stopped_deletion_ends_as_stopped_and_says_what_is_gone_already() {
+        let paths: Vec<PathBuf> = (0..5).map(|i| PathBuf::from(format!("/x/f{i}"))).collect();
+        let stopped = deletion_outcome(&paths, 2, Vec::new(), true);
+        assert!(stopped.cancelled && !stopped.ok);
+        assert_eq!(stopped.message, "Cancelled · 2 items were deleted for good before the stop");
+        assert_eq!(deletion_outcome(&paths, 0, Vec::new(), true).message, Outcome::stopped().message, "nothing gone, nothing to say");
+        let failed = deletion_outcome(&paths, 1, vec!["f3: Permission denied".into()], true);
+        assert!(failed.cancelled && !failed.ok);
+        assert_eq!(failed.message, "f3: Permission denied · 1 item was deleted for good before the stop");
+        let done = deletion_outcome(&paths, 5, Vec::new(), false);
+        assert!(done.ok && !done.cancelled && done.message == "Deleted 5 items");
     }
 
     /// The real jobs that end with `done` when stopped (deleting for good, a copy that failed nothing) say not ok either.

@@ -420,6 +420,7 @@
   "“{}” is treated as a server": "«{}» считается сервером",
   "“{}” is treated as a local folder": "«{}» считается локальной папкой",
   "{} items could not be removed": "Не удалось удалить {} элемент|Не удалось удалить {} элемента|Не удалось удалить {} элементов",
+  "{} items were deleted for good before the stop": "{} элемент удалён навсегда до остановки|{} элемента удалены навсегда до остановки|{} элементов удалены навсегда до остановки",
   "Nothing to compress": "Нечего сжимать",
   "No tool installed to unpack this kind of archive (install 7z)": "Не установлена программа для распаковки такого архива (установите 7z)",
   "Unknown": "Неизвестно",

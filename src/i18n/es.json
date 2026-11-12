@@ -420,6 +420,7 @@
   "“{}” is treated as a server": "«{}» se trata como servidor",
   "“{}” is treated as a local folder": "«{}» se trata como carpeta local",
   "{} items could not be removed": "No se pudo eliminar {} elemento|No se pudieron eliminar {} elementos",
+  "{} items were deleted for good before the stop": "{} elemento se eliminó definitivamente antes de detener|{} elementos se eliminaron definitivamente antes de detener",
   "Nothing to compress": "Nada que comprimir",
   "No tool installed to unpack this kind of archive (install 7z)": "No hay ninguna herramienta instalada para desempaquetar este tipo de archivo (instala 7z)",
   "Unknown": "Desconocido",
