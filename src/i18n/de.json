@@ -148,7 +148,6 @@
   "The source file is already in this folder and would overwrite itself.": "Die Quelldatei liegt bereits in diesem Ordner und würde sich selbst überschreiben.",
   "Can't move items over themselves": "Elemente können nicht über sich selbst verschoben werden",
   "The source items are already in this folder and would overwrite themselves.": "Die Quellelemente liegen bereits in diesem Ordner und würden sich selbst überschreiben.",
-  "Open the folder first to compress its files": "Öffnen Sie zuerst den Ordner, um seine Dateien zu komprimieren",
   "Archive": "Archiv",
   "Open a regular folder to drop files into": "Öffnen Sie einen normalen Ordner, um Dateien dort abzulegen",
   "Search": "Suchen",
@@ -919,5 +918,8 @@
   "The server cannot be reached": "Der Server ist nicht erreichbar",
   "The server no longer knows this item": "Der Server kennt dieses Element nicht mehr",
   "This is not supported here": "Das wird hier nicht unterstützt",
-  "Too many files are open": "Zu viele Dateien sind geöffnet"
+  "Too many files are open": "Zu viele Dateien sind geöffnet",
+  "The selected items are in different folders. Open the folder first to compress them": "Die gewählten Elemente liegen in verschiedenen Ordnern. Öffne zuerst den Ordner, um sie zu komprimieren",
+  "Not included, because they are in other folders ({}): {}{}": "Nicht enthalten, weil sie in anderen Ordnern liegen ({}): {}{}",
+  "Created “{}” · {} not included, because they are in other folders": "„{}“ erstellt · {} nicht enthalten, weil sie in anderen Ordnern liegen"
 }

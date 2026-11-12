@@ -148,7 +148,6 @@
   "The source file is already in this folder and would overwrite itself.": "Исходный файл уже находится здесь и перезаписал бы сам себя.",
   "Can't move items over themselves": "Нельзя переместить элементы на самих себя",
   "The source items are already in this folder and would overwrite themselves.": "Исходные элементы уже находятся здесь и перезаписали бы сами себя.",
-  "Open the folder first to compress its files": "Сначала откройте папку, чтобы сжать её файлы",
   "Archive": "Архив",
   "Open a regular folder to drop files into": "Откройте обычную папку, чтобы перетащить в неё файлы",
   "Search": "Поиск",
@@ -919,5 +918,8 @@
   "The server cannot be reached": "Сервер недоступен",
   "The server no longer knows this item": "Сервер больше не знает этого элемента",
   "This is not supported here": "Здесь это не поддерживается",
-  "Too many files are open": "Открыто слишком много файлов"
+  "Too many files are open": "Открыто слишком много файлов",
+  "The selected items are in different folders. Open the folder first to compress them": "Выбранные элементы находятся в разных папках. Сначала откройте папку, чтобы сжать их",
+  "Not included, because they are in other folders ({}): {}{}": "Не включены, так как они в других папках ({}): {}{}",
+  "Created “{}” · {} not included, because they are in other folders": "«{}» создан · не включено {}: они в других папках"
 }

@@ -625,6 +625,11 @@ pub fn compress(sources: &[PathBuf], out: &Path, format: ArchiveFormat, control:
         .and_then(|p| p.parent())
         .ok_or_else(|| io::Error::other(tr("Nothing to compress")))?
         .to_path_buf();
+    // The names in the archive are those of the items in one folder; items of other folders would be taken for
+    // items of this one (or be another file of the same name), so they are refused before anything is made
+    if sources.iter().any(|p| p.parent() != Some(base.as_path())) {
+        return Err(io::Error::other(tr("The selected items are in different folders. Open the folder first to compress them")));
+    }
     let names: Vec<_> = sources.iter().filter_map(|p| p.file_name().map(|n| n.to_owned())).collect();
     // `out` was free when its name was chosen. A file that is there now is not ours to fill, nor to
     // remove when the job fails, so the job ends before it touches anything
@@ -1653,5 +1658,34 @@ pub(crate) mod tests {
         let control = Control::unlimited();
         let err = extract_beside(Path::new("/"), &control).unwrap_err();
         assert_eq!(crate::fs::describe::io_error(&err), "It has no folder to go in");
+    }
+
+    #[test]
+    fn items_of_two_folders_are_refused_before_anything_is_made_and_one_folder_is_as_before() {
+        let root = std::env::temp_dir().join(format!("compression_compress_folders_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        std::fs::write(root.join("b.txt"), "b").unwrap();
+        // The same name in another folder: it must never stand in for the first one
+        std::fs::write(root.join("sub/a.txt"), "other a").unwrap();
+        let listing = |dir: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        let before = listing(&root);
+        for format in [ArchiveFormat::Zip, ArchiveFormat::TarGz] {
+            let out = root.join(format!("both{}", format.extension()));
+            let err = compress(&[root.join("a.txt"), root.join("sub/a.txt")], &out, format, &Control::unlimited()).unwrap_err();
+            assert_eq!(crate::fs::describe::io_error(&err), "The selected items are in different folders. Open the folder first to compress them");
+            assert!(!out.exists(), "no archive is made");
+            assert_eq!(listing(&root), before, "nothing is left behind");
+            // One folder: as always
+            compress(&[root.join("a.txt"), root.join("b.txt")], &out, format, &Control::unlimited()).unwrap();
+            assert!(out.is_file());
+            std::fs::remove_file(&out).unwrap();
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

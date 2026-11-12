@@ -148,7 +148,6 @@
   "The source file is already in this folder and would overwrite itself.": "Tệp nguồn đã nằm trong thư mục này và sẽ tự ghi đè lên chính nó.",
   "Can't move items over themselves": "Không thể chuyển các mục đè lên chính chúng",
   "The source items are already in this folder and would overwrite themselves.": "Các mục nguồn đã nằm trong thư mục này và sẽ tự ghi đè lên chính chúng.",
-  "Open the folder first to compress its files": "Hãy mở thư mục trước để nén các tệp trong đó",
   "Archive": "Tệp nén",
   "Open a regular folder to drop files into": "Hãy mở một thư mục thông thường để thả tệp vào",
   "Search": "Tìm kiếm",
@@ -919,5 +918,8 @@
   "The server cannot be reached": "Không thể kết nối tới máy chủ",
   "The server no longer knows this item": "Máy chủ không còn biết mục này",
   "This is not supported here": "Điều này không được hỗ trợ ở đây",
-  "Too many files are open": "Có quá nhiều tệp đang mở"
+  "Too many files are open": "Có quá nhiều tệp đang mở",
+  "The selected items are in different folders. Open the folder first to compress them": "Các mục đã chọn nằm trong những thư mục khác nhau. Hãy mở thư mục trước để nén chúng",
+  "Not included, because they are in other folders ({}): {}{}": "Không được đưa vào vì nằm trong thư mục khác ({}): {}{}",
+  "Created “{}” · {} not included, because they are in other folders": "Đã tạo “{}” · {} mục không được đưa vào vì nằm trong thư mục khác"
 }

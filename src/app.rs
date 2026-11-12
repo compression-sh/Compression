@@ -254,6 +254,8 @@ pub(crate) enum Dialog {
     BatchRename { entries: Vec<RenameEntry>, rules: RenameRules, first_frame: bool },
     Compress {
         sources: Vec<PathBuf>,
+        /// Selected items that lie in other folders than this one: not in the archive, and the dialog says so.
+        left_out: Vec<PathBuf>,
         name: String,
         format: ArchiveFormat,
         first_frame: bool,
@@ -1561,16 +1563,18 @@ impl CompressionApp {
 
     fn open_compress_dialog(&mut self, sources: Vec<PathBuf>) {
         let base = self.current_path.clone();
-        let sources: Vec<PathBuf> = sources.into_iter().filter(|p| p.parent() == Some(base.as_path())).collect();
+        // An archive is made of the items of one folder, this one: what is in another folder (a search result, a
+        // recent file) is not in it, and the dialog says so before anything is made
+        let (sources, left_out): (Vec<PathBuf>, Vec<PathBuf>) = sources.into_iter().partition(|p| p.parent() == Some(base.as_path()));
         if sources.is_empty() {
-            self.set_toast(tr("Open the folder first to compress its files"));
+            self.set_toast(tr("The selected items are in different folders. Open the folder first to compress them"));
             return;
         }
         let name = match sources.as_slice() {
             [one] => ops::archive_stem(one),
             _ => base.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| tr("Archive").to_owned()),
         };
-        self.dialog = Some(Dialog::Compress { sources, name, format: ArchiveFormat::Zip, first_frame: true });
+        self.dialog = Some(Dialog::Compress { sources, left_out, name, format: ArchiveFormat::Zip, first_frame: true });
     }
 
     fn open_pick_folder(&mut self, op: TransferOp, items: Vec<PathBuf>) {
@@ -6454,7 +6458,7 @@ impl CompressionApp {
     }
 
     fn compress_contents(&mut self, ui: &mut egui::Ui, dialog: &mut Dialog) -> bool {
-        let Dialog::Compress { sources, name, format, first_frame } = dialog else { return false };
+        let Dialog::Compress { sources, left_out, name, format, first_frame } = dialog else { return false };
         let theme = self.theme;
         let mut close = material::dialog_header(ui, tr("Compress"), Some(&Self::describe_count(sources)), &theme, "cz_close");
 
@@ -6489,6 +6493,13 @@ impl CompressionApp {
             }
         });
 
+        if !left_out.is_empty() {
+            let names: Vec<String> = left_out.iter().take(3).map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+            let more = if left_out.len() > 3 { format!(", +{}", left_out.len() - 3) } else { String::new() };
+            let warning = SerpantinumTheme { subtext1: theme.yellow, ..theme };
+            material::hint_label(ui, &trf("Not included, because they are in other folders ({}): {}{}", &[&left_out.len(), &names.join(", "), &more]), &warning);
+        }
+
         let footer = material::dialog_footer(ui, &theme, FooterSpec { enabled: !name.trim().is_empty(), ..FooterSpec::new("cz", icons::COMPRESS, tr("Compress")) });
         submit |= footer.primary;
         close |= footer.cancel;
@@ -6496,7 +6507,7 @@ impl CompressionApp {
         if submit && !name.trim().is_empty() {
             let file_name = format!("{}{}", name.trim().replace('/', "_"), format.extension());
             let out = ops::unique_path(&self.current_path, std::ffi::OsStr::new(&file_name), "copy");
-            let (sources, format) = (sources.clone(), *format);
+            let (sources, format, left) = (sources.clone(), *format, left_out.len());
             let shown = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let title = trf("Compressing into {}", &[&shown]);
             self.engine.spawn(JobKind::Compress, title, String::new(), move |w| {
@@ -6504,6 +6515,7 @@ impl CompressionApp {
                 let size = ops::tree_bytes(&sources);
                 w.shared.bytes_total.store(size, Relaxed);
                 match w.archive_control(0, size, |control| ops::compress(&sources, &out, format, control)) {
+                    Ok(()) if left > 0 => Outcome::done(trf("Created “{}” · {} not included, because they are in other folders", &[&shown, &left])).with(Effect::Record(UndoEntry::new(trf("Compression into {}", &[&shown]), vec![Edit::Trash(out)]))),
                     Ok(()) => Outcome::done(trf("Created “{}”", &[&shown])).with(Effect::Record(UndoEntry::new(trf("Compression into {}", &[&shown]), vec![Edit::Trash(out)]))),
                     // The unfinished archive is already gone
                     Err(err) if engine::is_cancel(&err) => Outcome::stopped(),
@@ -9271,6 +9283,103 @@ mod tests {
         let mut w = Window { app, ctx: egui::Context::default(), frame: eframe::Frame::_new_kittest(), time: 0.0, last: Vec::new(), shapes: Vec::new(), circles: Vec::new() };
         w.run(Vec::new(), 3);
         assert_eq!(w.app.toast_message(), Some("Permission denied"));
+    }
+
+    fn archive_entries(archive: &Path) -> Vec<String> {
+        let mut names: Vec<String> = if archive.to_string_lossy().ends_with(".zip") {
+            let zip = zip::ZipArchive::new(std::fs::File::open(archive).unwrap()).unwrap();
+            zip.file_names().map(|n| n.unwrap().into_owned()).collect()
+        } else {
+            let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(std::fs::File::open(archive).unwrap()));
+            tar.entries().unwrap().map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned()).collect()
+        };
+        names.sort();
+        names
+    }
+
+    fn compress_files(name: &str, count: usize) -> (PathBuf, Vec<PathBuf>) {
+        let root = window_dir(name);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        for file in ["a.txt", "b.txt"] {
+            std::fs::write(root.join(file), file).unwrap();
+        }
+        let elsewhere: Vec<PathBuf> = (1..=count)
+            .map(|n| {
+                let path = root.join(if n % 2 == 0 { "sub" } else { "other" }).join(format!("x{n}.txt"));
+                std::fs::write(&path, "x").unwrap();
+                path
+            })
+            .collect();
+        (root, elsewhere)
+    }
+
+    #[test]
+    fn a_selection_from_several_folders_keeps_this_folders_items_and_the_dialog_names_what_is_left_out() {
+        let (root, elsewhere) = compress_files("compress_left_out", 2);
+        let mut w = Window::new(root.clone());
+        let mut selection = vec![root.join("a.txt"), elsewhere[0].clone(), elsewhere[1].clone()];
+        selection.push(root.join("b.txt"));
+        w.app.open_compress_dialog(selection);
+        match &w.app.dialog {
+            Some(Dialog::Compress { sources, left_out, .. }) => {
+                assert_eq!(sources, &[root.join("a.txt"), root.join("b.txt")]);
+                assert_eq!(left_out, &elsewhere);
+            }
+            _ => panic!("no compress dialog"),
+        }
+        w.run(Vec::new(), 12);
+        assert!(w.shows("Not included, because they are in other folders (2): x1.txt, x2.txt"), "{:?}", w.last);
+
+        // Nothing is left out: nothing is said
+        w.app.dialog = None;
+        w.run(Vec::new(), 12);
+        w.app.open_compress_dialog(vec![root.join("a.txt"), root.join("b.txt")]);
+        assert!(matches!(&w.app.dialog, Some(Dialog::Compress { left_out, .. }) if left_out.is_empty()));
+        w.run(Vec::new(), 12);
+        assert!(!w.last.iter().any(|t| t.starts_with("Not included")), "{:?}", w.last);
+    }
+
+    #[test]
+    fn only_three_names_of_what_is_left_out_are_shown_and_the_rest_is_counted() {
+        let (root, elsewhere) = compress_files("compress_many_left_out", 5);
+        let mut w = Window::new(root.clone());
+        let mut selection = vec![root.join("a.txt")];
+        selection.extend(elsewhere);
+        w.app.open_compress_dialog(selection);
+        w.run(Vec::new(), 12);
+        assert!(w.shows("Not included, because they are in other folders (5): x1.txt, x2.txt, x3.txt, +2"), "{:?}", w.last);
+        assert!(!w.last.iter().any(|t| t.contains("x4.txt")), "{:?}", w.last);
+    }
+
+    #[test]
+    fn when_every_item_is_in_another_folder_there_is_no_dialog_and_the_reason_is_told() {
+        let (root, elsewhere) = compress_files("compress_all_left_out", 2);
+        let mut w = Window::new(root);
+        w.app.open_compress_dialog(elsewhere);
+        assert!(w.app.dialog.is_none());
+        assert_eq!(w.app.toast_message(), Some("The selected items are in different folders. Open the folder first to compress them"));
+    }
+
+    #[test]
+    fn the_archive_holds_only_the_items_of_this_folder_and_the_message_counts_the_others() {
+        for (format, extension) in [(ArchiveFormat::Zip, ".zip"), (ArchiveFormat::TarGz, ".tar.gz")] {
+            let (root, elsewhere) = compress_files("compress_submit", 3);
+            let mut w = Window::new(root.clone());
+            w.app.open_compress_dialog(vec![root.join("a.txt"), elsewhere[0].clone(), root.join("b.txt"), elsewhere[1].clone(), elsewhere[2].clone()]);
+            if let Some(Dialog::Compress { format: chosen, name, .. }) = &mut w.app.dialog {
+                *chosen = format;
+                *name = "bundle".to_owned();
+            }
+            w.run(Vec::new(), 6);
+            w.run(vec![egui::Event::Key { key: egui::Key::Enter, physical_key: Some(egui::Key::Enter), pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }], 2);
+            w.run(vec![egui::Event::Key { key: egui::Key::Enter, physical_key: Some(egui::Key::Enter), pressed: false, repeat: false, modifiers: egui::Modifiers::NONE }], 2);
+            let archive = root.join(format!("bundle{extension}"));
+            w.until("the job said what it did", |w| w.app.toast_message().is_some_and(|t| t.starts_with("Created")));
+            assert_eq!(w.app.toast_message(), Some(format!("Created “bundle{extension}” · 3 not included, because they are in other folders").as_str()));
+            assert_eq!(archive_entries(&archive), ["a.txt", "b.txt"], "{extension}");
+            assert!(w.app.dialog.is_none());
+        }
     }
 
     #[test]
