@@ -403,6 +403,29 @@ fn split_name(name: &str) -> (&str, &str) {
     }
 }
 
+/// Open `path` for reading, as the regular file it was looked at as: a name that has become a pipe (or a link) since
+/// must not hold the job up (opening a pipe waits for a writer that may never come) nor be followed.
+pub(crate) fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(test)]
+    tests::swap_before_open(path);
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        return Err(io::Error::other(trf("Cannot copy {}: it is a named pipe, socket or device file", &[&name])));
+    }
+    // The flag was for the opening; a file is read the usual way
+    // SAFETY: the descriptor belongs to `file`, which is open; `fcntl` with these commands only reads and sets flags.
+    unsafe {
+        let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+    Ok(file)
+}
+
 fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = src.symlink_metadata()?;
     if meta.file_type().is_symlink() {
@@ -424,7 +447,7 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
         Err(io::Error::other(trf("Cannot copy {}: it is a named pipe, socket or device file", &[&name])))
     } else {
         // Not `std::fs::copy`: it fails the whole copy when the target refuses the permissions
-        let reader = std::fs::File::open(src)?;
+        let reader = open_regular_file(src)?;
         // Not `File::create`: a file that appeared there meanwhile is not ours to cut short
         let writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
         copy_contents(&reader, &writer, &meta)?;
@@ -1244,6 +1267,56 @@ pub(crate) mod tests {
 
     /// A folder on this disk and one on another file system (`/dev/shm`); `None` where that cannot be had, or as root,
     /// who can remove what no one else can.
+    /// Paths that the tests turn into something else just before they are opened, as a program might between the
+    /// moment a copy looks at a file and the moment it opens it: into a pipe (`None`) or into a link to a file.
+    static SWAPS: std::sync::Mutex<Vec<(PathBuf, Option<PathBuf>)>> = std::sync::Mutex::new(Vec::new());
+
+    pub(crate) fn swap_before_open_of(path: &Path, link_to: Option<PathBuf>) {
+        SWAPS.lock().unwrap().push((path.to_path_buf(), link_to));
+    }
+
+    pub(super) fn swap_before_open(path: &Path) {
+        let swap = SWAPS.lock().unwrap().iter().find(|(p, _)| p == path).cloned();
+        let Some((_, link)) = swap else { return };
+        let _ = std::fs::remove_file(path);
+        match link {
+            Some(target) => std::os::unix::fs::symlink(target, path).unwrap(),
+            None => {
+                let name = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())).unwrap();
+                // SAFETY: `name` is a valid C string; `mkfifo` only creates the file.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn the_copy_of_the_trash_and_of_an_undo_does_not_wait_for_a_file_that_became_a_pipe_nor_follow_a_link() {
+        let dir = std::env::temp_dir().join(format!("compression_ops_swap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (secret, to_pipe, to_link) = (dir.join("secret"), dir.join("to_pipe"), dir.join("to_link"));
+        for file in [&secret, &to_pipe, &to_link] {
+            std::fs::write(file, "contents").unwrap();
+        }
+        swap_before_open_of(&to_pipe, None);
+        swap_before_open_of(&to_link, Some(secret.clone()));
+        // Run on a thread so that a copy that waits for the pipe ends this test instead of hanging it
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (a, b, c, d, e) = (to_pipe.clone(), dir.join("pipe_copy"), to_link.clone(), dir.join("link_copy"), dir.join("plain_copy"));
+        let plain = secret.clone();
+        std::thread::spawn(move || {
+            let results = (copy_tree(&a, &b), copy_tree(&c, &d), copy_tree(&plain, &e));
+            let _ = tx.send(results);
+        });
+        let (pipe, link, plain) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the copy waited for a pipe");
+        assert!(pipe.unwrap_err().to_string().contains("named pipe"));
+        assert!(link.is_err());
+        assert!(!dir.join("pipe_copy").exists() && !dir.join("link_copy").exists());
+        plain.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("plain_copy")).unwrap(), "contents");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     pub(crate) fn two_file_systems(name: &str) -> Option<(PathBuf, PathBuf)> {
         use std::os::unix::fs::MetadataExt;
         let root = std::env::temp_dir().join(format!("compression_{name}_{}", std::process::id()));

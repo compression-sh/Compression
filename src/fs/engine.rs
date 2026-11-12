@@ -703,30 +703,8 @@ impl Mover {
     }
 }
 
-/// Open `path` for reading, as the regular file it was looked at as: a name that has become a pipe (or a link) since
-/// must not hold the job up (opening a pipe waits for a writer that may never come) nor be followed.
-fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    #[cfg(test)]
-    tests::swap_before_open(path);
-    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(path)?;
-    if !file.metadata()?.file_type().is_file() {
-        return Err(special_file_error(path));
-    }
-    // The flag was for the opening; a file is read the usual way
-    // SAFETY: the descriptor belongs to `file`, which is open; `fcntl` with these commands only reads and sets flags.
-    unsafe {
-        let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
-        }
-    }
-    Ok(file)
-}
-
 fn copy_file(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
-    let reader = open_regular_file(src)?;
+    let reader = ops::open_regular_file(src)?;
     let meta = reader.metadata()?;
     // `create_new`: a file that is already there is an error, and not ours to remove below
     let writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
@@ -1434,24 +1412,6 @@ mod tests {
         }
     }
 
-    /// Paths that the tests turn into something else just before they are opened, as a program might between the
-    /// moment a copy looks at a file and the moment it opens it: into a pipe (`None`) or into a link to a file.
-    static SWAPS: Mutex<Vec<(PathBuf, Option<PathBuf>)>> = Mutex::new(Vec::new());
-
-    pub(super) fn swap_before_open(path: &Path) {
-        let swap = SWAPS.lock().unwrap().iter().find(|(p, _)| p == path).cloned();
-        let Some((_, link)) = swap else { return };
-        let _ = std::fs::remove_file(path);
-        match link {
-            Some(target) => std::os::unix::fs::symlink(target, path).unwrap(),
-            None => {
-                let name = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())).unwrap();
-                // SAFETY: `name` is a valid C string; `mkfifo` only creates the file.
-                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-            }
-        }
-    }
-
     pub(super) fn race_here(target: &Path) {
         if RACES.lock().unwrap().iter().any(|p| p == target) {
             let _ = std::fs::write(target, "intruder");
@@ -1621,8 +1581,8 @@ mod tests {
         for file in [&secret, &to_pipe, &to_link] {
             std::fs::write(file, "contents").unwrap();
         }
-        SWAPS.lock().unwrap().push((to_pipe.clone(), None));
-        SWAPS.lock().unwrap().push((to_link.clone(), Some(secret.clone())));
+        crate::fs::ops::tests::swap_before_open_of(&to_pipe, None);
+        crate::fs::ops::tests::swap_before_open_of(&to_link, Some(secret.clone()));
 
         // A pipe waits for a writer that never comes: the copy has to say so and finish
         let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(to_pipe.clone(), dir.join("pipe_copy"))], Decision::Replace);
@@ -1634,7 +1594,7 @@ mod tests {
         assert!(!dir.join("link_copy").exists(), "the copy took the contents of what the link points at");
 
         // A file that stays one is opened as before, for reading in the usual way
-        let file = open_regular_file(&secret).unwrap();
+        let file = ops::open_regular_file(&secret).unwrap();
         // SAFETY: the descriptor belongs to `file`, which is open.
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
         assert_eq!(flags & libc::O_NONBLOCK, 0, "the flag for the opening must not stay");
