@@ -418,6 +418,36 @@ static REMOTE_ROOTS: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 static MOUNTS: RwLock<Vec<Mount>> = RwLock::new(Vec::new());
 static LISTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The folders the person chose to treat as servers (`Settings::remote_folders`). In a test they are the test's own:
+/// tests run side by side and must not change each other's.
+#[cfg(not(test))]
+static USER_REMOTE: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
+#[cfg(test)]
+thread_local! {
+    static USER_REMOTE: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_user_remote<R>(f: impl FnOnce(&mut Vec<PathBuf>) -> R) -> R {
+    #[cfg(not(test))]
+    return f(&mut USER_REMOTE.write().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(test)]
+    USER_REMOTE.with(|folders| f(&mut folders.borrow_mut()))
+}
+
+/// Take in the folders the person treats as servers; nothing happens when they are the ones already known.
+pub fn set_user_remote_folders(folders: &[PathBuf]) {
+    with_user_remote(|known| {
+        if known.as_slice() != folders {
+            *known = folders.to_vec();
+        }
+    });
+}
+
+/// Whether the person chose to treat `folder` itself (a mount point) as a server.
+pub fn is_user_remote(folder: &Path) -> bool {
+    with_user_remote(|known| known.iter().any(|f| f == folder))
+}
+
 /// Whether `path` lies on a server (or phone), where reading files is slow and costs data.
 pub fn is_remote(path: &Path) -> bool {
     if path.starts_with(gvfs_root()) {
@@ -431,7 +461,10 @@ pub fn remote_root(path: &Path) -> Option<PathBuf> {
     if let Some(root) = declared_root(path) {
         return Some(root);
     }
-    REMOTE_ROOTS.read().ok()?.iter().filter(|r| path.starts_with(r)).max_by_key(|r| r.as_os_str().len()).cloned()
+    let chosen = with_user_remote(|known| known.iter().filter(|r| path.starts_with(r)).max_by_key(|r| r.as_os_str().len()).cloned());
+    let found = REMOTE_ROOTS.read().ok().and_then(|roots| roots.iter().filter(|r| path.starts_with(r)).max_by_key(|r| r.as_os_str().len()).cloned());
+    // The closest mount point decides
+    [chosen, found].into_iter().flatten().max_by_key(|r| r.as_os_str().len())
 }
 
 /// The mount folder `path` lies on (a GVfs one, or a server's by `remote_root`), found by its name alone: what

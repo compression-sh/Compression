@@ -168,6 +168,10 @@ enum MenuAction {
     Mount(String, String),
     Unmount(String, String, PathBuf),
     Eject(String, String, PathBuf),
+    /// Treat the mount point as a server, though Compression does not know it as one (set by hand, see `Settings::remote_folders`).
+    TreatAsServer(PathBuf),
+    /// Treat it as the local folder it is, as it was before.
+    TreatAsLocal(PathBuf),
     /// An entry a plugin added: the plugin's id, the entry's id and the files it applies to.
     Plugin(&'static str, String, Vec<PathBuf>, Option<&'static str>),
     /// Measure these folders.
@@ -195,6 +199,9 @@ pub(crate) enum TransferOp {
 pub(crate) enum ConfirmAction {
     DeleteForever(Vec<PathBuf>),
     EmptyTrash,
+    /// Treat this mount point as a server (no trash, no previews, nothing replaced): asked for first, since deleting
+    /// there is for good then.
+    TreatAsServer(PathBuf),
     /// The dialog's choice replaces files that exist: each one asked about in turn, the answer sent once all agreed.
     ReplaceFile { queue: Vec<PathBuf>, answer: Vec<PathBuf> },
     /// A plugin entry that asked "are you sure?": the plugin, the entry and its files.
@@ -597,6 +604,7 @@ impl CompressionApp {
     pub fn new(initial_path: PathBuf, theme: SerpantinumTheme, settings: Settings, ctx: &egui::Context) -> Self {
         // Before anything looks at a path: which ones are on servers (the listing that says so comes later)
         network::prime_remote_roots();
+        network::set_user_remote_folders(&settings.remote_folders);
         apps::preload();
         crate::ui::fonts::preload();
         // Ctrl+= / Ctrl+- resize icons (see `zoom_icons`), not the whole interface
@@ -1575,10 +1583,11 @@ impl CompressionApp {
             self.fonts_dirty = true;
         }
         network::set_remote_previews(s.remote_previews);
+        network::set_user_remote_folders(&s.remote_folders);
         if s.plugins != old.plugins {
             self.plugins.set_enabled_map(&s.plugins);
         }
-        let reread = s.show_hidden != old.show_hidden || s.plugins != old.plugins || s.remote_previews != old.remote_previews;
+        let reread = s.show_hidden != old.show_hidden || s.plugins != old.plugins || s.remote_previews != old.remote_previews || s.remote_folders != old.remote_folders;
         let resort = s.sort_by != old.sort_by || s.sort_order != old.sort_order || s.folders_first != old.folders_first || s.size_on_disk != old.size_on_disk;
         self.rebuild_theme();
         if reread {
@@ -3442,7 +3451,14 @@ impl CompressionApp {
                         .inner;
                     // The whole name when it is cut short, how full the drive is, and what a click does to one that is not mounted
                     let unmounted = place.drive.as_ref().is_some_and(|d| !d.mounted);
-                    let tip = place_tooltip(material::is_shortened(ui.ctx(), &resp).then(|| tr_dyn(&place.name)), space.map(|(_, words)| words), unmounted);
+                    // A drive the person treats as a server shows the dot of one, and says so
+                    let treated = place.drive.as_ref().is_some_and(|d| d.mounted) && network::is_user_remote(&place.path);
+                    let link = treated.then(|| network_ui::LinkState::of(true, true, self.folder_health(&place.path))).flatten();
+                    if let Some(state) = link {
+                        state.paint(ui, resp.rect, &self.theme);
+                    }
+                    let treated_words = link.map(|state| format!("{}\n{}", tr("Treated as a server"), state.words()));
+                    let tip = place_tooltip(material::is_shortened(ui.ctx(), &resp).then(|| tr_dyn(&place.name)), space.map(|(_, words)| words), treated_words, unmounted);
                     let resp = if tip.is_empty() { resp } else { resp.on_hover_text(tip) };
                     if ticking && let Some(builtin) = place.builtin {
                         let tick = egui::Rect::from_center_size(egui::pos2(resp.rect.right() - 22.0, resp.rect.center().y), egui::Vec2::splat(30.0));
@@ -4740,6 +4756,8 @@ impl CompressionApp {
             MenuAction::Mount(dev, name) => self.mount_drive(ctx, dev, name, true),
             MenuAction::Unmount(dev, name, mount) => self.unmount_drive(ctx, dev, name, mount, false),
             MenuAction::Eject(dev, name, mount) => self.unmount_drive(ctx, dev, name, mount, true),
+            MenuAction::TreatAsServer(folder) => self.ask_to_treat_as_server(folder),
+            MenuAction::TreatAsLocal(folder) => self.treat_folder_as_server(folder, false),
             MenuAction::Plugin(plugin, id, paths, confirm) => self.run_plugin_entry(ctx, plugin, id, paths, confirm),
             MenuAction::CalcSize(paths) => self.calculate_sizes(&paths),
             MenuAction::ConnectToServer => self.open_connect_dialog(),
@@ -4820,6 +4838,8 @@ impl CompressionApp {
                     | MenuAction::Mount(..)
                     | MenuAction::Unmount(..)
                     | MenuAction::Eject(..)
+                    | MenuAction::TreatAsServer(_)
+                    | MenuAction::TreatAsLocal(_)
                     | MenuAction::ConnectToServer
                     | MenuAction::Connect(..)
                     | MenuAction::Disconnect(_)
@@ -5111,6 +5131,14 @@ impl CompressionApp {
                     if drive.removable && !drive.system {
                         leave.push((icons::EJECT, tr("Eject"), MenuAction::Eject(dev, name, mount.clone())));
                     }
+                    // By hand, for a drive Compression does not know as a server: never for what the system mounted, and
+                    // never "as local" for a server that is known as one (that would take its safe behaviour away)
+                    let mut kind = Vec::new();
+                    if network::is_user_remote(mount) {
+                        kind.push((icons::LAN_CONNECT, tr("Treat as local"), MenuAction::TreatAsLocal(mount.clone())));
+                    } else if !drive.system && !network::is_remote(mount) {
+                        kind.push((icons::SERVER_NETWORK, tr("Treat as server"), MenuAction::TreatAsServer(mount.clone())));
+                    }
                     let groups = vec![
                         vec![
                             (icons::OPEN, tr("Open"), MenuAction::OpenPath(mount.clone())),
@@ -5118,6 +5146,7 @@ impl CompressionApp {
                             (icons::NEW_WINDOW, tr("Open in new window"), MenuAction::OpenInNewWindow(mount.clone())),
                         ],
                         leave,
+                        kind,
                         vec![(icons::INFO, tr("Properties"), MenuAction::Properties(mount.clone()))],
                     ];
                     groups.into_iter().filter(|g| !g.is_empty()).collect()
@@ -5339,6 +5368,11 @@ impl CompressionApp {
                                         continue;
                                     }
                                     let resp = menu_item(ui, ("menu", g, idx), icon, shown, hints[g][idx].as_deref(), &self.theme);
+                                    // What an entry means, before it is chosen
+                                    let resp = match menu_explanation(action) {
+                                        Some(words) => resp.on_hover_text(words),
+                                        None => resp,
+                                    };
                                     item_ids.push(resp.id);
                                     if resp.hovered() && interactive && sub_hover.is_none() {
                                         sub_hover = Some(None);
@@ -5693,14 +5727,15 @@ impl CompressionApp {
         let mut close = material::dialog_header(ui, title, None, &theme, "confirm_close");
         ui.label(egui::RichText::new(body.as_str()).size(material::FONT_BODY).color(theme.subtext0));
 
-        let replacing = matches!(action, ConfirmAction::ReplaceFile { .. });
-        let icon = if replacing { icons::CHECK } else { icons::DELETE_FOREVER };
+        let affirming = matches!(action, ConfirmAction::ReplaceFile { .. } | ConfirmAction::TreatAsServer(_));
+        let icon = if affirming { icons::CHECK } else { icons::DELETE_FOREVER };
         let footer = material::dialog_footer(ui, &theme, FooterSpec { danger: true, ..FooterSpec::new("confirm", icon, confirm) });
         close |= footer.cancel;
         if footer.primary {
             match std::mem::replace(action, ConfirmAction::EmptyTrash) {
                 ConfirmAction::DeleteForever(paths) => self.delete_forever(paths),
                 ConfirmAction::EmptyTrash => self.empty_trash(),
+                ConfirmAction::TreatAsServer(folder) => self.treat_folder_as_server(folder, true),
                 ConfirmAction::Plugin(plugin, id, paths) => self.run_plugin_confirmed(ui.ctx(), plugin, &id, &paths),
                 ConfirmAction::ReplaceFile { mut queue, answer } => {
                     if queue.is_empty() {
@@ -5753,6 +5788,37 @@ impl CompressionApp {
             })
             .collect();
         self.dialog = Some(Dialog::BatchRename { entries, rules: RenameRules::new(), first_frame: true });
+    }
+
+    /// Say what treating a folder as a server means, and set it only when the person agrees.
+    fn ask_to_treat_as_server(&mut self, folder: PathBuf) {
+        let name = folder.file_name().map_or_else(|| folder.display().to_string(), |n| n.to_string_lossy().into_owned());
+        self.dialog = Some(Dialog::Confirm {
+            title: tr("Treat this folder as a server?").to_owned(),
+            body: trf("Files deleted in “{}” can't be moved to the trash or restored. Previews are turned off, and nothing there is replaced.", &[&name]),
+            confirm: tr("Treat as server").to_owned(),
+            action: ConfirmAction::TreatAsServer(folder),
+        });
+    }
+
+    /// The person treats `folder` (the mount point of a drive) as a server, or as local again. Only by hand: nothing
+    /// is marked by itself. It takes effect at once, and is written to the settings.
+    pub(super) fn treat_folder_as_server(&mut self, folder: PathBuf, server: bool) {
+        let name = folder.file_name().map_or_else(|| folder.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let known = self.settings.remote_folders.contains(&folder);
+        if server == known {
+            return;
+        }
+        if server {
+            self.settings.remote_folders.push(folder);
+        } else {
+            self.settings.remote_folders.retain(|f| *f != folder);
+        }
+        network::set_user_remote_folders(&self.settings.remote_folders);
+        self.persist_settings();
+        // What was read as local (previews, counts) is read again under the other rules
+        self.reread_items();
+        self.set_toast(if server { trf("“{}” is treated as a server", &[&name]) } else { trf("“{}” is treated as a local folder", &[&name]) });
     }
 
     /// Pins, folder icons and default apps follow a path that was renamed.
@@ -6759,10 +6825,20 @@ fn name_field(ui: &mut egui::Ui, theme: &SerpantinumTheme, text: &mut String, fi
 }
 
 
+/// What a menu entry means, for the entries whose effect is bigger than their words: shown when the pointer rests on
+/// them, before they are chosen.
+fn menu_explanation(action: &MenuAction) -> Option<&'static str> {
+    match action {
+        MenuAction::TreatAsServer(_) => Some(tr("Treated as a server: no trash, previews off, delete is permanent")),
+        MenuAction::TreatAsLocal(_) => Some(tr("Back to a local folder: trash, previews and undo for deleting work again")),
+        _ => None,
+    }
+}
+
 /// The tooltip of a sidebar place: its whole name (when cut short), the room left on a drive, and
 /// that a click mounts a drive that is not mounted. Empty when there is nothing to add.
-fn place_tooltip(name: Option<String>, space: Option<String>, unmounted: bool) -> String {
-    [name, space, unmounted.then(|| tr("Not mounted – click to mount").to_owned())].into_iter().flatten().collect::<Vec<_>>().join("\n")
+fn place_tooltip(name: Option<String>, space: Option<String>, treated: Option<String>, unmounted: bool) -> String {
+    [name, space, treated, unmounted.then(|| tr("Not mounted – click to mount").to_owned())].into_iter().flatten().collect::<Vec<_>>().join("\n")
 }
 
 /// How long a message stays: at least 3 s (7 s with a button), longer for long text so it can be read.
@@ -7316,6 +7392,270 @@ mod tests {
         assert_eq!(app.current_path, given_remote);
         let app = CompressionApp::new(given_local, SerpantinumTheme::default(), Settings::default(), &ctx);
         assert_eq!(app.current_path, local.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn mounted_drive(name: &str, path: &Path, system: bool) -> Place {
+        let mut place = Place::new(name, path.to_path_buf(), icons::USB, crate::fs::places::PlaceGroup::Devices);
+        place.drive = Some(crate::fs::drives::Drive { dev: format!("/dev/{name}"), mounted: true, removable: true, system });
+        place
+    }
+
+    #[test]
+    fn a_folder_treated_as_a_server_is_one_everywhere_until_it_is_treated_as_local_again_and_only_by_hand() {
+        let base = std::env::temp_dir().join(format!("compression_treat_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (stick, other) = (base.join("stick"), base.join("stick2"));
+        std::fs::create_dir_all(stick.join("docs")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let said = |app: &CompressionApp| app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+        crate::settings::SAVES.with(|n| n.set(0));
+        // Nothing marks a folder by itself: a drive of a type nobody knows is local until the person says otherwise
+        network::prime_remote_roots();
+        assert!(!network::is_remote(&stick) && !network::is_user_remote(&stick) && app.settings.remote_folders.is_empty());
+
+        // By hand: the folder and what is inside it are a server, a folder that only starts with the same letters is not
+        app.treat_folder_as_server(stick.clone(), true);
+        assert_eq!(app.settings.remote_folders, vec![stick.clone()]);
+        assert!(network::is_user_remote(&stick) && network::is_remote(&stick) && network::is_remote(&stick.join("docs")));
+        assert!(!network::is_remote(&other) && !network::is_remote(&base));
+        assert!(!network::previews_allowed(&stick.join("docs")), "no previews on a server");
+        assert_eq!(said(&app), "“stick” is treated as a server");
+        assert_eq!(crate::settings::SAVES.with(|n| n.get()), 1, "written to the settings at once");
+        // Again: nothing changes, nothing is written twice
+        app.treat_folder_as_server(stick.clone(), true);
+        assert_eq!(app.settings.remote_folders, vec![stick.clone()]);
+        assert_eq!(crate::settings::SAVES.with(|n| n.get()), 1);
+
+        // Back: local again, as before
+        app.treat_folder_as_server(stick.clone(), false);
+        assert!(app.settings.remote_folders.is_empty());
+        assert!(!network::is_user_remote(&stick) && !network::is_remote(&stick.join("docs")) && network::previews_allowed(&stick.join("docs")));
+        assert_eq!(said(&app), "“stick” is treated as a local folder");
+        assert_eq!(crate::settings::SAVES.with(|n| n.get()), 2);
+        app.treat_folder_as_server(stick.clone(), false);
+        assert_eq!(crate::settings::SAVES.with(|n| n.get()), 2, "nothing to undo, nothing written");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_folders_treated_as_servers_are_saved_in_settings_json_and_are_servers_again_after_a_restart() {
+        let base = std::env::temp_dir().join(format!("compression_treat_restart_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let stick = base.join("stick");
+        std::fs::create_dir_all(&stick).unwrap();
+        // What the settings file says: the key and the folder
+        let settings = Settings { remote_folders: vec![stick.clone()], ..Settings::default() };
+        let file = base.join("config").join("settings.json");
+        settings.save_to(&file).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["remote_folders"], serde_json::json!([stick.to_string_lossy()]), "{text}");
+        // A file from before the setting existed has none
+        let without: Settings = serde_json::from_str("{}").unwrap();
+        assert!(without.remote_folders.is_empty());
+        // After a restart the window reads it back, and the folder is a server before anything looks at it
+        network::set_user_remote_folders(&[]);
+        assert!(!network::is_remote(&stick));
+        let loaded: Settings = serde_json::from_str(&text).unwrap();
+        let ctx = egui::Context::default();
+        let app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), loaded, &ctx);
+        assert_eq!(app.settings.remote_folders, vec![stick.clone()]);
+        assert!(network::is_remote(&stick) && network::is_remote(&stick.join("any")));
+        // Settings read again from the file (another window changed them) take effect too
+        let cleared = Settings { remote_folders: Vec::new(), ..Settings::default() };
+        let mut app = app;
+        assert!(app.apply_settings_file(cleared));
+        assert!(!network::is_remote(&stick));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_drive_menu_offers_to_treat_a_drive_as_a_server_or_as_local_and_never_for_what_is_known_or_the_systems() {
+        let base = std::env::temp_dir().join(format!("compression_treat_menu_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (stick, nfs, boot) = (base.join("stick"), base.join("nfs"), base.join("boot"));
+        for dir in [&stick, &nfs, &boot] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let entries = |app: &CompressionApp, place: &Place| -> Vec<String> {
+            let target = MenuTarget::Drive(place.drive.clone().unwrap(), place.name.clone(), place.path.clone());
+            app.menu_entries(&target).into_iter().flatten().map(|(_, label, _)| label.to_owned()).collect()
+        };
+        let has = |labels: &[String], text: &str| labels.iter().any(|l| l == text);
+        let drive = mounted_drive("stick", &stick, false);
+        // An ordinary drive: it can be treated as a server, not as local (it is local)
+        let labels = entries(&app, &drive);
+        assert!(has(&labels, "Treat as server") && !has(&labels, "Treat as local"), "{labels:?}");
+        // After the person has: the other way round
+        app.treat_folder_as_server(stick.clone(), true);
+        let labels = entries(&app, &drive);
+        assert!(has(&labels, "Treat as local") && !has(&labels, "Treat as server"), "{labels:?}");
+        // A server that Compression knows is not offered "as local": that would take its safe behaviour away
+        network::declare_remote_for_tests(&nfs);
+        let labels = entries(&app, &mounted_drive("nfs", &nfs, false));
+        assert!(!has(&labels, "Treat as server") && !has(&labels, "Treat as local"), "{labels:?}");
+        // What the system mounted is not offered either, and neither is a drive that is not mounted
+        let labels = entries(&app, &mounted_drive("boot", &boot, true));
+        assert!(!has(&labels, "Treat as server") && !has(&labels, "Treat as local"), "{labels:?}");
+        let mut unmounted = mounted_drive("gone", &base.join("gone"), false);
+        unmounted.drive.as_mut().unwrap().mounted = false;
+        let labels = entries(&app, &unmounted);
+        assert!(!has(&labels, "Treat as server") && !has(&labels, "Treat as local"), "{labels:?}");
+        // Choosing "Treat as server" asks first and sets nothing; "Treat as local" is done at once
+        let ctx = app.ctx.clone();
+        app.treat_folder_as_server(stick.clone(), false);
+        app.run_action(&ctx, MenuAction::TreatAsServer(stick.clone()));
+        assert!(!network::is_user_remote(&stick), "nothing is set before the person agrees");
+        assert!(matches!(&app.dialog, Some(Dialog::Confirm { action: ConfirmAction::TreatAsServer(f), .. }) if *f == stick));
+        app.treat_folder_as_server(stick.clone(), true);
+        app.run_action(&ctx, MenuAction::TreatAsLocal(stick.clone()));
+        assert!(!network::is_user_remote(&stick));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn treating_a_folder_as_a_server_is_asked_about_first_says_what_it_means_and_can_be_cancelled() {
+        let base = window_dir("treat_ask");
+        let stick = base.join("stick");
+        std::fs::create_dir_all(&stick).unwrap();
+        let mut w = Window::new(base.clone());
+        let ctx = w.ctx.clone();
+        let reason = "Files deleted in “stick” can't be moved to the trash or restored. Previews are turned off, and nothing there is replaced.";
+
+        // The question says what changes; nothing is set while it is open
+        w.app.run_action(&ctx, MenuAction::TreatAsServer(stick.clone()));
+        w.run(Vec::new(), 15);
+        assert!(w.shows("Treat this folder as a server?") && w.shows(reason), "{:?}", w.last);
+        assert!(!network::is_user_remote(&stick) && w.app.settings.remote_folders.is_empty());
+        // Cancel: the dialog goes, nothing was set
+        w.click(w.at("Cancel"), egui::PointerButton::Primary);
+        assert!(w.app.dialog.is_none(), "{:?}", w.last);
+        assert!(!network::is_user_remote(&stick) && w.app.settings.remote_folders.is_empty(), "cancelling must not set it");
+        // Esc cancels as well
+        w.app.run_action(&ctx, MenuAction::TreatAsServer(stick.clone()));
+        w.run(Vec::new(), 15);
+        w.key(egui::Key::Escape);
+        assert!(w.app.dialog.is_none() && !network::is_user_remote(&stick));
+        // Agreeing sets it
+        w.app.run_action(&ctx, MenuAction::TreatAsServer(stick.clone()));
+        w.run(Vec::new(), 15);
+        w.click(w.at("Treat as server"), egui::PointerButton::Primary);
+        assert!(network::is_user_remote(&stick) && w.app.settings.remote_folders == vec![stick.clone()], "{:?}", w.last);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_drive_menu_explains_treating_as_a_server_before_it_is_chosen() {
+        let base = window_dir("treat_hint");
+        let stick = base.join("stick");
+        std::fs::create_dir_all(&stick).unwrap();
+        let mut w = Window::new(base.clone());
+        let ctx = w.ctx.clone();
+        let drive = mounted_drive("thestick", &stick, false);
+        let target = MenuTarget::Drive(drive.drive.clone().unwrap(), drive.name.clone(), drive.path.clone());
+        let explained = |w: &Window, words: &str| w.shapes.iter().any(|(t, _)| t == words);
+        let (server, local) = (
+            "Treated as a server: no trash, previews off, delete is permanent",
+            "Back to a local folder: trash, previews and undo for deleting work again",
+        );
+        w.app.open_menu(&ctx, egui::pos2(300.0, 200.0), target.clone());
+        w.run(Vec::new(), 15);
+        assert!(w.shows("Treat as server") && !explained(&w, server), "no hint before the pointer rests on it");
+        w.run(vec![egui::Event::PointerMoved(w.at("Treat as server"))], 40);
+        assert!(explained(&w, server), "the menu does not say what it means: {:?}", w.last);
+        // The other way round says what comes back
+        w.app.menu = None;
+        w.run(Vec::new(), 20);
+        w.app.treat_folder_as_server(stick.clone(), true);
+        w.app.open_menu(&ctx, egui::pos2(300.0, 200.0), target);
+        w.run(Vec::new(), 15);
+        w.run(vec![egui::Event::PointerMoved(w.at("Treat as local"))], 40);
+        assert!(explained(&w, local) && !explained(&w, server), "{:?}", w.last);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn deleting_in_a_folder_treated_as_a_server_is_for_good_with_no_trash_and_no_undo_and_local_again_brings_them_back() {
+        let base = std::env::temp_dir().join(format!("compression_treat_delete_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let stick = base.join("stick");
+        std::fs::create_dir_all(&stick).unwrap();
+        let (kept, gone) = (stick.join("treat_delete_kept.txt"), stick.join("treat_delete_gone.txt"));
+        std::fs::write(&kept, "x").unwrap();
+        std::fs::write(&gone, "x").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let in_trash = |name: &str| crate::fs::trash::files_dir().is_some_and(|files| files.join(name).symlink_metadata().is_ok());
+        app.treat_folder_as_server(stick.clone(), true);
+
+        // "Move to trash" asks to delete for good, and changes nothing yet
+        app.trash_paths(vec![gone.clone()]);
+        let Some(Dialog::Confirm { title, action: ConfirmAction::DeleteForever(paths), .. }) = app.dialog.take() else { panic!("no question") };
+        assert_eq!((title.as_str(), paths.as_slice()), ("Delete permanently?", [gone.clone()].as_slice()));
+        assert!(gone.exists() && !in_trash("treat_delete_gone.txt"));
+        // Agreed: gone for good, nothing in the trash, nothing to undo, no Undo button
+        app.status_toast = None;
+        app.delete_forever(paths);
+        finish_jobs(&mut app);
+        assert!(!gone.exists(), "the file is deleted");
+        assert!(!in_trash("treat_delete_gone.txt"), "nothing reached the trash");
+        assert!(app.history.undo_label().is_none(), "there is nothing to undo");
+        assert!(app.status_toast.as_ref().is_some_and(|t| t.action.is_none()), "no Undo button for a deletion for good");
+        app.undo();
+        assert_eq!(app.status_toast.as_ref().map(|t| t.message.as_str()), Some("Nothing to undo"));
+
+        // Treated as local again: the trash and the undo are back
+        app.treat_folder_as_server(stick.clone(), false);
+        app.trash_paths(vec![kept.clone()]);
+        assert!(app.dialog.is_none() && !kept.exists(), "no question, and the file is in the trash");
+        assert!(in_trash("treat_delete_kept.txt"));
+        assert!(app.history.undo_label().is_some_and(|l| l.starts_with("Move of")));
+        assert!(app.status_toast.as_ref().is_some_and(|t| t.action.is_some()), "an Undo button");
+        app.undo();
+        finish_jobs(&mut app);
+        assert!(kept.exists() && !in_trash("treat_delete_kept.txt"), "the undo brought it back");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_sidebar_shows_the_dot_of_a_server_on_a_drive_treated_as_one_and_says_so() {
+        let base = window_dir("treat_dot");
+        let stick = base.join("stick");
+        std::fs::create_dir_all(&stick).unwrap();
+        let mut w = Window::new(base.clone());
+        let theme = w.app.theme;
+        // The drive list is read on a thread and may replace what is put here: put it back before every frame
+        let frames = |w: &mut Window, n: usize| {
+            for _ in 0..n {
+                if !w.app.places.iter().any(|p| p.name == "thestick") {
+                    w.app.places.push(mounted_drive("thestick", &stick, false));
+                }
+                w.run(Vec::new(), 1);
+            }
+        };
+        let dot = |w: &Window| {
+            let row = w.shapes.iter().find(|(t, _)| t == "thestick").unwrap_or_else(|| panic!("the drive is not drawn: {:?}", w.last)).1;
+            w.circles.iter().any(|(c, r, fill, _)| (c.y - row.center().y - 8.0).abs() < 1.0 && *r == 3.5 && *fill == theme.green && c.x < row.left())
+        };
+        frames(&mut w, 12);
+        assert!(!dot(&w), "a local drive has no dot");
+        w.app.treat_folder_as_server(stick.clone(), true);
+        frames(&mut w, 12);
+        assert!(dot(&w), "a drive treated as a server has the dot of one: {:?}", w.circles);
+        // And says so when the pointer rests on it
+        let at = w.at("thestick");
+        w.run(vec![egui::Event::PointerMoved(at)], 40);
+        let tip = w.last.iter().find(|t| t.starts_with("Treated as a server")).cloned();
+        assert_eq!(tip.as_deref(), Some("Treated as a server\nConnected"), "{:?}", w.last);
+        w.app.treat_folder_as_server(stick.clone(), false);
+        w.run(vec![egui::Event::PointerMoved(egui::pos2(900.0, 650.0))], 5);
+        frames(&mut w, 12);
+        assert!(!dot(&w), "treated as local again: no dot");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -8121,11 +8461,11 @@ mod tests {
 
     #[test]
     fn the_tooltip_of_a_sidebar_place_has_what_is_cut_off_the_room_left_and_what_a_click_does() {
-        assert_eq!(place_tooltip(None, None, false), "");
-        assert_eq!(place_tooltip(Some("A long name".into()), None, false), "A long name");
-        assert_eq!(place_tooltip(None, Some("1 GB free of 2 GB".into()), false), "1 GB free of 2 GB");
-        assert_eq!(place_tooltip(None, None, true), "Not mounted – click to mount");
-        assert_eq!(place_tooltip(Some("Name".into()), Some("room".into()), true), "Name\nroom\nNot mounted – click to mount");
+        assert_eq!(place_tooltip(None, None, None, false), "");
+        assert_eq!(place_tooltip(Some("A long name".into()), None, None, false), "A long name");
+        assert_eq!(place_tooltip(None, Some("1 GB free of 2 GB".into()), None, false), "1 GB free of 2 GB");
+        assert_eq!(place_tooltip(None, None, None, true), "Not mounted – click to mount");
+        assert_eq!(place_tooltip(Some("Name".into()), Some("room".into()), None, true), "Name\nroom\nNot mounted – click to mount");
     }
 
     #[test]

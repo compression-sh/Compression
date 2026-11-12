@@ -158,7 +158,7 @@ impl LinkState {
         }
     }
 
-    fn paint(self, ui: &egui::Ui, row: egui::Rect, theme: &SerpantinumTheme) {
+    pub(super) fn paint(self, ui: &egui::Ui, row: egui::Rect, theme: &SerpantinumTheme) {
         let center = egui::pos2(row.left() + material::INSET_ICON + 8.0, row.center().y + 8.0);
         let (color, filled) = self.look(theme);
         let painter = ui.painter();
@@ -599,7 +599,9 @@ impl CompressionApp {
 
     /// Ask the connected servers whether they still answer (see `mount_health`).
     fn probe_servers(&mut self, ctx: &egui::Context) {
-        let servers: Vec<PathBuf> = self.net.mounts.iter().filter(|m| m.address.is_some() && !self.net.leaving.contains(&m.local)).map(|m| m.local.clone()).collect();
+        let mut servers: Vec<PathBuf> = self.net.mounts.iter().filter(|m| m.address.is_some() && !self.net.leaving.contains(&m.local)).map(|m| m.local.clone()).collect();
+        // The drives the person treats as servers are watched like them, as long as they are mounted
+        servers.extend(self.places.iter().filter(|p| p.drive.as_ref().is_some_and(|d| d.mounted) && network::is_user_remote(&p.path)).map(|p| p.path.clone()));
         let ctx_asked = ctx.clone();
         self.net.probes.tick(&servers, Instant::now(), move |local, tx| {
             let ctx = ctx_asked.clone();
@@ -613,6 +615,11 @@ impl CompressionApp {
         if self.net.probes.asking() {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
+    }
+
+    /// How the drive at `folder`, which the person treats as a server, is doing.
+    pub(super) fn folder_health(&self, folder: &Path) -> Health {
+        self.net.probes.health(folder, Instant::now())
     }
 
     /// How the server mounted at `mount` is doing.
@@ -2524,5 +2531,49 @@ mod tests {
         // Each request that waited is asked for once the server is there
         assert_eq!(asked[1] - asked[0], 2, "{asked:?}");
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_folder_treated_as_a_server_gets_the_rules_of_one_for_renaming_and_deleting_and_loses_them_when_treated_as_local() {
+        let dir = std::env::temp_dir().join(format!("compression_treat_rules_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(file), file).unwrap();
+        }
+        let dir = dir.canonicalize().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(dir.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.treat_folder_as_server(dir.clone(), true);
+
+        // Renaming goes the way of a server: the call does not wait, the name changes when the thread has done it
+        let (release, hold) = mpsc::channel::<()>();
+        let hold = Mutex::new(hold);
+        app.net.rename = Arc::new(move |from, to| {
+            let _ = hold.lock().unwrap().recv();
+            crate::compat::rename_noreplace(from, to)
+        });
+        assert_eq!(app.rename_entry(&dir.join("a.txt"), "a2.txt"), Ok(()));
+        assert!(dir.join("a.txt").exists() && !dir.join("a2.txt").exists(), "nothing has happened yet");
+        release.send(()).unwrap();
+        wait_for(|| {
+            app.poll_network(&ctx);
+            app.history.undo_label().map(drop)
+        });
+        assert!(dir.join("a2.txt").exists());
+
+        // Deleting asks, as for a server: there is no trash, the file is deleted for good or not at all
+        app.trash_paths(vec![dir.join("b.txt")]);
+        assert!(matches!(&app.dialog, Some(Dialog::Confirm { action: ConfirmAction::DeleteForever(paths), .. }) if *paths == [dir.join("b.txt")]));
+        assert!(dir.join("b.txt").exists());
+
+        // As local again: renaming is done on the spot, deleting goes to the trash without a question
+        app.dialog = None;
+        app.treat_folder_as_server(dir.clone(), false);
+        assert_eq!(app.rename_entry(&dir.join("c.txt"), "c2.txt"), Ok(()));
+        assert!(dir.join("c2.txt").exists() && !dir.join("c.txt").exists(), "a local rename happens at once");
+        app.trash_paths(vec![dir.join("b.txt")]);
+        assert!(app.dialog.is_none() && !dir.join("b.txt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

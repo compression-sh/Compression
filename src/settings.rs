@@ -91,6 +91,9 @@ pub struct Settings {
     pub show_thumbnails: bool,
     /// Previews and folder item counts also for files on servers, which reads them over the network.
     pub remote_previews: bool,
+    /// Folders (mount points) the person chose to treat as servers, though Compression does not know them as such:
+    /// nothing in the window waits for them, they get no previews, and nothing on them is replaced. Only set by hand.
+    pub remote_folders: Vec<PathBuf>,
     pub show_extensions: bool,
     pub relative_dates: bool,
     pub decimal_units: bool,
@@ -280,6 +283,7 @@ impl Default for Settings {
             show_status_bar: true,
             show_thumbnails: true,
             remote_previews: false,
+            remote_folders: Vec::new(),
             show_extensions: true,
             relative_dates: true,
             decimal_units: false,
@@ -397,7 +401,7 @@ impl Settings {
         }
     }
 
-    fn save_to(&self, file: &std::path::Path) -> std::io::Result<()> {
+    pub(crate) fn save_to(&self, file: &std::path::Path) -> std::io::Result<()> {
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir)?;
         }
