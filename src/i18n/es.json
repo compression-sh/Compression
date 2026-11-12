@@ -401,6 +401,7 @@
   "Could not unmount “{}”: {}": "No se pudo desmontar «{}»: {}",
   "Authentication cancelled": "Autenticación cancelada",
   "Not mounted – click to mount": "No montado: clic para montar",
+  "An undo or redo is still running, try again in a moment": "Aún se está deshaciendo o rehaciendo, inténtalo de nuevo en un momento",
   "Nothing to compress": "Nada que comprimir",
   "No tool installed to unpack this kind of archive (install 7z)": "No hay ninguna herramienta instalada para desempaquetar este tipo de archivo (instala 7z)",
   "Unknown": "Desconocido",

@@ -401,6 +401,7 @@
   "Could not unmount “{}”: {}": "„{}“ konnte nicht ausgehängt werden: {}",
   "Authentication cancelled": "Anmeldung abgebrochen",
   "Not mounted – click to mount": "Nicht eingehängt – Klick zum Einhängen",
+  "An undo or redo is still running, try again in a moment": "Rückgängig oder Wiederholen läuft noch, gleich noch einmal versuchen",
   "Nothing to compress": "Nichts zu komprimieren",
   "No tool installed to unpack this kind of archive (install 7z)": "Kein Programm zum Entpacken dieser Archivart installiert (7z installieren)",
   "Unknown": "Unbekannt",

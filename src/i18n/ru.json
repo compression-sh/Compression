@@ -401,6 +401,7 @@
   "Could not unmount “{}”: {}": "Не удалось отключить «{}»: {}",
   "Authentication cancelled": "Аутентификация отменена",
   "Not mounted – click to mount": "Не смонтировано – нажмите, чтобы смонтировать",
+  "An undo or redo is still running, try again in a moment": "Отмена или повтор ещё выполняется, повторите чуть позже",
   "Nothing to compress": "Нечего сжимать",
   "No tool installed to unpack this kind of archive (install 7z)": "Не установлена программа для распаковки такого архива (установите 7z)",
   "Unknown": "Неизвестно",

@@ -4495,7 +4495,6 @@ impl CompressionApp {
         if paths.is_empty() {
             return;
         }
-        let label = Self::describe_count(&paths);
         let (mut trashed, mut failed, mut removed) = (Vec::new(), Vec::new(), Vec::new());
         for path in &paths {
             match trash::trash(path) {
@@ -4506,6 +4505,8 @@ impl CompressionApp {
                 Err(err) => failed.push(format!("{}: {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), crate::fs::describe::io_error(&err))),
             }
         }
+        // What was moved, not what was asked for
+        let label = Self::describe_count(&removed);
         let next = self.items.iter().position(|i| removed.contains(&i.path));
         if self.is_mixed_listing() {
             self.selected_index = None;
@@ -4528,31 +4529,33 @@ impl CompressionApp {
         }
         let mut message = trf("Moved {} to trash", &[&label]);
         if !failed.is_empty() {
-            message.push_str(&format!(" · {}", trf("{} failed", &[&failed.len()])));
+            message.push_str(&format!(" · {}: {}", trf("{} failed", &[&failed.len()]), failed.join(" · ")));
         }
         self.history.record(UndoEntry::new(trf("Move of {} to trash", &[&label]), trashed.into_iter().map(Edit::Restore).collect()));
         self.set_toast_action(message, ToastAction::Undo);
     }
 
     fn restore_paths(&mut self, paths: Vec<PathBuf>) {
-        let label = Self::describe_count(&paths);
         let mut failed = Vec::new();
         let mut restored = Vec::new();
         for path in &paths {
             match trash::restore(path) {
                 Ok(back) => restored.push(back),
-                Err(err) => failed.push(crate::fs::describe::io_error(&err)),
+                Err(err) => failed.push(format!("{}: {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), crate::fs::describe::io_error(&err))),
             }
         }
         self.selected_index = None;
         self.refresh_listing();
-        if !restored.is_empty() {
+        // What was restored, not what was asked for
+        let label = Self::describe_count(&restored);
+        let done = !restored.is_empty();
+        if done {
             self.history.record(UndoEntry::new(trf("Restoring {}", &[&label]), restored.into_iter().map(Edit::Trash).collect()));
         }
-        if failed.is_empty() {
-            self.set_toast(trf("Restored {}", &[&label]));
-        } else {
-            self.set_toast(trf("Could not restore: {}", &[&failed.join(" · ")]));
+        match (done, failed.is_empty()) {
+            (true, true) => self.set_toast(trf("Restored {}", &[&label])),
+            (true, false) => self.set_toast(format!("{} · {}: {}", trf("Restored {}", &[&label]), trf("{} failed", &[&failed.len()]), failed.join(" · "))),
+            _ => self.set_toast(trf("Could not restore: {}", &[&failed.join(" · ")])),
         }
     }
 
@@ -6971,6 +6974,65 @@ mod tests {
         std::fs::remove_file(&gone).unwrap();
         finish_jobs(&mut app);
         assert!(matches!(&events.borrow()[..], [crate::plugins::FileOpEvent::Removed(g)] if *g == [gone.clone()]), "{:?}", events.borrow());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn moving_to_the_trash_in_part_says_how_many_went_and_which_did_not_and_why() {
+        let base = std::env::temp_dir().join(format!("compression_trash_part_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let (good, bad) = (base.join("good.txt"), base.join("bad.txt"));
+        std::fs::write(&good, "x").unwrap();
+        std::fs::write(&bad, "x").unwrap();
+        crate::fs::trash::tests_refuse::refuse(&bad);
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let said = |app: &CompressionApp| app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+
+        // One of two goes: what went is counted, what did not is named with its reason
+        app.trash_paths(vec![good.clone(), bad.clone()]);
+        assert_eq!(said(&app), "Moved “good.txt” to trash · 1 failed: bad.txt: Permission denied");
+        assert!(!good.exists() && bad.exists());
+        assert_eq!(app.history.undo_label(), Some("Move of “good.txt” to trash"));
+        // None goes: the same names and reasons, nothing recorded
+        app.trash_paths(vec![bad.clone()]);
+        assert_eq!(said(&app), "Could not move to trash: bad.txt: Permission denied");
+        // Two of three: counted as two
+        let (c, d) = (base.join("c.txt"), base.join("d.txt"));
+        std::fs::write(&c, "x").unwrap();
+        std::fs::write(&d, "x").unwrap();
+        app.trash_paths(vec![c, bad.clone(), d]);
+        assert_eq!(said(&app), "Moved 2 items to trash · 1 failed: bad.txt: Permission denied");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn restoring_in_part_says_what_came_back_and_what_did_not() {
+        let base = std::env::temp_dir().join(format!("compression_restore_part_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("back.txt");
+        std::fs::write(&file, "x").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let said = |app: &CompressionApp| app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+        app.trash_paths(vec![file.clone()]);
+        // Where it went is read from the undo entry: the trash is shared with the other tests of the run
+        let entry = app.history.pop_undo().expect("trashing is undoable");
+        let trashed = match entry.edits.as_slice() {
+            [Edit::Restore(path)] => path.clone(),
+            other => panic!("unexpected undo entry {other:?}"),
+        };
+        app.history.push_undo(entry);
+        let nowhere = base.join("not-in-the-trash.txt");
+
+        app.restore_paths(vec![trashed.clone(), nowhere.clone()]);
+        assert_eq!(said(&app), "Restored “back.txt” · 1 failed: not-in-the-trash.txt: The trash has no record of where this came from");
+        assert!(file.exists());
+        // Nothing restored: the failure alone, with its name
+        app.restore_paths(vec![nowhere]);
+        assert_eq!(said(&app), "Could not restore: not-in-the-trash.txt: The trash has no record of where this came from");
         let _ = std::fs::remove_dir_all(&base);
     }
 

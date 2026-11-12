@@ -401,6 +401,7 @@
   "Could not unmount “{}”: {}": "Không thể gỡ gắn kết “{}”: {}",
   "Authentication cancelled": "Đã hủy xác thực",
   "Not mounted – click to mount": "Chưa gắn kết – nhấp để gắn kết",
+  "An undo or redo is still running, try again in a moment": "Đang hoàn tác hoặc làm lại, hãy thử lại sau giây lát",
   "Nothing to compress": "Không có gì để nén",
   "No tool installed to unpack this kind of archive (install 7z)": "Chưa cài công cụ nào để giải nén loại tệp này (hãy cài 7z)",
   "Unknown": "Không rõ",

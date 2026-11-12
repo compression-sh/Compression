@@ -130,7 +130,8 @@ impl CompressionApp {
         let kept = outcome.left.take();
         match outcome.effect {
             Effect::Record(entry) => {
-                undoable = outcome.ok;
+                // Something was done and can be taken back, even when the job failed in part or was stopped
+                undoable = true;
                 self.report_moves(&entry);
                 self.forget_entry_sizes(&entry);
                 self.history.record(entry);
@@ -172,6 +173,7 @@ impl CompressionApp {
 
     fn run_history(&mut self, redo: bool) {
         if self.history_job.is_some() {
+            self.set_toast(tr("An undo or redo is still running, try again in a moment"));
             return;
         }
         let entry = if redo { self.history.pop_redo() } else { self.history.pop_undo() };
@@ -598,6 +600,42 @@ mod tests {
         app.finish_job(outcome);
         assert_eq!(app.history.redo_label(), Some("one step"));
         assert!(app.history.undo_label().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+        crate::settings::NO_SAVE.with(|n| n.set(false));
+    }
+
+    #[test]
+    fn a_job_that_did_part_of_its_work_or_was_stopped_still_offers_undo_for_what_it_did() {
+        let (mut app, dir) = app_in("partial_undo");
+        let step = || Effect::Record(UndoEntry::new("copy", vec![Edit::Trash(dir.join("copied"))]));
+        for (outcome, undo) in [
+            (Outcome::done("Copied".into()).with(step()), true),
+            (Outcome::failed("a: Permission denied".into()).with(step()), true),
+            (Outcome::stopped().with(step()), true),
+            (Outcome::failed("a: Permission denied".into()), false),
+            (Outcome::stopped(), false),
+        ] {
+            let shown = outcome.message.clone();
+            app.finish_job(outcome);
+            let toast = app.status_toast.as_ref().expect("the result is said");
+            assert_eq!(toast.action.is_some(), undo, "{shown:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        crate::settings::NO_SAVE.with(|n| n.set(false));
+    }
+
+    #[test]
+    fn undo_and_redo_say_so_while_an_earlier_one_is_still_running_instead_of_doing_nothing() {
+        let (mut app, dir) = app_in("undo_busy");
+        app.history.record(UndoEntry::new("one step", vec![Edit::Trash(dir.join("x"))]));
+        app.history_job = Some(1);
+        for redo in [false, true] {
+            app.status_toast = None;
+            if redo { app.redo() } else { app.undo() }
+            let said = app.status_toast.as_ref().map(|t| t.message.clone());
+            assert_eq!(said.as_deref(), Some(tr("An undo or redo is still running, try again in a moment")), "redo: {redo}");
+        }
+        assert_eq!(app.history.undo_label(), Some("one step"), "the step must stay for later");
         std::fs::remove_dir_all(&dir).unwrap();
         crate::settings::NO_SAVE.with(|n| n.set(false));
     }
