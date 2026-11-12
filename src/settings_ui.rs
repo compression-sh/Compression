@@ -17,7 +17,9 @@ use crate::ui::icons;
 use crate::ui::material::{self, button, chip, choice_row, filled_icon_button, group_card, nav_item_roving, switch_row_with, ButtonKind, Column};
 use crate::ui::theme::{self, SerpantinumTheme, ACCENTS};
 
-const CATEGORY_COUNT: i32 = 8;
+const CATEGORY_COUNT: i32 = 9;
+/// The page of the context menus (`app::menu_layout`).
+pub(crate) const CONTEXT_MENU_TAB: usize = 8;
 /// The widest the settings column grows in a wide window.
 const PAGE_WIDTH: f32 = 720.0;
 /// The category that lists the sidebar's places.
@@ -56,6 +58,7 @@ fn categories() -> [(usize, &'static str, &'static str); CATEGORY_COUNT as usize
         (5, icons::KEYBOARD, tr("Keybindings")),
         (6, icons::APPS, tr("Applications")),
         (7, icons::TEMPLATE, tr("Plugins")),
+        (CONTEXT_MENU_TAB, icons::MENU, tr("Context menu")),
     ]
 }
 
@@ -206,6 +209,7 @@ impl CompressionApp {
                             4 => self.behavior_tab(ui),
                             5 => self.keybindings_tab(ui, keybind_search, capture, conflict_warning),
                             6 => self.applications_tab(ui, picking, defaults, known, marks),
+                            CONTEXT_MENU_TAB => self.context_menu_tab(ui),
                             _ => self.plugins_tab(ui),
                         }
                         ui.add_space(8.0);

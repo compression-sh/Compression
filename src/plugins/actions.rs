@@ -355,7 +355,11 @@ impl Plugin for Actions {
     }
 
     fn menu_items(&self, selection: &[FileItem]) -> Vec<MenuItem> {
-        self.entries.iter().filter(|e| e.def.applies(selection)).map(|e| MenuItem::new(e.id.clone(), e.label, icons::TERMINAL).group(tr("Actions"))).collect()
+        self.entries.iter().filter(|e| e.def.applies(selection)).map(|e| MenuItem::new(e.id.clone(), e.label, icons::TERMINAL).group("actions", tr("Actions"))).collect()
+    }
+
+    fn menu_catalog(&self) -> Vec<MenuItem> {
+        self.entries.iter().map(|e| MenuItem::new(e.id.clone(), e.label, icons::TERMINAL).group("actions", tr("Actions"))).collect()
     }
 
     fn run(&mut self, id: &str, paths: &[PathBuf], dir: &Path) -> Reaction {
@@ -704,6 +708,8 @@ mod tests {
         actions.run(&ids[0], &[], &dir);
         let _ = actions.done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("ran.txt")).unwrap().trim(), "mine");
+        let catalog: Vec<(String, Option<&str>)> = actions.menu_catalog().into_iter().map(|m| (m.id, m.group.map(|g| g.0))).collect();
+        assert_eq!(catalog, [("a.json".to_owned(), Some("actions")), ("m.json".to_owned(), Some("actions"))]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

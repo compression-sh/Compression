@@ -475,21 +475,30 @@ impl Plugin for Tags {
         }
     }
 
+    fn menu_catalog(&self) -> Vec<MenuItem> {
+        let group = ("tags", tr("Tags"));
+        vec![
+            MenuItem::new("toggle:*", tr("Each tag"), icons::TAG).group(group.0, group.1),
+            MenuItem::new("new", tr("New tag…"), icons::ADD).group(group.0, group.1),
+            MenuItem::new("clear", tr("Remove all tags"), icons::CLOSE).group(group.0, group.1),
+        ]
+    }
+
     fn menu_items(&self, selection: &[FileItem]) -> Vec<MenuItem> {
         // Links cannot carry attributes
         if selection.is_empty() || selection.iter().any(|i| i.is_symlink) {
             return Vec::new();
         }
         let per_file: Vec<Vec<String>> = selection.iter().map(|i| self.tags_of(&i.path)).collect();
-        let group = tr("Tags");
+        let group = ("tags", tr("Tags"));
         let mut items = Vec::new();
         for name in self.known() {
             let all = per_file.iter().all(|tags| tags.iter().any(|t| same_tag(t, &name)));
-            items.push(MenuItem::new(format!("toggle:{name}"), intern(&name), if all { icons::CHECK } else { icons::TAG }).group(group));
+            items.push(MenuItem::new(format!("toggle:{name}"), intern(&name), if all { icons::CHECK } else { icons::TAG }).group(group.0, group.1));
         }
-        items.push(MenuItem::new("new", tr("New tag…"), icons::ADD).group(group));
+        items.push(MenuItem::new("new", tr("New tag…"), icons::ADD).group(group.0, group.1));
         if per_file.iter().any(|tags| !tags.is_empty()) {
-            items.push(MenuItem::new("clear", tr("Remove all tags"), icons::CLOSE).group(group));
+            items.push(MenuItem::new("clear", tr("Remove all tags"), icons::CLOSE).group(group.0, group.1));
         }
         items
     }

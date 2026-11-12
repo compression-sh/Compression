@@ -200,27 +200,35 @@ impl Plugin for Git {
         self.rx.is_some() || self.running > 0
     }
 
+    fn menu_catalog(&self) -> Vec<MenuItem> {
+        let group = ("git", tr("Git"));
+        [(Action::Stage, tr("Stage"), icons::ADD), (Action::Unstage, tr("Unstage"), icons::REMOVE), (Action::Diff, tr("Show diff"), icons::CODE), (Action::Discard, tr("Discard changes"), icons::UNDO)]
+            .into_iter()
+            .map(|(action, label, icon)| MenuItem::new(action.id(), label, icon).group(group.0, group.1))
+            .collect()
+    }
+
     fn menu_items(&self, selection: &[FileItem]) -> Vec<MenuItem> {
         let Some(repo) = self.repo.as_ref().filter(|r| !selection.is_empty() && selection.iter().all(|i| i.path.starts_with(&r.root))) else {
             return Vec::new();
         };
         let paths: Vec<&Path> = selection.iter().map(|i| i.path.as_path()).collect();
         let applies = repo.applies(&paths);
-        let group = tr("Git");
+        let group = ("git", tr("Git"));
         let mut items = Vec::new();
         if applies.stage {
-            items.push(MenuItem::new(Action::Stage.id(), tr("Stage"), icons::ADD).group(group));
+            items.push(MenuItem::new(Action::Stage.id(), tr("Stage"), icons::ADD).group(group.0, group.1));
         }
         if applies.unstage {
-            items.push(MenuItem::new(Action::Unstage.id(), tr("Unstage"), icons::REMOVE).group(group));
+            items.push(MenuItem::new(Action::Unstage.id(), tr("Unstage"), icons::REMOVE).group(group.0, group.1));
         }
         if applies.diff {
-            items.push(MenuItem::new(Action::Diff.id(), tr("Show diff"), icons::CODE).group(group));
+            items.push(MenuItem::new(Action::Diff.id(), tr("Show diff"), icons::CODE).group(group.0, group.1));
         }
         if applies.discard {
             let files = repo.states.iter().filter(|(p, (_, y))| matches!(y, 'M' | 'D') && paths.iter().any(|s| p.starts_with(s))).count();
             let question = intern(&trn(files, "Discard the changes to {} file? They can't be brought back.", "Discard the changes to {} files? They can't be brought back."));
-            items.push(MenuItem::new(Action::Discard.id(), tr("Discard changes"), icons::UNDO).group(group).confirm(question));
+            items.push(MenuItem::new(Action::Discard.id(), tr("Discard changes"), icons::UNDO).group(group.0, group.1).confirm(question));
         }
         items
     }

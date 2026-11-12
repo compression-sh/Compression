@@ -23,6 +23,7 @@ mod plugin_ui;
 mod quick_look;
 mod swipe;
 mod watching;
+pub(crate) mod menu_layout;
 mod tabs;
 use swipe::{Swipe, SwipeDetector};
 use tabs::TabSlot;
@@ -5593,10 +5594,47 @@ impl CompressionApp {
             // Above the closing group of path and properties
             groups.insert(groups.len().saturating_sub(1), group);
         }
+        // The person's own order of this menu, where they made one (Settings → Context menu)
+        if let Some(layout) = self.menu_kind(target).and_then(|kind| self.menu_layout(kind)) {
+            groups = menu_layout::apply(groups, layout, &self.plugin_group_names());
+        }
         for group in &mut groups {
             self.retain_allowed(group);
         }
         groups
+    }
+
+    /// Which of the menus that can be arranged `target` opens: one file, one folder, or the empty space of a folder.
+    /// Not in the trash, and not for several items at once.
+    fn menu_kind(&self, target: &MenuTarget) -> Option<menu_layout::MenuKind> {
+        use menu_layout::MenuKind;
+        match target {
+            _ if self.in_trash() => None,
+            MenuTarget::Item(item) if self.menu_group(item).len() == 1 => Some(if item.is_dir { MenuKind::Folder } else { MenuKind::File }),
+            MenuTarget::Folder => Some(MenuKind::Background),
+            _ => None,
+        }
+    }
+
+    /// The person's layout of a menu, if they made one.
+    pub(crate) fn menu_layout(&self, kind: menu_layout::MenuKind) -> Option<&crate::settings::MenuLayout> {
+        let layouts = &self.settings.menu_layouts;
+        match kind {
+            menu_layout::MenuKind::File => layouts.file.as_ref(),
+            menu_layout::MenuKind::Folder => layouts.folder.as_ref(),
+            menu_layout::MenuKind::Background => layouts.background.as_ref(),
+        }
+    }
+
+    /// The submenus of the enabled plugins: their ids and names.
+    pub(crate) fn plugin_group_names(&self) -> Vec<(String, &'static str)> {
+        let mut names: Vec<(String, &'static str)> = Vec::new();
+        for (_, item) in self.plugins.menu_catalog(false).into_iter().chain(self.plugins.menu_catalog(true)) {
+            if let Some((id, label)) = item.group && !names.iter().any(|(n, _)| n == id) {
+                names.push((id.to_owned(), label));
+            }
+        }
+        names
     }
 
     /// The entries plugins add for the files the menu acts on; entries sharing a group fold into a submenu.
@@ -5604,11 +5642,11 @@ impl CompressionApp {
         let selection = self.menu_group(item);
         let paths: Vec<PathBuf> = selection.iter().map(|i| i.path.clone()).collect();
         let mut entries: Vec<MenuEntry> = Vec::new();
-        let mut folded: Vec<(&'static str, &'static str, Vec<MenuEntry>)> = Vec::new();
+        let mut folded: Vec<((&'static str, &'static str), &'static str, Vec<MenuEntry>)> = Vec::new();
         for (plugin, entry) in self.plugins.menu_items(&selection) {
             let action = MenuAction::Plugin(plugin, entry.id, paths.clone(), entry.confirm);
             match entry.group {
-                Some(group) => match folded.iter_mut().find(|(g, ..)| *g == group) {
+                Some(group) => match folded.iter_mut().find(|(g, ..)| g.0 == group.0) {
                     Some((.., list)) => list.push((entry.icon, entry.label, action)),
                     None => folded.push((group, entry.icon, vec![(entry.icon, entry.label, action)])),
                 },
@@ -5619,7 +5657,7 @@ impl CompressionApp {
             if list.len() == 1 {
                 entries.push(list.remove(0));
             } else {
-                entries.push((icon, group, MenuAction::Submenu(list)));
+                entries.push((icon, group.1, MenuAction::Submenu(list)));
             }
         }
         (!entries.is_empty()).then_some(entries)

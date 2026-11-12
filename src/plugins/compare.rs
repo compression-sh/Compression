@@ -509,6 +509,14 @@ impl Plugin for Compare {
         changed
     }
 
+    fn menu_catalog(&self) -> Vec<MenuItem> {
+        vec![MenuItem::new("compare", tr("Compare"), icons::SYNC)]
+    }
+
+    fn folder_menu_catalog(&self) -> Vec<MenuItem> {
+        vec![MenuItem::new("compare_tab", tr("Compare with the other tab"), icons::SYNC), MenuItem::new("compare_pick", tr("Compare folders…"), icons::SYNC)]
+    }
+
     fn menu_items(&self, selection: &[FileItem]) -> Vec<MenuItem> {
         match selection {
             [a, b] if a.is_dir && b.is_dir && !a.is_symlink && !b.is_symlink => vec![MenuItem::new("compare", tr("Compare"), icons::SYNC)],

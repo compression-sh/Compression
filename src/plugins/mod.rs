@@ -45,7 +45,8 @@ pub struct MenuItem {
     pub id: String,
     pub label: &'static str,
     pub icon: &'static str,
-    pub group: Option<&'static str>,
+    /// The submenu it goes in: an id that stays the same in every language, and the name shown.
+    pub group: Option<(&'static str, &'static str)>,
     /// When set, the app asks this question first and runs the entry only after a yes.
     pub confirm: Option<&'static str>,
 }
@@ -55,8 +56,8 @@ impl MenuItem {
         Self { id: id.into(), label, icon, group: None, confirm: None }
     }
 
-    pub fn group(mut self, group: &'static str) -> Self {
-        self.group = Some(group);
+    pub fn group(mut self, id: &'static str, label: &'static str) -> Self {
+        self.group = Some((id, label));
         self
     }
 
@@ -169,6 +170,15 @@ pub trait Plugin {
     /// Entries for the menu of the open folder and the main menu. `others` holds the folder of the
     /// other tab when exactly two tabs are open. `run` receives `[here, others...]` as its paths.
     fn folder_menu_items(&self, _here: &Path, _others: &[PathBuf]) -> Vec<MenuItem> {
+        Vec::new()
+    }
+    /// Every entry `menu_items` can give, whatever the selection, for the settings of the context menu. An entry that
+    /// stands for a family (one per tag) is listed once, with an id ending in `*`.
+    fn menu_catalog(&self) -> Vec<MenuItem> {
+        Vec::new()
+    }
+    /// Every entry `folder_menu_items` can give, as `menu_catalog` does.
+    fn folder_menu_catalog(&self) -> Vec<MenuItem> {
         Vec::new()
     }
     /// Work the plugin started from its own window (a button there), taken once.
@@ -370,6 +380,11 @@ impl Plugins {
 
     pub fn folder_menu_items(&self, here: &Path, others: &[PathBuf]) -> Vec<(&'static str, MenuItem)> {
         self.active().flat_map(|p| p.folder_menu_items(here, others).into_iter().map(|item| (p.id(), item))).collect()
+    }
+
+    /// Every entry the enabled plugins can add to the menu of files and folders (`folder` false) or of the open folder.
+    pub fn menu_catalog(&self, folder: bool) -> Vec<(&'static str, MenuItem)> {
+        self.active().flat_map(|p| (if folder { p.folder_menu_catalog() } else { p.menu_catalog() }).into_iter().map(|item| (p.id(), item))).collect()
     }
 
     /// What plugins want done after something in their window.

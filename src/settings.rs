@@ -97,6 +97,8 @@ pub struct Settings {
     /// Programs (AppImages) the person said to run without asking, each as it was then: a file that changed since is
     /// asked about again.
     pub trusted_programs: Vec<TrustedProgram>,
+    /// The person's own order of the context menus (Settings → Context menu); a menu without one is the built-in one.
+    pub menu_layouts: MenuLayouts,
     pub show_extensions: bool,
     pub relative_dates: bool,
     pub decimal_units: bool,
@@ -288,6 +290,7 @@ impl Default for Settings {
             remote_previews: false,
             remote_folders: Vec::new(),
             trusted_programs: Vec::new(),
+            menu_layouts: MenuLayouts::default(),
             show_extensions: true,
             relative_dates: true,
             decimal_units: false,
@@ -307,6 +310,53 @@ pub const SCROLL_SPEED_DEFAULT: f32 = 1.0;
 /// What the slider in the settings covers; `settings.json` may hold any value in `SCROLL_SPEED_RANGE`.
 pub const SCROLL_SPEED_SLIDER: std::ops::RangeInclusive<f32> = 0.25..=2.25;
 pub const SCROLL_SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.1..=5.0;
+
+/// The context menus that can be arranged, each `None` while it is the built-in one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MenuLayouts {
+    /// The menu of one file.
+    pub file: Option<MenuLayout>,
+    /// The menu of one folder.
+    pub folder: Option<MenuLayout>,
+    /// The menu of the empty space of a folder.
+    pub background: Option<MenuLayout>,
+}
+
+/// A context menu as the person arranged it: groups (with a line between them) of entries and submenus. Entries are named
+/// by ids that do not change with the language (`copy`, `plugin:git:stage`, `plugin:actions:convert.json`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MenuLayout {
+    pub groups: Vec<Vec<MenuNode>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MenuNode {
+    Entry {
+        id: String,
+        #[serde(default)]
+        hidden: bool,
+    },
+    /// `name` is the person's own text, or `builtin:<key>` / `plugin-group:<id>` for a submenu Compression or a plugin
+    /// names (shown in the language of the window).
+    Submenu {
+        name: String,
+        #[serde(default)]
+        hidden: bool,
+        #[serde(default)]
+        entries: Vec<MenuLeaf>,
+    },
+}
+
+/// An entry inside a submenu.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MenuLeaf {
+    pub id: String,
+    #[serde(default)]
+    pub hidden: bool,
+}
 
 /// A program file the person trusts to run without a question, as it was when they said so.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
