@@ -224,6 +224,60 @@ pub fn get_image_png() -> Option<Vec<u8>> {
     }
 }
 
+/// What the system clipboard offers, found out without taking any of it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Offer {
+    pub files: bool,
+    pub image: bool,
+}
+
+impl Offer {
+    /// Whether a paste would find something: files, or a picture to save.
+    pub fn anything(self) -> bool {
+        self.files || self.image
+    }
+
+    /// What a list of offered types (MIME types) stands for. A vector picture is not a picture to save.
+    fn of_types<'a>(types: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut offer = Self::default();
+        for t in types {
+            offer.files |= t == URI_LIST || t == GNOME_FILES;
+            offer.image |= t.starts_with("image/") && !t.contains("svg");
+        }
+        offer
+    }
+}
+
+/// What the system clipboard offers, or `None` when that could not be found out (then nothing may be
+/// said about it). It asks the compositor or the selection owner, so it belongs on a thread of its own.
+pub fn offer() -> Option<Offer> {
+    // What this process holds is text, never files or a picture
+    if own_text().is_some() {
+        return Some(Offer::default());
+    }
+    if on_wayland() {
+        use wl_clipboard_rs::paste::{ClipboardType, Error, Seat, get_mime_types};
+        match get_mime_types(ClipboardType::Regular, Seat::Unspecified) {
+            Ok(types) => Some(Offer::of_types(types.iter().map(String::as_str))),
+            Err(Error::ClipboardEmpty | Error::NoMimeType) => Some(Offer::default()),
+            Err(_) => None,
+        }
+    } else {
+        // The X11 library has no way to ask for the types alone
+        let mut board = arboard::Clipboard::new().ok()?;
+        match board.get().file_list() {
+            Ok(paths) if !paths.is_empty() => return Some(Offer { files: true, image: false }),
+            Ok(_) | Err(arboard::Error::ContentNotAvailable) => {}
+            Err(_) => return None,
+        }
+        match board.get_image() {
+            Ok(_) => Some(Offer { files: false, image: true }),
+            Err(arboard::Error::ContentNotAvailable) => Some(Offer::default()),
+            Err(_) => None,
+        }
+    }
+}
+
 fn get_wayland() -> Option<(Vec<PathBuf>, bool)> {
     use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents};
     let read = |mime: &str| -> Option<String> {
@@ -360,6 +414,29 @@ mod tests {
         assert_eq!(percent_decode("file:/tmp/a%20b"), percent_decode("file:///tmp/a%20b"));
         assert_eq!(percent_decode("file:relative"), None);
         assert_eq!(percent_decode("file://other-host/tmp/example"), None);
+    }
+
+    #[test]
+    fn the_types_on_offer_say_whether_files_or_a_picture_can_be_pasted() {
+        let of = |types: &[&str]| Offer::of_types(types.iter().copied());
+        assert_eq!(of(&["text/uri-list", "text/plain"]), Offer { files: true, image: false });
+        assert_eq!(of(&["x-special/gnome-copied-files"]), Offer { files: true, image: false });
+        assert_eq!(of(&["image/png"]), Offer { files: false, image: true });
+        assert_eq!(of(&["image/jpeg", "text/html"]), Offer { files: false, image: true });
+        assert_eq!(of(&["image/svg+xml"]), Offer::default(), "a vector picture is not saved as a picture");
+        assert!(of(&["image/svg+xml", "image/png"]).image);
+        assert_eq!(of(&["text/plain", "text/plain;charset=utf-8", "UTF8_STRING"]), Offer::default());
+        assert_eq!(of(&[]), Offer::default());
+        assert!(!Offer::default().anything());
+        assert!(Offer { files: true, image: false }.anything() && Offer { files: false, image: true }.anything());
+    }
+
+    #[test]
+    fn text_held_by_this_process_offers_neither_files_nor_a_picture() {
+        let _turn = OWN_TEXT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        set_own_text(Some("/home/me/a file".to_owned()));
+        assert_eq!(offer(), Some(Offer::default()), "answered without asking anybody");
+        set_own_text(None);
     }
 }
 

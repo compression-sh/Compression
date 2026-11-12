@@ -534,6 +534,15 @@ pub struct CompressionApp {
     pub(crate) system_theme: SerpantinumTheme,
     /// Follows the files a theme comes from; `None` when none could be watched.
     theme_watch: Option<crate::theme_watch::ThemeWatch>,
+    /// What the system clipboard offered when the folder menu was opened; `None` until the probe answers
+    /// (or when it could not tell), and then the entry stays usable.
+    clipboard_offer: Option<crate::clipboard::Offer>,
+    /// The probe that asks the system clipboard, off the UI thread; replaced by tests.
+    clipboard_probe: fn() -> Option<crate::clipboard::Offer>,
+    /// A probe that is running, with the number of the menu it was started for; at most one at a time.
+    clipboard_probe_rx: Option<(u64, mpsc::Receiver<Option<crate::clipboard::Offer>>)>,
+    /// Counts the menus opened, so that an answer is only taken by the menu that asked.
+    menu_serial: u64,
     /// The theme file problems the toast has told about already (see `tell_about_theme_problems`).
     theme_problems_told: Vec<String>,
     /// Follows `settings.json`, so an edit by hand applies at once; `None` when it could not be watched.
@@ -758,6 +767,10 @@ impl CompressionApp {
             system_theme: SerpantinumTheme::load(),
             theme_watch: crate::theme_watch::ThemeWatch::new(ctx),
             theme_problems_told: Vec::new(),
+            clipboard_offer: None,
+            clipboard_probe: crate::clipboard::offer,
+            clipboard_probe_rx: None,
+            menu_serial: 0,
             settings_watch: crate::settings_watch::SettingsWatch::new(ctx),
             from_theme: faded,
             target_theme: faded,
@@ -1581,7 +1594,44 @@ impl CompressionApp {
             _ => None,
         };
         material::reset_anim(ctx, egui::Id::unique("context_menu_anim"), 0.0);
+        self.menu_serial += 1;
+        // What was said for an earlier menu says nothing about the clipboard now
+        self.clipboard_offer = None;
+        if matches!(target, MenuTarget::Folder) {
+            self.probe_clipboard(ctx);
+        }
         self.menu = Some(ContextMenu { pos, target, open_label: None, label_rx });
+    }
+
+    /// Asks what the system clipboard offers, on a thread of its own: its owner may take its time, or never
+    /// answer. Only one question is out at a time; while it is, the entry stays usable (see `menu_entries_all`).
+    fn probe_clipboard(&mut self, ctx: &egui::Context) {
+        if self.clipboard_probe_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (probe, ctx) = (self.clipboard_probe, ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(probe());
+            ctx.request_repaint();
+        });
+        self.clipboard_probe_rx = Some((self.menu_serial, rx));
+    }
+
+    /// Takes the probe's answer in, if it has come. An answer for a menu that is gone is dropped.
+    fn take_clipboard_offer(&mut self) {
+        let Some((serial, rx)) = &self.clipboard_probe_rx else { return };
+        let answer = match rx.try_recv() {
+            Ok(offer) => Some(offer),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(None),
+        };
+        if let Some(offer) = answer {
+            if *serial == self.menu_serial {
+                self.clipboard_offer = offer;
+            }
+            self.clipboard_probe_rx = None;
+        }
     }
 
     fn toggle_main_menu(&mut self, ctx: &egui::Context) {
@@ -5165,9 +5215,14 @@ impl CompressionApp {
                 self.history_entries(),
                 {
                     let mut edit = Vec::new();
-                    if self.clipboard.is_some() {
-                        edit.push((icons::PASTE, tr("Paste"), MenuAction::Paste));
-                    }
+                    // Usable when this window holds something, or the system clipboard offers files or a picture;
+                    // greyed out only when both are known to be empty (until the probe has answered it is not known)
+                    let something = self.clipboard.is_some() || self.clipboard_offer.is_none_or(|offer| offer.anything());
+                    edit.push(if something {
+                        (icons::PASTE, tr("Paste"), MenuAction::Paste)
+                    } else {
+                        (icons::PASTE, tr("Paste"), MenuAction::Unavailable(tr("Nothing to paste")))
+                    });
                     edit.extend(fold(icons::SELECT_ALL, tr("Select"), vec![
                         (icons::SELECT_ALL, tr("Select all"), MenuAction::SelectAll),
                         (icons::SELECT_INVERSE, tr("Invert selection"), MenuAction::InvertSelection),
@@ -5396,6 +5451,7 @@ impl CompressionApp {
     }
 
     fn render_menu(&mut self, ctx: &egui::Context) {
+        self.take_clipboard_offer();
         if let Some(menu) = self.menu.as_mut()
             && let Some(Ok(label)) = menu.label_rx.as_ref().map(|rx| rx.try_recv()) {
                 menu.open_label = label;
@@ -9003,6 +9059,163 @@ mod tests {
         let (_, r) = w.shapes.iter().find(|(t, _)| t == "Refreshed").unwrap();
         assert!(r.height() < 24.0, "{r:?}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn paste_entry(app: &CompressionApp) -> Option<MenuAction> {
+        app.menu_entries(&MenuTarget::Folder).into_iter().flatten().find(|(_, label, _)| *label == "Paste").map(|(_, _, action)| action)
+    }
+
+    fn paste_is_usable(app: &CompressionApp) -> bool {
+        matches!(paste_entry(app), Some(MenuAction::Paste))
+    }
+
+    fn offers_files() -> Option<crate::clipboard::Offer> {
+        Some(crate::clipboard::Offer { files: true, image: false })
+    }
+
+    fn offers_a_picture() -> Option<crate::clipboard::Offer> {
+        Some(crate::clipboard::Offer { files: false, image: true })
+    }
+
+    fn offers_nothing() -> Option<crate::clipboard::Offer> {
+        Some(crate::clipboard::Offer::default())
+    }
+
+    fn cannot_tell() -> Option<crate::clipboard::Offer> {
+        None
+    }
+
+    /// Opens the folder menu in an empty spot of the list and lets the probe answer.
+    fn open_folder_menu(w: &mut Window) {
+        w.click(egui::pos2(600.0, 500.0), egui::PointerButton::Secondary);
+        assert!(matches!(w.app.menu.as_ref().map(|m| &m.target), Some(MenuTarget::Folder)), "the menu did not open");
+        w.until("the probe answered", |w| w.app.clipboard_probe_rx.is_none());
+    }
+
+    #[test]
+    fn the_folder_menu_offers_paste_for_what_another_program_copied() {
+        let root = window_dir("paste_entry_files");
+        for probe in [offers_files as fn() -> _, offers_a_picture] {
+            let mut w = Window::new(root.clone());
+            assert!(w.app.clipboard.is_none(), "nothing of this window's own is held");
+            w.app.clipboard_probe = probe;
+            open_folder_menu(&mut w);
+            assert!(w.shows("Paste"), "{:?}", w.last);
+            assert!(paste_is_usable(&w.app), "files or a picture of another program can be pasted");
+        }
+    }
+
+    #[test]
+    fn the_folder_menu_greys_paste_out_only_when_nothing_can_be_pasted() {
+        let root = window_dir("paste_entry_empty");
+        let mut w = Window::new(root.clone());
+        w.app.clipboard_probe = offers_nothing;
+        open_folder_menu(&mut w);
+        assert!(w.shows("Paste"), "the entry is still shown: {:?}", w.last);
+        assert!(matches!(paste_entry(&w.app), Some(MenuAction::Unavailable("Nothing to paste"))));
+
+        // What this window holds itself can be pasted, whatever the system clipboard says
+        w.app.clipboard = Some(Clipboard { paths: vec![root.join("x")], cut: false, moving: None });
+        assert!(paste_is_usable(&w.app));
+        w.app.clipboard = None;
+
+        // When the system could not say, nothing is claimed about it
+        w.app.clipboard_probe = cannot_tell;
+        w.key(egui::Key::Escape);
+        open_folder_menu(&mut w);
+        assert!(paste_is_usable(&w.app));
+        // Before the probe has answered at all
+        w.app.clipboard_offer = None;
+        assert!(paste_is_usable(&w.app));
+    }
+
+    #[test]
+    fn the_menu_of_the_trash_has_no_paste() {
+        let root = window_dir("paste_entry_trash");
+        let mut app = CompressionApp::new(root, SerpantinumTheme::default(), Settings::default(), &egui::Context::default());
+        app.clipboard = Some(Clipboard { paths: vec![PathBuf::from("/tmp/x")], cut: false, moving: None });
+        app.current_path = crate::fs::trash::files_dir().expect("a trash folder");
+        assert!(app.in_trash());
+        assert!(paste_entry(&app).is_none());
+        let labels: Vec<_> = app.menu_entries(&MenuTarget::Folder).into_iter().flatten().map(|e| e.1).collect();
+        assert!(labels.contains(&"Empty trash"), "{labels:?}");
+    }
+
+    /// A probe that does not answer until the test lets it; counts how many were started.
+    static HUNG_STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static HUNG_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+    fn hung_probe() -> Option<crate::clipboard::Offer> {
+        HUNG_STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Never for good: a test that fails must not leave the thread, or a hung run, behind
+        let open = HUNG_GATE.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = HUNG_GATE.1.wait_timeout_while(open, std::time::Duration::from_secs(4), |open| !*open);
+        offers_nothing()
+    }
+
+    #[test]
+    fn a_clipboard_owner_that_never_answers_does_not_stop_the_menu_and_the_answer_comes_later() {
+        use std::sync::atomic::Ordering;
+        let root = window_dir("paste_entry_hung");
+        let mut w = Window::new(root);
+        w.app.clipboard_probe = hung_probe;
+        let before = HUNG_STARTED.load(Ordering::SeqCst);
+
+        // The menu opens and is drawn while the probe hangs, and "Paste" is usable meanwhile
+        let started = std::time::Instant::now();
+        w.click(egui::pos2(600.0, 500.0), egui::PointerButton::Secondary);
+        w.run(Vec::new(), 5);
+        assert!(started.elapsed() < std::time::Duration::from_millis(1500), "the frame waited for the probe: {:?}", started.elapsed());
+        assert!(w.shows("Paste") && paste_is_usable(&w.app), "{:?}", w.last);
+        w.until("the probe started", |_| HUNG_STARTED.load(Ordering::SeqCst) > before);
+
+        // Opening the menu again does not ask a second time while the first question is out
+        w.key(egui::Key::Escape);
+        w.click(egui::pos2(620.0, 520.0), egui::PointerButton::Secondary);
+        w.click(egui::pos2(640.0, 540.0), egui::PointerButton::Secondary);
+        assert_eq!(HUNG_STARTED.load(Ordering::SeqCst), before + 1, "a second probe thread was started");
+        assert!(paste_is_usable(&w.app));
+
+        // The answer of the first question was for an earlier menu: it is not taken by this one
+        *HUNG_GATE.0.lock().unwrap() = true;
+        HUNG_GATE.1.notify_all();
+        w.until("the probe ended", |w| w.app.clipboard_probe_rx.is_none());
+        assert!(paste_is_usable(&w.app), "an old answer must not grey the entry of a newer menu");
+
+        // A later menu asks again, and now the answer is taken: nothing to paste
+        w.key(egui::Key::Escape);
+        open_folder_menu(&mut w);
+        assert_eq!(HUNG_STARTED.load(Ordering::SeqCst), before + 2);
+        assert!(matches!(paste_entry(&w.app), Some(MenuAction::Unavailable(_))));
+
+        // The next menu does not inherit that answer: it asks, and until it is told the entry is usable
+        *HUNG_GATE.0.lock().unwrap() = false;
+        w.key(egui::Key::Escape);
+        w.click(egui::pos2(600.0, 500.0), egui::PointerButton::Secondary);
+        assert!(w.app.clipboard_offer.is_none() && paste_is_usable(&w.app), "the answer of the earlier menu was kept");
+    }
+
+    #[test]
+    fn an_answer_arriving_while_the_menu_is_open_flips_the_entry() {
+        let root = window_dir("paste_entry_flip");
+        let mut w = Window::new(root);
+        w.app.clipboard_probe = offers_nothing;
+        w.app.menu_serial += 1;
+        let (tx, rx) = mpsc::channel();
+        w.app.clipboard_probe_rx = Some((w.app.menu_serial, rx));
+        assert!(paste_is_usable(&w.app));
+        tx.send(offers_nothing()).unwrap();
+        w.app.take_clipboard_offer();
+        assert!(matches!(paste_entry(&w.app), Some(MenuAction::Unavailable(_))));
+        assert!(w.app.clipboard_probe_rx.is_none());
+        // A probe whose thread died without an answer leaves the entry usable and frees the slot
+        w.app.menu_serial += 1;
+        w.app.clipboard_offer = None;
+        let (tx, rx) = mpsc::channel::<Option<crate::clipboard::Offer>>();
+        w.app.clipboard_probe_rx = Some((w.app.menu_serial, rx));
+        drop(tx);
+        w.app.take_clipboard_offer();
+        assert!(paste_is_usable(&w.app) && w.app.clipboard_probe_rx.is_none());
     }
 
     #[test]
