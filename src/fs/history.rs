@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use super::{ops, trash};
+use crate::i18n::trf;
 
 /// One step that takes back (part of) a change.
 #[derive(Debug, Clone)]
@@ -182,30 +183,53 @@ fn done(result: io::Result<Edit>) -> Step {
     result.map_or_else(Step::Failed, Step::Done)
 }
 
-/// Rename `(from, to)` pairs together, going through temporary names so names can be swapped.
+/// Rename `(from, to)` pairs together, going through temporary names so names can be swapped. No step replaces
+/// anything: a name that is taken stops the rename, and every item goes back to its old name, unless that was taken
+/// meanwhile too; then it keeps its temporary name and the error says so.
 pub fn rename_many(pairs: &[(PathBuf, PathBuf)]) -> io::Result<()> {
+    rename_many_with(pairs, &|from, to| crate::compat::rename_noreplace(from, to))
+}
+
+/// `rename_many` with the rename it uses (never replacing outside tests).
+fn rename_many_with(pairs: &[(PathBuf, PathBuf)], rename: &dyn Fn(&Path, &Path) -> io::Result<()>) -> io::Result<()> {
     let mut staged: Vec<(&Path, PathBuf, &Path)> = Vec::new();
+    let mut stranded: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (i, (from, to)) in pairs.iter().enumerate() {
         let temp = from.with_file_name(format!(".compression-rename-{}-{i}", std::process::id()));
-        if let Err(err) = std::fs::rename(from, &temp) {
+        if let Err(err) = rename(from, &temp) {
             for (old, temp, _) in staged.into_iter().rev() {
-                let _ = std::fs::rename(temp, old);
+                if rename(&temp, old).is_err() {
+                    stranded.push((temp, old.to_path_buf()));
+                }
             }
-            return Err(err);
+            return Err(with_stranded(err, &stranded));
         }
         staged.push((from, temp, to));
     }
     let mut failure = None;
     for (from, temp, to) in staged {
-        // A name taken since the staging must not be replaced
-        if let Err(err) = crate::compat::rename_noreplace(&temp, to) {
-            let _ = std::fs::rename(&temp, from);
+        // A name taken since the staging must not be replaced, and neither may the old name on the way back
+        if let Err(err) = rename(&temp, to) {
+            if rename(&temp, from).is_err() {
+                stranded.push((temp, from.to_path_buf()));
+            }
             failure.get_or_insert(err);
         }
     }
-    failure.map_or(Ok(()), Err)
+    failure.map_or(Ok(()), |err| Err(with_stranded(err, &stranded)))
 }
 
+/// `err`, and where the items are that could not get their old name back (kept under their temporary name, so that
+/// nothing is replaced and nothing is lost without a word). Its kind stays the kind of `err`.
+fn with_stranded(err: io::Error, stranded: &[(PathBuf, PathBuf)]) -> io::Error {
+    let Some((now, was)) = stranded.first() else { return err };
+    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut text = trf("“{}” could not get its name back and is now called “{}”", &[&name(was), &name(now)]);
+    if stranded.len() > 1 {
+        text.push_str(&format!(" (+{})", stranded.len() - 1));
+    }
+    io::Error::new(err.kind(), format!("{}: {text}", crate::fs::describe::io_error(&err)))
+}
 
 #[cfg(test)]
 mod tests {
@@ -399,4 +423,66 @@ mod tests {
         crate::fs::ops::tests::unlock_and_remove(&root);
         crate::fs::ops::tests::unlock_and_remove(&shm);
     }
+
+    #[test]
+    fn an_old_name_taken_on_the_way_back_is_not_replaced_and_the_error_says_where_the_item_is() {
+        let dir = std::env::temp_dir().join(format!("compression_many_stranded_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "mine").unwrap();
+        std::fs::write(dir.join("taken"), "keep me").unwrap();
+        // While the item waits under its temporary name, another program takes its old name
+        let rename = |from: &Path, to: &Path| {
+            if to == dir.join("a") {
+                std::fs::write(to, "the other program's").unwrap();
+            }
+            crate::compat::rename_noreplace(from, to)
+        };
+        let err = rename_many_with(&[(dir.join("a"), dir.join("taken"))], &rename).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        let temp = format!(".compression-rename-{}-0", std::process::id());
+        assert!(err.to_string().ends_with(&format!("“a” could not get its name back and is now called “{temp}”")), "{err}");
+        // Nothing was replaced, nothing is lost
+        assert_eq!(std::fs::read_to_string(dir.join("taken")).unwrap(), "keep me");
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "the other program's");
+        assert_eq!(std::fs::read_to_string(dir.join(&temp)).unwrap(), "mine");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_staging_that_fails_halfway_puts_back_what_was_staged_without_replacing() {
+        let dir = std::env::temp_dir().join(format!("compression_many_halfway_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "A").unwrap();
+        // "b" is not there: its staging fails, and "a" goes back to its name
+        let err = rename_many(&[(dir.join("a"), dir.join("x")), (dir.join("b"), dir.join("y"))]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "A");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no staging name is left");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+
+    #[test]
+    fn a_staging_that_fails_halfway_does_not_replace_an_old_name_that_was_taken_meanwhile() {
+        let dir = std::env::temp_dir().join(format!("compression_many_halfway_taken_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "mine").unwrap();
+        let rename = |from: &Path, to: &Path| {
+            if to == dir.join("a") {
+                std::fs::write(to, "the other program's").unwrap();
+            }
+            crate::compat::rename_noreplace(from, to)
+        };
+        let err = rename_many_with(&[(dir.join("a"), dir.join("x")), (dir.join("b"), dir.join("y"))], &rename).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let temp = format!(".compression-rename-{}-0", std::process::id());
+        assert!(err.to_string().ends_with(&format!("is now called “{temp}”")), "{err}");
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "the other program's");
+        assert_eq!(std::fs::read_to_string(dir.join(&temp)).unwrap(), "mine");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
 }

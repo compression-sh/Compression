@@ -931,5 +931,6 @@
   "Another window is open. Open the properties again.": "Une autre fenêtre est ouverte. Rouvrez les propriétés.",
   "Not available ({})": "Indisponible ({})",
   "The archive has an entry that would land outside the folder: {}": "L’archive contient une entrée qui atterrirait hors du dossier : {}",
-  "The archive could not be listed": "Le contenu de l’archive n’a pas pu être listé"
+  "The archive could not be listed": "Le contenu de l’archive n’a pas pu être listé",
+  "“{}” could not get its name back and is now called “{}”": "« {} » n’a pas pu reprendre son nom et s’appelle maintenant « {} »"
 }

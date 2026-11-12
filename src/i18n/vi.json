@@ -931,5 +931,6 @@
   "Another window is open. Open the properties again.": "Đang mở một cửa sổ khác. Hãy mở lại thuộc tính.",
   "Not available ({})": "Không khả dụng ({})",
   "The archive has an entry that would land outside the folder: {}": "Tệp nén có một mục sẽ nằm ngoài thư mục: {}",
-  "The archive could not be listed": "Không thể liệt kê nội dung tệp nén"
+  "The archive could not be listed": "Không thể liệt kê nội dung tệp nén",
+  "“{}” could not get its name back and is now called “{}”": "“{}” không lấy lại được tên cũ và giờ có tên “{}”"
 }
