@@ -887,5 +887,7 @@
   "Themes cannot be changed in administrator mode": "Không thể thay đổi giao diện ở chế độ quản trị viên",
   "There is no folder for the themes": "Không có thư mục cho giao diện",
   "Could not save the theme: {}": "Không thể lưu giao diện: {}",
-  "Could not delete the theme: {}": "Không thể xóa giao diện: {}"
+  "Could not delete the theme: {}": "Không thể xóa giao diện: {}",
+  "Renaming…": "Đang đổi tên…",
+  "“{}” is already being renamed": "“{}” đang được đổi tên"
 }

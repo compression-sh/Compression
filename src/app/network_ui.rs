@@ -36,7 +36,8 @@ pub(super) enum NetMsg {
     /// A server's folder was asked about: `local` is it when it is there.
     Checked { id: u64, local: Option<PathBuf>, is_dir: bool, next: Next },
     /// An item on a server was renamed (or not): `path` is the old path.
-    Renamed { path: PathBuf, target: PathBuf, new_name: String, result: Result<(), String> },
+    /// `item` is the renamed item as the thread read it, so that the window need not look at the server.
+    Renamed { path: PathBuf, target: PathBuf, new_name: String, item: Option<FileItem>, result: Result<(), String> },
     Reconnect { local: PathBuf, name: String, address: Address, back: Option<PathBuf>, tabs: Vec<(u64, PathBuf)>, left: Left, result: Result<(), String> },
 }
 
@@ -92,6 +93,8 @@ pub(super) struct NetState {
     /// Logins and questions of connections that wait for the window to have room for them: no dialog is shown over
     /// another one, since the one underneath (a question of a copy, a name being typed) would be lost.
     waiting_prompts: VecDeque<(u64, Prompt)>,
+    /// Renames that have been asked of a server and not answered: the old path, and the one it is to get.
+    pub(super) renaming: HashMap<PathBuf, PathBuf>,
     /// What the window knows about paths on servers without having to ask in a frame.
     pub(super) known: Known,
     #[cfg(test)]
@@ -103,6 +106,10 @@ impl NetState {
         *self.generations.entry(mount.to_path_buf()).or_insert(0) += 1;
     }
 
+    pub(super) fn is_being_renamed(&self, path: &Path) -> bool {
+        self.renaming.contains_key(path)
+    }
+
     fn generation_of(&self, mount: &Option<PathBuf>) -> u64 {
         mount.as_ref().and_then(|m| self.generations.get(m)).copied().unwrap_or(0)
     }
@@ -110,7 +117,7 @@ impl NetState {
     pub(super) fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         let servers = Servers::load();
-        Self { tx, rx, servers: servers.0, servers_problem: servers.1, mounts: Vec::new(), pending: Vec::new(), checking: Vec::new(), navs: HashMap::new(), generations: HashMap::new(), ask: ask_server, next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new(), waiting_prompts: VecDeque::new(), known: Known::default(), #[cfg(test)] rename: Arc::new(crate::compat::rename_noreplace) }
+        Self { tx, rx, servers: servers.0, servers_problem: servers.1, mounts: Vec::new(), pending: Vec::new(), checking: Vec::new(), navs: HashMap::new(), generations: HashMap::new(), ask: ask_server, next_id: 1, listing: false, last: Instant::now(), leaving: HashSet::new(), probes: Probes::new(), waiting_prompts: VecDeque::new(), renaming: HashMap::new(), known: Known::default(), #[cfg(test)] rename: Arc::new(crate::compat::rename_noreplace) }
     }
 }
 
@@ -543,10 +550,28 @@ impl CompressionApp {
                         }
                     }
                 }
-                NetMsg::Renamed { path, target, new_name, result } => match result {
-                    Ok(()) => self.renamed(&path, target, &new_name),
-                    Err(message) => self.set_toast(message),
-                },
+                NetMsg::Renamed { path, target, new_name, item, result } => {
+                    self.net.renaming.remove(&path);
+                    // The dialog that asked, if it is still there, takes the answer; otherwise it comes as a message
+                    let asking = matches!(&self.dialog, Some(Dialog::Rename { path: asked, .. }) if *asked == path);
+                    match result {
+                        Ok(()) => {
+                            if asking {
+                                self.dialog = None;
+                            }
+                            self.renamed(&path, target, &new_name, item);
+                        }
+                        Err(message) => match &mut self.dialog {
+                            Some(Dialog::Rename { waiting, error, first_frame, .. }) if asking => {
+                                *waiting = false;
+                                *error = Some(message);
+                                // The field was locked and lost the focus: it gets it back, to be typed in again
+                                *first_frame = true;
+                            }
+                            _ => self.set_toast(message),
+                        },
+                    }
+                }
                 NetMsg::Forgot { name, result } => match result {
                     Ok(()) => self.set_toast(trf("Forgot the password of “{}”", &[&name])),
                     Err(err) => self.set_toast(trf("Could not forget the password: {}", &[&err])),
@@ -1055,8 +1080,9 @@ impl CompressionApp {
         });
     }
 
-    /// Rename an item on a server on a thread of its own.
+    /// Rename an item on a server on a thread of its own. The item stays marked as being renamed until the answer is in.
     pub(super) fn rename_on_server(&mut self, path: PathBuf, target: PathBuf, new_name: String) {
+        self.net.renaming.insert(path.clone(), target.clone());
         let (tx, ctx) = (self.net.tx.clone(), self.ctx.clone());
         #[cfg(test)]
         let rename = self.net.rename.clone();
@@ -1065,7 +1091,9 @@ impl CompressionApp {
             let result = rename(&path, &target).map_err(|err| rename_error(&err, &new_name));
             #[cfg(not(test))]
             let result = crate::compat::rename_noreplace(&path, &target).map_err(|err| rename_error(&err, &new_name));
-            let _ = tx.send(NetMsg::Renamed { path, target, new_name, result });
+            // Read here, where waiting for the server does no harm
+            let item = if result.is_ok() { FileItem::from_path(&target) } else { None };
+            let _ = tx.send(NetMsg::Renamed { path, target, new_name, item, result });
             ctx.request_repaint();
         });
     }
@@ -2418,6 +2446,298 @@ mod tests {
         assert!(dir.join("a.txt").exists() && app.history.undo_label().is_none());
         // Bad names are still refused on the spot
         assert!(app.rename_entry(&dir.join("a.txt"), "x/y").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Puts a renamer in the app that counts its calls and answers only when told to: `None` renames for real, a kind is an error.
+    fn gated_rename(app: &mut CompressionApp) -> (Arc<AtomicUsize>, mpsc::Sender<Option<std::io::ErrorKind>>) {
+        let (answer, hold) = mpsc::channel::<Option<std::io::ErrorKind>>();
+        let (hold, calls) = (Mutex::new(hold), Arc::new(AtomicUsize::new(0)));
+        let counted = calls.clone();
+        app.net.rename = Arc::new(move |from, to| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            match hold.lock().unwrap().recv_timeout(Duration::from_secs(10)) {
+                Ok(Some(kind)) => Err(std::io::Error::from(kind)),
+                _ => crate::compat::rename_noreplace(from, to),
+            }
+        });
+        (calls, answer)
+    }
+
+    fn names(app: &CompressionApp) -> Vec<String> {
+        let mut names: Vec<String> = app.items.iter().map(|i| i.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    fn press(key: egui::Key) -> Vec<egui::Event> {
+        let m = egui::Modifiers::NONE;
+        vec![egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers: m }]
+    }
+
+    fn release(key: egui::Key) -> Vec<egui::Event> {
+        let m = egui::Modifiers::NONE;
+        vec![egui::Event::Key { key, physical_key: Some(key), pressed: false, repeat: false, modifiers: m }]
+    }
+
+    /// The rename dialog of `a.txt` on a server, drawn, with `new_name` typed in.
+    fn rename_dialog(name: &str, files: &[&str], new_name: &str) -> (CompressionApp, PathBuf, egui::Context, eframe::Frame, f64) {
+        let (mut app, dir, ctx) = app_on_server_folder(name, files);
+        app.open_rename(dir.join("a.txt"));
+        let (mut frame, mut time) = (eframe::Frame::_new_kittest(), 0.0);
+        frames(&mut app, &ctx, &mut frame, &mut time, Vec::new(), 6);
+        if let Some(Dialog::Rename { name, .. }) = &mut app.dialog {
+            *name = new_name.to_owned();
+        }
+        frames(&mut app, &ctx, &mut frame, &mut time, Vec::new(), 2);
+        (app, dir, ctx, frame, time)
+    }
+
+    #[test]
+    fn an_answer_that_comes_after_a_change_of_folder_leaves_the_folder_shown_alone() {
+        let (mut app, dir, ctx) = app_on_server_folder("elsewhere", &["a.txt"]);
+        let other = std::env::temp_dir().join(format!("compression_server_rename_other_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&other);
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("x.txt"), "x").unwrap();
+        let other = other.canonicalize().unwrap();
+        let (calls, answer) = gated_rename(&mut app);
+        assert_eq!(app.rename_entry(&dir.join("a.txt"), "b.txt"), Ok(()));
+        wait_for(|| (calls.load(Ordering::SeqCst) == 1).then_some(()));
+
+        // The person goes to another folder while the server thinks
+        app.current_path = other.clone();
+        app.reload_items();
+        wait_for(|| (!app.poll_reload()).then_some(()));
+        assert_eq!(names(&app), ["x.txt"]);
+        answer.send(None).unwrap();
+        wait_for(|| {
+            app.poll_network(&ctx);
+            app.history.undo_label().map(drop)
+        });
+        // Nothing of the other folder's list is touched, nothing is selected there; the rename is still recorded and told
+        assert_eq!(names(&app), ["x.txt"], "an item of another folder appeared in the list");
+        assert!(app.selection.is_empty() && app.selected_index.is_none());
+        assert_eq!(app.status_toast.as_ref().unwrap().message, "Renamed to “b.txt”");
+        assert!(app.history.undo_label().unwrap().starts_with("Renaming of"));
+        assert!(app.net.renaming.is_empty());
+        assert!(dir.join("b.txt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&other).unwrap();
+    }
+
+    #[test]
+    fn the_renamed_item_comes_from_the_thread_and_the_window_does_not_look_at_the_server() {
+        let (mut app, dir, ctx) = app_on_server_folder("fromthread", &["a.txt"]);
+        app.reload_items();
+        wait_for(|| (!app.poll_reload()).then_some(()));
+        // An item that exists nowhere: if the window read it itself, it would find nothing and show nothing
+        let mut ghost = FileItem::sample("ghost.txt", crate::fs::file_item::FileType::Document);
+        ghost.path = dir.join("ghost.txt");
+        app.net.tx.send(NetMsg::Renamed { path: dir.join("a.txt"), target: dir.join("ghost.txt"), new_name: "ghost.txt".into(), item: Some(ghost), result: Ok(()) }).unwrap();
+        app.poll_network(&ctx);
+        assert_eq!(names(&app), ["ghost.txt"], "the item the thread read is the one shown");
+        assert_eq!(app.selected_index.and_then(|i| app.items.get(i)).map(|i| i.name.as_str()), Some("ghost.txt"));
+        // When the thread could not read it, nothing is looked up here either: the old name is gone, the next refresh has the new one
+        app.net.tx.send(NetMsg::Renamed { path: dir.join("ghost.txt"), target: dir.join("a.txt"), new_name: "a.txt".into(), item: None, result: Ok(()) }).unwrap();
+        app.poll_network(&ctx);
+        assert!(names(&app).is_empty(), "{:?}", names(&app));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_search_listing_replaces_the_renamed_item_where_it_is() {
+        let (mut app, dir, ctx) = app_on_server_folder("mixed", &["a.txt", "keep.txt"]);
+        app.reload_items();
+        wait_for(|| (!app.poll_reload()).then_some(()));
+        app.search_query = "txt".to_owned();
+        assert!(app.is_mixed_listing());
+        let place = app.items.iter().position(|i| i.name == "a.txt").unwrap();
+        let mut fresh = FileItem::sample("b.txt", crate::fs::file_item::FileType::Document);
+        fresh.path = dir.join("b.txt");
+        app.net.tx.send(NetMsg::Renamed { path: dir.join("a.txt"), target: dir.join("b.txt"), new_name: "b.txt".into(), item: Some(fresh.clone()), result: Ok(()) }).unwrap();
+        app.poll_network(&ctx);
+        assert_eq!(app.items.len(), 2);
+        assert_eq!(app.items[place].name, "b.txt", "replaced where it was");
+        // An item that is not in the results is not added to them
+        app.net.tx.send(NetMsg::Renamed { path: dir.join("zzz.txt"), target: dir.join("yyy.txt"), new_name: "yyy.txt".into(), item: Some(fresh), result: Ok(()) }).unwrap();
+        app.poll_network(&ctx);
+        assert_eq!(app.items.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_rename_dialog_stays_for_the_server_and_a_second_enter_asks_nothing_more() {
+        let (mut app, dir, ctx, mut frame, mut time) = rename_dialog("enter", &["a.txt"], "b.txt");
+        let (calls, answer) = gated_rename(&mut app);
+        // Enter twice in the same frame, and again later
+        let mut twice = press(egui::Key::Enter);
+        twice.extend(release(egui::Key::Enter));
+        twice.extend(press(egui::Key::Enter));
+        frames(&mut app, &ctx, &mut frame, &mut time, twice, 3);
+        wait_for(|| (calls.load(Ordering::SeqCst) >= 1).then_some(()));
+        frames(&mut app, &ctx, &mut frame, &mut time, press(egui::Key::Enter), 3);
+        let shown = frames(&mut app, &ctx, &mut frame, &mut time, release(egui::Key::Enter), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a second request went out");
+        assert!(matches!(app.dialog, Some(Dialog::Rename { waiting: true, error: None, .. })), "the dialog must wait for the answer, with nothing said against it");
+        // The name cannot be typed over while it waits
+        frames(&mut app, &ctx, &mut frame, &mut time, vec![egui::Event::Text("zz".into())], 3);
+        assert!(matches!(&app.dialog, Some(Dialog::Rename { name, .. }) if name == "b.txt"), "the name was changed while waiting");
+        assert!(shown.iter().any(|(t, _)| t == "Renaming…"), "{:?}", shown.iter().map(|s| &s.0).collect::<Vec<_>>());
+        // A click on the button, which says what is going on, sends nothing either
+        let button = shown.iter().find(|(t, _)| t == "Renaming…").unwrap().1.center();
+        let m = egui::Modifiers::NONE;
+        let primary = egui::PointerButton::Primary;
+        frames(&mut app, &ctx, &mut frame, &mut time, vec![egui::Event::PointerMoved(button)], 3);
+        frames(&mut app, &ctx, &mut frame, &mut time, vec![egui::Event::PointerButton { pos: button, button: primary, pressed: true, modifiers: m }], 2);
+        frames(&mut app, &ctx, &mut frame, &mut time, vec![egui::Event::PointerButton { pos: button, button: primary, pressed: false, modifiers: m }], 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the button sent a second request");
+        assert!(matches!(app.dialog, Some(Dialog::Rename { waiting: true, error: None, .. })), "a click on the waiting button must do nothing");
+        assert!(app.net.is_being_renamed(&dir.join("a.txt")));
+
+        // The answer closes the dialog, and the item is there once, under its new name
+        answer.send(None).unwrap();
+        wait_for(|| {
+            frames(&mut app, &ctx, &mut frame, &mut time, Vec::new(), 1);
+            app.history.undo_label().map(drop)
+        });
+        frames(&mut app, &ctx, &mut frame, &mut time, Vec::new(), 12);
+        assert!(app.dialog.is_none() && app.closing_dialog.is_none() || app.dialog.is_none());
+        assert_eq!(names(&app), ["b.txt"]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!app.net.is_being_renamed(&dir.join("a.txt")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_second_rename_of_the_same_item_is_refused_until_the_first_is_answered() {
+        let (mut app, dir, ctx) = app_on_server_folder("twice", &["a.txt"]);
+        let (calls, answer) = gated_rename(&mut app);
+        assert_eq!(app.rename_entry(&dir.join("a.txt"), "b.txt"), Ok(()));
+        wait_for(|| (calls.load(Ordering::SeqCst) == 1).then_some(()));
+        assert_eq!(app.rename_entry(&dir.join("a.txt"), "c.txt"), Err("“a.txt” is already being renamed".to_owned()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        answer.send(None).unwrap();
+        wait_for(|| {
+            app.poll_network(&ctx);
+            app.history.undo_label().map(drop)
+        });
+        // Answered: the old name is gone, and so is the mark; another item is free to be renamed
+        assert!(!app.net.is_being_renamed(&dir.join("a.txt")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_error_from_the_server_stays_in_the_dialog_with_the_name_and_can_be_sent_again() {
+        let (mut app, dir, ctx, mut frame, mut time) = rename_dialog("error", &["a.txt", "b.txt"], "b.txt");
+        let (calls, answer) = gated_rename(&mut app);
+        frames(&mut app, &ctx, &mut frame, &mut time, press(egui::Key::Enter), 2);
+        frames(&mut app, &ctx, &mut frame, &mut time, release(egui::Key::Enter), 2);
+        wait_for(|| (calls.load(Ordering::SeqCst) == 1).then_some(()));
+        answer.send(Some(std::io::ErrorKind::AlreadyExists)).unwrap();
+        let shown = wait_for(|| {
+            let shown = frames(&mut app, &ctx, &mut frame, &mut time, Vec::new(), 1);
+            (!app.net.is_being_renamed(&dir.join("a.txt"))).then_some(shown)
+        });
+        let shown = if shown.iter().any(|(t, _)| t == "“b.txt” already exists") { shown } else { frames(&mut app, &ctx, &mut frame, &mut time, Vec::new(), 3) };
+        // Open, with the reason in it, the name still typed, nothing said as a message, nothing changed
+        match &app.dialog {
+            Some(Dialog::Rename { name, error, waiting, .. }) => {
+                assert_eq!(name, "b.txt");
+                assert_eq!(error.as_deref(), Some("“b.txt” already exists"));
+                assert!(!waiting, "the dialog must be editable again");
+            }
+            other => panic!("the dialog is gone: {}", other.is_some()),
+        }
+        assert!(shown.iter().any(|(t, _)| t == "“b.txt” already exists"), "the reason is drawn in the dialog");
+        assert!(app.status_toast.is_none(), "an error that has a dialog is not also a message");
+        assert!(dir.join("a.txt").exists() && app.history.undo_label().is_none());
+
+        // Another name, sent again: a new request, and this time it goes through
+        if let Some(Dialog::Rename { name, .. }) = &mut app.dialog {
+            *name = "c.txt".to_owned();
+        }
+        frames(&mut app, &ctx, &mut frame, &mut time, press(egui::Key::Enter), 2);
+        frames(&mut app, &ctx, &mut frame, &mut time, release(egui::Key::Enter), 2);
+        wait_for(|| (calls.load(Ordering::SeqCst) == 2).then_some(()));
+        answer.send(None).unwrap();
+        wait_for(|| {
+            frames(&mut app, &ctx, &mut frame, &mut time, Vec::new(), 1);
+            app.history.undo_label().map(drop)
+        });
+        assert!(dir.join("c.txt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn escape_while_the_server_works_closes_the_dialog_and_the_answer_comes_as_a_message() {
+        for (outcome, expect) in [(None, "Renamed to “b.txt”"), (Some(std::io::ErrorKind::AlreadyExists), "“b.txt” already exists")] {
+            let (mut app, dir, ctx, mut frame, mut time) = rename_dialog("escape", &["a.txt"], "b.txt");
+            let (calls, answer) = gated_rename(&mut app);
+            frames(&mut app, &ctx, &mut frame, &mut time, press(egui::Key::Enter), 2);
+            frames(&mut app, &ctx, &mut frame, &mut time, release(egui::Key::Enter), 2);
+            wait_for(|| (calls.load(Ordering::SeqCst) == 1).then_some(()));
+            assert!(matches!(app.dialog, Some(Dialog::Rename { waiting: true, .. })));
+            frames(&mut app, &ctx, &mut frame, &mut time, press(egui::Key::Escape), 2);
+            frames(&mut app, &ctx, &mut frame, &mut time, release(egui::Key::Escape), 12);
+            assert!(app.dialog.is_none(), "Escape must close the dialog while the server works");
+            assert!(app.net.is_being_renamed(&dir.join("a.txt")), "the rename goes on");
+
+            answer.send(outcome).unwrap();
+            wait_for(|| {
+                app.poll_network(&ctx);
+                app.status_toast.as_ref().map(|t| t.message.clone())
+            });
+            assert_eq!(app.status_toast.as_ref().unwrap().message, expect);
+            assert_eq!(app.history.undo_label().is_some(), outcome.is_none(), "an undo exists only for a rename that happened");
+            assert!(app.dialog.is_none() && app.net.renaming.is_empty());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_item_that_is_being_renamed_on_a_server_is_drawn_dimmed_until_the_answer() {
+        let (mut app, dir, ctx) = app_on_server_folder("dim", &["a.txt", "other.txt"]);
+        let (mut frame, mut time) = (eframe::Frame::_new_kittest(), 0.0);
+        let name_color = |app: &mut CompressionApp, frame: &mut eframe::Frame, time: &mut f64, name: &str| -> egui::Color32 {
+            fn find(shape: &egui::Shape, name: &str) -> Option<egui::Color32> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == name => t.galley.job.sections.first().map(|s| s.format.color),
+                    egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, name)),
+                    _ => None,
+                }
+            }
+            let ctx = app.ctx.clone();
+            let mut found = None;
+            for _ in 0..25 {
+                *time += 0.05;
+                let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 700.0))), time: Some(*time), ..Default::default() };
+                let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, frame));
+                out.textures_delta.clear();
+                found = out.shapes.iter().find_map(|c| find(&c.shape, name));
+            }
+            found.unwrap_or_else(|| panic!("{name} is not drawn"))
+        };
+        app.reload_items();
+        wait_for(|| (!app.poll_reload()).then_some(()));
+        // In the list and in the grid
+        for (mode, from, to) in [(crate::app::ViewMode::List, "a.txt", "b.txt"), (crate::app::ViewMode::Grid, "b.txt", "a.txt")] {
+            app.view_mode = mode;
+            let normal = name_color(&mut app, &mut frame, &mut time, from);
+            let (calls, answer) = gated_rename(&mut app);
+            assert_eq!(app.rename_entry(&dir.join(from), to), Ok(()));
+            wait_for(|| (calls.load(Ordering::SeqCst) == 1).then_some(()));
+            let dimmed = name_color(&mut app, &mut frame, &mut time, from);
+            let untouched = name_color(&mut app, &mut frame, &mut time, "other.txt");
+            assert_ne!(dimmed, normal, "{mode:?}: the item being renamed looks like any other");
+            assert_eq!(untouched, normal, "{mode:?}: another item is dimmed too");
+            answer.send(None).unwrap();
+            wait_for(|| {
+                app.poll_network(&ctx);
+                (!app.net.is_being_renamed(&dir.join(from))).then_some(())
+            });
+            assert_eq!(name_color(&mut app, &mut frame, &mut time, to), normal, "{mode:?}: the renamed item stays dimmed");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

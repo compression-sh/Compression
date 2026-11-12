@@ -1376,6 +1376,8 @@ pub fn file_row(
     theme: &SerpantinumTheme,
     selected: bool,
     cut: bool,
+    // Being renamed on a server: dimmed like what is cut, without its badge
+    busy: bool,
     should_scroll: bool,
     thumb: Option<&egui::TextureHandle>,
     path_hint: Option<&str>,
@@ -1388,6 +1390,7 @@ pub fn file_row(
     let fx = fx(ui, id, &response, true, &FxSpec::ROW);
     let sel_t = animate(ui.ctx(), id.with("sel"), selected);
     let cut_t = animate(ui.ctx(), id.with("cut"), cut);
+    let busy_t = animate(ui.ctx(), id.with("busy"), busy);
     let thumb_t = animate(ui.ctx(), id.with("thumb"), thumb.is_some());
     let r = scaled(rect, fx.scale);
 
@@ -1398,7 +1401,7 @@ pub fn file_row(
     );
     paint_fill(ui.painter(), r, CornerRadius::same(radius_md()), bg, &fx);
 
-    let fade = lerp(1.0, 0.58, cut_t);
+    let fade = lerp(1.0, 0.58, cut_t.max(busy_t));
     // The icon grows with the row, so a tight list is not full of oversized glyphs
     let icon_size = (row_height * 0.52).round().clamp(16.0, 24.0);
     let k = icon_size / 24.0;
@@ -1588,6 +1591,8 @@ pub fn file_tile(
     theme: &SerpantinumTheme,
     selected: bool,
     cut: bool,
+    // Being renamed on a server: dimmed like what is cut, without its badge
+    busy: bool,
     should_scroll: bool,
     thumb: Option<&egui::TextureHandle>,
     grid_size: crate::settings::GridSize,
@@ -1602,6 +1607,7 @@ pub fn file_tile(
     let fx = fx(ui, id, &response, true, &FxSpec::TILE);
     let sel_t = animate(ui.ctx(), id.with("sel"), selected);
     let cut_t = animate(ui.ctx(), id.with("cut"), cut);
+    let busy_t = animate(ui.ctx(), id.with("busy"), busy);
     let thumb_t = animate(ui.ctx(), id.with("thumb"), thumb.is_some());
     let r = scaled(rect, fx.scale);
 
@@ -1612,7 +1618,7 @@ pub fn file_tile(
     );
     paint_fill(ui.painter(), r, CornerRadius::same(radius_lg()), bg, &fx);
 
-    let fade = lerp(1.0, 0.58, cut_t);
+    let fade = lerp(1.0, 0.58, cut_t.max(busy_t));
     // Anchor layout positions to `rect` so multi-line text baselines stay rock-steady during hover/press scaling
     let picture = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + pic_sz * 0.5 + 12.0), Vec2::splat(pic_sz));
     let scaled_picture = scaled(picture, fx.scale);

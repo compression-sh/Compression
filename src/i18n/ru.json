@@ -887,5 +887,7 @@
   "Themes cannot be changed in administrator mode": "В режиме администратора темы изменять нельзя",
   "There is no folder for the themes": "Нет папки для тем",
   "Could not save the theme: {}": "Не удалось сохранить тему: {}",
-  "Could not delete the theme: {}": "Не удалось удалить тему: {}"
+  "Could not delete the theme: {}": "Не удалось удалить тему: {}",
+  "Renaming…": "Переименование…",
+  "“{}” is already being renamed": "«{}» уже переименовывается"
 }

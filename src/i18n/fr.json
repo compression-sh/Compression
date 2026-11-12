@@ -887,5 +887,7 @@
   "Themes cannot be changed in administrator mode": "Les thèmes ne peuvent pas être modifiés en mode administrateur",
   "There is no folder for the themes": "Il n’y a pas de dossier pour les thèmes",
   "Could not save the theme: {}": "Impossible d’enregistrer le thème : {}",
-  "Could not delete the theme: {}": "Impossible de supprimer le thème : {}"
+  "Could not delete the theme: {}": "Impossible de supprimer le thème : {}",
+  "Renaming…": "Renommage…",
+  "“{}” is already being renamed": "« {} » est déjà en cours de renommage"
 }

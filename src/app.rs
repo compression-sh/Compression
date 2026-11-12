@@ -232,7 +232,8 @@ struct MenuGhost {
 
 pub(crate) enum Dialog {
     Create { is_dir: bool, name: String, error: Option<String>, first_frame: bool, templates: Vec<Template>, template: usize, edited: bool },
-    Rename { path: PathBuf, is_dir: Option<bool>, name: String, error: Option<String>, first_frame: bool },
+    /// `waiting`: the item is on a server and the rename has been asked for; the dialog stays for the answer.
+    Rename { path: PathBuf, is_dir: Option<bool>, name: String, error: Option<String>, first_frame: bool, waiting: bool },
     Confirm { title: String, body: String, confirm: String, action: ConfirmAction },
     Alert { title: String, body: String },
     Properties { props: Box<Properties>, scan: Option<FolderScan>, tab: usize },
@@ -1186,7 +1187,12 @@ impl CompressionApp {
     /// Show a file that was just made or renamed into the open folder without reading the whole folder again,
     /// which stalls the window on a big folder or a slow drive. Whatever the listing hides stays hidden.
     fn add_listed(&mut self, path: &Path) {
-        let fresh = FileItem::from_path(path).filter(|item| self.listed(item));
+        self.add_listed_item(path, FileItem::from_path(path));
+    }
+
+    /// `add_listed` for an item that has been read already.
+    fn add_listed_item(&mut self, path: &Path, item: Option<FileItem>) {
+        let fresh = item.filter(|item| self.listed(item));
         if fresh.is_some() && self.settings.show_thumbnails {
             self.thumbs.ensure(path);
         }
@@ -3858,11 +3864,12 @@ impl CompressionApp {
                 let slot = item_rects[idx].1;
                 let selected = self.selection.contains(&idx);
                 let is_cut = cut.contains(&item.path);
+                let is_busy = self.net.is_being_renamed(&item.path);
                 let hint = self.path_hint(item);
                 let thumb = thumb_for(&self.thumbs, &self.folder_icons, item, show_thumbs);
                 let resp = ui
                     .scope_builder(egui::UiBuilder::new().max_rect(slot), |ui| {
-                        file_row(ui, idx, item, &self.theme, selected, is_cut, should_scroll, thumb, hint.as_deref(), &self.columns, &self.settings.column_widths, row_height)
+                        file_row(ui, idx, item, &self.theme, selected, is_cut, is_busy, should_scroll, thumb, hint.as_deref(), &self.columns, &self.settings.column_widths, row_height)
                     })
                     .inner;
                 plugin_ui::paint_marks(ui, &self.theme, &self.plugins.marks(item), egui::pos2(resp.rect.left() + 38.0, resp.rect.center().y + 9.0), egui::pos2(resp.rect.left() + 13.0, resp.rect.center().y + 12.0));
@@ -3961,10 +3968,11 @@ impl CompressionApp {
                         continue;
                     }
                     let is_cut = cut.contains(&item.path);
+                let is_busy = self.net.is_being_renamed(&item.path);
                     let thumb = thumb_for(&self.thumbs, &self.folder_icons, item, show_thumbs);
                     let resp = ui
                         .scope_builder(egui::UiBuilder::new().max_rect(slot), |ui| {
-                            file_tile(ui, idx, item, &self.theme, selected, is_cut, should_scroll, thumb, grid_size, grid_lines)
+                            file_tile(ui, idx, item, &self.theme, selected, is_cut, is_busy, should_scroll, thumb, grid_size, grid_lines)
                         })
                         .inner;
                     item_rects.push((idx, resp.rect));
@@ -4673,7 +4681,7 @@ impl CompressionApp {
     fn open_rename(&mut self, path: PathBuf) {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let is_dir = self.item_is_dir(&path);
-        self.dialog = Some(Dialog::Rename { path, is_dir, name, error: None, first_frame: true });
+        self.dialog = Some(Dialog::Rename { path, is_dir, name, error: None, first_frame: true, waiting: false });
     }
 
     /// Rename `path` inside its folder and keep the renamed item selected.
@@ -4687,28 +4695,37 @@ impl CompressionApp {
         }
         let target = path.with_file_name(new_name);
         if network::is_remote(path) {
+            // A rename that is out is not asked for twice: the second would find the old name gone
+            if self.net.is_being_renamed(path) {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                return Err(trf("“{}” is already being renamed", &[&name]));
+            }
             // A server may take its time: the name is checked and the item renamed on a thread, and the window goes
             // on with the result (`NetMsg::Renamed`)
             self.rename_on_server(path.to_path_buf(), target, new_name.to_owned());
             return Ok(());
         }
         crate::compat::rename_noreplace(path, &target).map_err(|err| rename_error(&err, new_name))?;
-        self.renamed(path, target, new_name);
+        let item = FileItem::from_path(&target);
+        self.renamed(path, target, new_name, item);
         Ok(())
     }
 
-    /// An item was renamed: show it under its new name, selected, and record the way back.
-    fn renamed(&mut self, path: &Path, target: PathBuf, new_name: &str) {
+    /// An item was renamed: record the way back and tell, and show it under its new name, selected, if the folder
+    /// it is in is the one shown. `item` is the renamed item as it was read (on a server by the thread that renamed
+    /// it): nothing here looks at the disk or the server.
+    fn renamed(&mut self, path: &Path, target: PathBuf, new_name: &str, item: Option<FileItem>) {
         self.retarget_path(path, &target);
 
         if self.is_mixed_listing() {
             if let Some(idx) = self.items.iter().position(|i| i.path == path)
-                && let Some(item) = FileItem::from_path(&target) {
+                && let Some(item) = item {
                     self.items[idx] = item;
                 }
-        } else {
+        } else if target.parent() == Some(self.current_path.as_path()) {
+            // Only the folder that is shown takes the item: the person may have gone elsewhere since asking
             self.items.retain(|i| i.path != path);
-            self.add_listed(&target);
+            self.add_listed_item(&target, item);
         }
         if let Some(idx) = self.items.iter().position(|i| i.path == target) {
             self.selected_index = Some(idx);
@@ -5861,11 +5878,13 @@ impl CompressionApp {
     }
 
     fn rename_dialog_contents(&mut self, ui: &mut egui::Ui, dialog: &mut Dialog) -> bool {
-        let Dialog::Rename { path, is_dir, name, error, first_frame } = dialog else { return false };
+        let Dialog::Rename { path, is_dir, name, error, first_frame, waiting } = dialog else { return false };
         let theme = self.theme;
         let mut close = material::dialog_header(ui, tr("Rename"), None, &theme, "rename_close");
 
-        let (changed, mut submit) = name_field(ui, &theme, name, first_frame, *is_dir == Some(false));
+        // While the server has not answered, the name cannot be changed or sent again
+        let busy = *waiting;
+        let (changed, mut submit) = ui.add_enabled_ui(!busy, |ui| name_field(ui, &theme, name, first_frame, *is_dir == Some(false))).inner;
         if changed {
             *error = None;
         }
@@ -5873,11 +5892,15 @@ impl CompressionApp {
             ui.label(egui::RichText::new(err).size(material::FONT_CAPTION).color(theme.red));
         }
 
-        let footer = material::dialog_footer(ui, &theme, FooterSpec::new("rename", icons::CHECK, tr("Rename")));
+        let label = if busy { tr("Renaming…") } else { tr("Rename") };
+        let footer = material::dialog_footer(ui, &theme, FooterSpec { enabled: !busy, ..FooterSpec::new("rename", icons::CHECK, label) });
         submit |= footer.primary;
+        // Cancel and Escape always work: a rename that is out goes on, and its answer comes as a message
         close |= footer.cancel;
-        if submit {
+        if submit && !busy {
             match self.rename_entry(path, name) {
+                // Out to a server: the dialog stays for the answer
+                Ok(()) if self.net.is_being_renamed(path) => *waiting = true,
                 Ok(()) => close = true,
                 Err(err) => *error = Some(err),
             }
