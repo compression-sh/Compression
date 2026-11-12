@@ -719,6 +719,40 @@ fn recent_listing(paths: Vec<PathBuf>, show_hidden: bool, filter: TypeFilter) ->
 }
 
 /// What to tell about a rename that did not work.
+/// Brings `paths` back from the trash, one after the other, until the job is stopped. Says what was restored and what
+/// failed, and records the way back for what was.
+fn restore_job(w: &mut engine::Worker, paths: &[PathBuf]) -> engine::Outcome {
+    w.shared.files_total.store(paths.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let (mut restored, mut failed, mut stopped) = (Vec::new(), Vec::new(), false);
+    for path in paths {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        w.shared.set_current(&name);
+        match trash::restore_with(path, &|from, to| engine::move_item(w, from, to)) {
+            Ok(back) => restored.push(back),
+            Err(err) if engine::is_cancel(&err) => {
+                stopped = true;
+                break;
+            }
+            Err(err) => failed.push(format!("{name}: {}", crate::fs::describe::io_error(&err))),
+        }
+        w.file_done();
+    }
+    // What was restored, not what was asked for
+    let label = CompressionApp::describe_count(&restored);
+    let effect = if restored.is_empty() {
+        engine::Effect::None
+    } else {
+        engine::Effect::Record(UndoEntry::new(trf("Restoring {}", &[&label]), restored.iter().cloned().map(Edit::Trash).collect()))
+    };
+    let outcome = match (restored.is_empty(), failed.is_empty()) {
+        _ if stopped => engine::Outcome::stopped(),
+        (false, true) => engine::Outcome::done(trf("Restored {}", &[&label])),
+        (false, false) => engine::Outcome::failed(format!("{} · {}: {}", trf("Restored {}", &[&label]), trf("{} failed", &[&failed.len()]), failed.join(" · "))),
+        (true, _) => engine::Outcome::failed(trf("Could not restore: {}", &[&failed.join(" · ")])),
+    };
+    outcome.with(effect)
+}
+
 fn rename_error(err: &std::io::Error, new_name: &str) -> String {
     match err.kind() {
         std::io::ErrorKind::AlreadyExists => trf("“{}” already exists", &[&new_name]),
@@ -5150,28 +5184,15 @@ impl CompressionApp {
         self.set_toast_action(message, ToastAction::Undo);
     }
 
+    /// Bring trashed items back, as a job: an item that came from another drive is copied back, which may take long, and
+    /// can be followed and stopped (see `engine::move_item`). What was brought back can be undone.
     fn restore_paths(&mut self, paths: Vec<PathBuf>) {
-        let mut failed = Vec::new();
-        let mut restored = Vec::new();
-        for path in &paths {
-            match trash::restore(path) {
-                Ok(back) => restored.push(back),
-                Err(err) => failed.push(format!("{}: {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), crate::fs::describe::io_error(&err))),
-            }
+        if paths.is_empty() {
+            return;
         }
         self.selected_index = None;
-        self.refresh_listing();
-        // What was restored, not what was asked for
-        let label = Self::describe_count(&restored);
-        let done = !restored.is_empty();
-        if done {
-            self.history.record(UndoEntry::new(trf("Restoring {}", &[&label]), restored.into_iter().map(Edit::Trash).collect()));
-        }
-        match (done, failed.is_empty()) {
-            (true, true) => self.set_toast(trf("Restored {}", &[&label])),
-            (true, false) => self.set_toast(format!("{} · {}: {}", trf("Restored {}", &[&label]), trf("{} failed", &[&failed.len()]), failed.join(" · "))),
-            _ => self.set_toast(trf("Could not restore: {}", &[&failed.join(" · ")])),
-        }
+        let title = trf("Restoring {}", &[&Self::describe_count(&paths)]);
+        self.engine.spawn(JobKind::History, title, String::new(), move |w| restore_job(w, &paths));
     }
 
     /// Ask before deleting for good (unless the setting turned the question off).
@@ -8846,12 +8867,18 @@ mod tests {
         app.history.push_undo(entry);
         let nowhere = base.join("not-in-the-trash.txt");
 
+        // A job: the window goes on at once, and the job can be stopped
         app.restore_paths(vec![trashed.clone(), nowhere.clone()]);
-        assert_eq!(said(&app), "Restored “back.txt” · 1 failed: not-in-the-trash.txt: The trash has no record of where this came from");
+        let job = app.engine.jobs.last().expect("a job");
+        assert!(job.kind == JobKind::History && job.controllable(), "{:?}", job.kind);
+        finish_jobs(&mut app);
+        assert_eq!(said(&app), "Failed: Restored “back.txt” · 1 failed: not-in-the-trash.txt: The trash has no record of where this came from");
         assert!(file.exists());
+        assert_eq!(app.history.undo_label(), Some("Restoring “back.txt”"), "what came back can go again");
         // Nothing restored: the failure alone, with its name
         app.restore_paths(vec![nowhere]);
-        assert_eq!(said(&app), "Could not restore: not-in-the-trash.txt: The trash has no record of where this came from");
+        finish_jobs(&mut app);
+        assert_eq!(said(&app), "Failed: Could not restore: not-in-the-trash.txt: The trash has no record of where this came from");
         let _ = std::fs::remove_dir_all(&base);
     }
 
