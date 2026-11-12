@@ -2576,4 +2576,58 @@ mod tests {
         assert!(app.dialog.is_none() && !dir.join("b.txt").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// Runs `n` frames of the window with the events given in the first one.
+    fn frames(app: &mut CompressionApp, ctx: &egui::Context, frame: &mut eframe::Frame, time: &mut f64, events: Vec<egui::Event>, n: usize) {
+        for i in 0..n {
+            *time += 0.05;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 700.0))),
+                time: Some(*time),
+                events: if i == 0 { events.clone() } else { Vec::new() },
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, frame));
+            out.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn a_click_beside_the_login_neither_closes_it_nor_cancels_the_connection_and_esc_cancels_it() {
+        let (mut app, base) = local_app("login_modal");
+        let ctx = app.ctx.clone();
+        let (mut frame, mut time) = (eframe::Frame::_new_kittest(), 0.0);
+        let answers = waiting_connection(&mut app, 7);
+        app.show_prompt(7, login_prompt());
+        frames(&mut app, &ctx, &mut frame, &mut time, Vec::new(), 15);
+        assert!(matches!(app.dialog, Some(Dialog::Login { id: 7, .. })) && app.net.pending[0].asking);
+        // Something typed into the focused field, then a click in the empty corner of the window
+        frames(&mut app, &ctx, &mut frame, &mut time, vec![egui::Event::Text("zzq".into())], 3);
+        let typed = |app: &CompressionApp| match &app.dialog {
+            Some(Dialog::Login { user, password, .. }) => Some(format!("{user}{password}")),
+            _ => None,
+        };
+        assert!(typed(&app).is_some_and(|t| t.contains("zzq")), "{:?}", typed(&app));
+        let (pos, none) = (egui::pos2(1090.0, 690.0), egui::Modifiers::NONE);
+        frames(&mut app, &ctx, &mut frame, &mut time, vec![egui::Event::PointerMoved(pos)], 3);
+        frames(&mut app, &ctx, &mut frame, &mut time, vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: none }], 2);
+        frames(&mut app, &ctx, &mut frame, &mut time, vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: none }], 8);
+        for _ in 0..3 {
+            app.poll_network(&ctx);
+        }
+        // Still there, still holding what was typed, and the connection is not cancelled
+        assert!(matches!(app.dialog, Some(Dialog::Login { id: 7, .. })), "the login closed by a click beside it");
+        assert!(typed(&app).is_some_and(|t| t.contains("zzq")), "what was typed is gone");
+        assert!(app.net.pending[0].asking, "the connection is no longer waiting for an answer");
+        assert!(answers.try_recv().is_err(), "a Cancel was sent for a click that missed");
+        // Esc is the way to cancel: the dialog closes and the connection is told
+        let key = |pressed| egui::Event::Key { key: egui::Key::Escape, physical_key: Some(egui::Key::Escape), pressed, repeat: false, modifiers: none };
+        frames(&mut app, &ctx, &mut frame, &mut time, vec![key(true)], 1);
+        frames(&mut app, &ctx, &mut frame, &mut time, vec![key(false)], 5);
+        app.poll_network(&ctx);
+        assert!(app.dialog.is_none());
+        assert!(matches!(answers.try_recv(), Ok(Reply::Cancel)), "Esc must cancel the connection");
+        assert!(!app.net.pending[0].asking);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 }

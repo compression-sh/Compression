@@ -288,6 +288,28 @@ pub(crate) enum Dialog {
     EditServer { index: usize, name: String, text: String, error: Option<String>, first_frame: bool },
 }
 
+impl Dialog {
+    /// Whether a click beside the dialog leaves it open. The dialogs that take what a person types (a name, a pattern,
+    /// an address, a password) and the question of a conflict are modal: they close with Esc or a button, so that no one
+    /// loses what was typed, or a connection that was being made, by a click that missed. Questions and information
+    /// (Confirm, Alert, Properties, Open with…, Quick Look, a plugin's window, a server's question) go with a click
+    /// beside them: nothing is lost.
+    fn survives_outside_click(&self) -> bool {
+        matches!(
+            self,
+            Dialog::Create { .. }
+                | Dialog::Rename { .. }
+                | Dialog::BatchRename { .. }
+                | Dialog::Compress { .. }
+                | Dialog::SelectPattern { .. }
+                | Dialog::Connect { .. }
+                | Dialog::Login { .. }
+                | Dialog::EditServer { .. }
+                | Dialog::Conflict { .. }
+        )
+    }
+}
+
 /// Rubber-band drag selection started inside the file listing.
 struct DragSelect {
     /// Origin in content coordinates (`screen_y + scroll_offset.y`).
@@ -5605,7 +5627,7 @@ impl CompressionApp {
         // Click outside the dialog card dismisses it
         let dialog_rect = dialog_area.response.rect;
         let outside_click = is_open
-            && !matches!(dialog, Dialog::Conflict { .. })
+            && !dialog.survives_outside_click()
             && !click_consumed
             && ctx.input(|i| {
                 i.pointer.primary_clicked()
@@ -7656,6 +7678,100 @@ mod tests {
         w.run(vec![egui::Event::PointerMoved(egui::pos2(900.0, 650.0))], 5);
         frames(&mut w, 12);
         assert!(!dot(&w), "treated as local again: no dot");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Opens a dialog on the window, for the tests of dialogs.
+    type Opener = Box<dyn Fn(&mut CompressionApp)>;
+
+    /// What was typed into the dialog, for the dialogs that take input.
+    fn typed_in(dialog: &Dialog) -> Option<String> {
+        match dialog {
+            Dialog::Create { name, .. } | Dialog::Rename { name, .. } | Dialog::Compress { name, .. } => Some(name.clone()),
+            Dialog::SelectPattern { pattern, .. } => Some(pattern.clone()),
+            Dialog::Connect { text, .. } => Some(text.clone()),
+            Dialog::EditServer { name, text, .. } => Some(format!("{name}{text}")),
+            Dialog::BatchRename { rules, .. } => Some(format!("{}{}{}{}{}", rules.template, rules.find, rules.replace, rules.prefix, rules.suffix)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_dialog_that_takes_input_stays_open_and_keeps_what_was_typed_when_the_click_misses_it_and_esc_closes_it() {
+        let base = window_dir("modal_inputs");
+        let file = base.join("one.txt");
+        std::fs::write(&file, "x").unwrap();
+        std::fs::write(base.join("two.txt"), "x").unwrap();
+        let mut w = Window::new(base.clone());
+        w.app.net.servers.saved.push(crate::fs::network::Server { name: "box".into(), address: crate::fs::network::Address::parse("sftp://me@host/").unwrap() });
+        w.run(Vec::new(), 15);
+        let two = base.join("two.txt");
+        let openers: Vec<(&str, Opener)> = vec![
+            ("Create", Box::new(|app| app.open_create_dialog(false))),
+            ("Rename", Box::new({ let file = file.clone(); move |app| app.open_rename(file.clone()) })),
+            ("BatchRename", Box::new({ let (a, b) = (file.clone(), two.clone()); move |app| app.open_batch_rename(vec![a.clone(), b.clone()]) })),
+            ("Compress", Box::new({ let file = file.clone(); move |app| app.open_compress_dialog(vec![file.clone()]) })),
+            ("SelectPattern", Box::new(|app| app.open_select_pattern())),
+            ("Connect", Box::new(|app| app.open_connect_dialog())),
+            ("EditServer", Box::new(|app| app.open_edit_server(0))),
+        ];
+        for (name, open) in &openers {
+            open(&mut w.app);
+            w.run(Vec::new(), 15);
+            assert!(w.app.dialog.is_some(), "{name} did not open");
+            let kind = std::mem::discriminant(w.app.dialog.as_ref().unwrap());
+            // Type something (the first field has the focus), then click in the empty corner of the window
+            w.run(vec![egui::Event::Text("zzq".into())], 3);
+            let typed = typed_in(w.app.dialog.as_ref().unwrap()).expect("a dialog with input");
+            assert!(typed.contains("zzq"), "{name}: nothing was typed: {typed:?}");
+            w.click(egui::pos2(1090.0, 690.0), egui::PointerButton::Primary);
+            w.run(Vec::new(), 10);
+            let still = w.app.dialog.as_ref().unwrap_or_else(|| panic!("{name} closed by a click beside it"));
+            assert_eq!(std::mem::discriminant(still), kind);
+            assert_eq!(typed_in(still).as_deref(), Some(typed.as_str()), "{name} lost what was typed");
+            // Esc does close it
+            w.key(egui::Key::Escape);
+            w.run(Vec::new(), 5);
+            assert!(w.app.dialog.is_none(), "{name} did not close with Esc");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_conflict_question_also_stays_open_for_a_click_beside_it() {
+        // A real question: a copy that found its target name taken (one without a request closes by itself)
+        let (mut w, root) = window_with_the_conflict_question("modal_conflict", false);
+        w.click(egui::pos2(1090.0, 690.0), egui::PointerButton::Primary);
+        w.run(Vec::new(), 10);
+        assert!(matches!(w.app.dialog, Some(Dialog::Conflict { request: Some(_), .. })), "the conflict question closed by a click beside it");
+        assert!(w.shows("Keep both"), "{:?}", w.last);
+        // Answered, the job goes on and the question goes
+        w.click(w.at("Skip"), egui::PointerButton::Primary);
+        w.until("the answer", |w| w.app.dialog.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn questions_and_information_still_close_with_a_click_beside_them() {
+        let base = window_dir("modal_questions");
+        let file = base.join("one.txt");
+        std::fs::write(&file, "x").unwrap();
+        let mut w = Window::new(base.clone());
+        w.run(Vec::new(), 15);
+        let openers: Vec<(&str, Opener)> = vec![
+            ("Confirm", Box::new(|app| app.dialog = Some(Dialog::Confirm { title: "Sure?".into(), body: "Really?".into(), confirm: "Yes".into(), action: ConfirmAction::EmptyTrash }))),
+            ("Alert", Box::new(|app| app.dialog = Some(Dialog::Alert { title: "Careful".into(), body: "Something".into() }))),
+            ("OpenWith", Box::new({ let file = file.clone(); move |app| app.open_open_with(file.clone()) })),
+            ("Properties", Box::new({ let file = file.clone(); move |app| app.open_properties(&file) })),
+        ];
+        for (name, open) in &openers {
+            open(&mut w.app);
+            w.run(Vec::new(), 15);
+            assert!(w.app.dialog.is_some(), "{name} did not open");
+            w.click(egui::pos2(1090.0, 690.0), egui::PointerButton::Primary);
+            w.run(Vec::new(), 10);
+            assert!(w.app.dialog.is_none(), "{name} stays open when the click misses it");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
