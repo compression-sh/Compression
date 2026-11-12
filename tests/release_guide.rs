@@ -67,3 +67,18 @@ fn the_checklist_has_the_steps_that_were_missing() {
         assert!(guide.contains(item), "the checklist lacks: {item}");
     }
 }
+
+#[test]
+fn nix_compiles_the_checkout_unless_release_json_names_its_very_version() {
+    // Nix is not run here: `default.nix` is read for the one decision the Nix follow-up of `release.yml` relies on
+    let default = read("default.nix");
+    // No release.json, or one without a version, is no release
+    assert!(default.contains("builtins.pathExists releaseFile"), "a missing release.json must not break the build");
+    assert!(default.contains(".version or null"), "a release.json without a version must count as none");
+    // The binary only for the version of this checkout, on x86_64 Linux and when not asked to compile
+    assert!(default.contains("if fromSource || pkgs.stdenv.hostPlatform.system != \"x86_64-linux\" || releaseVersion != checkoutVersion"));
+    assert!(default.contains("then import ./nix/package.nix"), "otherwise the checkout is compiled");
+    assert!(default.contains("else import ./nix/bin.nix"));
+    // And the release workflow is what writes release.json after a tag
+    assert!(read(".github/workflows/release.yml").contains("nix/release.json"));
+}

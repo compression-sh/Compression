@@ -330,6 +330,12 @@ pub(crate) fn file() -> Option<PathBuf> {
     crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("compression").join("settings.json"))
 }
 
+/// Settings a tool lays over `settings.json`: `managed.json` beside it, which the home-manager module
+/// (`nix/home-manager.nix`) writes. Its keys win over the file's; Compression only reads it.
+pub(crate) fn managed_file() -> Option<PathBuf> {
+    file().map(|f| f.with_file_name("managed.json"))
+}
+
 #[cfg(test)]
 thread_local! {
     /// Set by a test that runs a whole window on its thread: its tabs and layout are not kept in the
@@ -347,14 +353,38 @@ impl Settings {
 
     /// The settings as the file has them now: `None` when there is no file to read, an error when
     /// it is not valid JSON (say, half way through an edit by hand).
+    /// What `managed.json` says (see `managed_file`) is laid over it.
     pub fn read() -> Option<Result<Self, serde_json::Error>> {
-        let text = std::fs::read_to_string(file()?).ok()?;
-        Some(Self::parse(&text))
+        let base = std::fs::read_to_string(file()?).ok();
+        let managed = managed_file().and_then(|m| std::fs::read_to_string(m).ok());
+        if base.is_none() && managed.is_none() {
+            return None;
+        }
+        Some(Self::parse_with(base.as_deref().unwrap_or("{}"), managed.as_deref()))
     }
 
     /// Settings from the text of a file, with the names and the rights of this session applied.
+    #[cfg(test)]
     fn parse(text: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str::<Settings>(text).map(|s| s.with_current_view_names().for_session(crate::fs::admin::is_admin()))
+        Self::parse_with(text, None)
+    }
+
+    /// `parse`, with the keys of `managed` (the text of `managed.json`) in place of the file's own. A `managed.json` that
+    /// is not a JSON object is left out, and said on stderr: the settings of the file still count.
+    fn parse_with(text: &str, managed: Option<&str>) -> Result<Self, serde_json::Error> {
+        let mut value: serde_json::Value = serde_json::from_str(text)?;
+        if let Some(managed) = managed {
+            match serde_json::from_str::<serde_json::Value>(managed) {
+                Ok(serde_json::Value::Object(keys)) => {
+                    if let Some(own) = value.as_object_mut() {
+                        own.extend(keys);
+                    }
+                }
+                Ok(_) => eprintln!("compression: managed.json is not a JSON object and is left out"),
+                Err(err) => eprintln!("compression: managed.json is left out: {}", crate::fs::describe::json_error(&err)),
+            }
+        }
+        serde_json::from_value::<Settings>(value).map(|s| s.with_current_view_names().for_session(crate::fs::admin::is_admin()))
     }
 
     /// The parts of the settings that change as a window is used and not because a person chose
@@ -588,5 +618,35 @@ mod tests {
         assert!(Settings::default().save_to(&file).unwrap().is_none());
         assert_eq!(broken_kept(&base), [kept]);
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn what_managed_json_says_is_laid_over_settings_json() {
+        let own = r#"{ "show_hidden": false, "theme": "dark", "folders_first": false }"#;
+        let managed = r#"{ "show_hidden": true, "theme": "nord" }"#;
+        let s = Settings::parse_with(own, Some(managed)).unwrap();
+        assert!(s.show_hidden && s.theme == "nord", "the managed keys win");
+        assert!(!s.folders_first, "the others stay the file's");
+        // Without a settings.json of its own (read() passes "{}"), the managed keys over the defaults
+        let s = Settings::parse_with("{}", Some(managed)).unwrap();
+        assert!(s.show_hidden && s.theme == "nord" && s.folders_first == Settings::default().folders_first);
+        // A managed.json that cannot be used is left out; the file still counts
+        for broken in ["not json", "[1, 2]", r#""text""#] {
+            let s = Settings::parse_with(own, Some(broken)).unwrap();
+            assert!(!s.show_hidden && s.theme == "dark", "{broken}");
+        }
+        // A managed value of the wrong type is an error of the settings, as one in settings.json is
+        assert!(Settings::parse_with(own, Some(r#"{ "show_hidden": "yes" }"#)).is_err());
+    }
+
+    #[test]
+    fn the_home_manager_module_writes_managed_json_from_its_settings() {
+        // Nix is not run here: the module is checked for what Compression relies on
+        let module = include_str!("../nix/home-manager.nix");
+        for needed in ["options.programs.compression", "settings = lib.mkOption", "pkgs.formats.json", "xdg.configFile.\"compression/managed.json\"", "home.packages = [ cfg.package ]", "lib.mkIf cfg.enable"] {
+            assert!(module.contains(needed), "{needed}");
+        }
+        assert_eq!(module.matches('{').count(), module.matches('}').count(), "braces");
+        assert_eq!(managed_file().map(|f| f.file_name().unwrap().to_owned()), Some("managed.json".into()));
     }
 }
