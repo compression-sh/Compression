@@ -817,7 +817,11 @@ pub fn apply(ctx: &egui::Context, theme: &SerpantinumTheme, popup: &SerpantinumT
     visuals.window_fill = popup.mantle;
     visuals.extreme_bg_color = theme.surface1;
     visuals.override_text_color = Some(theme.text);
-    ctx.set_visuals(visuals);
+    // The palette says light or dark, not the desktop: egui would otherwise switch to its own style for the mode the
+    // desktop names (as early as the first frame) and the palette's colors would be gone
+    let mode = if theme.light { egui::Theme::Light } else { egui::Theme::Dark };
+    ctx.set_theme(mode);
+    ctx.set_visuals_of(mode, visuals);
     super::material::set_focus_color(ctx, theme.mauve);
 
     ctx.all_styles_mut(|style| {
@@ -839,6 +843,23 @@ pub fn apply(ctx: &egui::Context, theme: &SerpantinumTheme, popup: &SerpantinumT
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn the_palette_holds_whether_the_desktop_says_light_or_dark_in_the_first_frame() {
+        for desktop in [egui::Theme::Light, egui::Theme::Dark] {
+            for light in [false, true] {
+                let theme = SerpantinumTheme { light, ..SerpantinumTheme::default() };
+                let ctx = egui::Context::default();
+                apply(&ctx, &theme, &theme);
+                let raw = egui::RawInput { system_theme: Some(desktop), ..Default::default() };
+                ctx.run_ui(raw, |_| {}).textures_delta.clear();
+                let visuals = ctx.global_style().visuals.clone();
+                assert_eq!(visuals.override_text_color, Some(theme.text), "desktop {desktop:?}, light palette {light}");
+                assert_eq!(visuals.panel_fill, theme.base, "desktop {desktop:?}, light palette {light}");
+                assert_eq!(visuals.dark_mode, !light, "desktop {desktop:?}, light palette {light}");
+            }
+        }
+    }
 
     #[test]
     fn every_preset_is_readable() {
