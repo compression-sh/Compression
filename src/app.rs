@@ -6228,9 +6228,12 @@ impl CompressionApp {
 
         // Click outside the dialog card dismisses it
         let dialog_rect = dialog_area.response.rect;
+        // Nor does the click that opened it: the Save of the file dialog opens its Replace question with a click that
+        // ends outside the card, in this very frame
         let outside_click = is_open
             && !dialog.survives_outside_click()
             && !click_consumed
+            && !fresh
             && ctx.input(|i| {
                 i.pointer.primary_clicked()
                     && i.pointer.interact_pos().is_some_and(|p| !dialog_rect.contains(p))
@@ -11255,6 +11258,26 @@ mod tests {
             assert!(w.app.status_toast.is_none(), "{}: {:?}", mount.name, w.app.status_toast.as_ref().map(|t| &t.message));
         }
         std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn the_replace_question_of_the_save_dialog_stays_open_after_the_click_on_save() {
+        let dir = window_dir("save_replace");
+        std::fs::write(dir.join("report.txt"), "old").unwrap();
+        let mut w = Window::new(dir.clone());
+        let args: Vec<String> = ["--chooser", "--mode", "save", "--name", "report.txt"].iter().map(|s| s.to_string()).collect();
+        w.app.chooser = crate::chooser::Spec::parse(&args).map(crate::chooser::Chooser::new);
+        w.run(Vec::new(), 5);
+        // The click that saves ends outside the card of the question it opens, in the same frame
+        w.click(w.at("Save"), egui::PointerButton::Primary);
+        w.run(Vec::new(), 5);
+        assert!(matches!(&w.app.dialog, Some(Dialog::Confirm { action: ConfirmAction::ReplaceFile { .. }, .. })), "the question went away: {:?}", w.last);
+        assert!(w.shows("Replace “report.txt”?"), "{:?}", w.last);
+        // A later click beside it still closes it, as it does any question that takes no input
+        w.click(egui::pos2(5.0, 5.0), egui::PointerButton::Primary);
+        assert!(w.app.dialog.is_none());
+        assert_eq!(std::fs::read_to_string(dir.join("report.txt")).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
