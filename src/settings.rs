@@ -380,17 +380,21 @@ impl Settings {
             return Ok(());
         }
         #[cfg(test)]
+        #[allow(clippy::needless_return)]
         {
             SAVES.with(|n| n.set(n.get() + 1));
             if FAIL_SAVE.with(std::cell::Cell::get) {
                 return Err(std::io::Error::from_raw_os_error(libc::EACCES));
             }
-            if NO_SAVE.with(std::cell::Cell::get) {
-                return Ok(());
-            }
+            // A test never writes the settings of whoever runs it (`NO_SAVE` stays for the tests that set it)
+            let _ = NO_SAVE.with(std::cell::Cell::get);
+            return Ok(());
         }
-        let Some(file) = file() else { return Ok(()) };
-        self.save_to(&file)
+        #[cfg(not(test))]
+        {
+            let Some(file) = file() else { return Ok(()) };
+            self.save_to(&file)
+        }
     }
 
     fn save_to(&self, file: &std::path::Path) -> std::io::Result<()> {

@@ -123,6 +123,8 @@ impl CompressionApp {
             return;
         };
         self.apply_look(&ctx);
+        // The main window may be out of sight and get no frames: what is typed here is written from here too
+        self.save_changed_settings();
         let theme = self.theme;
         let popup_theme = self.popup_theme;
         let mut close = false;
@@ -206,6 +208,8 @@ impl CompressionApp {
         }
 
         if close {
+            // What the person changed here is written now, not after the pause
+            self.save_settings_now();
             set_settings_open(false);
             self.capturing_key = false;
             self.close_theme_editor();

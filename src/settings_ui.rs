@@ -284,8 +284,8 @@ impl CompressionApp {
                             .font(egui::FontId::proportional(material::FONT_BODY)),
                     );
                     if resp.changed() {
+                        // Written once the typing pauses (`save_changed_settings`), not at every key
                         self.settings.start_path = if path_str.trim().is_empty() { None } else { Some(PathBuf::from(path_str.trim())) };
-                        self.persist_settings();
                     }
                 });
                 if !valid {
@@ -500,7 +500,6 @@ impl CompressionApp {
                     if text.len() == 7 && theme::parse_hex(&text).is_some() {
                         self.settings.accent = Some(text.to_lowercase());
                         self.rebuild_theme();
-                        self.persist_settings();
                     }
                 }
             });
@@ -908,7 +907,6 @@ impl CompressionApp {
                 );
                 if resp.changed() {
                     self.settings.terminal = command;
-                    self.persist_settings();
                 }
             });
             material::hint_label_inset(ui, tr("Command that opens a terminal; {} stands for the folder. Leave empty to find one automatically."), &theme, 14);
@@ -931,7 +929,6 @@ impl CompressionApp {
                 );
                 if resp.changed() {
                     self.settings.templates_dir = if path_str.trim().is_empty() { None } else { Some(PathBuf::from(path_str.trim())) };
-                    self.persist_settings();
                 }
             });
             let hint = tr("Files in this folder are offered when you create a new file.");

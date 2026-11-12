@@ -413,6 +413,11 @@ pub struct CompressionApp {
     /// The part of the window the listing fills (drops on items must land inside it).
     dnd_view: egui::Rect,
     error_message: Option<String>,
+    /// How long the person must pause before the history and the settings are written: they change with every step
+    /// through the folders, and every write waits for the disk.
+    write_delay: std::time::Duration,
+    /// The settings that differ from the file, as last seen, and since when they have not changed.
+    settings_change: Option<(Settings, std::time::Instant)>,
     /// The folder cannot be read for lack of rights: offer to open it as administrator.
     error_denied: bool,
 
@@ -651,6 +656,8 @@ impl CompressionApp {
             wl_dnd: None,
             release_pointer: false,
             error_message: None,
+            write_delay: WRITE_DELAY,
+            settings_change: None,
             error_denied: false,
             theme: faded,
             popup_theme: theme,
@@ -1627,6 +1634,14 @@ impl CompressionApp {
     }
 
     /// Re-apply theme / font / scale to egui after a change, and write changed preferences to disk.
+    /// The history of visited folders is written once the person has paused (see `write_delay`), not at every step.
+    fn write_recent_after_a_pause(&mut self, ctx: &egui::Context) {
+        recent::flush_if_idle(self.write_delay);
+        if recent::has_waiting() {
+            ctx.request_repaint_after(self.write_delay);
+        }
+    }
+
     fn sync_settings(&mut self, ctx: &egui::Context) {
         self.apply_look(ctx);
         crate::fs::file_item::set_format_options(self.settings.decimal_units, self.settings.relative_dates);
@@ -1696,7 +1711,8 @@ impl CompressionApp {
         }
     }
 
-    fn save_changed_settings(&mut self) {
+    /// The settings as they are now: what the window shows (view, sort, tabs) is taken into them.
+    fn current_settings(&mut self) -> Settings {
         if self.chooser.is_none() {
             let (paths, active) = self.session();
             self.settings.session_tabs = paths;
@@ -1707,7 +1723,7 @@ impl CompressionApp {
             Some(_) => (self.settings.view_mode, self.view_mode),
             None => (self.view_mode, self.settings.chooser_view_mode),
         };
-        let current = Settings {
+        Settings {
             view_mode,
             chooser_view_mode,
             sort_by: self.sort_by,
@@ -1716,9 +1732,39 @@ impl CompressionApp {
             folders_first: self.folders_first,
             columns: self.columns.clone(),
             ..self.settings.clone()
+        }
+    }
+
+    /// Writes the settings when they differ from the file and have not changed for `write_delay`: they change with
+    /// every step through the folders (the tabs, the last folder), and each write waits for the disk. A change that
+    /// comes meanwhile starts the wait over; the window's closing writes at once (`Drop`).
+    fn save_changed_settings(&mut self) {
+        let current = self.current_settings();
+        if current == self.saved_settings {
+            self.settings_change = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        let waited = match &self.settings_change {
+            Some((seen, since)) if *seen == current => now.saturating_duration_since(*since),
+            _ => {
+                self.settings_change = Some((current.clone(), now));
+                std::time::Duration::ZERO
+            }
         };
-        if current != self.saved_settings {
+        if waited >= self.write_delay {
             self.store_settings(current, false);
+        } else {
+            // Without input there would be no frame to write in
+            self.ctx.request_repaint_after(self.write_delay - waited);
+        }
+    }
+
+    /// Writes changed settings now, for a change the person has finished (the Settings window closing).
+    pub(super) fn save_settings_now(&mut self) {
+        let current = self.current_settings();
+        if current != self.saved_settings {
+            self.store_settings(current, true);
         }
     }
 
@@ -2427,6 +2473,9 @@ struct Crumb {
 /// Width of context menus; wide enough for a label next to its shortcut.
 const MENU_WIDTH: f32 = 264.0;
 
+/// How long the person pauses before the history and the settings are written, see `CompressionApp::write_delay`.
+const WRITE_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Content width below which the sidebar is hidden.
 const SIDEBAR_BREAKPOINT: f32 = 680.0;
 /// Narrowest the path pill may get before header buttons start to drop out.
@@ -2454,6 +2503,18 @@ const SETTINGS_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 const CRUMB_HEIGHT: f32 = 26.0;
 const CRUMB_INSET: f32 = (material::CONTROL_HEIGHT - CRUMB_HEIGHT) / 2.0;
 const CRUMB_ICON_STEP: f32 = material::INSET_LABEL - material::INSET_ICON + 8.0;
+
+impl Drop for CompressionApp {
+    /// A window that closes writes what still waits: the history and settings the pause had not yet written. A
+    /// failure cannot be told to anyone any more.
+    fn drop(&mut self) {
+        recent::flush();
+        let current = self.current_settings();
+        if current != self.saved_settings {
+            let _ = current.save();
+        }
+    }
+}
 
 impl eframe::App for CompressionApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -2522,6 +2583,7 @@ impl eframe::App for CompressionApp {
         self.drop_zones.clear();
         self.poll_config_files(&ctx);
         self.sync_settings(&ctx);
+        self.write_recent_after_a_pause(&ctx);
         let shown_px = match self.view_mode {
             ViewMode::Grid => self.settings.grid_size.picture_size(),
             ViewMode::List => 32.0,
@@ -7094,6 +7156,152 @@ mod tests {
     }
 
     #[test]
+    fn many_steps_through_the_folders_write_the_history_once_after_a_pause() {
+        let work = window_dir("recent_pause");
+        let dirs: Vec<PathBuf> = ["a", "b", "c", "d"].iter().map(|n| work.join(n)).collect();
+        for dir in &dirs {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let file = work.join("history").join("recent.json");
+        crate::fs::recent::TEST_FILE.with(|f| *f.borrow_mut() = Some(file.clone()));
+        let mut w = Window::new(work.clone());
+        w.app.write_delay = std::time::Duration::from_millis(250);
+        for dir in &dirs {
+            w.app.navigate_to(dir.clone());
+            w.run(Vec::new(), 3);
+        }
+        assert!(!file.exists(), "the history is written at every step");
+        assert!(crate::fs::recent::has_waiting());
+        // After the pause it is written, once, with all the steps, the last one first
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        w.run(Vec::new(), 3);
+        let text = std::fs::read_to_string(&file).expect("nothing was written after the pause");
+        let at = |dir: &PathBuf| text.find(&dir.to_string_lossy().into_owned()).unwrap_or_else(|| panic!("{} is missing: {text}", dir.display()));
+        assert!(at(&dirs[3]) < at(&dirs[2]) && at(&dirs[2]) < at(&dirs[1]) && at(&dirs[1]) < at(&dirs[0]), "{text}");
+        assert!(!crate::fs::recent::has_waiting());
+        // Nothing new: nothing is written again
+        let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        w.run(Vec::new(), 5);
+        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), written);
+        crate::fs::recent::TEST_FILE.with(|f| *f.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_change_of_the_settings_is_written_once_after_a_pause_and_every_new_change_starts_the_wait_over() {
+        use crate::settings::SAVES;
+        let base = window_dir("settings_pause");
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.write_delay = std::time::Duration::from_millis(300);
+        app.saved_settings = app.current_settings();
+        SAVES.with(|n| n.set(0));
+        let saves = || SAVES.with(|n| n.get());
+        let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+
+        // A change is not written at once
+        app.show_hidden = !app.show_hidden;
+        app.save_changed_settings();
+        assert_eq!(saves(), 0);
+        sleep(200);
+        // Another change meanwhile: the wait begins again, so after 200 ms more it is still not written
+        app.folders_first = !app.folders_first;
+        app.save_changed_settings();
+        sleep(200);
+        app.save_changed_settings();
+        assert_eq!(saves(), 0, "a new change must start the wait over");
+        // Nothing changed for the whole wait: written, once, and counted as saved
+        sleep(200);
+        app.save_changed_settings();
+        assert_eq!(saves(), 1);
+        let now = app.current_settings();
+        assert_eq!(app.saved_settings, now);
+        for _ in 0..3 {
+            sleep(50);
+            app.save_changed_settings();
+        }
+        assert_eq!(saves(), 1, "nothing differs any more");
+        // Changing it back to what the file has needs no write at all
+        app.show_hidden = !app.show_hidden;
+        app.save_changed_settings();
+        app.show_hidden = !app.show_hidden;
+        sleep(350);
+        app.save_changed_settings();
+        assert_eq!(saves(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn closing_a_window_writes_what_still_waits_and_a_change_the_person_has_finished_is_written_at_once() {
+        use crate::settings::SAVES;
+        let base = window_dir("settings_drop");
+        let ctx = egui::Context::default();
+        let make = || {
+            let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+            app.write_delay = std::time::Duration::from_secs(3600);
+            app.saved_settings = app.current_settings();
+            app
+        };
+        let saves = || SAVES.with(|n| n.get());
+        SAVES.with(|n| n.set(0));
+
+        // The window closes with a change and a visited folder waiting: both are written then
+        let history = base.join("history").join("recent.json");
+        crate::fs::recent::TEST_FILE.with(|f| *f.borrow_mut() = Some(history.clone()));
+        let mut app = make();
+        app.show_hidden = !app.show_hidden;
+        app.save_changed_settings();
+        crate::fs::recent::record(&base.join("visited"));
+        assert!(!history.exists());
+        assert_eq!(saves(), 0);
+        drop(app);
+        assert_eq!(saves(), 1, "the closing window wrote what was waiting");
+        assert!(std::fs::read_to_string(&history).is_ok_and(|text| text.contains("visited")), "the history was not written");
+        crate::fs::recent::TEST_FILE.with(|f| *f.borrow_mut() = None);
+        // Nothing waits: nothing is written
+        let app = make();
+        drop(app);
+        assert_eq!(saves(), 1);
+        // Finishing a change (closing the Settings window) writes at once, however long the pause is
+        let mut app = make();
+        app.sort_by = SortBy::Size;
+        app.save_settings_now();
+        assert_eq!(saves(), 2);
+        let now = app.current_settings();
+        assert_eq!(app.saved_settings, now);
+        drop(app);
+        assert_eq!(saves(), 2, "already written");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_failed_write_after_the_pause_is_said_once_and_tried_again_later() {
+        use crate::settings::{FAIL_SAVE, SAVES};
+        let base = window_dir("settings_pause_fail");
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.write_delay = std::time::Duration::from_millis(100);
+        app.saved_settings = app.current_settings();
+        SAVES.with(|n| n.set(0));
+        FAIL_SAVE.with(|f| f.set(true));
+        app.show_hidden = !app.show_hidden;
+        app.save_changed_settings();
+        assert_eq!(SAVES.with(|n| n.get()), 0, "not before the pause");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        app.save_changed_settings();
+        assert_eq!(SAVES.with(|n| n.get()), 1);
+        assert!(app.status_toast.as_ref().is_some_and(|t| t.message.contains("could not be saved")));
+        let now = app.current_settings();
+        assert_ne!(app.saved_settings, now, "an unwritten file is not a saved one");
+        // Asked again at once: the retry wait holds it back
+        app.save_changed_settings();
+        assert_eq!(SAVES.with(|n| n.get()), 1);
+        FAIL_SAVE.with(|f| f.set(false));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn restoring_in_part_says_what_came_back_and_what_did_not() {
         let base = std::env::temp_dir().join(format!("compression_restore_part_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -7382,6 +7590,8 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let ctx = egui::Context::default();
         let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        // Writing at once, to test the failure and the retry; the pause has its own test
+        app.write_delay = std::time::Duration::ZERO;
         NO_SAVE.with(|n| n.set(true));
         app.saved_settings = app.settings.clone();
         let saves = || SAVES.with(|n| n.get());
