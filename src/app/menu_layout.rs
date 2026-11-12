@@ -125,14 +125,20 @@ pub(crate) fn builtin_entry(id: &str) -> Option<(&'static str, &'static str)> {
 
 /// The name an entry has when it stands alone although it was made for a submenu ("New tab" under "Open in"): a submenu
 /// left with one entry shows that entry, under a name that says all of it.
-fn full_label(id: &str, label: &'static str) -> &'static str {
+/// Built-in entries have a name of their own for that; the entries of the built-in "More actions" and "Select" say all
+/// there is already. Any other (of a plugin's submenu, of one the person named) takes its submenu's name in front:
+/// "Git: Stage", "Mine: Copy".
+fn full_label(id: &str, label: &'static str, submenu: Option<&str>) -> &'static str {
     match id {
         "new_tab" => tr("Open in new tab"),
         "new_window" => tr("Open in new window"),
         "terminal" => tr("Open in terminal"),
         "icon_image" => tr("Custom icon: image…"),
         "icon_glyph" => tr("Custom icon: glyph…"),
-        _ => label,
+        _ => match submenu {
+            Some(name) if name != tr("More actions") && name != tr("Select") && !name.is_empty() => crate::plugins::intern(&trf("{}: {}", &[&name, &label])),
+            _ => label,
+        },
     }
 }
 
@@ -305,7 +311,7 @@ pub(super) fn apply(groups: Vec<Vec<MenuEntry>>, layout: &MenuLayout, plugin_gro
                         // One entry left: it stands for itself, under its whole name
                         1 => {
                             let (id, (icon, label, action)) = children.remove(0);
-                            placed.push((icon, full_label(&id, label), action));
+                            placed.push((icon, full_label(&id, label, Some(submenu_label(name, plugin_groups))), action));
                         }
                         _ => {
                             let icon = children[0].1.0;
@@ -328,9 +334,11 @@ pub(super) fn apply(groups: Vec<Vec<MenuEntry>>, layout: &MenuLayout, plugin_gro
         let piece: Vec<MenuEntry> = if !ours.is_empty() && ours.iter().all(|&i| unknown(i)) {
             vec![node]
         } else {
+            // The submenu it came out of is named in front of it (see `full_label`)
+            let from = matches!(node.2, MenuAction::Submenu(_)).then_some(node.1);
             ours.iter().filter(|&&i| unknown(i)).map(|&i| {
                 let (icon, label, action) = made[i].entry.clone();
-                (icon, full_label(made[i].id.as_deref().unwrap_or_default(), label), action)
+                (icon, full_label(made[i].id.as_deref().unwrap_or_default(), label, from), action)
             }).collect()
         };
         if piece.is_empty() {
@@ -778,6 +786,28 @@ mod tests {
         };
         let out = apply(made_folder_menu(), &layout, &[("tags".to_owned(), "Tags")]);
         assert_eq!(labels(&out), strings(&[&["Mine > Copy, Cut, work"], &["Tags > New tag…, New tab, New window"], &["Open", "Properties"]]));
+    }
+
+    #[test]
+    fn a_lone_entry_of_a_plugin_or_own_submenu_takes_the_submenu_name_in_front() {
+        let p = PathBuf::from("/x/a.rs");
+        let git = |id: &str, label: &'static str| (icons::ADD, label, MenuAction::Plugin("git", id.into(), vec![p.clone()], None));
+        let made = vec![
+            vec![(icons::COPY, tr("Copy"), MenuAction::Copy(vec![p.clone()])), (icons::DUPLICATE, tr("Duplicate"), MenuAction::Duplicate(vec![p.clone()]))],
+            vec![(icons::ADD, "Git", MenuAction::Submenu(vec![git("stage", "Stage"), git("diff", "Show diff")]))],
+            vec![(icons::INFO, tr("Properties"), MenuAction::Properties(p.clone()))],
+        ];
+        let layout = MenuLayout {
+            groups: vec![
+                vec![submenu("plugin-group:git", &["plugin:git:stage"]), submenu("Mine", &["copy"]), submenu("builtin:more", &["duplicate"])],
+                vec![entry("properties")],
+            ],
+        };
+        let out = apply(made.clone(), &layout, &[("git".to_owned(), "Git")]);
+        // A plugin's submenu and one of the person's: their name in front; "More actions" says all already
+        assert_eq!(labels(&out)[0], ["Git: Stage", "Mine: Copy", "Duplicate"]);
+        // What the layout does not name and left a plugin's submenu: the same
+        assert_eq!(labels(&out)[1], ["Git: Show diff"]);
     }
 
     #[test]

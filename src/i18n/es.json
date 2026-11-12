@@ -316,6 +316,7 @@
   "Renaming of {}": "Renombrado de {}",
   "Renamed to “{}”": "Renombrado a «{}»",
   "Could not move to trash: {}": "No se pudo mover a la papelera: {}",
+  "{}: {}": "{}: {}",
   "Empty space": "Espacio vacío",
   "Custom icon: image…": "Icono propio: imagen…",
   "Custom icon: glyph…": "Icono propio: glifo…",
