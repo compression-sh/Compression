@@ -600,6 +600,10 @@ pub struct CompressionApp {
     pub(crate) settings_retry: Option<std::time::Instant>,
     settings_error: Option<String>,
     pub(crate) system_theme: SerpantinumTheme,
+    /// What the desktop prefers (light or dark, its accent), which the "System" theme follows without Serpantinum.
+    appearance: crate::ui::appearance::Appearance,
+    /// The desktop's answers and changes, from the portal (see `ui::appearance::watch`).
+    appearance_rx: std::sync::mpsc::Receiver<crate::ui::appearance::Appearance>,
     /// Follows the files a theme comes from; `None` when none could be watched.
     theme_watch: Option<crate::theme_watch::ThemeWatch>,
     /// A paste that waits for what the system clipboard holds (read on a thread of its own).
@@ -890,7 +894,9 @@ impl CompressionApp {
             settings_retry: None,
             settings_error: None,
             settings,
-            system_theme: SerpantinumTheme::load(),
+            system_theme: SerpantinumTheme::system(&crate::ui::appearance::Appearance::default()),
+            appearance: crate::ui::appearance::Appearance::default(),
+            appearance_rx: crate::ui::appearance::watch(ctx),
             theme_watch: crate::theme_watch::ThemeWatch::new(ctx),
             theme_problems_told: Vec::new(),
             pending_paste: None,
@@ -1115,7 +1121,7 @@ impl CompressionApp {
 
     pub fn refresh(&mut self) {
         // Also reload the theme from disk in case the wallpaper / Matugen theme changed
-        self.system_theme = SerpantinumTheme::load();
+        self.system_theme = SerpantinumTheme::system(&self.appearance);
         self.rebuild_theme();
         self.sizes.cancel_all();
         crate::fs::dirsize::clear();
@@ -1973,6 +1979,7 @@ impl CompressionApp {
     /// Takes up a theme file or `settings.json` rewritten from outside. The Settings window does
     /// this in its own frames too, as the main window gets none while on another workspace.
     pub(super) fn poll_config_files(&mut self, ctx: &egui::Context) {
+        self.poll_appearance();
         if self.theme_watch.as_mut().is_some_and(|w| w.changed(ctx)) {
             self.reload_external_theme();
         }
@@ -1981,9 +1988,19 @@ impl CompressionApp {
         }
     }
 
+    /// The desktop switched between light and dark or changed its accent: the "System" theme follows.
+    fn poll_appearance(&mut self) {
+        let Some(latest) = self.appearance_rx.try_iter().last() else { return };
+        if latest != self.appearance {
+            self.appearance = latest;
+            self.system_theme = SerpantinumTheme::system(&latest);
+            self.rebuild_theme();
+        }
+    }
+
     /// A generator rewrote the Serpantinum colors or a theme file of the user's.
     fn reload_external_theme(&mut self) {
-        self.system_theme = SerpantinumTheme::load();
+        self.system_theme = SerpantinumTheme::system(&self.appearance);
         crate::ui::theme::reload_user_themes();
         self.tell_about_theme_problems();
         self.rebuild_theme();
@@ -11501,6 +11518,32 @@ mod tests {
         }
         assert!(!dir.join("ran").exists(), "nothing ran without an answer");
         assert!(is_app_image(Path::new("/x/a.AppImage")) && is_app_image(Path::new("/x/a.appimage")) && !is_app_image(Path::new("/x/appimage.txt")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_system_theme_turns_light_with_the_desktop_and_takes_its_accent() {
+        let dir = window_dir("system_theme");
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(dir.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        assert_eq!(app.settings.theme, "system");
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.appearance_rx = rx;
+        let accent = egui::Color32::from_rgb(40, 160, 90);
+        tx.send(crate::ui::appearance::Appearance { light: Some(false), accent: None }).unwrap();
+        tx.send(crate::ui::appearance::Appearance { light: Some(true), accent: Some(accent) }).unwrap();
+        app.poll_appearance();
+        // Only the last word counts (the test runs with a home without a Serpantinum palette)
+        let day = crate::ui::appearance::Appearance { light: Some(true), accent: Some(accent) };
+        assert_eq!(app.appearance, day);
+        assert_eq!(app.system_theme, SerpantinumTheme::from_appearance(&day));
+        assert!(app.system_theme.light && app.target_theme.light, "the window did not follow the desktop");
+        // A theme chosen by name stays as it is
+        app.settings.theme = "dark".into();
+        app.rebuild_theme();
+        tx.send(crate::ui::appearance::Appearance { light: Some(false), accent: None }).unwrap();
+        app.poll_appearance();
+        assert!(app.target_theme.light == crate::ui::theme::preset("dark").unwrap().colors.to_theme().light);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

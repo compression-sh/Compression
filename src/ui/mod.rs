@@ -1,3 +1,4 @@
+pub mod appearance;
 pub mod fonts;
 pub mod icon_style;
 pub mod icons;
