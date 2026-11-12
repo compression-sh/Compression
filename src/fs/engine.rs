@@ -383,13 +383,13 @@ impl Worker {
     }
 
     /// Runs archive work (`ops::compress`, `ops::extract`) under this job's control: it stops when
-    /// the job is cancelled or after `ops::ARCHIVE_TIME_LIMIT`, and reports into `bytes_done`.
+    /// the job is cancelled, and reports into `bytes_done`.
     /// `base` is what the job's earlier archives already added; `size` is what this one adds.
     pub fn archive_control<R>(&self, base: u64, size: u64, work: impl FnOnce(&ops::Control) -> R) -> R {
         let shared = &self.shared;
         let cancelled = || shared.cancel.load(Relaxed);
         let progress = |done: u64| shared.bytes_done.store(base + done.min(size), Relaxed);
-        work(&ops::Control::new(&cancelled, &progress, ops::ARCHIVE_TIME_LIMIT))
+        work(&ops::Control::new(&cancelled, &progress))
     }
 
     pub fn add_bytes(&self, n: u64) {

@@ -833,7 +833,6 @@
   "Theme name": "Name des Designs",
   "Settings reloaded": "Einstellungen neu geladen",
   "Settings file has an error: {}": "Fehler in settings.json: {}",
-  "It took longer than {} minutes and was stopped": "Es dauerte länger als {} Minuten und wurde beendet",
   "The archive program printed too much": "Das Archivprogramm hat zu viel ausgegeben",
   "Not enough free space": "Nicht genug freier Platz",
   "There may not be enough room in “{}”.": "Im Ordner „{}“ ist möglicherweise nicht genug Platz.",

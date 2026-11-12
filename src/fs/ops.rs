@@ -3,47 +3,42 @@
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::process::{self, Failure};
 use crate::i18n::{tr, trf};
 
-/// How long one archive may take, to pack or to unpack, before it is stopped.
-pub const ARCHIVE_TIME_LIMIT: Duration = Duration::from_secs(30 * 60);
-
 /// What the person at the window decides about a long archive job while it runs: whether it goes
 /// on, and where it has got to. `compress` and `extract` ask before every chunk of work and give up
-/// with `ErrorKind::Interrupted` (cancelled) or `ErrorKind::TimedOut` (out of time).
+/// with `ErrorKind::Interrupted` once it is cancelled. There is no time limit: packing or unpacking
+/// many gigabytes onto a slow drive takes as long as it takes, and the person can stop it.
 pub struct Control<'a> {
     /// True once the job was cancelled.
     cancelled: &'a dyn Fn() -> bool,
     /// Told how many bytes of the archive at hand are done (read when unpacking, written when packing).
     progress: &'a dyn Fn(u64),
-    deadline: Instant,
 }
 
 impl<'a> Control<'a> {
-    pub fn new(cancelled: &'a dyn Fn() -> bool, progress: &'a dyn Fn(u64), limit: Duration) -> Self {
-        Self { cancelled, progress, deadline: Instant::now() + limit }
+    pub fn new(cancelled: &'a dyn Fn() -> bool, progress: &'a dyn Fn(u64)) -> Self {
+        Self { cancelled, progress }
     }
 
     /// `Ok` while the job may go on.
     pub fn check(&self) -> io::Result<()> {
-        if (self.cancelled)() {
-            Err(stopped())
-        } else if Instant::now() >= self.deadline {
-            Err(timed_out())
-        } else {
-            Ok(())
-        }
+        if (self.cancelled)() { Err(stopped()) } else { Ok(()) }
     }
 }
 
+/// How long an archive program may run: as long as it takes (it is stopped by a cancel, see `Control`). The wait has to
+/// be some length, and this one is far beyond any job.
+const NO_TIME_LIMIT: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+
 #[cfg(test)]
 impl Control<'_> {
-    /// No cancelling, no limit worth speaking of, no one watching the progress.
+    /// No cancelling, no one watching the progress.
     pub fn unlimited() -> Control<'static> {
-        Control::new(&|| false, &|_| {}, Duration::from_secs(24 * 3600))
+        Control::new(&|| false, &|_| {})
     }
 
     /// Tells the progress by hand, as the files being read or written do.
@@ -56,14 +51,9 @@ fn stopped() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "cancelled")
 }
 
-fn timed_out() -> io::Error {
-    let minutes = (ARCHIVE_TIME_LIMIT.as_secs() / 60).to_string();
-    io::Error::new(io::ErrorKind::TimedOut, trf("It took longer than {} minutes and was stopped", &[&minutes]))
-}
-
-/// A cancelled or timed out job: the work of the archive is to be taken back.
+/// A cancelled job: the work of the archive is to be taken back.
 fn is_stop(err: &io::Error) -> bool {
-    matches!(err.kind(), io::ErrorKind::Interrupted | io::ErrorKind::TimedOut)
+    err.kind() == io::ErrorKind::Interrupted
 }
 
 /// A file or stream that asks the `Control` before every read and write, and counts the bytes that
@@ -598,17 +588,17 @@ pub fn seven_zip() -> &'static str {
 const TOOL_OUTPUT_LIMIT: usize = 64 << 20;
 
 /// Runs an archive program to its end, in a process group of its own that is killed when the job is
-/// cancelled or out of time. The program's last line of complaint is the error.
+/// cancelled. The program's last line of complaint is the error.
 fn run_tool(command: Command, control: &Control) -> io::Result<()> {
-    let left = control.deadline.saturating_duration_since(Instant::now());
-    match process::run_capped_with(command, None, TOOL_OUTPUT_LIMIT, left, &|| (control.cancelled)()) {
+    match process::run_capped_with(command, None, TOOL_OUTPUT_LIMIT, NO_TIME_LIMIT, &|| (control.cancelled)()) {
         Ok(output) if output.success => Ok(()),
         Ok(output) => {
             let text = String::from_utf8_lossy(if output.stderr.is_empty() { &output.stdout } else { &output.stderr });
             Err(io::Error::other(text.lines().last().unwrap_or(tr("The program failed")).to_owned()))
         }
         Err(Failure::Cancelled) => Err(stopped()),
-        Err(Failure::TimedOut) => Err(timed_out()),
+        // Not within a hundred years
+        Err(Failure::TimedOut) => Err(io::Error::from(io::ErrorKind::TimedOut)),
         Err(Failure::TooMuchOutput) => Err(io::Error::other(tr("The archive program printed too much"))),
         Err(Failure::Io(e)) => Err(e),
     }
@@ -991,7 +981,7 @@ impl<T: Read + std::os::fd::AsRawFd> Read for Polled<'_, T> {
 }
 
 /// Unpack a compressed tar file: `program -dc` writes the tar stream, and `unpack_tar` puts the entries in place. The
-/// program runs in a process group of its own and is killed when the unpacking ends early (a stop, the time, a refused
+/// program runs in a process group of its own and is killed when the unpacking ends early (a stop, a refused
 /// entry); its error message is the reason when it fails.
 fn unpack_compressed_tar(program: &str, archive: &Path, dest: &Path, control: &Control) -> io::Result<()> {
     use std::os::unix::process::CommandExt;
@@ -1037,16 +1027,16 @@ fn unpack_compressed_tar(program: &str, archive: &Path, dest: &Path, control: &C
     }
 }
 
-/// The listing of an archive by 7z (`l -slt`), within the time of the job.
+/// The listing of an archive by 7z (`l -slt`), until the job is cancelled.
 fn seven_zip_listing(archive: &Path, control: &Control) -> io::Result<String> {
     let mut cmd = Command::new(seven_zip());
     cmd.arg("l").arg("-slt").arg("--").arg(archive);
-    let left = control.deadline.saturating_duration_since(Instant::now());
-    match process::run_capped_with(cmd, None, TOOL_OUTPUT_LIMIT, left, &|| (control.cancelled)()) {
+    match process::run_capped_with(cmd, None, TOOL_OUTPUT_LIMIT, NO_TIME_LIMIT, &|| (control.cancelled)()) {
         Ok(output) if output.success => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
         Ok(output) => Err(io::Error::other(String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or(tr("The program failed")).to_owned())),
         Err(Failure::Cancelled) => Err(stopped()),
-        Err(Failure::TimedOut) => Err(timed_out()),
+        // Not within a hundred years
+        Err(Failure::TimedOut) => Err(io::Error::from(io::ErrorKind::TimedOut)),
         Err(Failure::TooMuchOutput) => Err(io::Error::other(tr("The archive program printed too much"))),
         Err(Failure::Io(e)) => Err(e),
     }
@@ -1118,6 +1108,7 @@ pub fn extract_beside(archive: &Path, control: &Control) -> io::Result<PathBuf> 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn a_free_name_for_a_name_that_is_not_utf8_keeps_its_bytes() {
@@ -1716,7 +1707,7 @@ pub(crate) mod tests {
                 assert!(done >= last.swap(done, Relaxed));
                 calls.fetch_add(1, Relaxed);
             };
-            let control = Control::new(&|| false, &progress, Duration::from_secs(60));
+            let control = Control::new(&|| false, &progress);
             let out = root.join(format!("pack{}", format.extension()));
             compress(&sources(&root), &out, format, &control).unwrap();
             // The zip counts the files' bytes; the tar stream adds its headers and padding
@@ -1738,7 +1729,7 @@ pub(crate) mod tests {
             assert!(done >= last.swap(done, Relaxed));
             calls.fetch_add(1, Relaxed);
         };
-        let control = Control::new(&|| false, &progress, Duration::from_secs(60));
+        let control = Control::new(&|| false, &progress);
         let dest = extract_beside(&out, &control).unwrap();
         assert!(dest.join("sub/four.bin").is_file());
         assert!(last.load(Relaxed) >= out.metadata().unwrap().len() / 2, "it read most of the archive");
@@ -1758,7 +1749,7 @@ pub(crate) mod tests {
                 }
             };
             let stop = || cancel.load(Relaxed);
-            let control = Control::new(&stop, &progress, Duration::from_secs(60));
+            let control = Control::new(&stop, &progress);
             let out = root.join(format!("pack{}", format.extension()));
             let err = compress(&sources(&root), &out, format, &control).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::Interrupted, "{format:?}: {err}");
@@ -1785,7 +1776,7 @@ pub(crate) mod tests {
                 }
             };
             let stop = || cancel.load(Relaxed);
-            let control = Control::new(&stop, &progress, Duration::from_secs(60));
+            let control = Control::new(&stop, &progress);
             let err = extract(&out, &dest, &control).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::Interrupted, "{ext}: {err}");
             let mut left: Vec<String> = std::fs::read_dir(&dest).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
@@ -1797,54 +1788,23 @@ pub(crate) mod tests {
         let out = root.join("pack.zip");
         let cancel = AtomicBool::new(true);
         let stop = || cancel.load(Relaxed);
-        let control = Control::new(&stop, &|_| {}, Duration::from_secs(60));
+        let control = Control::new(&stop, &|_| {});
         assert!(extract_beside(&out, &control).is_err());
         assert!(!root.join("pack").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn a_job_out_of_time_stops_like_a_cancelled_one_but_says_why() {
-        let root = archive_sandbox("timeout");
-        let out = root.join("pack.zip");
-        let none = Control::new(&|| false, &|_| {}, Duration::ZERO);
-        let err = compress(&sources(&root), &out, ArchiveFormat::Zip, &none).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert!(err.to_string().contains("30"), "{err}");
-        assert!(!out.exists());
-
-        compress(&sources(&root), &out, ArchiveFormat::Zip, &Control::unlimited()).unwrap();
-        let dest = root.join("into");
-        std::fs::create_dir_all(&dest).unwrap();
-        let err = extract(&out, &dest, &none).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
-
-        // The same through the libraries that copy by themselves
-        let tgz = root.join("pack.tar.gz");
-        let err = compress(&sources(&root), &tgz, ArchiveFormat::TarGz, &none).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
-        assert!(!tgz.exists());
-        compress(&sources(&root), &tgz, ArchiveFormat::TarGz, &Control::unlimited()).unwrap();
-        let err = extract(&tgz, &dest, &none).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
-        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn a_program_that_packs_is_killed_when_cancelled_or_out_of_time() {
+    fn a_program_that_packs_is_killed_when_cancelled_and_not_for_taking_its_time() {
         let sleeper = || {
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg("sleep 30");
             cmd
         };
-        // Out of time
-        let started = Instant::now();
-        let control = Control::new(&|| false, &|_| {}, Duration::from_millis(200));
-        let err = run_tool(sleeper(), &control).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_secs(10));
+        // A program that takes its time is not stopped for it
+        let mut slow = Command::new("sh");
+        slow.arg("-c").arg("sleep 1.5; echo packed");
+        assert!(run_tool(slow, &Control::unlimited()).is_ok());
         // Cancelled while it runs
         let cancel = AtomicBool::new(false);
         let started = Instant::now();
@@ -1853,7 +1813,7 @@ pub(crate) mod tests {
                 std::thread::sleep(Duration::from_millis(200));
                 cancel.store(true, Relaxed);
             });
-            run_tool(sleeper(), &Control::new(&|| cancel.load(Relaxed), &|_| {}, Duration::from_secs(60))).unwrap_err()
+            run_tool(sleeper(), &Control::new(&|| cancel.load(Relaxed), &|_| {})).unwrap_err()
         });
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -1908,7 +1868,7 @@ pub(crate) mod tests {
         for fmt in [ArchiveFormat::Zip, ArchiveFormat::TarGz] {
             let out = root.join(format!("cancelled{}", fmt.extension()));
             let cancelled = || true;
-            let control = Control::new(&cancelled, &|_| {}, Duration::from_secs(60));
+            let control = Control::new(&cancelled, &|_| {});
             assert!(compress(&[root.join("a.txt")], &out, fmt, &control).is_err());
             assert!(!out.exists(), "{fmt:?}: the half-made archive is gone");
         }
@@ -2124,7 +2084,7 @@ pub(crate) mod tests {
         assert_eq!(names(&inside), ["broken.tar.xz"]);
         // A stop while the program writes: the job ends as a stop and the folder goes
         let good = archive_as(&inside, "big.tar.xz", &raw_tar(&[("a", 'f', ""), ("b", 'f', "")])).unwrap();
-        let err = extract_beside(&good, &Control::new(&|| true, &|_| {}, Duration::from_secs(60))).unwrap_err();
+        let err = extract_beside(&good, &Control::new(&|| true, &|_| {})).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Interrupted, "{err}");
         assert_eq!(names(&inside), ["big.tar.xz", "broken.tar.xz"]);
         let _ = std::fs::remove_dir_all(&root);
@@ -2145,14 +2105,23 @@ pub(crate) mod tests {
 
 
     #[test]
-    fn the_output_of_a_program_that_says_nothing_still_notices_the_end_of_the_time() {
+    fn the_output_of_a_program_that_says_nothing_still_notices_a_cancel() {
         let mut child = Command::new("sleep").arg("30").stdout(std::process::Stdio::piped()).spawn().unwrap();
-        let control = Control::new(&|| false, &|_| {}, Duration::from_millis(300));
+        let cancel = AtomicBool::new(false);
+        let stop = || cancel.load(Relaxed);
+        let control = Control::new(&stop, &|_| {});
         let started = Instant::now();
-        let mut polled = Polled { inner: child.stdout.take().unwrap(), control: &control };
-        let err = polled.read(&mut [0u8; 16]).unwrap_err();
+        let err = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                cancel.store(true, Relaxed);
+            });
+            let mut polled = Polled { inner: child.stdout.take().unwrap(), control: &control };
+            polled.read(&mut [0u8; 16]).unwrap_err()
+        });
         assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
-        assert!(err.to_string().contains("minutes"), "{err}");
+        // Wrapped, as the reader does with every stop: the library that reads would try an Interrupted again for good
+        assert_eq!(err.to_string(), "cancelled");
         let _ = child.kill();
         let _ = child.wait();
     }
