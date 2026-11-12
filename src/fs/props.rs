@@ -223,7 +223,7 @@ pub struct Properties {
 }
 
 impl Properties {
-    pub fn load(path: &Path) -> Option<Self> {
+    pub fn load(path: &Path, mime_tool: &[String], mime_limit: std::time::Duration) -> Option<Self> {
         let item = FileItem::from_path(path)?;
 
         #[cfg(unix)]
@@ -245,7 +245,12 @@ impl Properties {
             .then(|| std::fs::read_dir(path).map(|rd| rd.count()).ok())
             .flatten();
 
-        let mime = if item.is_dir { String::new() } else { super::apps::mime_of(path) };
+        // The type is part of the picture, so a failure shows as text instead of a made-up type
+        let mime = if item.is_dir {
+            String::new()
+        } else {
+            super::apps::mime_with(mime_tool, path, mime_limit).unwrap_or_else(|why| trf("Not available ({})", &[&why.text()]))
+        };
         let extra = type_details(&item, &mime);
 
         Some(Self {

@@ -3,10 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::fs::process;
+use crate::i18n::tr;
 
 #[derive(Debug, Clone)]
 pub struct AppEntry {
@@ -16,20 +17,6 @@ pub struct AppEntry {
     mimes: Vec<String>,
     /// Raw `Icon=` value: an absolute path or a theme icon name.
     pub icon: Option<String>,
-}
-
-/// MIME type of a file, as the system's shared-mime-info database sees it.
-pub fn mime_of(path: &Path) -> String {
-    let queried = Command::new("xdg-mime")
-        .args(["query", "filetype"])
-        .arg(path)
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .filter(|m| !m.is_empty());
-    queried.unwrap_or_else(|| "application/octet-stream".to_owned())
 }
 
 fn application_dirs() -> Vec<PathBuf> {
@@ -254,38 +241,54 @@ pub fn load_icon_image(path: &Path, px: u32) -> Option<eframe::egui::ColorImage>
     }
 }
 
-pub fn default_for(mime: &str) -> Option<String> {
-    Command::new("xdg-mime")
-        .args(["query", "default", mime])
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .filter(|s| !s.is_empty())
+/// What was found out about the default application of one category (or one type).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Known {
+    /// Still being asked.
+    Pending,
+    /// The system answered: the application's id, or `None` when it names none.
+    Is(Option<String>),
+    /// It could not be asked, and why.
+    Failed(Why),
 }
 
-static CATEGORY_DEFAULTS: RwLock<Option<Vec<Option<String>>>> = RwLock::new(None);
+type Slots = Arc<Mutex<Vec<Known>>>;
+
+static CATEGORY_DEFAULTS: Mutex<Option<Slots>> = Mutex::new(None);
+
+/// Ask for the current default of every category, each on a thread of its own and each within `call`: an answer that
+/// does not come holds up nobody else. The slots fill in as the answers come.
+fn start_preload(program: Vec<String>, call: Duration) -> Slots {
+    let slots: Slots = Arc::new(Mutex::new(vec![Known::Pending; CATEGORIES.len()]));
+    for (idx, category) in CATEGORIES.iter().enumerate() {
+        let (slots, program) = (slots.clone(), program.clone());
+        std::thread::spawn(move || {
+            let found = match default_with(&program, category.mimes[0], call) {
+                Ok(id) => Known::Is(id),
+                Err(why) => Known::Failed(why),
+            };
+            if let Ok(mut all) = slots.lock() {
+                all[idx] = found;
+            }
+        });
+    }
+    slots
+}
 
 /// Query the current default of every category in the background (`xdg-mime` is a slow script, and
 /// one run per category on the UI thread made the settings tab stall).
-pub fn preload_category_defaults() {
-    if let Ok(mut slot) = CATEGORY_DEFAULTS.write() {
-        *slot = None;
+pub fn preload_category_defaults(program: Vec<String>) {
+    let slots = start_preload(program, CALL_LIMIT);
+    if let Ok(mut current) = CATEGORY_DEFAULTS.lock() {
+        *current = Some(slots);
     }
-    std::thread::spawn(|| {
-        let found = std::thread::scope(|s| {
-            let jobs: Vec<_> = CATEGORIES.iter().map(|c| s.spawn(|| default_for(c.mimes[0]))).collect();
-            jobs.into_iter().map(|j| j.join().ok().flatten()).collect::<Vec<_>>()
-        });
-        if let Ok(mut slot) = CATEGORY_DEFAULTS.write() {
-            *slot = Some(found);
-        }
-    });
 }
 
-/// The defaults found by `preload_category_defaults`, once they are in.
-pub fn category_defaults() -> Option<Vec<Option<String>>> {
-    CATEGORY_DEFAULTS.read().ok().and_then(|d| d.clone())
+/// The defaults found by `preload_category_defaults` so far, in the order of `CATEGORIES`; `Pending` for the ones
+/// that are not in yet (all of them before a preload was started).
+pub fn category_defaults() -> Vec<Known> {
+    let slots = CATEGORY_DEFAULTS.lock().ok().and_then(|c| c.clone());
+    slots.and_then(|s| s.lock().ok().map(|a| a.clone())).unwrap_or_else(|| vec![Known::Pending; CATEGORIES.len()])
 }
 
 fn split_exec(exec: &str) -> Vec<String> {
@@ -465,7 +468,7 @@ pub struct DefaultsReport {
 }
 
 /// `program` (a program and its leading arguments, `xdg-mime` outside tests) with `args`, within `timeout`.
-fn run_tool(program: &[String], args: &[&str], timeout: Duration) -> Result<process::Output, Why> {
+fn run_tool<S: AsRef<std::ffi::OsStr>>(program: &[String], args: &[S], timeout: Duration) -> Result<process::Output, Why> {
     let Some((first, leading)) = program.split_first() else { return Err(Why::Missing) };
     let mut command = Command::new(first);
     command.args(leading).args(args);
@@ -517,12 +520,53 @@ pub(crate) fn set_defaults_with(program: &[String], mimes: &[String], app_id: &s
 }
 
 /// The default of `mime` as `xdg-mime query default` says: `Ok(None)` when it names none, `Err` when it could not be asked.
-fn default_with(program: &[String], mime: &str, timeout: Duration) -> Result<Option<String>, Why> {
+pub fn default_with(program: &[String], mime: &str, timeout: Duration) -> Result<Option<String>, Why> {
     let out = run_tool(program, &["query", "default", mime], timeout)?;
     if !out.success {
         return Err(Why::Refused);
     }
     Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_owned()).filter(|s| !s.is_empty()))
+}
+
+impl Why {
+    /// What to tell the person, as the end of a sentence in parentheses.
+    pub fn text(self) -> &'static str {
+        match self {
+            Why::Missing => tr("xdg-mime is not installed"),
+            Why::TimedOut => tr("xdg-mime did not answer in time"),
+            Why::Refused => tr("xdg-mime reported an error"),
+            Why::NotKept => tr("the system did not keep the change"),
+        }
+    }
+}
+
+/// MIME type of a file. The name decides when the system's pattern table knows it (no process, no reading of the file,
+/// which matters on servers); only otherwise is `xdg-mime query filetype` asked, within `timeout`. A failure is an
+/// error, never a made-up type.
+pub fn mime_with(program: &[String], path: &Path, timeout: Duration) -> Result<String, Why> {
+    if let Some(mime) = path.file_name().and_then(|n| mime_of_name(&n.to_string_lossy())) {
+        return Ok(mime);
+    }
+    let out = run_tool(program, &[std::ffi::OsStr::new("query"), std::ffi::OsStr::new("filetype"), path.as_os_str()], timeout)?;
+    let mime = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if !out.success || mime.is_empty() {
+        return Err(Why::Refused);
+    }
+    Ok(mime)
+}
+
+/// The type of a file and the application the system opens it with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileType {
+    pub mime: String,
+    pub default: Option<String>,
+}
+
+/// `mime_with`, then `default_with` for that type; each call may take `call`.
+pub fn file_type_with(program: &[String], path: &Path, call: Duration) -> Result<FileType, Why> {
+    let mime = mime_with(program, path, call)?;
+    let default = default_with(program, &mime, call)?;
+    Ok(FileType { mime, default })
 }
 
 /// Set the default of `mimes` on a worker and send what came of it to `tx`; the window never waits for `xdg-mime`.
@@ -573,7 +617,8 @@ pub fn mime_of_name(name: &str) -> Option<String> {
     let lower = name.to_lowercase();
     let mut best: Option<(u32, usize, &str)> = None;
     for (weight, mime, glob) in &globs.other {
-        if super::glob::matches(glob, &lower, true) && best.is_none_or(|(w, l, _)| (*weight, glob.len()) > (w, l)) {
+        // A pattern of the database is one pattern on the whole name: no commas, and plain text is no substring
+        if super::glob::wildcard(glob, &lower) && best.is_none_or(|(w, l, _)| (*weight, glob.len()) > (w, l)) {
             best = Some((*weight, glob.len(), mime));
         }
     }
@@ -712,6 +757,109 @@ pub(crate) mod tests {
         let (failed, _) = set_defaults_with(&tool, &mimes(&["image/png"]), "v.desktop", SHORT, Duration::from_secs(10));
         assert_eq!(failed, vec![("image/png".to_owned(), Why::TimedOut)]);
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in for `xdg-mime query …` that runs `body` (a shell; `$1 $2` are the words of the question, `$3` its
+    /// argument) and logs each question in `dir/asked`.
+    pub(crate) fn query_tool(dir: &Path, body: &str) -> Vec<String> {
+        let script = dir.join("xdg-mime");
+        std::fs::write(&script, format!("echo \"$1 $2 $3\" >> '{}/asked'\n{body}\n", dir.display())).unwrap();
+        vec!["/bin/sh".to_owned(), script.display().to_string()]
+    }
+
+    pub(crate) const FILETYPE: &str = "case \"$1 $2\" in \"query filetype\") echo application/x-compression-test;; \"query default\") echo viewer.desktop;; esac";
+    pub(crate) const UNKNOWN: &str = "thing.zzqq";
+
+    #[test]
+    fn a_name_the_pattern_table_knows_needs_no_process() {
+        if mime_of_name("a.png").is_none() {
+            return;
+        }
+        // The program does not exist, and nothing is read: the name decides
+        let found = mime_with(&["/nonexistent/xdg-mime".to_owned()], Path::new("/nonexistent/dir/a.png"), CALL_LIMIT);
+        assert_eq!(found, Ok("image/png".to_owned()));
+    }
+
+    #[test]
+    fn a_name_the_table_does_not_know_is_asked_of_xdg_mime() {
+        let dir = sandbox("ask");
+        let tool = query_tool(&dir, FILETYPE);
+        assert_eq!(mime_with(&tool, &dir.join(UNKNOWN), CALL_LIMIT), Ok("application/x-compression-test".to_owned()));
+        let asked = std::fs::read_to_string(dir.join("asked")).unwrap();
+        assert!(asked.starts_with("query filetype "), "{asked}");
+        let found = file_type_with(&tool, &dir.join(UNKNOWN), CALL_LIMIT).unwrap();
+        assert_eq!(found, FileType { mime: "application/x-compression-test".to_owned(), default: Some("viewer.desktop".to_owned()) });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pattern_of_the_database_is_matched_on_the_whole_name_and_a_name_it_does_not_know_gets_no_type() {
+        if mime_of_name("a.png").is_none() {
+            return;
+        }
+        // `*,v` is one pattern (RCS files), not the two patterns `*` and `v`
+        assert_eq!(mime_of_name("thing.zzqq"), None);
+        assert_eq!(mime_of_name("notes without an extension"), None);
+        assert_eq!(mime_of_name("file,v"), Some("text/plain".to_owned()));
+        // A plain name is the whole name, not a part of it
+        assert_eq!(mime_of_name("Makefile"), Some("text/x-makefile".to_owned()));
+        assert_eq!(mime_of_name("my makefile notes.zzqq"), None);
+    }
+
+    #[test]
+    fn a_hanging_xdg_mime_ends_in_timed_out_and_is_killed() {
+        let dir = sandbox("hang_lookup");
+        let tool = query_tool(&dir, "sleep 30");
+        let started = Instant::now();
+        assert_eq!(mime_with(&tool, &dir.join(UNKNOWN), SHORT), Err(Why::TimedOut));
+        assert_eq!(default_with(&tool, "image/png", SHORT), Err(Why::TimedOut));
+        assert_eq!(file_type_with(&tool, &dir.join(UNKNOWN), SHORT), Err(Why::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_or_failing_xdg_mime_is_an_error_and_never_a_made_up_type() {
+        let dir = sandbox("fail_lookup");
+        let gone = vec!["/nonexistent/xdg-mime".to_owned()];
+        assert_eq!(mime_with(&gone, &dir.join(UNKNOWN), CALL_LIMIT), Err(Why::Missing));
+        assert_eq!(default_with(&gone, "image/png", CALL_LIMIT), Err(Why::Missing));
+        let fails = query_tool(&dir, "exit 1");
+        assert_eq!(mime_with(&fails, &dir.join(UNKNOWN), CALL_LIMIT), Err(Why::Refused));
+        assert_eq!(default_with(&fails, "image/png", CALL_LIMIT), Err(Why::Refused));
+        // Success without an answer says nothing about the type
+        let silent = query_tool(&dir, "exit 0");
+        assert_eq!(mime_with(&silent, &dir.join(UNKNOWN), CALL_LIMIT), Err(Why::Refused));
+        // A type with no default is an answer, not an error
+        assert_eq!(default_with(&silent, "image/png", CALL_LIMIT), Ok(None));
+        // The default is only asked when the type is known
+        let half = query_tool(&dir, "case \"$2\" in filetype) echo a/b;; *) exit 1;; esac");
+        assert_eq!(file_type_with(&half, &dir.join(UNKNOWN), CALL_LIMIT), Err(Why::Refused));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_category_that_does_not_answer_holds_up_no_other_one() {
+        let dir = sandbox("preload");
+        let first = CATEGORIES[0].mimes[0];
+        let tool = query_tool(&dir, &format!("case \"$3\" in {first}) sleep 30;; *) echo viewer.desktop;; esac"));
+        let slots = start_preload(tool, Duration::from_millis(1500));
+        let snapshot = || slots.lock().unwrap().clone();
+        let started = Instant::now();
+        while snapshot().iter().skip(1).any(|k| *k == Known::Pending) {
+            assert!(started.elapsed() < Duration::from_secs(1), "the others waited: {:?}", snapshot());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The others are in; the first is still being asked
+        let now = snapshot();
+        assert_eq!(now[0], Known::Pending);
+        assert!(now.iter().skip(1).all(|k| *k == Known::Is(Some("viewer.desktop".to_owned()))), "{now:?}");
+        while snapshot()[0] == Known::Pending {
+            assert!(started.elapsed() < Duration::from_secs(6), "no end of the wait");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(snapshot()[0], Known::Failed(Why::TimedOut));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

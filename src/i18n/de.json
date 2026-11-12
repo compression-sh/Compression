@@ -924,5 +924,10 @@
   "Created “{}” · {} not included, because they are in other folders": "„{}“ erstellt · {} nicht enthalten, weil sie in anderen Ordnern liegen",
   "Cancelled after {}": "Abgebrochen nach {}",
   "The clipboard did not answer": "Die Zwischenablage hat nicht geantwortet",
-  "The folder changed while the clipboard was read": "Der Ordner hat gewechselt, während die Zwischenablage gelesen wurde"
+  "The folder changed while the clipboard was read": "Der Ordner hat gewechselt, während die Zwischenablage gelesen wurde",
+  "Could not find out what opens this file ({})": "Es ließ sich nicht herausfinden, womit diese Datei geöffnet wird ({})",
+  "Could not find out the type and the default application ({})": "Typ und Standardprogramm ließen sich nicht ermitteln ({})",
+  "The type of this file is not known, so no default can be set for it": "Der Typ dieser Datei ist nicht bekannt, deshalb lässt sich dafür kein Standard festlegen",
+  "Another window is open. Open the properties again.": "Ein anderes Fenster ist offen. Eigenschaften bitte erneut öffnen.",
+  "Not available ({})": "Nicht verfügbar ({})"
 }

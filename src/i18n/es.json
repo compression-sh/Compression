@@ -924,5 +924,10 @@
   "Created “{}” · {} not included, because they are in other folders": "«{}» creado · {} no incluidos, porque están en otras carpetas",
   "Cancelled after {}": "Cancelado tras {}",
   "The clipboard did not answer": "El portapapeles no respondió",
-  "The folder changed while the clipboard was read": "La carpeta cambió mientras se leía el portapapeles"
+  "The folder changed while the clipboard was read": "La carpeta cambió mientras se leía el portapapeles",
+  "Could not find out what opens this file ({})": "No se pudo averiguar con qué se abre este archivo ({})",
+  "Could not find out the type and the default application ({})": "No se pudo averiguar el tipo ni la aplicación predeterminada ({})",
+  "The type of this file is not known, so no default can be set for it": "No se conoce el tipo de este archivo, así que no se puede fijar un valor predeterminado",
+  "Another window is open. Open the properties again.": "Hay otra ventana abierta. Abre las propiedades de nuevo.",
+  "Not available ({})": "No disponible ({})"
 }

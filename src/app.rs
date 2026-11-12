@@ -129,7 +129,7 @@ struct ContextMenu {
     target: MenuTarget,
     /// "Open with <default app>" for files that have one; resolved off the UI thread.
     open_label: Option<String>,
-    label_rx: Option<mpsc::Receiver<Option<String>>>,
+    label_rx: Option<mpsc::Receiver<Result<Option<String>, apps::Why>>>,
 }
 
 #[derive(Clone)]
@@ -278,6 +278,10 @@ pub(crate) enum Dialog {
         first_frame: bool,
         for_file: bool,
         for_type: bool,
+        /// The worker asking `xdg-mime` for the type and the system's default; the list is usable before it answers.
+        lookup: Option<mpsc::Receiver<Result<apps::FileType, apps::Why>>>,
+        /// Why the worker could not say; the dialog tells.
+        unknown: Option<apps::Why>,
     },
     /// `error`: why a rename on a server was not started (an item of it is already being renamed).
     BatchRename { entries: Vec<RenameEntry>, rules: RenameRules, first_frame: bool, error: Option<String> },
@@ -421,10 +425,27 @@ fn free_space_due(asked: Option<&(PathBuf, std::time::Instant)>, folder: &Path, 
     !asked.is_some_and(|(was, at)| was == folder && now.saturating_duration_since(*at) < FREE_SPACE_EVERY)
 }
 
+/// The lists of the "Open with" dialog, as indexes into `installed`: the application in use (a choice made for the
+/// file, else the system's default), the ones made for the type, everything else.
+fn open_with_lists(installed: &[AppEntry], mime: &str, current: Option<&str>) -> (Option<usize>, Vec<usize>, Vec<usize>) {
+    let default = current.and_then(|id| installed.iter().position(|a| a.id == id));
+    let recommended: Vec<usize> = if mime.is_empty() {
+        Vec::new()
+    } else {
+        apps::apps_for(installed, mime, None).into_iter().filter_map(|a| installed.iter().position(|b| b.id == a.id)).filter(|i| Some(*i) != default).collect()
+    };
+    let others = (0..installed.len()).filter(|i| Some(*i) != default && !recommended.contains(i)).collect();
+    (default, recommended, others)
+}
+
 /// What the thread that opens a file reports back.
 enum OpenReport {
     Failed(String),
     NoApp(PathBuf),
+    /// `xdg-mime` could not say what opens the file: nothing is opened, and the person is told why.
+    Unknown(apps::Why),
+    /// What the thread that read the properties of a file found: `None` when it could not be read.
+    Properties(PathBuf, Option<Box<Properties>>),
 }
 
 pub struct CompressionApp {
@@ -449,11 +470,15 @@ pub struct CompressionApp {
     /// Where the thread that opens a file reports a type nothing is set up for, or a failure.
     open_tx: mpsc::Sender<OpenReport>,
     open_rx: mpsc::Receiver<OpenReport>,
+    /// The properties of a file are being read on a worker; asking again meanwhile starts nothing.
+    properties_pending: bool,
     /// What setting a default application came to, from the worker that asked `xdg-mime`.
     pub(crate) defaults_tx: mpsc::Sender<apps::DefaultsReport>,
     pub(crate) defaults_rx: mpsc::Receiver<apps::DefaultsReport>,
     /// The program that sets default applications (and its leading arguments); `xdg-mime`, other only in tests.
     pub(crate) mime_tool: Vec<String>,
+    /// How long one question to it may take; other only in tests.
+    pub(crate) mime_limit: std::time::Duration,
     /// The folder is still being read, so there is nothing to show yet.
     loading: bool,
     /// What to select once the listing in the making arrives: the selected files, the focused one, and whether to scroll to it.
@@ -741,9 +766,11 @@ impl CompressionApp {
             pending_reload: None,
             open_tx,
             open_rx,
+            properties_pending: false,
             defaults_tx,
             defaults_rx,
             mime_tool: vec!["xdg-mime".to_owned()],
+            mime_limit: apps::CALL_LIMIT,
             loading: false,
             restore_selection: None,
             watching: watching::Watching::new(ctx),
@@ -1304,13 +1331,14 @@ impl CompressionApp {
         }
         // Asking `xdg-mime` is slow, so the thread decides: a type nothing is set up for goes to the
         // "Open with" dialog, because `xdg-open` would fail without a word
-        let (path, tx, ctx) = (path.to_path_buf(), self.open_tx.clone(), self.ctx.clone());
+        let (path, tx, ctx, tool, limit) = (path.to_path_buf(), self.open_tx.clone(), self.ctx.clone(), self.mime_tool.clone(), self.mime_limit);
         std::thread::spawn(move || {
-            let mime = apps::mime_of(&path);
-            let report = if apps::has_handler(&apps::installed(), &mime, apps::default_for(&mime).as_deref()) {
-                open::that_detached(&path).err().map(|err| OpenReport::Failed(crate::fs::describe::io_error(&err)))
-            } else {
-                Some(OpenReport::NoApp(path))
+            let report = match apps::file_type_with(&tool, &path, limit) {
+                Ok(found) if apps::has_handler(&apps::installed(), &found.mime, found.default.as_deref()) => {
+                    open::that_detached(&path).err().map(|err| OpenReport::Failed(crate::fs::describe::io_error(&err)))
+                }
+                Ok(_) => Some(OpenReport::NoApp(path)),
+                Err(why) => Some(OpenReport::Unknown(why)),
             };
             if let Some(report) = report {
                 let _ = tx.send(report);
@@ -1328,6 +1356,19 @@ impl CompressionApp {
                     self.set_toast(tr("No app is set to open this file. Choose one."));
                     self.open_open_with(path);
                 }
+                OpenReport::Properties(path, props) => {
+                    self.properties_pending = false;
+                    match props {
+                        // What the person typed into a dialog that opened meanwhile is not thrown away
+                        Some(_) if self.dialog.is_some() => self.set_toast(tr("Another window is open. Open the properties again.")),
+                        Some(props) => {
+                            let scan = props.item.is_dir.then(|| FolderScan::start(path));
+                            self.dialog = Some(Dialog::Properties { props, scan, tab: 0 });
+                        }
+                        None => self.set_toast(tr("Could not read properties")),
+                    }
+                }
+                OpenReport::Unknown(why) => self.set_toast(trf("Could not find out what opens this file ({})", &[&why.text()])),
             }
         }
     }
@@ -1717,10 +1758,13 @@ impl CompressionApp {
                 let (tx, rx) = mpsc::channel();
                 let path = item.path.clone();
                 let chosen = self.open_overrides.get(&path).cloned();
-                let ctx = ctx.clone();
+                let (ctx, tool, limit) = (ctx.clone(), self.mime_tool.clone(), self.mime_limit);
                 std::thread::spawn(move || {
-                    let id = chosen.or_else(|| apps::default_for(&apps::mime_of(&path)));
-                    let label = id.and_then(|id| apps::installed().iter().find(|a| a.id == id).map(|a| trf("Open with {}", &[&a.name])));
+                    let id = match chosen {
+                        Some(id) => Ok(Some(id)),
+                        None => apps::file_type_with(&tool, &path, limit).map(|found| found.default),
+                    };
+                    let label = id.map(|id| id.and_then(|id| apps::installed().iter().find(|a| a.id == id).map(|a| trf("Open with {}", &[&a.name]))));
                     let _ = tx.send(label);
                     ctx.request_repaint();
                 });
@@ -4826,13 +4870,16 @@ impl CompressionApp {
     }
 
     fn open_properties(&mut self, path: &Path) {
-        match Properties::load(path) {
-            Some(props) => {
-                let scan = props.item.is_dir.then(|| FolderScan::start(path.to_path_buf()));
-                self.dialog = Some(Dialog::Properties { props: Box::new(props), scan, tab: 0 });
-            }
-            None => self.set_toast(tr("Could not read properties")),
+        // Reading them touches the file (and `xdg-mime` for its type), so a worker does it and the window stays free
+        if std::mem::replace(&mut self.properties_pending, true) {
+            return;
         }
+        let (path, tx, ctx, tool, limit) = (path.to_path_buf(), self.open_tx.clone(), self.ctx.clone(), self.mime_tool.clone(), self.mime_limit);
+        std::thread::spawn(move || {
+            let props = Properties::load(&path, &tool, limit).map(Box::new);
+            let _ = tx.send(OpenReport::Properties(path, props));
+            ctx.request_repaint();
+        });
     }
 
     fn open_create_dialog(&mut self, is_dir: bool) {
@@ -5686,11 +5733,17 @@ impl CompressionApp {
 
     fn render_menu(&mut self, ctx: &egui::Context) {
         self.take_clipboard_offer();
+        let mut unanswered = None;
         if let Some(menu) = self.menu.as_mut()
-            && let Some(Ok(label)) = menu.label_rx.as_ref().map(|rx| rx.try_recv()) {
-                menu.open_label = label;
+            && let Some(Ok(answer)) = menu.label_rx.as_ref().map(|rx| rx.try_recv()) {
+                menu.open_label = answer.clone().unwrap_or(None);
                 menu.label_rx = None;
+                unanswered = answer.err();
             }
+        // The entry just says "Open" without the label; only a missing answer is worth saying
+        if unanswered == Some(apps::Why::TimedOut) {
+            self.set_toast(trf("Could not find out what opens this file ({})", &[&apps::Why::TimedOut.text()]));
+        }
 
         // A closed menu fades out from the snapshot taken while it was open
         let t = material::animate(ctx, egui::Id::unique("context_menu_anim"), self.menu.is_some());
@@ -6828,17 +6881,17 @@ impl CompressionApp {
     }
 
     fn open_open_with(&mut self, path: PathBuf) {
-        let mime = apps::mime_of(&path);
-        let default_id = apps::default_for(&mime);
         let installed: Vec<AppEntry> = self.installed_apps().to_vec();
-        let current = self.open_overrides.get(&path).cloned().or(default_id.clone());
-        let default = current.as_deref().and_then(|id| installed.iter().position(|a| a.id == id));
-        let recommended: Vec<usize> = apps::apps_for(&installed, &mime, None)
-            .into_iter()
-            .filter_map(|a| installed.iter().position(|b| b.id == a.id))
-            .filter(|i| Some(*i) != default)
-            .collect();
-        let others: Vec<usize> = (0..installed.len()).filter(|i| Some(*i) != default && !recommended.contains(i)).collect();
+        // The name usually says the type; the system's default (and the type, when the name does not say) come from a
+        // worker, so the dialog opens at once
+        let mime = path.file_name().and_then(|n| apps::mime_of_name(&n.to_string_lossy())).unwrap_or_default();
+        let (tx, rx) = mpsc::channel();
+        let (asked, ctx, tool, limit) = (path.clone(), self.ctx.clone(), self.mime_tool.clone(), self.mime_limit);
+        std::thread::spawn(move || {
+            let _ = tx.send(apps::file_type_with(&tool, &asked, limit));
+            ctx.request_repaint();
+        });
+        let (default, recommended, others) = open_with_lists(&installed, &mime, self.open_overrides.get(&path).map(String::as_str));
         self.dialog = Some(Dialog::OpenWith {
             path,
             mime,
@@ -6851,14 +6904,36 @@ impl CompressionApp {
             first_frame: true,
             for_file: false,
             for_type: false,
+            lookup: Some(rx),
+            unknown: None,
         });
     }
 
     fn open_with_contents(&mut self, ui: &mut egui::Ui, dialog: &mut Dialog) -> bool {
-        let Dialog::OpenWith { path, mime, apps: listed, default, recommended, others, selected, query, first_frame, for_file, for_type } = dialog else { return false };
+        let Dialog::OpenWith { path, mime, apps: listed, default, recommended, others, selected, query, first_frame, for_file, for_type, lookup, unknown } = dialog else { return false };
         let theme = self.theme;
+        if let Some(answer) = lookup.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            *lookup = None;
+            match answer {
+                Ok(found) => {
+                    let before = *default;
+                    let current = self.open_overrides.get(path.as_path()).cloned().or(found.default);
+                    *mime = found.mime;
+                    (*default, *recommended, *others) = open_with_lists(listed, mime, current.as_deref());
+                    // The choice follows the default, unless the person has already picked something else
+                    if *selected == before {
+                        *selected = *default;
+                    }
+                }
+                Err(why) => *unknown = Some(why),
+            }
+        }
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut close = material::dialog_header(ui, tr("Open with"), Some(&format!("{name} · {mime}")), &theme, "ow_close");
+        let subtitle = if mime.is_empty() { name.clone() } else { format!("{name} · {mime}") };
+        let mut close = material::dialog_header(ui, tr("Open with"), Some(&subtitle), &theme, "ow_close");
+        if let Some(why) = unknown {
+            material::hint_label(ui, &trf("Could not find out the type and the default application ({})", &[&why.text()]), &theme);
+        }
 
         // Search over every installed application
         material::input_frame(&theme).show(ui, |ui| {
@@ -6945,6 +7020,11 @@ impl CompressionApp {
             close = true;
         }
 
+        if launch && *for_type && mime.is_empty() {
+            // Nothing is half done: no default can be set without the type, so the file is not opened either
+            self.set_toast(tr("The type of this file is not known, so no default can be set for it"));
+            launch = false;
+        }
         if launch
             && let Some(app) = selected.and_then(|i| listed.get(i)) {
                 match apps::launch(app, path) {
@@ -7387,6 +7467,120 @@ mod tests {
         assert!(matches!(&w.app.dialog, Some(Dialog::OpenWith { path, .. }) if *path == file));
         assert!(w.app.status_toast.as_ref().is_some_and(|t| t.message == tr("No app is set to open this file. Choose one.")));
         std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    /// A window in a folder with `thing.zzqq` (a name no pattern knows), whose `xdg-mime` is the stand-in `body`.
+    fn lookup_window(name: &str, body: &str, limit_ms: u64) -> (Window, PathBuf, PathBuf) {
+        let work = window_dir(name);
+        let file = work.join(apps::tests::UNKNOWN);
+        std::fs::write(&file, "x").unwrap();
+        let mut w = Window::new(work.clone());
+        w.app.mime_tool = apps::tests::query_tool(&work, body);
+        w.app.mime_limit = std::time::Duration::from_millis(limit_ms);
+        (w, work, file)
+    }
+
+    fn open_with_state(w: &Window) -> (String, Option<usize>, Option<usize>, bool, Option<apps::Why>) {
+        match &w.app.dialog {
+            Some(Dialog::OpenWith { mime, default, selected, lookup, unknown, .. }) => (mime.clone(), *default, *selected, lookup.is_some(), *unknown),
+            _ => panic!("no Open with dialog"),
+        }
+    }
+
+    #[test]
+    fn open_with_opens_at_once_and_marks_the_default_when_the_worker_answers() {
+        let body = format!("sleep 0.6; {}", apps::tests::FILETYPE);
+        let (mut w, work, file) = lookup_window("openwith_async", &body, 10_000);
+        let started = std::time::Instant::now();
+        w.app.open_open_with(file);
+        assert!(started.elapsed() < std::time::Duration::from_millis(300), "the dialog waited for xdg-mime: {:?}", started.elapsed());
+        // Applications of the test's own, so that the default can be found among them
+        if let Some(Dialog::OpenWith { apps: listed, recommended, others, .. }) = &mut w.app.dialog {
+            *listed = vec![apps::tests::entry("other.desktop", "Other"), apps::tests::entry("viewer.desktop", "Viewer")];
+            (*recommended, *others) = (Vec::new(), vec![0, 1]);
+        }
+        w.run(Vec::new(), 5);
+        // Open, usable, nothing marked yet
+        assert_eq!(open_with_state(&w), (String::new(), None, None, true, None));
+        w.until("the answer", |w| !open_with_state(w).3);
+        assert_eq!(open_with_state(&w), ("application/x-compression-test".to_owned(), Some(1), Some(1), false, None));
+        assert!(w.shows("application/x-compression-test") || w.shows(&format!("{} · application/x-compression-test", apps::tests::UNKNOWN)), "{:?}", w.last);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn open_with_keeps_a_choice_the_person_made_before_the_answer() {
+        let body = format!("sleep 0.5; {}", apps::tests::FILETYPE);
+        let (mut w, work, file) = lookup_window("openwith_picked", &body, 10_000);
+        w.app.open_open_with(file);
+        if let Some(Dialog::OpenWith { apps: listed, recommended, others, selected, .. }) = &mut w.app.dialog {
+            *listed = vec![apps::tests::entry("other.desktop", "Other"), apps::tests::entry("viewer.desktop", "Viewer")];
+            (*recommended, *others) = (Vec::new(), vec![0, 1]);
+            *selected = Some(0);
+        }
+        w.until("the answer", |w| !open_with_state(w).3);
+        let state = open_with_state(&w);
+        assert_eq!((state.1, state.2), (Some(1), Some(0)), "the default is marked, the person's pick stays");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn open_with_says_so_when_xdg_mime_does_not_answer() {
+        let (mut w, work, file) = lookup_window("openwith_timeout", "sleep 30", 300);
+        w.app.open_open_with(file);
+        w.until("the hint", |w| open_with_state(w).4.is_some());
+        assert_eq!(open_with_state(&w).4, Some(apps::Why::TimedOut));
+        w.run(Vec::new(), 3);
+        assert!(w.shows("Could not find out the type and the default application (xdg-mime did not answer in time)"), "{:?}", w.last);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn opening_a_file_tells_when_xdg_mime_does_not_answer_and_opens_no_dialog() {
+        let (mut w, work, file) = lookup_window("open_timeout", "sleep 30", 300);
+        let started = std::time::Instant::now();
+        w.app.open_file(&file);
+        assert!(started.elapsed() < std::time::Duration::from_millis(300), "{:?}", started.elapsed());
+        w.until("the toast", |w| {
+            w.app.poll_opened();
+            w.app.status_toast.is_some()
+        });
+        let toast = w.app.status_toast.as_ref().unwrap().message.clone();
+        assert_eq!(toast, "Could not find out what opens this file (xdg-mime did not answer in time)");
+        assert!(w.app.dialog.is_none(), "a missing answer is no reason to ask which app to use");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn properties_are_read_on_a_worker_and_a_type_that_cannot_be_found_is_said_so() {
+        let (mut w, work, file) = lookup_window("props_async", "sleep 0.5; exit 1", 10_000);
+        let started = std::time::Instant::now();
+        w.app.open_properties(&file);
+        assert!(started.elapsed() < std::time::Duration::from_millis(300), "{:?}", started.elapsed());
+        // Asking again while it is being read starts nothing new
+        w.app.open_properties(&file);
+        assert!(w.app.dialog.is_none());
+        w.until("the properties", |w| {
+            w.app.poll_opened();
+            w.app.dialog.is_some()
+        });
+        let Some(Dialog::Properties { props, .. }) = &w.app.dialog else { panic!("no properties") };
+        assert_eq!(props.mime, "Not available (xdg-mime reported an error)");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn properties_that_arrive_while_another_dialog_is_open_do_not_replace_it() {
+        let (mut w, work, file) = lookup_window("props_busy", "exit 1", 10_000);
+        w.app.open_properties(&file);
+        w.app.dialog = Some(Dialog::Alert { title: "Typing".into(), body: "here".into() });
+        w.until("the answer", |w| {
+            w.app.poll_opened();
+            !w.app.properties_pending
+        });
+        assert!(matches!(w.app.dialog, Some(Dialog::Alert { .. })), "the dialog the person had was replaced");
+        assert_eq!(w.app.status_toast.as_ref().unwrap().message, "Another window is open. Open the properties again.");
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     /// "Always" measures the folders of the listing, the selection's status line adds them up, and

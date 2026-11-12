@@ -34,6 +34,8 @@ pub(crate) struct SettingsState {
     pub(crate) hex: String,
     picking: Option<usize>,
     defaults: Vec<Option<String>>,
+    /// What is known about each category's default: still being asked, answered (then `defaults` holds it), or not askable.
+    known: Vec<apps::Known>,
     /// Categories whose default is being set, or was set in part.
     marks: HashMap<usize, DefaultMark>,
     keybind_search: String,
@@ -70,7 +72,7 @@ impl CompressionApp {
             self.settings_raise = true;
             return;
         }
-        apps::preload_category_defaults();
+        apps::preload_category_defaults(self.mime_tool.clone());
         self.settings_fresh = true;
         self.icon_card_samples = pick_icon_card_samples();
         self.settings_win = Some(SettingsState {
@@ -79,6 +81,7 @@ impl CompressionApp {
             hex: self.settings.accent.clone().unwrap_or_default(),
             picking: None,
             defaults: Vec::new(),
+            known: Vec::new(),
             marks: HashMap::new(),
             keybind_search: String::new(),
             capture: None,
@@ -157,7 +160,7 @@ impl CompressionApp {
 
     /// The settings of the chosen category, in a column that stops growing with the window.
     pub(crate) fn settings_page(&mut self, ui: &mut egui::Ui, state: &mut SettingsState) {
-        let SettingsState { tab, font_query, hex, picking, defaults, marks, keybind_search, capture, conflict_warning, theme_browser } = state;
+        let SettingsState { tab, font_query, hex, picking, defaults, known, marks, keybind_search, capture, conflict_warning, theme_browser } = state;
         let ctx = ui.ctx().clone();
 
         // Ctrl+PageUp / Ctrl+PageDown (or Ctrl+Tab) switch category from anywhere in the window
@@ -202,7 +205,7 @@ impl CompressionApp {
                             SIDEBAR_TAB => self.sidebar_tab(ui),
                             4 => self.behavior_tab(ui),
                             5 => self.keybindings_tab(ui, keybind_search, capture, conflict_warning),
-                            6 => self.applications_tab(ui, picking, defaults, marks),
+                            6 => self.applications_tab(ui, picking, defaults, known, marks),
                             _ => self.plugins_tab(ui),
                         }
                         ui.add_space(8.0);
@@ -1297,17 +1300,23 @@ impl CompressionApp {
         }
     }
 
-    fn applications_tab(&mut self, ui: &mut egui::Ui, picking: &mut Option<usize>, defaults: &mut Vec<Option<String>>, marks: &mut HashMap<usize, DefaultMark>) {
+    fn applications_tab(&mut self, ui: &mut egui::Ui, picking: &mut Option<usize>, defaults: &mut Vec<Option<String>>, known: &mut Vec<apps::Known>, marks: &mut HashMap<usize, DefaultMark>) {
         let theme = self.theme;
-        if defaults.is_empty() {
-            match apps::category_defaults() {
-                Some(found) => *defaults = found,
-                None => {
-                    material::hint_label(ui, tr("Loading…"), &theme);
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
-                    return;
+        if known.len() != apps::CATEGORIES.len() {
+            *known = vec![apps::Known::Pending; apps::CATEGORIES.len()];
+            *defaults = vec![None; apps::CATEGORIES.len()];
+        }
+        // Each answer is taken in as it comes; one that does not come holds up no other row
+        for (idx, found) in apps::category_defaults().into_iter().enumerate() {
+            if known[idx] == apps::Known::Pending && found != apps::Known::Pending {
+                if let apps::Known::Is(id) = &found {
+                    defaults[idx] = id.clone();
                 }
+                known[idx] = found;
             }
+        }
+        if known.contains(&apps::Known::Pending) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
         }
         material::section_label(ui, tr("Default applications"), &theme);
         material::hint_label(ui, tr("The application that opens each kind of file. This changes the system-wide defaults."), &theme);
@@ -1315,10 +1324,16 @@ impl CompressionApp {
         let installed = self.installed_apps();
         for (idx, category) in apps::CATEGORIES.iter().enumerate() {
             let current = defaults.get(idx).and_then(|d| d.as_deref()).and_then(|id| installed.iter().find(|a| a.id == id));
-            let value = match marks.get(&idx) {
-                Some(DefaultMark::Setting) => tr("Setting…"),
-                Some(DefaultMark::Partial) => tr("Partly set"),
-                None => current.map_or(tr("Not set"), |a| a.name.as_str()),
+            let unavailable;
+            let value = match (marks.get(&idx), &known[idx]) {
+                (Some(DefaultMark::Setting), _) => tr("Setting…"),
+                (Some(DefaultMark::Partial), _) => tr("Partly set"),
+                (None, apps::Known::Pending) => tr("Loading…"),
+                (None, apps::Known::Failed(why)) => {
+                    unavailable = trf("Not available ({})", &[&why.text()]);
+                    unavailable.as_str()
+                }
+                (None, apps::Known::Is(_)) => current.map_or(tr("Not set"), |a| a.name.as_str()),
             };
             let is_open = *picking == Some(idx);
             if category_row(ui, ("cat_row", idx), category.icon, tr(category.label), value, &theme, is_open).clicked() {
@@ -1398,10 +1413,16 @@ impl CompressionApp {
                 if let Some(slot) = state.defaults.get_mut(*idx) {
                     *slot = Some(app_id.clone());
                 }
+                if let Some(known) = state.known.get_mut(*idx) {
+                    *known = apps::Known::Is(Some(app_id.clone()));
+                }
             } else {
                 // What the system says is what the row shows: the old application when nothing took
                 if let Some(slot) = state.defaults.get_mut(*idx) {
                     *slot = now.first().cloned().flatten();
+                }
+                if let Some(known) = state.known.get_mut(*idx) {
+                    *known = apps::Known::Is(now.first().cloned().flatten());
                 }
                 if now.iter().any(|n| n.as_deref() == Some(app_id.as_str())) {
                     state.marks.insert(*idx, DefaultMark::Partial);
@@ -1417,12 +1438,7 @@ impl CompressionApp {
         let types: Vec<&str> = failed.iter().take(3).map(|(m, _)| m.as_str()).collect();
         let more = failed.len().saturating_sub(3);
         let extra = if more > 0 { format!(" +{more}") } else { String::new() };
-        let why = match why {
-            apps::Why::Missing => tr("xdg-mime is not installed"),
-            apps::Why::TimedOut => tr("xdg-mime did not answer in time"),
-            apps::Why::Refused => tr("xdg-mime reported an error"),
-            apps::Why::NotKept => tr("the system did not keep the change"),
-        };
+        let why = why.text();
         self.set_toast(trf("Could not make {} the default for {}: {} ({})", &[&app_name, &label, &format!("{}{extra}", types.join(", ")), &why]));
     }
 }
@@ -1863,6 +1879,7 @@ mod tests {
             hex: String::new(),
             picking: None,
             defaults: vec![Some("old.desktop".to_owned()); apps::CATEGORIES.len()],
+            known: vec![apps::Known::Is(Some("old.desktop".to_owned())); apps::CATEGORIES.len()],
             marks: HashMap::new(),
             keybind_search: String::new(),
             capture: None,
@@ -1878,9 +1895,9 @@ mod tests {
         let mut shown = Vec::new();
         for n in 0..4 {
             let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 1400.0))), time: Some(n as f64 * 0.05), ..Default::default() };
-            let SettingsState { picking, defaults, marks, .. } = state;
+            let SettingsState { picking, defaults, known, marks, .. } = state;
             let mut out = ctx.run_ui(raw, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| app.applications_tab(ui, picking, defaults, marks));
+                egui::ScrollArea::vertical().show(ui, |ui| app.applications_tab(ui, picking, defaults, known, marks));
             });
             out.textures_delta.clear();
             shown = texts(&out).into_iter().map(|t| t.0).collect();
@@ -1892,7 +1909,7 @@ mod tests {
     fn take_reports(app: &mut CompressionApp, state: &mut SettingsState, done: impl Fn(&CompressionApp, &SettingsState) -> bool) {
         for _ in 0..500 {
             // The settings window is taken out of the app while it is drawn, and is back when reports are polled
-            app.settings_win = Some(std::mem::replace(state, SettingsState { tab: 6, font_query: String::new(), hex: String::new(), picking: None, defaults: Vec::new(), marks: HashMap::new(), keybind_search: String::new(), capture: None, conflict_warning: None, theme_browser: None }));
+            app.settings_win = Some(std::mem::replace(state, SettingsState { tab: 6, font_query: String::new(), hex: String::new(), picking: None, defaults: Vec::new(), known: Vec::new(), marks: HashMap::new(), keybind_search: String::new(), capture: None, conflict_warning: None, theme_browser: None }));
             app.poll_defaults();
             *state = app.settings_win.take().unwrap();
             if done(app, state) {
@@ -1930,6 +1947,22 @@ mod tests {
         assert_eq!(calls.lines().filter(|l| *l == "query").count(), apps::CATEGORIES[0].mimes.len(), "{calls}");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir0);
+    }
+
+    #[test]
+    fn a_category_that_cannot_be_asked_shows_why_and_the_others_still_show_theirs() {
+        let (mut app, mut state, dir) = defaults_window("notices", vec!["/nonexistent/xdg-mime".to_owned()]);
+        state.known[0] = apps::Known::Pending;
+        state.known[1] = apps::Known::Failed(apps::Why::TimedOut);
+        state.known[2] = apps::Known::Failed(apps::Why::Missing);
+        let shown = applications_texts(&mut app, &mut state);
+        let count = |text: &str| shown.iter().filter(|t| *t == text).count();
+        assert_eq!(count("Loading…"), 1, "{shown:?}");
+        assert_eq!(count("Not available (xdg-mime did not answer in time)"), 1, "{shown:?}");
+        assert_eq!(count("Not available (xdg-mime is not installed)"), 1, "{shown:?}");
+        // The four others are answered and say so (nothing of theirs is installed here)
+        assert_eq!(count("Not set"), apps::CATEGORIES.len() - 3, "{shown:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

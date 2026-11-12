@@ -924,5 +924,10 @@
   "Created “{}” · {} not included, because they are in other folders": "«{}» создан · не включено {}: они в других папках",
   "Cancelled after {}": "Отменено после {}",
   "The clipboard did not answer": "Буфер обмена не ответил",
-  "The folder changed while the clipboard was read": "Папка изменилась, пока читался буфер обмена"
+  "The folder changed while the clipboard was read": "Папка изменилась, пока читался буфер обмена",
+  "Could not find out what opens this file ({})": "Не удалось выяснить, чем открывается этот файл ({})",
+  "Could not find out the type and the default application ({})": "Не удалось определить тип и приложение по умолчанию ({})",
+  "The type of this file is not known, so no default can be set for it": "Тип файла неизвестен, поэтому для него нельзя задать приложение по умолчанию",
+  "Another window is open. Open the properties again.": "Открыто другое окно. Откройте свойства ещё раз.",
+  "Not available ({})": "Недоступно ({})"
 }
