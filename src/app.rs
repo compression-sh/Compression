@@ -4673,10 +4673,7 @@ impl CompressionApp {
     fn empty_trash(&mut self) {
         self.selected_index = None;
         let title = tr("Emptying the trash").to_owned();
-        self.engine.spawn(JobKind::Delete, title, String::new(), |_| match trash::empty() {
-            Ok(()) => Outcome::done(tr("The trash is empty").to_owned()),
-            Err(err) => Outcome::failed(crate::fs::describe::io_error(&err)),
-        });
+        self.engine.spawn(JobKind::Delete, title, String::new(), engine::empty_trash);
     }
 
     fn run_action(&mut self, ctx: &egui::Context, action: MenuAction) {

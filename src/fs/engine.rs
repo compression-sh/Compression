@@ -703,8 +703,30 @@ impl Mover {
     }
 }
 
+/// Open `path` for reading, as the regular file it was looked at as: a name that has become a pipe (or a link) since
+/// must not hold the job up (opening a pipe waits for a writer that may never come) nor be followed.
+fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(test)]
+    tests::swap_before_open(path);
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(special_file_error(path));
+    }
+    // The flag was for the opening; a file is read the usual way
+    // SAFETY: the descriptor belongs to `file`, which is open; `fcntl` with these commands only reads and sets flags.
+    unsafe {
+        let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+    Ok(file)
+}
+
 fn copy_file(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
-    let reader = std::fs::File::open(src)?;
+    let reader = open_regular_file(src)?;
     let meta = reader.metadata()?;
     // `create_new`: a file that is already there is an error, and not ours to remove below
     let writer = std::fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
@@ -1341,6 +1363,34 @@ pub fn extract_into(w: &mut Worker, items: Vec<PathBuf>, dest: PathBuf) -> Outco
     }
 }
 
+/// Empty the trash, one item at a time (the item and its record together), going on past what cannot be removed.
+pub fn empty_trash(w: &mut Worker) -> Outcome {
+    empty_trash_folders(w, trash::all_roots())
+}
+
+fn empty_trash_folders(w: &mut Worker, roots: Vec<PathBuf>) -> Outcome {
+    let entries = trash::entries_in(&roots);
+    w.shared.files_total.store(entries.len() as u64, Relaxed);
+    let mut failures: Vec<(PathBuf, String)> = Vec::new();
+    for path in &entries {
+        if w.shared.checkpoint().is_err() {
+            return Outcome::stopped();
+        }
+        w.shared.set_current(&name_of(path));
+        if let Err(err) = trash::delete_forever(path) {
+            failures.push((PathBuf::from(name_of(path)), crate::fs::describe::io_error(&err)));
+        }
+        w.file_done();
+    }
+    trash::forget_orphan_records(&roots);
+    if failures.is_empty() {
+        Outcome::done(tr("The trash is empty").to_owned())
+    } else {
+        let head = trn(failures.len(), "{} item could not be removed", "{} items could not be removed");
+        Outcome::failed(left_out_note(&failures, head))
+    }
+}
+
 pub fn delete_forever(w: &mut Worker, paths: Vec<PathBuf>) -> Outcome {
     w.shared.files_total.store(paths.len() as u64, Relaxed);
     let mut failures = Vec::new();
@@ -1381,6 +1431,24 @@ mod tests {
     pub(super) fn cancel_before_swap(w: &Worker, target: &Path) {
         if CANCELS.lock().unwrap().iter().any(|p| p == target) {
             w.shared.cancel.store(true, Relaxed);
+        }
+    }
+
+    /// Paths that the tests turn into something else just before they are opened, as a program might between the
+    /// moment a copy looks at a file and the moment it opens it: into a pipe (`None`) or into a link to a file.
+    static SWAPS: Mutex<Vec<(PathBuf, Option<PathBuf>)>> = Mutex::new(Vec::new());
+
+    pub(super) fn swap_before_open(path: &Path) {
+        let swap = SWAPS.lock().unwrap().iter().find(|(p, _)| p == path).cloned();
+        let Some((_, link)) = swap else { return };
+        let _ = std::fs::remove_file(path);
+        match link {
+            Some(target) => std::os::unix::fs::symlink(target, path).unwrap(),
+            None => {
+                let name = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())).unwrap();
+                // SAFETY: `name` is a valid C string; `mkfifo` only creates the file.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
         }
     }
 
@@ -1529,6 +1597,111 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "new");
         crate::fs::ops::tests::unlock_and_remove(&root);
         crate::fs::ops::tests::unlock_and_remove(&shm);
+    }
+
+    /// A trash folder with the items `names` (and their records) in it.
+    fn trash_with(name: &str, names: &[&str]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("compression_empty_{name}_{}", std::process::id()));
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        std::fs::create_dir_all(root.join("files")).unwrap();
+        std::fs::create_dir_all(root.join("info")).unwrap();
+        for item in names {
+            std::fs::create_dir_all(root.join("files").join(item)).unwrap();
+            std::fs::write(root.join("files").join(item).join("data"), "x").unwrap();
+            std::fs::write(root.join("info").join(format!("{item}.trashinfo")), "[Trash Info]").unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn a_file_that_becomes_a_pipe_or_a_link_before_it_is_opened_neither_holds_the_copy_up_nor_is_followed() {
+        use std::os::fd::AsRawFd;
+        let dir = sandbox("swap_before_open");
+        let (secret, to_pipe, to_link) = (dir.join("secret"), dir.join("to_pipe"), dir.join("to_link"));
+        for file in [&secret, &to_pipe, &to_link] {
+            std::fs::write(file, "contents").unwrap();
+        }
+        SWAPS.lock().unwrap().push((to_pipe.clone(), None));
+        SWAPS.lock().unwrap().push((to_link.clone(), Some(secret.clone())));
+
+        // A pipe waits for a writer that never comes: the copy has to say so and finish
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(to_pipe.clone(), dir.join("pipe_copy"))], Decision::Replace);
+        assert!(!outcome.ok && outcome.message.contains("named pipe"), "{}", outcome.message);
+        assert!(!dir.join("pipe_copy").exists());
+        // A link that took the file's place is not followed to what it points at
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(to_link.clone(), dir.join("link_copy"))], Decision::Replace);
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert!(!dir.join("link_copy").exists(), "the copy took the contents of what the link points at");
+
+        // A file that stays one is opened as before, for reading in the usual way
+        let file = open_regular_file(&secret).unwrap();
+        // SAFETY: the descriptor belongs to `file`, which is open.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, 0, "the flag for the opening must not stay");
+        let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(secret.clone(), dir.join("secret_copy"))], Decision::Replace);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(std::fs::read_to_string(dir.join("secret_copy")).unwrap(), "contents");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn emptying_the_trash_removes_every_item_with_its_record_and_the_records_without_an_item() {
+        use std::os::unix::fs::PermissionsExt;
+        let (first, second) = (trash_with("all_one", &["a", "b"]), trash_with("all_two", &["c"]));
+        std::fs::write(second.join("info/orphan.trashinfo"), "[Trash Info]").unwrap();
+        // An item with a folder that has lost its permissions is emptied too (not as root, who needs no help)
+        std::fs::set_permissions(first.join("files/b"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let roots = vec![first.clone(), second.clone()];
+        let (outcome, _) = run_job(move |w| empty_trash_folders(w, roots), Decision::Replace);
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(outcome.message, "The trash is empty");
+        for root in [&first, &second] {
+            assert_eq!(names(&root.join("files")), Vec::<String>::new(), "{}", root.display());
+            assert_eq!(names(&root.join("info")), Vec::<String>::new(), "{}", root.display());
+        }
+        crate::fs::ops::tests::unlock_and_remove(&first);
+        crate::fs::ops::tests::unlock_and_remove(&second);
+    }
+
+    #[test]
+    fn emptying_the_trash_goes_on_past_what_cannot_be_removed_and_names_it() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (open, shut) = (trash_with("past_open", &["a", "b"]), trash_with("past_shut", &["c", "d"]));
+        // Nothing can be removed from this folder, whatever the permissions of the items
+        std::fs::set_permissions(shut.join("files"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let roots = vec![shut.clone(), open.clone()];
+        let (outcome, _) = run_job(move |w| empty_trash_folders(w, roots), Decision::Replace);
+        assert!(!outcome.ok && !outcome.cancelled);
+        assert!(outcome.message.starts_with("2 items could not be removed: "), "{}", outcome.message);
+        assert!(outcome.message.contains("(Permission denied)"), "{}", outcome.message);
+        // The other trash was emptied all the same, and what stays keeps its record
+        assert_eq!(names(&open.join("files")), Vec::<String>::new());
+        assert_eq!(names(&open.join("info")), Vec::<String>::new());
+        assert_eq!(names(&shut.join("files")), ["c", "d"]);
+        assert_eq!(names(&shut.join("info")), ["c.trashinfo", "d.trashinfo"]);
+        crate::fs::ops::tests::unlock_and_remove(&open);
+        crate::fs::ops::tests::unlock_and_remove(&shut);
+    }
+
+    #[test]
+    fn emptying_the_trash_can_be_cancelled_and_then_removes_nothing_more() {
+        let root = trash_with("cancel", &["a", "b", "c"]);
+        let roots = vec![root.clone()];
+        let (outcome, _) = run_job(
+            move |w| {
+                w.shared.cancel.store(true, Relaxed);
+                empty_trash_folders(w, roots)
+            },
+            Decision::Replace,
+        );
+        assert!(outcome.cancelled && !outcome.ok, "{}", outcome.message);
+        assert_eq!(names(&root.join("files")), ["a", "b", "c"]);
+        assert_eq!(names(&root.join("info")).len(), 3);
+        crate::fs::ops::tests::unlock_and_remove(&root);
     }
 
     #[test]

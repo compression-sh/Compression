@@ -97,7 +97,7 @@ fn unescape_mount(field: &str) -> std::ffi::OsString {
 }
 
 /// Every trash folder: the home one first.
-fn all_roots() -> Vec<PathBuf> {
+pub(crate) fn all_roots() -> Vec<PathBuf> {
     root().into_iter().chain(drive_roots()).collect()
 }
 
@@ -297,27 +297,63 @@ pub fn restore(trashed: &Path) -> io::Result<PathBuf> {
     Ok(target)
 }
 
-/// Delete an item for good; for trashed items this also drops their record.
+/// Delete an item for good; for trashed items this also drops their record, and an item whose own folders
+/// have lost their write permission (a copy keeps the permissions it had) is made removable first.
 pub fn delete_forever(path: &Path) -> io::Result<()> {
-    remove_tree(path)?;
     // A trashed item sits in `<trash>/files`, its record in `<trash>/info`: in the home trash or one on a drive
-    if let Some(root) = path.parent().filter(|p| p.file_name().is_some_and(|n| n == "files")).and_then(Path::parent)
-        && root.join("info").is_dir() {
-            let _ = std::fs::remove_file(record_of(root, path));
+    let trash_root = path.parent().filter(|p| p.file_name().is_some_and(|n| n == "files")).and_then(Path::parent).filter(|root| root.join("info").is_dir());
+    if let Err(first) = remove_tree(path) {
+        // Only in the trash, where it is the person's own copy that is removed
+        if trash_root.is_none() {
+            return Err(first);
         }
+        make_removable(path);
+        remove_tree(path)?;
+    }
+    if let Some(root) = trash_root {
+        let _ = std::fs::remove_file(record_of(root, path));
+    }
     Ok(())
 }
 
-pub fn empty() -> io::Result<()> {
-    for root in all_roots() {
-        for sub in ["files", "info"] {
-            let Ok(entries) = std::fs::read_dir(root.join(sub)) else { continue };
-            for entry in entries.flatten() {
-                remove_tree(&entry.path())?;
+/// The folders of `path` (and below) that belong to the person get read, write and search permission, so that they
+/// can be emptied and removed. Nothing is made over to anyone, and a link is not followed.
+fn make_removable(path: &Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return };
+    // SAFETY: `geteuid` has no preconditions.
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o700));
+    }
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            make_removable(&entry.path());
+        }
+    }
+}
+
+/// What is in the trash folders `roots`: the items of their `files` folders.
+pub(crate) fn entries_in(roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots.iter().filter_map(|root| std::fs::read_dir(root.join("files")).ok()).flat_map(|entries| entries.flatten().map(|e| e.path())).collect()
+}
+
+/// Records in `roots` whose item is no longer there (left by an emptying that stopped between an item and its
+/// record, or by another program).
+pub(crate) fn forget_orphan_records(roots: &[PathBuf]) {
+    for root in roots {
+        let Ok(records) = std::fs::read_dir(root.join("info")) else { continue };
+        for record in records.flatten() {
+            let path = record.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".trashinfo")) else { continue };
+            if root.join("files").join(name).symlink_metadata().is_err() {
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
-    Ok(())
 }
 
 fn record_of(root: &Path, trashed: &Path) -> PathBuf {
@@ -561,6 +597,77 @@ mod tests {
         let record = trashed.parent().and_then(Path::parent).unwrap().join("info").join(format!("{}.trashinfo", trashed.file_name().unwrap().to_string_lossy()));
         let _ = remove_tree(trashed);
         let _ = std::fs::remove_file(record);
+    }
+
+    fn trash_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("compression_trash_root_{name}_{}", std::process::id()));
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        std::fs::create_dir_all(root.join("files")).unwrap();
+        std::fs::create_dir_all(root.join("info")).unwrap();
+        root
+    }
+
+    #[test]
+    fn an_item_in_the_trash_whose_folders_lost_their_write_permission_is_still_deleted_with_its_record() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root removes anything
+        }
+        let root = trash_root("locked");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("tree/box/inner")).unwrap();
+        std::fs::write(outside.join("tree/box/inner/a.txt"), "x").unwrap();
+        let trashed = trash_in(&root, None, &outside.join("tree")).unwrap();
+        let record = root.join("info/tree.trashinfo");
+        assert!(record.exists());
+        // Folders the person cannot enter or empty any more, as a copy that kept such permissions leaves them
+        std::fs::set_permissions(trashed.join("box/inner"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(trashed.join("box"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(remove_tree(&trashed).is_err(), "the test needs an item that cannot be removed as it is");
+
+        delete_forever(&trashed).unwrap();
+        assert!(!trashed.exists() && !record.exists(), "the item and its record go together");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn a_locked_folder_outside_the_trash_is_not_unlocked_by_a_deletion() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let root = trash_root("outside_locked");
+        let locked = root.join("locked");
+        std::fs::create_dir_all(locked.join("sub")).unwrap();
+        std::fs::write(locked.join("sub/a.txt"), "x").unwrap();
+        std::fs::set_permissions(locked.join("sub"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(delete_forever(&locked).is_err());
+        assert_eq!(locked.join("sub").metadata().unwrap().permissions().mode() & 0o777, 0o555, "its permissions are left alone");
+        assert!(locked.join("sub/a.txt").exists());
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn records_without_an_item_are_forgotten_and_the_others_and_foreign_files_stay() {
+        let root = trash_root("orphans");
+        std::fs::write(root.join("files/kept"), "x").unwrap();
+        std::fs::write(root.join("info/kept.trashinfo"), "[Trash Info]").unwrap();
+        std::fs::write(root.join("info/gone.trashinfo"), "[Trash Info]").unwrap();
+        std::fs::write(root.join("info/notes.txt"), "mine").unwrap();
+        forget_orphan_records(std::slice::from_ref(&root));
+        assert!(root.join("info/kept.trashinfo").exists());
+        assert!(!root.join("info/gone.trashinfo").exists());
+        assert!(root.join("info/notes.txt").exists());
+        // The items of several trash folders are listed together
+        let other = trash_root("orphans_two");
+        std::fs::write(other.join("files/second"), "x").unwrap();
+        let mut names: Vec<String> = entries_in(&[root.clone(), other.clone()]).iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["kept", "second"]);
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&other);
     }
 
     #[test]

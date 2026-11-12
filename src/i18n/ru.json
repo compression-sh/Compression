@@ -404,6 +404,7 @@
   "An undo or redo is still running, try again in a moment": "Отмена или повтор ещё выполняется, повторите чуть позже",
   "Files that have no trash on their drive or server can't be moved to the trash. {} will be deleted for good.": "Файлы, для которых на их диске или сервере нет корзины, нельзя переместить в корзину. {} будет удалено безвозвратно.",
   "There is no trash on this drive": "На этом диске нет корзины",
+  "{} items could not be removed": "Не удалось удалить {} элемент|Не удалось удалить {} элемента|Не удалось удалить {} элементов",
   "Nothing to compress": "Нечего сжимать",
   "No tool installed to unpack this kind of archive (install 7z)": "Не установлена программа для распаковки такого архива (установите 7z)",
   "Unknown": "Неизвестно",
