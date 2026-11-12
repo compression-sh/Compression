@@ -412,6 +412,7 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
 
             let mut app = CompressionApp::new(initial_path, theme, settings, &cc.egui_ctx);
             app.tell_about_theme_problems();
+            app.tell_about_unsaved_settings();
             if fs::admin::is_admin() {
                 app.set_toast(i18n::tr("Running as administrator. Changes to settings are not saved."));
             }

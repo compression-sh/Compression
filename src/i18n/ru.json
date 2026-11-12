@@ -932,5 +932,6 @@
   "Not available ({})": "Недоступно ({})",
   "The archive has an entry that would land outside the folder: {}": "В архиве есть запись, которая оказалась бы вне папки: {}",
   "The archive could not be listed": "Не удалось получить список содержимого архива",
-  "“{}” could not get its name back and is now called “{}”": "«{}» не удалось вернуть прежнее имя, теперь он называется «{}»"
+  "“{}” could not get its name back and is now called “{}”": "«{}» не удалось вернуть прежнее имя, теперь он называется «{}»",
+  "The settings could not be saved when Compression was last closed: {}": "Не удалось сохранить настройки при последнем закрытии Compression: {}"
 }

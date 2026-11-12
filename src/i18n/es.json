@@ -932,5 +932,6 @@
   "Not available ({})": "No disponible ({})",
   "The archive has an entry that would land outside the folder: {}": "El archivo contiene una entrada que quedaría fuera de la carpeta: {}",
   "The archive could not be listed": "No se pudo listar el contenido del archivo",
-  "“{}” could not get its name back and is now called “{}”": "«{}» no pudo recuperar su nombre y ahora se llama «{}»"
+  "“{}” could not get its name back and is now called “{}”": "«{}» no pudo recuperar su nombre y ahora se llama «{}»",
+  "The settings could not be saved when Compression was last closed: {}": "No se pudieron guardar los ajustes la última vez que se cerró Compression: {}"
 }

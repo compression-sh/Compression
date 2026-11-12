@@ -1865,6 +1865,13 @@ impl CompressionApp {
 
     /// Says once that theme files could not be loaded, and again only when that is a different set of
     /// files or reasons; the Settings page keeps showing them either way.
+    /// Says once that the settings could not be written when Compression last closed (see `save_on_close`).
+    pub(crate) fn tell_about_unsaved_settings(&mut self) {
+        if let Some(why) = take_unsaved_note(unsaved_note().as_deref()) {
+            self.set_toast(trf("The settings could not be saved when Compression was last closed: {}", &[&why]));
+        }
+    }
+
     pub(crate) fn tell_about_theme_problems(&mut self) {
         let now: Vec<String> = crate::ui::theme::problems().iter().map(|p| p.describe()).collect();
         if now != self.theme_problems_told {
@@ -2857,14 +2864,54 @@ const CRUMB_ICON_STEP: f32 = material::INSET_LABEL - material::INSET_ICON + 8.0;
 
 impl Drop for CompressionApp {
     /// A window that closes writes what still waits: the history and settings the pause had not yet written. A
-    /// failure cannot be told to anyone any more.
+    /// failure of the settings cannot be shown by this window any more: it is noted for the next start.
     fn drop(&mut self) {
         recent::flush();
         let current = self.current_settings();
         if current != self.saved_settings {
-            let _ = current.save();
+            save_on_close(|| current.save(), unsaved_note().as_deref());
         }
     }
+}
+
+thread_local! {
+    /// The note file of a test (see `unsaved_note`); none by default, so that no test reads or writes one by chance.
+    static UNSAVED_NOTE_FOR_TESTS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Where a settings write that failed as the last window closed is noted (`~/.cache/compression`), so that the next
+/// start can say so. `None` as administrator, whose settings are never written.
+fn unsaved_note() -> Option<PathBuf> {
+    if cfg!(test) {
+        return UNSAVED_NOTE_FOR_TESTS.with(|n| n.borrow().clone());
+    }
+    if crate::fs::admin::is_admin() {
+        return None;
+    }
+    dirs::cache_dir().map(|d| d.join("compression").join("settings-not-saved.txt"))
+}
+
+/// Writes the settings as the window goes. A failure is printed on stderr and noted in `note` with its reason.
+fn save_on_close(save: impl FnOnce() -> std::io::Result<()>, note: Option<&Path>) {
+    let Err(err) = save() else { return };
+    let why = crate::fs::describe::io_error(&err);
+    eprintln!("compression: the settings could not be saved: {why}");
+    if let Some(note) = note {
+        if let Some(dir) = note.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(err) = std::fs::write(note, &why) {
+            eprintln!("compression: and this could not be noted in {}: {}", note.display(), crate::fs::describe::io_error(&err));
+        }
+    }
+}
+
+/// The reason noted by `save_on_close`, if there is one; the note is removed, so it is told once.
+fn take_unsaved_note(note: Option<&Path>) -> Option<String> {
+    let note = note?;
+    let why = std::fs::read_to_string(note).ok()?;
+    let _ = std::fs::remove_file(note);
+    Some(why.trim().to_owned()).filter(|w| !w.is_empty()).or_else(|| Some(tr("The program failed").to_owned()))
 }
 
 impl eframe::App for CompressionApp {
@@ -7608,6 +7655,39 @@ mod tests {
         });
         assert!(matches!(w.app.dialog, Some(Dialog::Properties { .. })));
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn settings_that_cannot_be_written_as_the_window_closes_are_noted_and_told_once_at_the_next_start() {
+        use crate::settings::FAIL_SAVE;
+        let base = window_dir("unsaved_note");
+        let note = base.join("cache/compression/settings-not-saved.txt");
+        UNSAVED_NOTE_FOR_TESTS.with(|n| *n.borrow_mut() = Some(note.clone()));
+        // A window whose last change cannot be written goes away
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.saved_settings = app.current_settings();
+        app.show_hidden = !app.show_hidden;
+        FAIL_SAVE.with(|f| f.set(true));
+        drop(app);
+        FAIL_SAVE.with(|f| f.set(false));
+        let why = crate::fs::describe::io_error(&std::io::Error::from_raw_os_error(libc::EACCES));
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), why);
+        // The next start says it, once
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.tell_about_unsaved_settings();
+        assert_eq!(app.toast_message(), Some(format!("The settings could not be saved when Compression was last closed: {why}").as_str()));
+        assert!(!note.exists(), "the note stays and would be told again");
+        app.status_toast = None;
+        app.tell_about_unsaved_settings();
+        assert!(app.status_toast.is_none());
+        // A window that writes its settings on the way leaves no note
+        app.saved_settings = app.current_settings();
+        app.show_hidden = !app.show_hidden;
+        drop(app);
+        assert!(!note.exists());
+        UNSAVED_NOTE_FOR_TESTS.with(|n| *n.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// "Always" measures the folders of the listing, the selection's status line adds them up, and

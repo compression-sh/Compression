@@ -932,5 +932,6 @@
   "Not available ({})": "Không khả dụng ({})",
   "The archive has an entry that would land outside the folder: {}": "Tệp nén có một mục sẽ nằm ngoài thư mục: {}",
   "The archive could not be listed": "Không thể liệt kê nội dung tệp nén",
-  "“{}” could not get its name back and is now called “{}”": "“{}” không lấy lại được tên cũ và giờ có tên “{}”"
+  "“{}” could not get its name back and is now called “{}”": "“{}” không lấy lại được tên cũ và giờ có tên “{}”",
+  "The settings could not be saved when Compression was last closed: {}": "Không lưu được cài đặt khi Compression đóng lần trước: {}"
 }
