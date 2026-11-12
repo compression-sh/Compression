@@ -50,7 +50,10 @@ impl CompressionApp {
                             }
                             self.request_drive_listing(ctx, true);
                         }
-                        Err(err) => self.set_toast(trf("Could not mount “{}”: {}", &[&name, &err])),
+                        Err(err) => self.set_toast(match drives::plain_error(&err) {
+                            Some(why) => trf("Could not mount “{}”: {}", &[&name, &why]),
+                            None => tr("Authentication cancelled").to_owned(),
+                        }),
                     }
                 }
                 DriveMsg::Gone { dev, name, eject, mount, result } => {
@@ -63,7 +66,10 @@ impl CompressionApp {
                             self.set_toast(if eject { trf("“{}” can be removed safely", &[&name]) } else { trf("Unmounted “{}”", &[&name]) });
                             self.request_drive_listing(ctx, true);
                         }
-                        Err(err) => self.set_toast(trf("Could not unmount “{}”: {}", &[&name, &err])),
+                        Err(err) => self.set_toast(match drives::plain_error(&err) {
+                            Some(why) => trf("Could not unmount “{}”: {}", &[&name, &why]),
+                            None => tr("Authentication cancelled").to_owned(),
+                        }),
                     }
                 }
             }

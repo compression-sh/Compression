@@ -399,6 +399,7 @@
   "“{}” can be removed safely": "Có thể rút “{}” an toàn",
   "Unmounted “{}”": "Đã gỡ gắn kết “{}”",
   "Could not unmount “{}”: {}": "Không thể gỡ gắn kết “{}”: {}",
+  "Authentication cancelled": "Đã hủy xác thực",
   "Nothing to compress": "Không có gì để nén",
   "No tool installed to unpack this kind of archive (install 7z)": "Chưa cài công cụ nào để giải nén loại tệp này (hãy cài 7z)",
   "Unknown": "Không rõ",

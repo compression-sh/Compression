@@ -399,6 +399,7 @@
   "“{}” can be removed safely": "«{}» можно безопасно извлечь",
   "Unmounted “{}”": "«{}» отключён",
   "Could not unmount “{}”: {}": "Не удалось отключить «{}»: {}",
+  "Authentication cancelled": "Аутентификация отменена",
   "Nothing to compress": "Нечего сжимать",
   "No tool installed to unpack this kind of archive (install 7z)": "Не установлена программа для распаковки такого архива (установите 7z)",
   "Unknown": "Неизвестно",

@@ -399,6 +399,7 @@
   "“{}” can be removed safely": "«{}» se puede quitar con seguridad",
   "Unmounted “{}”": "«{}» desmontado",
   "Could not unmount “{}”: {}": "No se pudo desmontar «{}»: {}",
+  "Authentication cancelled": "Autenticación cancelada",
   "Nothing to compress": "Nada que comprimir",
   "No tool installed to unpack this kind of archive (install 7z)": "No hay ninguna herramienta instalada para desempaquetar este tipo de archivo (instala 7z)",
   "Unknown": "Desconocido",

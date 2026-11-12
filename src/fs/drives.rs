@@ -205,9 +205,34 @@ fn is_mounted(dev: &str) -> bool {
     run("lsblk", &["-no", "MOUNTPOINT", dev]).is_ok_and(|s| !s.trim().is_empty())
 }
 
+/// What a failed `udisksctl` call says, in words a person can read. `None` means the person
+/// closed the sign-in dialog themselves: that is not an error.
+pub fn plain_error(raw: &str) -> Option<String> {
+    if raw.contains("NotAuthorizedDismissed") {
+        return None;
+    }
+    // "…: GDBus.Error:org.freedesktop.UDisks2.Error.Failed: the reason" becomes "the reason"
+    let said = match raw.split_once("GDBus.Error:") {
+        Some((_, rest)) => rest.split_once(": ").map_or(rest, |(_, why)| why),
+        None => raw,
+    };
+    Some(said.trim().to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_sign_in_dialog_is_not_an_error_and_other_errors_lose_the_bus_prefix() {
+        let dismissed = "Error mounting /dev/sda1: GDBus.Error:org.freedesktop.UDisks2.Error.NotAuthorizedDismissed: The authentication dialog was dismissed";
+        assert_eq!(plain_error(dismissed), None);
+        let failed = "Error mounting /dev/sdb1 at /run/media/me/data: GDBus.Error:org.freedesktop.UDisks2.Error.Failed: wrong fs type";
+        assert_eq!(plain_error(failed).as_deref(), Some("wrong fs type"));
+        assert_eq!(plain_error("GDBus.Error:org.freedesktop.UDisks2.Error.Failed").as_deref(), Some("org.freedesktop.UDisks2.Error.Failed"));
+        assert_eq!(plain_error("udisksctl: No such file or directory").as_deref(), Some("udisksctl: No such file or directory"));
+        assert_eq!(plain_error("  spaced  ").as_deref(), Some("spaced"));
+    }
 
     const SAMPLE: &str = r#"{"blockdevices":[
       {"name":"nvme0n1","path":"/dev/nvme0n1","label":null,"size":"500G","mountpoint":null,"rm":false,"hotplug":false,"type":"disk","fstype":null,"children":[

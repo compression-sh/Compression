@@ -2565,7 +2565,7 @@ impl eframe::App for CompressionApp {
         }
 
         if let Some(toast) = &mut self.status_toast {
-            let lifetime = if toast.action.is_some() { 7.0 } else { 3.0 };
+            let lifetime = toast_seconds(&toast.message, toast.action.is_some());
             if !toast.leaving && toast.since.elapsed().as_secs_f32() > lifetime {
                 toast.leaving = true;
             }
@@ -6625,11 +6625,29 @@ fn name_field(ui: &mut egui::Ui, theme: &SerpantinumTheme, text: &mut String, fi
 }
 
 
+/// How long a message stays: at least 3 s (7 s with a button), longer for long text so it can be read.
+fn toast_seconds(message: &str, has_action: bool) -> f32 {
+    const CHARACTERS_PER_SECOND: f32 = 15.0;
+    let floor: f32 = if has_action { 7.0 } else { 3.0 };
+    floor.max(2.0 + message.chars().count() as f32 / CHARACTERS_PER_SECOND).min(15.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn a_message_stays_longer_the_longer_it_is_but_never_beyond_fifteen_seconds() {
+        assert_eq!(toast_seconds("Refreshed", false), 3.0);
+        assert_eq!(toast_seconds("Refreshed", true), 7.0);
+        let long = "x".repeat(120);
+        assert_eq!(toast_seconds(&long, false), 10.0);
+        assert_eq!(toast_seconds(&long, true), 10.0);
+        assert_eq!(toast_seconds(&"x".repeat(5000), false), 15.0);
+        assert_eq!(toast_seconds("", false), 3.0);
+    }
 
     #[test]
     fn previews_are_prepared_for_the_screen_then_two_pages_below_then_one_above() {
