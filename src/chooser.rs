@@ -35,7 +35,9 @@ impl Filter {
         }
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         self.patterns.iter().any(|p| match p {
-            Pattern::Glob(g) => crate::fs::glob::matches(g, &name, false),
+            // One pattern on the whole name, as GTK reads a filter's glob: a comma is a character (`*,v` is RCS files),
+            // and text without wildcards is the name itself, not part of it. Letters match in either case.
+            Pattern::Glob(g) => crate::fs::glob::wildcard(&g.to_lowercase(), &name.to_lowercase()),
             Pattern::Mime(m) => crate::fs::apps::name_is_mime(&name, m),
         })
     }
@@ -382,6 +384,22 @@ mod tests {
         let p = PathBuf::from("/home/a b/ü#1.txt");
         assert_eq!(from_uri(&uri(&p)), Some(p));
         assert_eq!(uri(Path::new("/a b")), "file:///a%20b");
+    }
+
+    #[test]
+    fn a_glob_of_a_filter_is_one_pattern_on_the_whole_name() {
+        let glob = |g: &str| Filter { label: String::new(), patterns: vec![Pattern::Glob(g.into())] };
+        // `*,v` names RCS files; it is not `*` and `v`
+        assert!(glob("*,v").accepts(Path::new("/x/main.c,v")));
+        assert!(!glob("*,v").accepts(Path::new("/x/main.c")));
+        // A name without wildcards is that name, not every name that contains it
+        assert!(glob("Makefile").accepts(Path::new("/x/Makefile")));
+        assert!(!glob("Makefile").accepts(Path::new("/x/Makefile.am")));
+        assert!(!glob("Makefile").accepts(Path::new("/x/GNUmakefile")));
+        // Wildcards, classes and either case
+        assert!(glob("*.png").accepts(Path::new("/x/A.PNG")));
+        assert!(!glob("*.png").accepts(Path::new("/x/a.png.txt")));
+        assert!(glob("img_[0-9]*.jpg").accepts(Path::new("/x/IMG_7.JPG")));
     }
 
     #[test]
