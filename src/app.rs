@@ -8261,17 +8261,47 @@ mod tests {
         w.app.poll_network(&ctx);
         assert_eq!(w.app.session().0, vec![other.clone(), home.clone(), other.clone(), home.clone()]);
 
-        // A window the person has moved on in meanwhile stays where it is
+        // A window the person has moved on in meanwhile stays where it is: elsewhere, back in the home folder again,
+        // or somewhere else without the history having noted it
+        for way in 0..3 {
+            let mut w = Window::new(other.clone());
+            let ctx = w.ctx.clone();
+            w.app.new_tab(b.clone());
+            w.run(Vec::new(), 20);
+            let left = w.app.leave_mount_remembering(&mount.local);
+            let expected = match way {
+                0 => {
+                    w.app.navigate_to(other.clone());
+                    other.clone()
+                }
+                1 => {
+                    w.app.navigate_to(other.clone());
+                    w.run(Vec::new(), 10);
+                    w.app.navigate_to(home.clone());
+                    home.clone()
+                }
+                _ => {
+                    w.app.arrive(other.clone());
+                    other.clone()
+                }
+            };
+            w.run(Vec::new(), 10);
+            w.app.net.tx.send(NetMsg::Gone { local: mount.local.clone(), name: "box".into(), left, result: Err("busy".into()) }).unwrap();
+            w.app.poll_network(&ctx);
+            assert_eq!(w.app.session().0.last(), Some(&expected), "way {way}");
+        }
+
+        // A parked tab that has been given another folder meanwhile keeps it
         let mut w = Window::new(other.clone());
         let ctx = w.ctx.clone();
-        w.app.new_tab(b.clone());
+        w.app.new_tab(a.clone());
+        w.app.new_tab(other.clone());
         w.run(Vec::new(), 20);
         let left = w.app.leave_mount_remembering(&mount.local);
-        w.app.navigate_to(other.clone());
-        w.run(Vec::new(), 10);
+        w.app.tabs[1].saved.as_mut().expect("the tab is parked").set_folder(other.clone());
         w.app.net.tx.send(NetMsg::Gone { local: mount.local.clone(), name: "box".into(), left, result: Err("busy".into()) }).unwrap();
         w.app.poll_network(&ctx);
-        assert_eq!(w.app.session().0.last(), Some(&other));
+        assert_eq!(w.app.session().0[1], other);
 
         // The same for a reconnect that failed
         let mut w = Window::new(other.clone());

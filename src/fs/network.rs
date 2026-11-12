@@ -1642,6 +1642,12 @@ impl Servers {
         (Servers { locked: true, ..Servers::default() }, Some(LoadProblem::NotKept))
     }
 
+    /// Servers that are never written to disk, for tests that go through code which saves them.
+    #[cfg(test)]
+    pub(crate) fn locked_for_tests() -> Self {
+        Servers { locked: true, ..Servers::default() }
+    }
+
     pub fn save(&self) {
         if crate::fs::admin::is_admin() {
             return;

@@ -57,6 +57,9 @@ struct Pending {
     then: Option<PathBuf>,
     /// The same for the tabs that were parked in the mount: `(tab id, folder below the top)`.
     tabs: Vec<(u64, PathBuf)>,
+    /// Other requests for the same mount that came while it was connecting (another folder, a new tab or window):
+    /// they are carried out once it is there, one connection serving them all.
+    later: Vec<(Address, OpenIn)>,
 }
 
 /// How an item on a server is renamed; the tests put a slow one here.
@@ -764,8 +767,14 @@ impl CompressionApp {
     }
 
     fn start_connecting(&mut self, address: Address, password: Option<String>, open: OpenIn, from_dialog: bool, save: bool) -> u64 {
-        // A second click on a server that is still connecting waits for the first
-        if let Some(p) = self.net.pending.iter().find(|p| p.address == address) {
+        // A second request for a server that is still connecting waits for the first: two connections to the same
+        // mount would get in each other's way. What it asks for beyond what the first brings (another folder, a new
+        // tab or window) comes when the server is there.
+        if let Some(p) = self.net.pending.iter_mut().find(|p| p.address.same_mount(&address)) {
+            let request = (address, open);
+            if (p.address != request.0 || p.open != request.1) && !p.later.contains(&request) {
+                p.later.push(request);
+            }
             return p.id;
         }
         let id = self.net.next_id;
@@ -779,8 +788,15 @@ impl CompressionApp {
             let _ = tx.send(msg);
             ctx.request_repaint();
         });
-        self.net.pending.push(Pending { id, address, open, replies, asking: false, from_dialog, save, then: None, tabs: Vec::new() });
+        self.net.pending.push(Pending { id, address, open, replies, asking: false, from_dialog, save, then: None, tabs: Vec::new(), later: Vec::new() });
         id
+    }
+
+    /// The requests that waited for a connection are carried out now that the server is there.
+    fn replay_later(&mut self, later: Vec<(Address, OpenIn)>) {
+        for (address, open) in later {
+            self.open_address(address, None, open);
+        }
     }
 
     /// Whether a connection to the server of `address` is on its way.
@@ -807,6 +823,7 @@ impl CompressionApp {
                 self.net.connection_changed(&local);
                 self.request_network_listing(ctx, true);
                 self.show_back(local, pending.then, pending.tabs, pending.open);
+                self.replay_later(pending.later);
             }
             Err(None) => {
                 if let Some(Dialog::Connect { busy, .. }) = &mut self.dialog {
@@ -2016,7 +2033,7 @@ mod tests {
 
     fn waiting_connection(app: &mut CompressionApp, id: u64) -> mpsc::Receiver<Reply> {
         let (replies, answers) = mpsc::channel();
-        app.net.pending.push(Pending { id, address: Address::parse("sftp://me@host/").unwrap(), open: OpenIn::Here, replies, asking: false, from_dialog: false, save: false, then: None, tabs: Vec::new() });
+        app.net.pending.push(Pending { id, address: Address::parse("sftp://me@host/").unwrap(), open: OpenIn::Here, replies, asking: false, from_dialog: false, save: false, then: None, tabs: Vec::new(), later: Vec::new() });
         answers
     }
 
@@ -2456,4 +2473,56 @@ mod tests {
 
 
 
+
+    #[test]
+    fn a_second_request_for_a_server_that_is_connecting_waits_for_it_and_is_carried_out_when_it_is_there() {
+        let (mut app, base) = local_app("same_mount");
+        let _answers = waiting_connection(&mut app, 7);
+        let parse = |text: &str| Address::parse(text).unwrap();
+        let (top, a, b) = (parse("sftp://me@host/"), parse("sftp://me@host/a"), parse("sftp://me@host/b"));
+
+        // Another folder of the same mount: no second connection, the folder is kept for later
+        assert_eq!(app.start_connecting(a.clone(), None, OpenIn::Here, false, false), 7);
+        assert_eq!(app.net.pending.len(), 1);
+        assert_eq!(app.net.pending[0].later, vec![(a.clone(), OpenIn::Here)]);
+        // ... each one once, with the way it was asked for (a new window is not lost)
+        assert_eq!(app.start_connecting(a.clone(), None, OpenIn::Here, false, false), 7);
+        assert_eq!(app.start_connecting(a.clone(), None, OpenIn::NewWindow, false, false), 7);
+        assert_eq!(app.start_connecting(b.clone(), None, OpenIn::NewTab, false, false), 7);
+        assert_eq!(app.net.pending.len(), 1);
+        assert_eq!(app.net.pending[0].later, vec![(a.clone(), OpenIn::Here), (a, OpenIn::NewWindow), (b, OpenIn::NewTab)]);
+        // The very same request as the one on its way adds nothing
+        assert_eq!(app.start_connecting(top, None, OpenIn::Here, false, false), 7);
+        assert_eq!(app.net.pending[0].later.len(), 3);
+
+        // Once the server is there they are asked for, one after the other
+        let waiting = std::mem::take(&mut app.net.pending[0].later);
+        let before = app.net.checking.len();
+        app.replay_later(waiting);
+        assert_eq!(app.net.checking.len(), before + 3);
+        app.replay_later(Vec::new());
+        assert_eq!(app.net.checking.len(), before + 3);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_connection_that_arrives_carries_out_what_waited_for_it() {
+        let (mut app, base) = local_app("arrives");
+        let ctx = app.ctx.clone();
+        app.net.servers = crate::fs::network::Servers::locked_for_tests();
+        let top = base.join("a");
+        let a = Address::parse("sftp://me@host/a").unwrap();
+        let mut asked = Vec::new();
+        for later in [Vec::new(), vec![(a.clone(), OpenIn::Here), (a, OpenIn::NewTab)]] {
+            let _answers = waiting_connection(&mut app, 7);
+            app.net.pending[0].later = later.clone();
+            let before = app.net.checking.len();
+            app.connected(&ctx, 7, Ok(top.clone()));
+            assert!(app.net.pending.is_empty());
+            asked.push(app.net.checking.len() - before);
+        }
+        // Each request that waited is asked for once the server is there
+        assert_eq!(asked[1] - asked[0], 2, "{asked:?}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 }
