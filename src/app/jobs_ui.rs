@@ -41,7 +41,7 @@ fn job_icon(kind: JobKind) -> &'static str {
         JobKind::Delete => icons::DELETE_FOREVER,
         JobKind::Permissions => icons::LOCK,
         JobKind::Rename => icons::RENAME,
-        JobKind::Other => icons::HISTORY,
+        JobKind::History | JobKind::Other => icons::HISTORY,
     }
 }
 
@@ -202,7 +202,9 @@ impl CompressionApp {
         };
         let label = entry.label.clone();
         let title = if redo { trf("Redoing {}…", &[&label]) } else { trf("Undoing {}…", &[&label]) };
-        let id = self.engine.spawn(JobKind::Other, title, String::new(), move |_| history_outcome(redo, &label, history::apply_entry(entry)));
+        let id = self.engine.spawn(JobKind::History, title, String::new(), move |w| {
+            history_outcome(redo, &label, history::apply_entry_with(entry, &|from, to| engine::move_item(w, from, to)))
+        });
         self.history_job = Some(id);
     }
 
@@ -577,6 +579,21 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("the undo never finished");
+    }
+
+    #[test]
+    fn an_undo_runs_as_a_job_that_can_be_stopped() {
+        let (mut app, dir) = app_in("undo_job");
+        std::fs::write(dir.join("b"), "B").unwrap();
+        app.history.record(UndoEntry::new("a renaming", vec![Edit::Move { from: dir.join("b"), to: dir.join("a") }]));
+        app.undo();
+        // What a stop does to it is in `engine` (an_undo_that_copies… / a_stopped_undo…)
+        let job = app.engine.jobs.last().expect("the undo runs as a job");
+        assert!(job.kind == JobKind::History && job.controllable(), "{:?}", job.kind);
+        settle(&mut app);
+        assert!(dir.join("a").exists() && !dir.join("b").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+        crate::settings::NO_SAVE.with(|n| n.set(false));
     }
 
     #[test]

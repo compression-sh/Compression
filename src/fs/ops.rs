@@ -495,6 +495,17 @@ impl std::fmt::Display for CopiedNotRemoved {
 
 impl std::error::Error for CopiedNotRemoved {}
 
+impl CopiedNotRemoved {
+    /// The error for a whole copy at `copy` whose original could not be removed because of `cause`.
+    pub(crate) fn error(copy: &Path, cause: io::Error) -> io::Error {
+        io::Error::other(Self { copy: copy.to_path_buf(), cause })
+    }
+}
+
+/// How an item is moved to another place: `move_path`, or a move that a job can follow and stop
+/// (`engine::move_item`). It is handed to the trash and to the undo, which move things on their own.
+pub type Mover<'a> = &'a dyn Fn(&Path, &Path) -> io::Result<()>;
+
 /// The details when `err` is the error of a move whose copy is whole and whose original is not (all) gone.
 pub fn copied_not_removed(err: &io::Error) -> Option<&CopiedNotRemoved> {
     err.get_ref().and_then(|inner| inner.downcast_ref::<CopiedNotRemoved>())

@@ -118,17 +118,33 @@ enum Step {
 
 /// Do the steps of `entry` in order. A step that fails does not stop the others; it is handed back in `left`, so that
 /// it is not lost from the history and can be tried again.
+#[cfg(test)]
 pub fn apply_entry(entry: UndoEntry) -> Applied {
+    apply_entry_with(entry, &ops::move_path)
+}
+
+/// `apply_entry`, moving items with `mover` (`engine::move_item` in a job, which shows a copy across file systems and
+/// can stop it). A stop keeps the step it came in and all after it, untried: they are not a failure, and count as no try.
+pub fn apply_entry_with(entry: UndoEntry, mover: ops::Mover<'_>) -> Applied {
     let UndoEntry { label, edits, retries } = entry;
     let total = edits.len();
-    let (mut inverse, mut kept, mut error) = (Vec::new(), Vec::new(), None);
+    let (mut inverse, mut kept, mut error, mut stopped) = (Vec::new(), Vec::new(), None, false);
     for edit in edits {
+        if stopped {
+            kept.push(edit);
+            continue;
+        }
         let again = edit.clone();
-        match step(edit) {
+        match step(edit, mover) {
             Step::Done(reverse) => inverse.push(reverse),
             Step::DoneWithLeftovers(reverse, err) => {
                 inverse.push(reverse);
                 error.get_or_insert(crate::fs::describe::io_error(&err));
+            }
+            Step::Failed(err) if super::engine::is_cancel(&err) => {
+                stopped = true;
+                error = Some(crate::i18n::tr("Cancelled").to_owned());
+                kept.push(again);
             }
             Step::Failed(err) => {
                 error.get_or_insert(crate::fs::describe::io_error(&err));
@@ -138,8 +154,9 @@ pub fn apply_entry(entry: UndoEntry) -> Applied {
     }
     inverse.reverse();
     let failed = kept.len();
-    let given_up = failed > 0 && retries >= RETRIES;
-    let left = (failed > 0 && !given_up).then(|| UndoEntry { label: label.clone(), edits: kept, retries: retries + 1 });
+    let given_up = failed > 0 && retries >= RETRIES && !stopped;
+    let tries = if stopped { retries } else { retries + 1 };
+    let left = (failed > 0 && !given_up).then(|| UndoEntry { label: label.clone(), edits: kept, retries: tries });
     let inverse = (!inverse.is_empty()).then(|| UndoEntry::new(label, inverse));
     Applied { inverse, left, error, failed, total, given_up }
 }
@@ -151,10 +168,10 @@ pub fn apply(entry: UndoEntry) -> (Option<UndoEntry>, Option<String>) {
     (applied.inverse, applied.error)
 }
 
-fn step(edit: Edit) -> Step {
+fn step(edit: Edit, mover: ops::Mover<'_>) -> Step {
     match edit {
-        Edit::Trash(path) => done(trash::trash(&path).map(Edit::Restore)),
-        Edit::Restore(trashed) => done(trash::restore(&trashed).map(Edit::Trash)),
+        Edit::Trash(path) => done(trash::trash_with(&path, mover).map(Edit::Restore)),
+        Edit::Restore(trashed) => done(trash::restore_with(&trashed, mover).map(Edit::Trash)),
         Edit::Move { from, to } => {
             if to.symlink_metadata().is_ok() {
                 Step::Failed(io::Error::other(trf("“{}” already exists", &[&to.file_name().map_or_else(|| to.to_string_lossy(), |n| n.to_string_lossy())])))
@@ -163,7 +180,7 @@ fn step(edit: Edit) -> Step {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let reverse = Edit::Move { from: to.clone(), to: from.clone() };
-                match ops::move_path(&from, &to) {
+                match mover(&from, &to) {
                     Ok(()) => Step::Done(reverse),
                     // The copy is whole where the move was meant to go: the step is done, what is left behind is said
                     Err(err) if ops::is_copied_not_removed(&err) => Step::DoneWithLeftovers(reverse, err),

@@ -25,6 +25,8 @@ pub enum JobKind {
     Permissions,
     /// Several items renamed on a server.
     Rename,
+    /// An undo, a redo or a restore from the trash: moves that may copy across file systems, so they can be stopped.
+    History,
     Other,
 }
 
@@ -256,7 +258,7 @@ pub struct Job {
 impl Job {
     /// Pausing and cancelling make sense where the work moves through files one at a time.
     pub fn controllable(&self) -> bool {
-        matches!(self.kind, JobKind::Copy | JobKind::Move | JobKind::Delete | JobKind::Extract | JobKind::Compress | JobKind::Permissions | JobKind::Rename)
+        matches!(self.kind, JobKind::Copy | JobKind::Move | JobKind::Delete | JobKind::Extract | JobKind::Compress | JobKind::Permissions | JobKind::Rename | JobKind::History)
     }
 
     pub fn paused(&self) -> bool {
@@ -1088,6 +1090,26 @@ fn transfer_one(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Option
         },
     }
     Ok(())
+}
+
+/// A move for an undo, a redo or a restore from the trash, made by a job: a rename, or across file systems a copy that
+/// shows its progress and can be stopped (a stop removes what was copied, the original stays), after which the original
+/// goes. It stands in for `ops::move_path` and fails as that does, `ops::CopiedNotRemoved` included.
+pub fn move_item(w: &Worker, src: &Path, dst: &Path) -> io::Result<()> {
+    w.shared.checkpoint()?;
+    match crate::compat::rename_noreplace(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            let (mut files, mut bytes) = (0, 0);
+            measure(src, &mut files, &mut bytes);
+            w.shared.files_total.fetch_add(files, Relaxed);
+            w.shared.bytes_total.fetch_add(bytes, Relaxed);
+            refuse_special_files(w, src, false)?;
+            copy_new(w, src, dst, None)?;
+            ops::remove_tree(src).map_err(|cause| ops::CopiedNotRemoved::error(dst, cause))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The room the copy of `src` takes in `dest`, given that its size, holes included, is `size`. A file with holes
@@ -2620,6 +2642,72 @@ mod tests {
         Some((from, to))
     }
 
+    /// Runs `apply_entry_with` as the window runs an undo: in a job of its own, moving with `move_item`.
+    fn undo_in_a_job(entry: crate::fs::history::UndoEntry, cancel_first: bool) -> (crate::fs::history::Applied, u64, u64) {
+        let mut e = engine();
+        let (tx, rx) = mpsc::channel();
+        let id = e.spawn(JobKind::History, String::new(), String::new(), move |w| {
+            if cancel_first {
+                w.shared.cancel.store(true, Relaxed);
+            }
+            let applied = crate::fs::history::apply_entry_with(entry, &|from, to| move_item(w, from, to));
+            let _ = tx.send((applied, w.shared.bytes_done.load(Relaxed), w.shared.bytes_total.load(Relaxed)));
+            Outcome::done(String::new())
+        });
+        assert!(e.jobs.iter().find(|j| j.id == id).is_some_and(Job::controllable), "an undo can be stopped");
+        wait(&mut e);
+        rx.recv().unwrap()
+    }
+
+    #[test]
+    fn an_undo_that_copies_across_file_systems_shows_its_progress() {
+        use crate::fs::history::{Edit, UndoEntry};
+        let Some((here, there)) = two_file_systems("undo_progress") else { return };
+        let data = vec![7u8; 300_000];
+        std::fs::write(there.join("big.bin"), &data).unwrap();
+        let entry = UndoEntry::new("Move of “big.bin”", vec![Edit::Move { from: there.join("big.bin"), to: here.join("big.bin") }]);
+        let (applied, done, total) = undo_in_a_job(entry, false);
+        assert!(applied.error.is_none() && applied.inverse.is_some(), "{:?}", applied.error);
+        assert_eq!(std::fs::read(here.join("big.bin")).unwrap(), data);
+        assert!(!there.join("big.bin").exists());
+        assert_eq!((done, total), (300_000, 300_000), "the copy is counted as it goes");
+        std::fs::remove_dir_all(&here).unwrap();
+        std::fs::remove_dir_all(&there).unwrap();
+    }
+
+    #[test]
+    fn a_stopped_undo_leaves_everything_where_it_was_and_keeps_its_steps_for_later() {
+        use crate::fs::history::{Edit, UndoEntry};
+        let Some((here, there)) = two_file_systems("undo_stop") else { return };
+        std::fs::write(there.join("a.bin"), "a").unwrap();
+        std::fs::write(there.join("b.bin"), "b").unwrap();
+        let edits = vec![Edit::Move { from: there.join("a.bin"), to: here.join("a.bin") }, Edit::Move { from: there.join("b.bin"), to: here.join("b.bin") }];
+        let (applied, _, _) = undo_in_a_job(UndoEntry::new("two", edits), true);
+        assert_eq!(applied.error.as_deref(), Some("Cancelled"));
+        assert!(applied.inverse.is_none() && !applied.given_up);
+        let left = applied.left.expect("the steps are kept");
+        assert_eq!(left.edits.len(), 2, "both, untried");
+        assert!(there.join("a.bin").exists() && there.join("b.bin").exists() && !here.join("a.bin").exists());
+        // A stop is no try: the steps are kept as often as a stop comes
+        let mut left = left;
+        for _ in 0..4 {
+            left = undo_in_a_job(left, true).0.left.expect("still kept");
+        }
+        // A real failure after them is the first try, not the fifth: kept, not given up
+        std::fs::write(here.join("a.bin"), "in the way").unwrap();
+        let (applied, _, _) = undo_in_a_job(left, false);
+        assert!(!applied.given_up && here.join("b.bin").exists(), "{:?}", applied.error);
+        let left = applied.left.expect("the failed step is kept");
+        assert_eq!(left.edits.len(), 1);
+        // Then it runs through
+        std::fs::remove_file(here.join("a.bin")).unwrap();
+        let (applied, _, _) = undo_in_a_job(left, false);
+        assert!(applied.error.is_none() && applied.left.is_none());
+        assert!(here.join("a.bin").exists() && here.join("b.bin").exists());
+        std::fs::remove_dir_all(&here).unwrap();
+        std::fs::remove_dir_all(&there).unwrap();
+    }
+
     fn mode(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -2823,7 +2911,7 @@ mod tests {
     /// is never a success: `ok` and `cancelled` do not hold together, for every kind of job.
     #[test]
     fn a_cancelled_job_is_never_ok_whatever_its_own_code_reports() {
-        for kind in [JobKind::Copy, JobKind::Move, JobKind::Extract, JobKind::Compress, JobKind::Delete, JobKind::Permissions, JobKind::Rename, JobKind::Other] {
+        for kind in [JobKind::Copy, JobKind::Move, JobKind::Extract, JobKind::Compress, JobKind::Delete, JobKind::Permissions, JobKind::Rename, JobKind::History, JobKind::Other] {
             let mut e = engine();
             let id = e.spawn(kind, "t".into(), String::new(), |w| {
                 while w.shared.checkpoint().is_ok() {

@@ -4,7 +4,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::ops::{is_copied_not_removed, move_path, remove_tree, unique_path, unique_path_where};
+use super::ops::{is_copied_not_removed, move_path, remove_tree, unique_path, unique_path_where, Mover};
 use crate::i18n::tr;
 
 pub fn root() -> Option<PathBuf> {
@@ -112,16 +112,21 @@ pub fn is_empty() -> bool {
 /// which the specification allows, by a copy if it must. Whoever cannot wait for such a copy, or wants to ask first,
 /// uses `trash_without_fallback`.
 pub fn trash(path: &Path) -> io::Result<PathBuf> {
-    trash_by(path, true)
+    trash_with(path, &move_path)
+}
+
+/// `trash`, moving the item with `mover` (an undo that runs as a job can follow the copy across file systems and stop it).
+pub fn trash_with(path: &Path, mover: Mover<'_>) -> io::Result<PathBuf> {
+    trash_by(path, true, mover)
 }
 
 /// `trash`, except that an item on a drive without a usable trash is not copied into the home trash: the error says
 /// so (`is_no_trash`) and nothing was changed.
 pub fn trash_without_fallback(path: &Path) -> io::Result<PathBuf> {
-    trash_by(path, false)
+    trash_by(path, false, &move_path)
 }
 
-fn trash_by(path: &Path, fallback: bool) -> io::Result<PathBuf> {
+fn trash_by(path: &Path, fallback: bool, mover: Mover<'_>) -> io::Result<PathBuf> {
     #[cfg(test)]
     if tests_refuse::refused(path) {
         return Err(io::Error::from_raw_os_error(libc::EACCES));
@@ -129,9 +134,9 @@ fn trash_by(path: &Path, fallback: bool) -> io::Result<PathBuf> {
     let home = root().ok_or_else(|| io::Error::other(tr("There is no trash folder")))?;
     let original = absolute(path)?;
     match drive_trash(&home, &original) {
-        DriveTrash::Own(root, topdir) => trash_in(&root, Some(&topdir), &original),
-        DriveTrash::Home => trash_in(&home, None, &original),
-        DriveTrash::Unavailable if fallback => trash_in(&home, None, &original),
+        DriveTrash::Own(root, topdir) => trash_in(&root, Some(&topdir), &original, mover),
+        DriveTrash::Home => trash_in(&home, None, &original, mover),
+        DriveTrash::Unavailable if fallback => trash_in(&home, None, &original, mover),
         DriveTrash::Unavailable => Err(io::Error::other(NoTrash)),
     }
 }
@@ -233,7 +238,7 @@ fn topdir_of(root: &Path) -> Option<&Path> {
 }
 
 /// Trash `original` (absolute) into `root`. On a drive, the record names the path from `topdir`.
-fn trash_in(root: &Path, topdir: Option<&Path>, original: &Path) -> io::Result<PathBuf> {
+fn trash_in(root: &Path, topdir: Option<&Path>, original: &Path, mover: Mover<'_>) -> io::Result<PathBuf> {
     let path = original;
     let (files, info) = (root.join("files"), root.join("info"));
     std::fs::create_dir_all(&files)?;
@@ -260,7 +265,7 @@ fn trash_in(root: &Path, topdir: Option<&Path>, original: &Path) -> io::Result<P
         return Err(err);
     }
     drop(record_file);
-    if let Err(err) = move_path(path, &target) {
+    if let Err(err) = mover(path, &target) {
         // A whole copy in the trash keeps its record: it is the only whole one there is, and the person can restore it
         if !is_copied_not_removed(&err) {
             let _ = std::fs::remove_file(&record);
@@ -272,6 +277,11 @@ fn trash_in(root: &Path, topdir: Option<&Path>, original: &Path) -> io::Result<P
 
 /// Put a trashed item back where it came from (next to it under a new name if that is taken).
 pub fn restore(trashed: &Path) -> io::Result<PathBuf> {
+    restore_with(trashed, &move_path)
+}
+
+/// `restore`, moving the item back with `mover` (see `trash_with`).
+pub fn restore_with(trashed: &Path, mover: Mover<'_>) -> io::Result<PathBuf> {
     if trashed.parent().and_then(Path::file_name).is_none_or(|n| n != "files") {
         return Err(io::Error::other(tr("The trash has no record of where this came from")));
     }
@@ -292,7 +302,7 @@ pub fn restore(trashed: &Path) -> io::Result<PathBuf> {
     std::fs::create_dir_all(folder)?;
     let target = unique_path(folder, original.file_name().unwrap_or_default(), "restored");
     // When the copy is whole but the trashed item cannot be removed, the record stays with what is left of it
-    move_path(trashed, &target)?;
+    mover(trashed, &target)?;
     let _ = std::fs::remove_file(record);
     Ok(target)
 }
@@ -421,6 +431,11 @@ fn decode(s: &str) -> std::ffi::OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `trash_in` with the plain move, as the trash uses it outside a job.
+    fn trash_in(root: &Path, topdir: Option<&Path>, original: &Path) -> io::Result<PathBuf> {
+        super::trash_in(root, topdir, original, &move_path)
+    }
 
     #[test]
     fn without_noreplace_support_trashing_is_refused_and_the_item_and_its_trash_stay_untouched() {
