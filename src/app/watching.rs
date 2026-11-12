@@ -312,3 +312,179 @@ impl CompressionApp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A folder of its own under the temp dir, removed again when the test ends, however it ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("compression_watching_{name}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir.canonicalize().unwrap())
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn app_in(dir: &Path, ctx: &egui::Context) -> CompressionApp {
+        CompressionApp::new(dir.to_path_buf(), SerpantinumTheme::default(), Settings::default(), ctx)
+    }
+
+    fn names(app: &CompressionApp) -> Vec<String> {
+        app.items.iter().map(|i| i.name.clone()).collect()
+    }
+
+    /// Runs the per-frame work until `done` holds, for up to four seconds.
+    fn pump(app: &mut CompressionApp, ctx: &egui::Context, done: impl Fn(&CompressionApp) -> bool) -> bool {
+        for _ in 0..200 {
+            app.poll_watch(ctx);
+            app.poll_reload();
+            if done(app) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn the_open_folder_is_followed_and_leaving_it_stops_that() {
+        let (a, b) = (Scratch::new("leave_a"), Scratch::new("leave_b"));
+        let ctx = egui::Context::default();
+        let mut app = app_in(&a.0, &ctx);
+        assert!(app.watching.watcher.is_some(), "inotify is available");
+        assert_eq!(app.watching.active, std::slice::from_ref(&a.0));
+
+        std::fs::write(a.0.join("new.txt"), "x").unwrap();
+        assert!(pump(&mut app, &ctx, |x| names(x).contains(&"new.txt".to_owned())), "{:?}", names(&app));
+
+        app.navigate_known(b.0.clone());
+        assert_eq!(app.watching.active, std::slice::from_ref(&b.0));
+        std::fs::write(a.0.join("after.txt"), "x").unwrap();
+        // Long enough for an event and the quiet time after it; nothing from the old folder may be waiting
+        for _ in 0..(2 * QUIET.as_millis() / 20 + 5) {
+            app.poll_watch(&ctx);
+            app.poll_reload();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.watching.pending.is_empty() && app.watching.first.is_none(), "{:?}", app.watching.pending);
+        assert!(names(&app).is_empty(), "the new folder is empty: {:?}", names(&app));
+
+        // The new folder is the one followed now
+        std::fs::write(b.0.join("here.txt"), "x").unwrap();
+        assert!(pump(&mut app, &ctx, |x| names(x) == ["here.txt"]), "{:?}", names(&app));
+    }
+
+    #[test]
+    fn changes_are_collected_until_things_go_quiet() {
+        let dir = Scratch::new("quiet");
+        let ctx = egui::Context::default();
+        let mut app = app_in(&dir.0, &ctx);
+        std::fs::write(dir.0.join("one.txt"), "x").unwrap();
+        // The first frame that sees the event only collects it
+        assert!(pump(&mut app, &ctx, |x| !x.watching.pending.is_empty()), "no event arrived");
+        assert!(names(&app).is_empty(), "applied before it went quiet: {:?}", names(&app));
+        std::thread::sleep(QUIET + Duration::from_millis(20));
+        app.poll_watch(&ctx);
+        assert_eq!(names(&app), ["one.txt"]);
+        assert!(app.watching.pending.is_empty() && app.watching.first.is_none() && app.watching.last.is_none(), "the batch is cleared");
+    }
+
+    #[test]
+    fn a_flood_or_lost_events_read_the_folder_again() {
+        let dir = Scratch::new("flood");
+        std::fs::write(dir.0.join("keep.txt"), "x").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app_in(&dir.0, &ctx);
+        let flood: BTreeMap<PathBuf, bool> = (0..=BURST).map(|n| (dir.0.join(format!("f{n}")), true)).collect();
+        app.apply_disk_changes(flood, false, Vec::new());
+        assert!(app.pending_reload.is_some(), "more than BURST names are read, not patched");
+        assert_eq!(names(&app), ["keep.txt"], "the listing is not patched meanwhile");
+        assert!(pump(&mut app, &ctx, |x| x.pending_reload.is_none()));
+
+        app.apply_disk_changes(BTreeMap::new(), true, Vec::new());
+        assert!(app.pending_reload.is_some(), "an overflow means events were lost");
+        assert!(pump(&mut app, &ctx, |x| x.pending_reload.is_none()));
+        assert_eq!(names(&app), ["keep.txt"]);
+    }
+
+    #[test]
+    fn a_few_changes_are_patched_in_without_reading_the_folder() {
+        let dir = Scratch::new("patch");
+        std::fs::write(dir.0.join("old.txt"), "x").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app_in(&dir.0, &ctx);
+        std::fs::remove_file(dir.0.join("old.txt")).unwrap();
+        std::fs::write(dir.0.join("new.txt"), "x").unwrap();
+        std::fs::write(dir.0.join(".hidden"), "x").unwrap();
+        let changed: BTreeMap<PathBuf, bool> =
+            ["old.txt", "new.txt", ".hidden"].iter().map(|n| (dir.0.join(n), true)).collect();
+        // A file outside the followed folder is no business of this listing
+        let other = Scratch::new("patch_other");
+        std::fs::write(other.0.join("elsewhere.txt"), "x").unwrap();
+        let mut changed = changed;
+        changed.insert(other.0.join("elsewhere.txt"), true);
+        app.apply_disk_changes(changed, false, Vec::new());
+        assert!(app.pending_reload.is_none(), "patched, not read again");
+        assert_eq!(names(&app), ["new.txt"], "removed goes, new comes, hidden stays hidden");
+    }
+
+    #[test]
+    fn a_parked_tab_whose_folder_went_away_is_read_again_when_shown() {
+        let (a, b) = (Scratch::new("gone_a"), Scratch::new("gone_b"));
+        let ctx = egui::Context::default();
+        let mut app = app_in(&a.0, &ctx);
+        app.new_tab(b.0.clone());
+        assert_eq!(app.active_tab, 1);
+        app.apply_disk_changes(BTreeMap::new(), false, vec![a.0.clone()]);
+        assert!(app.tabs[0].saved.as_ref().is_some_and(|s| s.stale), "the parked tab is marked");
+        assert_eq!(app.current_path, b.0, "the tab on show is left alone");
+    }
+
+    #[test]
+    fn a_search_follows_the_folders_of_its_results_up_to_a_limit() {
+        let base = Scratch::new("mixed");
+        let ctx = egui::Context::default();
+        let mut app = app_in(&base.0, &ctx);
+        let mut items = Vec::new();
+        for n in 0..MIXED_FOLDERS + 20 {
+            let dir = base.0.join(format!("d{n:03}"));
+            std::fs::create_dir(&dir).unwrap();
+            // Two results in one folder count once
+            for f in ["a.txt", "b.txt"] {
+                std::fs::write(dir.join(f), "x").unwrap();
+                items.push(FileItem::from_path(&dir.join(f)).unwrap());
+            }
+        }
+        app.search_query = "txt".to_owned();
+        app.items = items;
+        let targets = app.watch_targets();
+        assert_eq!(targets.len(), MIXED_FOLDERS);
+        assert_eq!(targets.iter().collect::<HashSet<_>>().len(), MIXED_FOLDERS, "each folder once");
+        assert_eq!(targets[0], base.0.join("d000"));
+        app.search_query.clear();
+        assert_eq!(app.watch_targets(), std::slice::from_ref(&base.0), "back to the folder itself");
+    }
+
+    #[test]
+    fn without_a_monitor_the_window_carries_on() {
+        let dir = Scratch::new("none");
+        let ctx = egui::Context::default();
+        let mut app = app_in(&dir.0, &ctx);
+        app.watching.watcher = None;
+        app.resync_watch();
+        std::fs::write(dir.0.join("x.txt"), "x").unwrap();
+        app.poll_watch(&ctx);
+        assert!(app.watching.pending.is_empty());
+        assert!(names(&app).is_empty(), "nothing is noticed, and nothing breaks");
+    }
+}
