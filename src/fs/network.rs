@@ -1259,28 +1259,38 @@ impl Session {
         }
         let scan = Command::new("ssh-keyscan").args(["-T", "10", "-p", &port.to_string(), &root.host]).stderr(Stdio::null()).output().map_err(|e| Failure::Message(super::describe::io_error(&e)))?;
         let keys = String::from_utf8_lossy(&scan.stdout).into_owned();
-        if keys.trim().is_empty() {
+        // One key is shown, and only that one is trusted: another the server sent was never seen by the person
+        let Some(key) = chosen_key(&keys) else {
             return Err(Failure::Message(trf("Could not reach {}", &[&root.host])));
-        }
+        };
         let mut fingerprint = Command::new("ssh-keygen");
         fingerprint.args(["-l", "-f", "-"]);
-        let (_, listed) = run_with_input_out(fingerprint, Some(keys.clone()), &|| self.cancelled())?;
-        let print = listed.lines().find(|l| l.contains("ED25519")).or_else(|| listed.lines().next()).and_then(|l| l.split_whitespace().nth(1)).unwrap_or("?").to_owned();
+        let (_, listed) = run_with_input_out(fingerprint, Some(format!("{key}\n")), &|| self.cancelled())?;
+        let print = listed.split_whitespace().nth(1).unwrap_or("?").to_owned();
         let message = format!("The identity of the remote computer ({}) is unknown.\nThe identity sent by the remote computer is {print}.", root.host);
         match self.ask(Prompt::Question { message, choices: vec!["Log In Anyway".into(), "Cancel Login".into()] }) {
             Reply::Choice(0) => {
                 let dir = dirs::home_dir().map(|h| h.join(".ssh")).ok_or(Failure::Cancelled)?;
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
-                }
-                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("known_hosts")).map_err(|e| Failure::Message(super::describe::io_error(&e)))?;
-                file.write_all(keys.as_bytes()).map_err(|e| Failure::Message(super::describe::io_error(&e)))?;
-                Ok(())
+                remember_host_key(&dir, key).map_err(|e| Failure::Message(super::describe::io_error(&e)))
             }
             _ => Err(Failure::Cancelled),
         }
     }
+}
+
+/// Of the keys `ssh-keyscan` printed (one `host type key` line each), the one to show and to trust: the ED25519 key
+/// when the server has one (what ssh asks for first), else the first. `None` when there is none.
+fn chosen_key(scan: &str) -> Option<&str> {
+    let keys = || scan.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
+    keys().find(|l| l.split_whitespace().nth(1) == Some("ssh-ed25519")).or_else(|| keys().next())
+}
+
+/// Adds `key`, a `known_hosts` line, to `known_hosts` in `ssh_dir` (made private if it is not there).
+fn remember_host_key(ssh_dir: &Path, key: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(ssh_dir);
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(ssh_dir.join("known_hosts"))?;
+    file.write_all(format!("{key}\n").as_bytes())
 }
 
 enum Attempt {
@@ -1783,6 +1793,25 @@ pub(crate) fn declare_remote_for_tests(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_key_that_was_shown_is_trusted() {
+        let scan = "# example.com:22 SSH-2.0-OpenSSH_9.6\nexample.com ssh-rsa AAAArsa\nexample.com ecdsa-sha2-nistp256 AAAAecdsa\nexample.com ssh-ed25519 AAAAed\n";
+        assert_eq!(chosen_key(scan), Some("example.com ssh-ed25519 AAAAed"));
+        assert_eq!(chosen_key("# c\n[h]:2222 ssh-rsa AAAArsa\n[h]:2222 ecdsa-sha2-nistp256 AAAAe\n"), Some("[h]:2222 ssh-rsa AAAArsa"), "no ED25519: the first");
+        assert_eq!(chosen_key("# only comments\n\n"), None);
+        let dir = std::env::temp_dir().join(format!("compression_known_hosts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ssh = dir.join(".ssh");
+        remember_host_key(&ssh, chosen_key(scan).unwrap()).unwrap();
+        assert_eq!(std::fs::read_to_string(ssh.join("known_hosts")).unwrap(), "example.com ssh-ed25519 AAAAed\n");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(ssh.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+        // What was there stays; the new key goes after it
+        remember_host_key(&ssh, "other ssh-ed25519 BBBB").unwrap();
+        assert_eq!(std::fs::read_to_string(ssh.join("known_hosts")).unwrap(), "example.com ssh-ed25519 AAAAed\nother ssh-ed25519 BBBB\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn addr(text: &str) -> Address {
         Address::parse(text).unwrap_or_else(|| panic!("{text} did not parse"))
