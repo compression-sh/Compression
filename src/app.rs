@@ -413,6 +413,8 @@ pub struct CompressionApp {
     /// The part of the window the listing fills (drops on items must land inside it).
     dnd_view: egui::Rect,
     error_message: Option<String>,
+    /// The folder cannot be read for lack of rights: offer to open it as administrator.
+    error_denied: bool,
 
     // Dynamic shell theme from Serpantinum
     pub(crate) theme: SerpantinumTheme,
@@ -649,6 +651,7 @@ impl CompressionApp {
             wl_dnd: None,
             release_pointer: false,
             error_message: None,
+            error_denied: false,
             theme: faded,
             popup_theme: theme,
             back_history: Vec::new(),
@@ -842,6 +845,7 @@ impl CompressionApp {
         if self.take_reload(std::time::Duration::from_millis(80)) {
             self.items.clear();
             self.error_message = None;
+            self.error_denied = false;
             self.loading = true;
             self.selection.clear();
             self.sync_selection(true);
@@ -1044,6 +1048,7 @@ impl CompressionApp {
                 items.retain(|i| self.chooser_accepts(i));
                 self.items = items;
                 self.error_message = None;
+                self.error_denied = false;
                 if self.settings.show_thumbnails {
                     self.thumbs.preload(self.items.iter().map(|i| (i.path.as_path(), (i.modified, i.size))));
                 }
@@ -1063,6 +1068,7 @@ impl CompressionApp {
                 self.items.clear();
                 self.selected_index = None;
                 self.error_message = Some(crate::fs::describe::io_error(&err));
+                self.error_denied = err.kind() == std::io::ErrorKind::PermissionDenied;
             }
         }
         self.sync_selection(true);
@@ -1840,6 +1846,7 @@ impl CompressionApp {
             self.selected_index = None;
             self.sync_selection(true);
             self.error_message = None;
+            self.error_denied = false;
             // A plugin that understands the query (`tag:work`) answers without a scan
             if let Some(paths) = self.plugins.search_paths(self.search_query.trim()) {
                 self.search.cancel();
@@ -2629,7 +2636,12 @@ impl eframe::App for CompressionApp {
             }
 
             if let Some(err) = &self.error_message {
-                material::empty_state(ui, &self.theme, icons::INFO, tr("This folder can't be opened"), Some(err));
+                let admin = self.error_denied.then(|| admin_entry(&self.current_path)).flatten();
+                let action = admin.as_ref().map(|(icon, label, _)| (*icon, *label));
+                if material::empty_state_with(ui, &self.theme, icons::INFO, tr("This folder can't be opened"), Some(err), action) {
+                    let dir = self.current_path.clone();
+                    self.open_as_admin(&dir);
+                }
             } else if self.items.is_empty() {
                 let (icon, title, hint) = if self.loading {
                     (icons::FOLDER, tr("Loading…"), None)
@@ -7467,6 +7479,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
+    }
+
+    /// Gives a folder its rights back when the test ends, however it ends.
+    struct Unlock(PathBuf);
+    impl Drop for Unlock {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    fn a_folder_without_rights_says_so_and_offers_administrator_access_only_where_it_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root can read it
+        }
+        let root = window_dir("denied");
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _unlock = Unlock(locked.clone());
+        let mut w = Window::new(root.clone());
+        w.app.navigate_to(locked.clone());
+        w.until("the error", |w| w.app.error_message.is_some());
+        w.run(Vec::new(), 20);
+        assert!(w.app.error_denied, "a refusal for lack of rights is not recognized");
+        assert!(w.shows("This folder can't be opened") && w.shows("Permission denied"), "{:?}", w.last);
+        assert_eq!(w.shows("Open as administrator"), crate::fs::admin::available(), "{:?}", w.last);
+
+        // Any other reason: no offer
+        w.app.error_denied = false;
+        w.run(Vec::new(), 5);
+        assert!(!w.shows("Open as administrator"), "{:?}", w.last);
+        drop(_unlock);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_hint_of_an_empty_state_wraps_inside_the_view_and_stays_centered() {
+        let root = window_dir("wrap");
+        let mut w = Window::new(root.clone());
+        let long = "No way to read this folder because the system answered with a very long explanation that does not fit on one line of a narrow window ".repeat(3);
+        w.app.error_message = Some(long.trim().to_owned());
+        w.run(Vec::new(), 20);
+        let (_, rect) = w.shapes.iter().find(|(t, _)| t.starts_with("No way to read this folder")).expect("the hint is not drawn");
+        assert!(rect.height() > 30.0, "the hint stays on one line: {rect:?}");
+        assert!(rect.width() <= 481.0, "wider than the wrap width: {rect:?}");
+        assert!(rect.left() >= 0.0 && rect.right() <= 1100.0, "outside the window: {rect:?}");
+        let (_, title) = w.shapes.iter().find(|(t, _)| t == "This folder can't be opened").unwrap();
+        assert!((rect.center().x - title.center().x).abs() < 2.0, "not centered under the title: {rect:?} vs {title:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

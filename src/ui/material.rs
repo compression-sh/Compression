@@ -2458,11 +2458,18 @@ pub fn input_icon(ui: &mut egui::Ui, icon: &str, size: f32, color: Color32) {
 
 /// Centered placeholder for views without content: a large quiet icon, a title and a hint.
 pub fn empty_state(ui: &mut egui::Ui, theme: &SerpantinumTheme, icon: &str, title: &str, hint: Option<&str>) {
+    empty_state_with(ui, theme, icon, title, hint, None);
+}
+
+/// `empty_state` with an optional button (icon, label) under the hint; true when it was clicked.
+/// The hint wraps to the width of the view.
+pub fn empty_state_with(ui: &mut egui::Ui, theme: &SerpantinumTheme, icon: &str, title: &str, hint: Option<&str>, action: Option<(&str, &str)>) -> bool {
     let id = ui.make_persistent_id(("empty_state", icon, title));
     let t = animate_enter(ui.ctx(), id, ANIM);
     let rect = ui.max_rect();
     let center = rect.center() - Vec2::new(0.0, 16.0 - (1.0 - t) * 8.0);
-    paint_icon(ui.painter(), center - Vec2::new(0.0, 34.0), icon, 56.0, theme.surface2.gamma_multiply(t));
+    // Quiet, but still readable over a see-through window
+    paint_icon(ui.painter(), center - Vec2::new(0.0, 34.0), icon, 56.0, lerp_color(theme.surface2, theme.subtext0, 0.45).gamma_multiply(t));
     ui.painter().text(
         center + Vec2::new(0.0, 12.0),
         Align2::CENTER_CENTER,
@@ -2470,15 +2477,21 @@ pub fn empty_state(ui: &mut egui::Ui, theme: &SerpantinumTheme, icon: &str, titl
         egui::FontId::proportional(FONT_TITLE),
         theme.subtext0.gamma_multiply(t),
     );
+    let mut below = center.y + 36.0;
     if let Some(hint) = hint {
-        ui.painter().text(
-            center + Vec2::new(0.0, 36.0),
-            Align2::CENTER_CENTER,
-            hint,
-            egui::FontId::proportional(FONT_CAPTION),
-            theme.subtext1.gamma_multiply(t),
-        );
+        let mut job = LayoutJob::simple(hint.to_owned(), egui::FontId::proportional(FONT_CAPTION), theme.subtext1.gamma_multiply(t), (rect.width() - 48.0).clamp(80.0, 480.0));
+        job.halign = egui::Align::Center;
+        let galley = ui.painter().layout_job(job);
+        let top = center.y + 36.0 - FONT_CAPTION / 2.0;
+        // Rows are centered inside the galley, so center the galley itself on the view
+        let pos = Pos2::new(center.x - galley.rect.center().x, top);
+        below = top + galley.size().y;
+        ui.painter().galley(pos, galley, theme.subtext1);
     }
+    let Some((icon, label)) = action else { return false };
+    let width = ui.painter().layout_no_wrap(label.to_owned(), egui::FontId::proportional(FONT_BODY), theme.text).size().x + 32.0 + 24.0;
+    let button_rect = Rect::from_min_size(Pos2::new(center.x - width / 2.0, below + 16.0), Vec2::new(width, BUTTON_HEIGHT));
+    ui.put(button_rect, |ui: &mut egui::Ui| button(ui, ("empty_state_action", icon), Some(icon), label, theme, ButtonKind::Tonal, true)).clicked()
 }
 
 /// A key combination drawn as a small flat pill.
