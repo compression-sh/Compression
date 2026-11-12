@@ -4091,6 +4091,10 @@ impl CompressionApp {
             .show(ctx, |ui| {
                 ui.set_opacity(t);
                 let right = if has_action { 8 } else { 20 };
+                // Inside the window: what does not fit on one line wraps, leaving room for the button
+                const BUTTON_ROOM: f32 = 88.0;
+                let outer = (ctx.content_rect().width() - 32.0).max(120.0);
+                let label_width = (outer - 20.0 - right as f32 - if has_action { BUTTON_ROOM } else { 0.0 }).max(60.0);
                 egui::Frame::new()
                     .fill(theme.surface2)
                     .corner_radius(egui::CornerRadius::same(material::radius_lg()))
@@ -4099,7 +4103,10 @@ impl CompressionApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.set_min_height(material::BUTTON_HEIGHT);
-                            ui.label(egui::RichText::new(message).size(material::FONT_BODY).color(theme.text));
+                            ui.scope(|ui| {
+                                ui.set_max_width(label_width);
+                                ui.add(egui::Label::new(egui::RichText::new(message).size(material::FONT_BODY).color(theme.text)).wrap_mode(egui::TextWrapMode::Wrap));
+                            });
                             if has_action {
                                 ui.add_space(8.0);
                                 act = material::button(ui, "toast_action", None, tr("Undo"), &theme, ButtonKind::Text, true).clicked();
@@ -7425,10 +7432,15 @@ mod tests {
         }
 
         fn run(&mut self, events: Vec<egui::Event>, frames: usize) {
+            self.run_sized(egui::vec2(1100.0, 700.0), events, frames);
+        }
+
+        /// `run` in a window of another size.
+        fn run_sized(&mut self, size: egui::Vec2, events: Vec<egui::Event>, frames: usize) {
             for n in 0..frames {
                 self.time += 0.05;
                 let raw = egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 700.0))),
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
                     time: Some(self.time),
                     events: if n == 0 { events.clone() } else { Vec::new() },
                     ..Default::default()
@@ -7676,6 +7688,38 @@ mod tests {
             }
             assert_eq!(tips > 0, tooltip, "{desc:?}: {tips} tooltips");
         }
+    }
+
+    #[test]
+    fn a_long_message_stays_inside_a_narrow_window_with_its_button_and_a_short_one_stays_on_one_line() {
+        let root = window_dir("narrowtoast");
+        let mut w = Window::new(root.clone());
+        let message = "Could not mount “Volume”: Error mounting /dev/sda1 at /run/media/me/Volume: the device is busy and cannot be mounted right now, try again later";
+        for with_button in [false, true] {
+            for width in (0..24).map(|i| 220.0 + 25.0 * i as f32) {
+                if with_button {
+                    w.app.set_toast_action(message, ToastAction::Undo);
+                } else {
+                    w.app.set_toast(message);
+                }
+                w.run_sized(egui::vec2(width, 500.0), Vec::new(), 30);
+                let rects: Vec<egui::Rect> = w.shapes.iter().filter(|(t, _)| t == message).map(|(_, r)| *r).collect();
+                assert_eq!(rects.len(), 1, "width {width}: {:?}", w.last);
+                let r = rects[0];
+                assert!(r.left() >= 0.0 && r.right() <= width, "width {width}, button {with_button}: the message is at {r:?}");
+                if with_button {
+                    let undo = w.shapes.iter().find(|(t, _)| t == "Undo").unwrap_or_else(|| panic!("no Undo button: {:?}", w.last)).1;
+                    assert!(undo.left() >= 0.0 && undo.right() <= width, "width {width}: the button is at {undo:?}");
+                    assert!(r.right() <= undo.left(), "width {width}: the message {r:?} runs into the button {undo:?}");
+                }
+            }
+        }
+        // A message that fits is one line, however wide the window
+        w.app.set_toast("Refreshed");
+        w.run_sized(egui::vec2(1100.0, 700.0), Vec::new(), 30);
+        let (_, r) = w.shapes.iter().find(|(t, _)| t == "Refreshed").unwrap();
+        assert!(r.height() < 24.0, "{r:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
