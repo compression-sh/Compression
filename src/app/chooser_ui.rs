@@ -311,4 +311,45 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&work);
     }
+
+    #[test]
+    fn files_are_told_by_their_content_on_the_reading_thread_not_on_the_window_s() {
+        let dir = std::env::temp_dir().join(format!("compression_chooser_thread_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R'];
+        png.extend([0u8; 32]);
+        std::fs::write(dir.join("scan"), &png).unwrap();
+        std::fs::write(dir.join("notes"), "words").unwrap();
+        std::fs::write(dir.join("photo.png"), &png).unwrap();
+        let mut app = app_in(&dir, &["--chooser", "--mode", "open", "--filter", "Images\tm:image/*"]);
+        if crate::fs::apps::mime_of_name("a.png").is_none() || !Path::new("/usr/share/mime/magic").exists() {
+            return;
+        }
+        // The drive "hangs" when a file is opened to tell its type
+        crate::fs::mount_health::tests::hang_under(&dir);
+        let release = dir.clone();
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            crate::fs::mount_health::tests::answer_again(&release);
+        });
+        app.reload_items_later();
+        let mut slowest = std::time::Duration::ZERO;
+        for _ in 0..400 {
+            let started = std::time::Instant::now();
+            let reading = app.poll_reload();
+            slowest = slowest.max(started.elapsed());
+            if !reading {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        opener.join().unwrap();
+        assert!(slowest < std::time::Duration::from_millis(500), "the window waited {slowest:?} for a file to be read");
+        let mut names: Vec<&str> = app.items.iter().map(|i| i.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["photo.png", "scan"], "the filter took files by their content");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

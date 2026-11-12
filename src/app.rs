@@ -718,6 +718,37 @@ pub struct CompressionApp {
 
 /// The items of the Recent and Bookmarks views for `paths`: what is still there, and passes the hidden-files setting and
 /// the type filter. Asks the file system about every path, so it runs on a thread when a server is among them.
+/// See `CompressionApp::dialog_filter`.
+#[derive(Clone)]
+enum DialogFilter {
+    /// Not a file dialog: everything.
+    All,
+    /// A dialog that chooses folders.
+    Folders,
+    /// A dialog that chooses files: folders, and the files its filter takes (all of them without one).
+    Files(Option<crate::chooser::Filter>),
+}
+
+impl DialogFilter {
+    fn accepts(&self, item: &FileItem) -> bool {
+        match self {
+            DialogFilter::All => true,
+            DialogFilter::Folders => item.is_dir,
+            DialogFilter::Files(filter) => item.is_dir || filter.as_ref().is_none_or(|f| f.accepts(&item.path)),
+        }
+    }
+
+    /// `listing` without what the dialog does not show.
+    fn apply(&self, listing: std::io::Result<Vec<FileItem>>) -> std::io::Result<Vec<FileItem>> {
+        listing.map(|mut items| {
+            if !matches!(self, DialogFilter::All) {
+                items.retain(|i| self.accepts(i));
+            }
+            items
+        })
+    }
+}
+
 fn recent_listing(paths: Vec<PathBuf>, show_hidden: bool, filter: TypeFilter) -> Vec<FileItem> {
     const LIMIT: usize = 150;
     paths
@@ -1197,6 +1228,7 @@ impl CompressionApp {
             return;
         }
         let listing = if self.in_recent() { Ok(recent_listing(paths, self.show_hidden, self.type_filter)) } else { read_folder(&self.current_path, &opts) };
+        let listing = self.dialog_filter().apply(listing);
         self.show_listing(listing);
     }
 
@@ -1219,11 +1251,12 @@ impl CompressionApp {
             return self.reload_items();
         }
         self.resync_watch();
-        let (path, opts) = (self.current_path.clone(), self.list_options());
+        let (path, opts, dialog) = (self.current_path.clone(), self.list_options(), self.dialog_filter());
         let (tx, rx) = mpsc::channel();
         let read = path.clone();
+        // What the file dialog does not show is left out here, on the thread: it may read files to tell their type
         std::thread::spawn(move || {
-            let _ = tx.send(read_folder(&read, &opts));
+            let _ = tx.send(dialog.apply(read_folder(&read, &opts)));
         });
         self.pending_reload = Some((path, rx));
     }
@@ -1264,8 +1297,8 @@ impl CompressionApp {
     fn show_listing(&mut self, listing: std::io::Result<Vec<FileItem>>) {
         self.loading = false;
         match listing {
-            Ok(mut items) => {
-                items.retain(|i| self.chooser_accepts(i));
+            // Without what the file dialog does not show: left out where the listing was read (`DialogFilter::apply`)
+            Ok(items) => {
                 self.items = items;
                 self.error_message = None;
                 self.error_denied = false;
@@ -1316,10 +1349,16 @@ impl CompressionApp {
 
     /// Whether the file chooser, if this is one, offers `item`.
     fn chooser_accepts(&self, item: &FileItem) -> bool {
+        self.dialog_filter().accepts(item)
+    }
+
+    /// What the file dialog lets the listing show, as a value a thread reading the folder can take along: telling a
+    /// file by its content reads it (see `apps::mime_of_file`), which must not happen on the window's thread.
+    fn dialog_filter(&self) -> DialogFilter {
         match &self.chooser {
-            Some(ch) if ch.spec.mode == crate::chooser::Mode::Folder => item.is_dir,
-            Some(ch) => item.is_dir || ch.accepts(&item.path),
-            None => true,
+            Some(ch) if ch.spec.mode == crate::chooser::Mode::Folder => DialogFilter::Folders,
+            Some(ch) => DialogFilter::Files(ch.spec.filters.get(ch.filter).cloned()),
+            None => DialogFilter::All,
         }
     }
 

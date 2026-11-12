@@ -206,10 +206,6 @@ impl Chooser {
         Self { spec, name_input, filter, choice_values, filled: None, focus_name, parent: None, size_seen: None, size_stored: None }
     }
 
-    pub fn accepts(&self, path: &Path) -> bool {
-        self.spec.filters.get(self.filter).is_none_or(|f| f.accepts(path))
-    }
-
     /// Remembers the size the user gave the dialog, once a resize has settled. Kept in a file of its
     /// own: the settings file is whole-file rewritten by whichever Compression window saves last.
     pub fn remember_size(&mut self, ctx: &eframe::egui::Context) {

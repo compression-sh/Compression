@@ -674,6 +674,8 @@ pub fn mime_of_file(path: &Path) -> Option<String> {
 /// The start of a regular file, without waiting on a pipe or following a link (see `ops::open_regular_file`).
 fn first_bytes(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read;
+    #[cfg(test)]
+    super::mount_health::tests::hang_if_asked_to(path);
     let file = super::ops::open_regular_file(path).ok()?;
     let mut bytes = Vec::new();
     file.take(MAGIC_BYTES).read_to_end(&mut bytes).ok()?;
