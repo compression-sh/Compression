@@ -818,7 +818,23 @@ fn unpack(archive: &Path, dest: &Path, control: &Control) -> io::Result<()> {
 
 /// The entry `name` of an archive would be written outside the folder it is unpacked into.
 fn outside(name: &Path) -> io::Error {
-    io::Error::other(trf("The archive has an entry that would land outside the folder: {}", &[&name.display()]))
+    io::Error::other(Outside(trf("The archive has an entry that would land outside the folder: {}", &[&name.display()])))
+}
+
+/// The error of `outside`, so that it can be told apart from what a program or a broken archive says.
+#[derive(Debug)]
+struct Outside(String);
+
+impl std::fmt::Display for Outside {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Outside {}
+
+fn is_outside(err: &io::Error) -> bool {
+    err.get_ref().is_some_and(|e| e.is::<Outside>())
 }
 
 /// `name` without `.` parts, as the entries of an archive are compared.
@@ -973,10 +989,15 @@ fn unpack_compressed_tar(program: &str, archive: &Path, dest: &Path, control: &C
     }
     let status = child.wait()?;
     let said = said.join().unwrap_or_default();
+    let program_failed = || Err(io::Error::other(said.lines().last().map_or_else(|| tr("The program failed").to_owned(), str::to_owned)));
+    // Only an exit code is the program's own failure: a signal is the kill above, or the pipe that was closed early
+    let failed_itself = status.code().is_some_and(|code| code != 0);
     match result {
-        Err(err) if status.success() || control.check().is_err() => Err(err),
-        // A program that failed explains a broken stream better than the tar reader does
-        Err(_) | Ok(()) if !status.success() => Err(io::Error::other(said.lines().last().map_or_else(|| tr("The program failed").to_owned(), str::to_owned))),
+        // A refused entry, a stop and the end of the time are the reason, however the program ended
+        Err(err) if is_outside(&err) || control.check().is_err() => Err(err),
+        // A program that failed by itself explains a broken stream better than the tar reader does
+        Err(_) if failed_itself => program_failed(),
+        Ok(()) if !status.success() => program_failed(),
         other => other,
     }
 }
@@ -2101,6 +2122,25 @@ pub(crate) mod tests {
         let before = names(&inside);
         assert!(extract_beside(&broken, &Control::unlimited()).is_err(), "a broken stream counts as unpacked");
         assert_eq!(names(&inside), before, "the half-unpacked folder is left");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    #[test]
+    fn a_refused_entry_is_the_reason_even_when_the_program_is_still_writing() {
+        if !have("xz") {
+            return;
+        }
+        // Far more data after the refused entry than a pipe holds: the program is surely still writing when the
+        // unpacking stops, and is killed
+        let (root, inside, outside) = evil_root("xz_refused_busy");
+        let mut tar = raw_tar(&[("../../outside/escape", 'f', "")]);
+        tar.extend(std::iter::repeat_n(0u8, 2 << 20));
+        let archive = archive_as(&inside, "busy.tar.xz", &tar).unwrap();
+        let err = extract_beside(&archive, &Control::unlimited()).unwrap_err();
+        assert!(is_outside(&err) && err.to_string().contains("outside the folder"), "{err}");
+        assert_eq!(names(&outside), ["secret"]);
+        assert_eq!(names(&inside), ["busy.tar.xz"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
