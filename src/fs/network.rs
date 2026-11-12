@@ -457,17 +457,8 @@ pub fn list_mounts() -> Vec<Mount> {
             found.push(Mount { name: label, address, local: entry.path(), kind: MountKind::Gvfs });
         }
     }
-    let helper = helper_root();
     let system = proc_mounts();
-    for (source, point, kind) in system.iter().cloned() {
-        if point.parent() == Some(helper.as_path()) {
-            let address = point.file_name().and_then(|id| read_record(&id.to_string_lossy()));
-            let name = address.as_ref().map(Address::name).unwrap_or_else(|| point.file_name().unwrap_or_default().to_string_lossy().into_owned());
-            found.push(Mount { name, address, local: point, kind: MountKind::Helper });
-        } else if let Some(address) = address_of_system_mount(&source, &kind) {
-            found.push(Mount { name: address.name(), address: Some(address), local: point, kind: MountKind::System });
-        }
-    }
+    found.extend(table_mounts(&system, &helper_root()));
     found.sort_by_key(|m| m.name.to_lowercase());
     if let Ok(mut roots) = REMOTE_ROOTS.write() {
         *roots = remote_roots(&found, &system);
@@ -477,6 +468,33 @@ pub fn list_mounts() -> Vec<Mount> {
     }
     LISTED.store(true, std::sync::atomic::Ordering::Relaxed);
     found
+}
+
+/// The servers of the mount table `system`: Compression's own mounts (in `helper`) and the system's (NFS, CIFS, sshfs,
+/// WebDAV), which carry an address. GVfs ones are not in it (they are found by their folder).
+fn table_mounts(system: &[(String, PathBuf, String)], helper: &Path) -> Vec<Mount> {
+    let mut found = Vec::new();
+    for (source, point, kind) in system.iter().cloned() {
+        if point.parent() == Some(helper) {
+            let address = point.file_name().and_then(|id| read_record(&id.to_string_lossy()));
+            let name = address.as_ref().map(Address::name).unwrap_or_else(|| point.file_name().unwrap_or_default().to_string_lossy().into_owned());
+            found.push(Mount { name, address, local: point, kind: MountKind::Helper });
+        } else if let Some(address) = address_of_system_mount(&source, &kind) {
+            found.push(Mount { name: address.name(), address: Some(address), local: point, kind: MountKind::System });
+        }
+    }
+    found
+}
+
+/// Learn where servers are mounted before the first listing is in: the listing runs on a thread, and until it has
+/// answered everything would count as local, so that a window opening on a folder of a server that does not answer
+/// would wait for it. The mount table is a file of the kernel that does not ask the mounts, so it is quick.
+pub fn prime_remote_roots() {
+    let system = proc_mounts();
+    let roots = remote_roots(&table_mounts(&system, &helper_root()), &system);
+    if let Ok(mut known) = REMOTE_ROOTS.write() {
+        *known = roots;
+    }
 }
 
 /// File system types that are other computers' storage and not otherwise known as servers (they have no address to show
@@ -2135,5 +2153,30 @@ mod tests {
         ];
         let roots = remote_roots(&[known, gvfs], &system);
         assert_eq!(roots, vec![PathBuf::from("/mnt/nas"), PathBuf::from("/mnt/cloud"), PathBuf::from("/mnt/s3"), PathBuf::from("/mnt/share")]);
+    }
+
+    #[test]
+    fn the_mount_table_alone_tells_which_folders_are_on_servers() {
+        let row = |source: &str, point: &str, kind: &str| (source.to_owned(), PathBuf::from(point), kind.to_owned());
+        let system = vec![
+            row("/dev/sda2", "/", "ext4"),
+            row("nas:/export/media", "/mnt/nfs", "nfs4"),
+            row("//host/share", "/mnt/smb", "cifs"),
+            row("me@host:/home/me", "/mnt/ssh", "fuse.sshfs"),
+            row("remote:", "/mnt/cloud", "fuse.rclone"),
+            row("gocryptfs", "/home/me/private", "fuse.gocryptfs"),
+            row("/dev/sdb1", "/media/stick", "vfat"),
+        ];
+        let roots = remote_roots(&table_mounts(&system, Path::new("/run/user/1000/compression-net")), &system);
+        for server in ["/mnt/nfs", "/mnt/smb", "/mnt/ssh", "/mnt/cloud"] {
+            assert!(roots.contains(&PathBuf::from(server)), "{server} is missing: {roots:?}");
+        }
+        for local in ["/", "/home/me/private", "/media/stick"] {
+            assert!(!roots.contains(&PathBuf::from(local)), "{local} is not a server: {roots:?}");
+        }
+        // Compression's own mounts count, found by where they are
+        let own = vec![row("me@host:/", "/run/user/1000/compression-net/sftp-me@host-1234", "fuse.sshfs")];
+        let roots = remote_roots(&table_mounts(&own, Path::new("/run/user/1000/compression-net")), &own);
+        assert_eq!(roots, vec![PathBuf::from("/run/user/1000/compression-net/sftp-me@host-1234")]);
     }
 }

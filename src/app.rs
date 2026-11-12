@@ -595,12 +595,15 @@ fn rename_error(err: &std::io::Error, new_name: &str) -> String {
 
 impl CompressionApp {
     pub fn new(initial_path: PathBuf, theme: SerpantinumTheme, settings: Settings, ctx: &egui::Context) -> Self {
+        // Before anything looks at a path: which ones are on servers (the listing that says so comes later)
+        network::prime_remote_roots();
         apps::preload();
         crate::ui::fonts::preload();
         // Ctrl+= / Ctrl+- resize icons (see `zoom_icons`), not the whole interface
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let places = Place::default_places();
-        let canonical_path = initial_path.canonicalize().unwrap_or(initial_path);
+        // A folder on a server is not asked about here (it may not answer): it is shown as it was given
+        let canonical_path = if network::is_remote(&initial_path) { initial_path } else { initial_path.canonicalize().unwrap_or(initial_path) };
 
         let mut settings = settings;
         let faded = { let mut t = theme; t.fade(settings.opacity); t };
@@ -7295,6 +7298,24 @@ mod tests {
         app.save_changed_settings();
         assert_eq!(SAVES.with(|n| n.get()), 1);
         FAIL_SAVE.with(|f| f.set(false));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_window_that_opens_on_a_server_does_not_ask_the_server_to_resolve_the_path_and_a_local_one_is_resolved() {
+        let base = std::env::temp_dir().join(format!("compression_start_remote_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (remote, local) = (base.join("remote"), base.join("local"));
+        std::fs::create_dir_all(remote.join("sub")).unwrap();
+        std::fs::create_dir_all(local.join("sub")).unwrap();
+        network::declare_remote_for_tests(&remote);
+        let ctx = egui::Context::default();
+        // A path with a detour: the one on a server is kept as it was given, the other is made plain
+        let (given_remote, given_local) = (remote.join("sub/.."), local.join("sub/.."));
+        let app = CompressionApp::new(given_remote.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        assert_eq!(app.current_path, given_remote);
+        let app = CompressionApp::new(given_local, SerpantinumTheme::default(), Settings::default(), &ctx);
+        assert_eq!(app.current_path, local.canonicalize().unwrap());
         let _ = std::fs::remove_dir_all(&base);
     }
 
