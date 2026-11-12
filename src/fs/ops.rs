@@ -888,14 +888,30 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> io::Result<()> {
             return Err(outside(&name));
         }
     }
+    // Deepest first, so that a folder's permissions never keep out what goes into it; its time is set after its own
+    // entry (the library sets the permissions of a folder, not its time), and making a folder below it does not change it
     folders.sort_by(|a, b| b.path_bytes().cmp(&a.path_bytes()));
     for mut folder in folders {
         let name = folder.path()?.into_owned();
+        let time = folder.header().mtime().ok();
         if !folder.unpack_in(&dest)? {
             return Err(outside(&name));
         }
+        if let Some(seconds) = time {
+            set_folder_time(&dest.join(plain(&name)), seconds);
+        }
     }
     Ok(())
+}
+
+/// Gives the folder at `path` the time `seconds` of its archive entry. A file system that keeps no such time (FAT keeps
+/// no folder times worth speaking of) or a folder that cannot be opened is no reason to fail the unpacking: the
+/// contents are all there, only the time is the time of unpacking.
+fn set_folder_time(path: &Path, seconds: u64) {
+    let time = std::time::UNIX_EPOCH + Duration::from_secs(seconds);
+    if let Err(err) = std::fs::File::open(path).and_then(|folder| folder.set_modified(time)) {
+        eprintln!("compression: the time of {} could not be set: {}", path.display(), crate::fs::describe::io_error(&err));
+    }
 }
 
 /// Every entry of a zip archive checked before anything is written: `enclosed_name` refuses absolute names and `..`,
@@ -2142,6 +2158,38 @@ pub(crate) mod tests {
         assert_eq!(names(&outside), ["secret"]);
         assert_eq!(names(&inside), ["busy.tar.xz"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    #[test]
+    fn folder_entries_of_an_archive_get_their_permissions_and_times() {
+        use std::os::unix::fs::PermissionsExt;
+        // A folder entry with its own mode and time, and a file in it that comes before the folder entry: the folder
+        // exists by then, and still takes the mode and time of its own entry (they are applied last)
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, kind, mode) in [("kept/a", tar::EntryType::Regular, 0o644), ("kept/", tar::EntryType::Directory, 0o750)] {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name).unwrap();
+            header.set_entry_type(kind);
+            header.set_mode(mode);
+            header.set_mtime(1_000_000_000);
+            let data: &[u8] = if kind == tar::EntryType::Regular { b"x" } else { b"" };
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            builder.append(&header, data).unwrap();
+        }
+        let tar = builder.into_inner().unwrap();
+        for format in ["folders.tar", "folders.tar.gz", "folders.tar.xz"] {
+            let (root, inside, _) = evil_root(&format!("folder_meta_{}", format.replace('.', "_")));
+            let Some(archive) = archive_as(&inside, format, &tar) else { continue };
+            let out = extract_beside(&archive, &Control::unlimited()).unwrap_or_else(|e| panic!("{format}: {e}"));
+            let meta = std::fs::metadata(out.join("kept")).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o750, "{format}: the folder's mode");
+            let mtime = meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            assert_eq!(mtime, 1_000_000_000, "{format}: the folder's time");
+            assert_eq!(std::fs::read_to_string(out.join("kept/a")).unwrap(), "x", "{format}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
 }
