@@ -125,15 +125,82 @@ fn backdrop<R>(ui: &mut egui::Ui, fill: egui::Color32, show: impl FnOnce(&mut eg
 }
 
 fn flat_rect(ui: &egui::Ui, rect: egui::Rect, fill: egui::Color32) -> egui::Shape {
+    let rect = crate::ui::material::snap(ui.painter(), rect);
+    // The corners of the window are rounded where this backdrop reaches them (see `window_rounding`)
+    let ctx = ui.ctx();
+    let (maximized, fullscreen) = ctx.input(|i| (i.viewport().maximized.unwrap_or(false), i.viewport().fullscreen.unwrap_or(false)));
+    let r = window_rounding(compositor_rounds_windows(), maximized, fullscreen, crate::ui::material::radius_window());
+    let corners = corners_at_window_edge(rect, ctx.content_rect(), r);
+    if corners != egui::CornerRadius::ZERO {
+        return egui::Shape::rect_filled(rect, corners, fill);
+    }
     let mut mesh = egui::Mesh::default();
-    mesh.add_colored_rect(crate::ui::material::snap(ui.painter(), rect), fill);
+    mesh.add_colored_rect(rect, fill);
     egui::Shape::mesh(mesh)
 }
+
+/// Whether the compositor rounds the corners of windows itself: Hyprland does (its `decoration:rounding`), so the window
+/// stays square there and the two roundings do not fight.
+fn compositor_rounds_windows() -> bool {
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|v| !v.is_empty())
+}
+
+/// How round the corners of the window are: `radius`, or square where the compositor rounds windows or the window fills
+/// the screen (maximized or fullscreen), as a window with its own decorations does.
+fn window_rounding(compositor_rounds: bool, maximized: bool, fullscreen: bool, radius: u8) -> u8 {
+    if compositor_rounds || maximized || fullscreen { 0 } else { radius }
+}
+
+/// The rounding of `rect` where its corners are the window's (`window`), `r` there and none elsewhere.
+fn corners_at_window_edge(rect: egui::Rect, window: egui::Rect, r: u8) -> egui::CornerRadius {
+    let near = |a: f32, b: f32| (a - b).abs() <= 0.5;
+    let (left, right, top, bottom) = (near(rect.left(), window.left()), near(rect.right(), window.right()), near(rect.top(), window.top()), near(rect.bottom(), window.bottom()));
+    let at = |yes: bool| if yes { r } else { 0 };
+    egui::CornerRadius { nw: at(left && top), ne: at(right && top), sw: at(left && bottom), se: at(right && bottom) }
+}
+
 
 /// Makes the empty part of a header around `rect` move the window, as a title bar would.
 pub(super) fn drag_area(ui: &egui::Ui, rect: egui::Rect, id: egui::Id) {
     let drag = ui.interact(rect, id, egui::Sense::click_and_drag());
     if drag.drag_started_by(egui::PointerButton::Primary) {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_window_is_round_at_its_own_corners_unless_the_compositor_rounds_it_or_it_fills_the_screen() {
+        assert_eq!(window_rounding(false, false, false, 12), 12);
+        assert_eq!(window_rounding(true, false, false, 12), 0, "Hyprland rounds windows itself");
+        assert_eq!(window_rounding(false, true, false, 12), 0, "maximized");
+        assert_eq!(window_rounding(false, false, true, 12), 0, "fullscreen");
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0));
+        // The sidebar: the left corners; the header beside it: the top right; the listing: the bottom right
+        let side = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 700.0));
+        assert_eq!(corners_at_window_edge(side, window, 12), egui::CornerRadius { nw: 12, ne: 0, sw: 12, se: 0 });
+        let header = egui::Rect::from_min_max(egui::pos2(200.0, 0.0), egui::pos2(1000.0, 50.0));
+        assert_eq!(corners_at_window_edge(header, window, 12), egui::CornerRadius { nw: 0, ne: 12, sw: 0, se: 0 });
+        let middle = egui::Rect::from_min_max(egui::pos2(200.0, 50.0), egui::pos2(1000.0, 700.0));
+        assert_eq!(corners_at_window_edge(middle, window, 12), egui::CornerRadius { nw: 0, ne: 0, sw: 0, se: 12 });
+        assert_eq!(corners_at_window_edge(middle, window, 0), egui::CornerRadius::ZERO);
+    }
+
+    #[test]
+    fn a_backdrop_at_a_corner_of_the_window_is_drawn_round_there() {
+        let ctx = egui::Context::default();
+        let size = egui::vec2(800.0, 600.0);
+        let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() }, |ui| {
+            let shape = flat_rect(ui, egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 600.0)), egui::Color32::RED);
+            match (compositor_rounds_windows(), shape) {
+                (false, egui::Shape::Rect(r)) => assert!(r.corner_radius.nw > 0 && r.corner_radius.sw > 0 && r.corner_radius.ne == 0),
+                (true, egui::Shape::Mesh(_)) => {}
+                (rounds, other) => panic!("compositor rounds {rounds}: {other:?}"),
+            }
+        });
+        out.textures_delta.clear();
     }
 }
