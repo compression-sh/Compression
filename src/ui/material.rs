@@ -505,10 +505,14 @@ pub fn paint_item_icon(painter: &egui::Painter, item: &FileItem, center: Pos2, s
 
 /// The type icon of a file as `style` draws it, whichever style is chosen.
 pub fn paint_item_icon_in(style: IconStyle, painter: &egui::Painter, item: &FileItem, center: Pos2, size: f32, (glyph, color): (&str, Color32), fade: f32) {
+    if item.is_dir && let Some(glyph) = crate::fs::places::folder_glyph(&item.path) {
+        return icon_style::paint_glyph(style, painter, center, glyph.encode_utf8(&mut [0; 4]), size, color.gamma_multiply(fade));
+    }
+    // The desktop's icon theme, where it has an icon for this; the classic drawing where it has none
+    if style == IconStyle::System && super::system_icons::paint(painter, &super::system_icons::names_for(item.is_dir, &item.name), center, size * 1.2, fade) {
+        return;
+    }
     if item.is_dir {
-        if let Some(glyph) = crate::fs::places::folder_glyph(&item.path) {
-            return icon_style::paint_glyph(style, painter, center, glyph.encode_utf8(&mut [0; 4]), size, color.gamma_multiply(fade));
-        }
         return icon_style::paint_folder(style, painter, center, size, color.gamma_multiply(fade));
     }
     let office = office_kind(&item.name).filter(|_| style == IconStyle::Classic);

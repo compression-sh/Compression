@@ -30,10 +30,13 @@ pub enum IconStyle {
     Clay,
     /// Folded paper: flat facets and creases.
     Origami,
+    /// Folders and file types from the icon theme the desktop has installed (see `system_icons`); what it lacks, and
+    /// the glyphs of the interface, as in Classic.
+    System,
 }
 
 impl IconStyle {
-    pub const ALL: [IconStyle; 8] = [
+    pub const ALL: [IconStyle; 9] = [
         IconStyle::Classic,
         IconStyle::Halloween,
         IconStyle::Winter,
@@ -42,6 +45,7 @@ impl IconStyle {
         IconStyle::Glossy,
         IconStyle::Clay,
         IconStyle::Origami,
+        IconStyle::System,
     ];
 
     pub fn label(self) -> &'static str {
@@ -54,6 +58,7 @@ impl IconStyle {
             IconStyle::Glossy => tr("Glossy"),
             IconStyle::Clay => tr("Clay"),
             IconStyle::Origami => tr("Origami"),
+            IconStyle::System => tr("System"),
         }
     }
 }
@@ -91,7 +96,7 @@ pub fn paint_glyph(style: IconStyle, painter: &egui::Painter, center: Pos2, glyp
 /// The type icon of a file, from its glyph.
 pub fn paint_file(style: IconStyle, painter: &egui::Painter, center: Pos2, glyph: &str, size: f32, color: Color32) {
     match style {
-        IconStyle::Classic => plain(painter, center, glyph, size, color),
+        IconStyle::Classic | IconStyle::System => plain(painter, center, glyph, size, color),
         IconStyle::Halloween if glyph == icons::SYMLINK => ghost(painter, center, size, color),
         IconStyle::Halloween => tombstone(painter, center, glyph, size, color),
         IconStyle::Winter => winter_file(painter, center, glyph, size, color),
@@ -114,7 +119,7 @@ pub fn paint_file(style: IconStyle, painter: &egui::Painter, center: Pos2, glyph
 
 pub fn paint_folder(style: IconStyle, painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     match style {
-        IconStyle::Classic => classic_folder(painter, center, size, color),
+        IconStyle::Classic | IconStyle::System => classic_folder(painter, center, size, color),
         IconStyle::Halloween => halloween_folder(painter, center, size, color),
         IconStyle::Winter => winter_folder(painter, center, size, color),
         IconStyle::Pixel => pixel_folder(painter, center, size, color),
