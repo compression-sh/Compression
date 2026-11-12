@@ -335,8 +335,15 @@ mod tests {
         }
     }
 
+    /// A window on `dir` whose first listing has arrived. The window waits only a moment for it and reads on in the
+    /// background (`open_listing`); a change made before it arrives would come in with that read, not from the monitor.
     fn app_in(dir: &Path, ctx: &egui::Context) -> CompressionApp {
-        CompressionApp::new(dir.to_path_buf(), SerpantinumTheme::default(), Settings::default(), ctx)
+        let mut app = CompressionApp::new(dir.to_path_buf(), SerpantinumTheme::default(), Settings::default(), ctx);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.take_reload(Duration::from_millis(50)) {
+            assert!(Instant::now() < deadline, "the first listing of {dir:?} never came");
+        }
+        app
     }
 
     fn names(app: &CompressionApp) -> Vec<String> {
@@ -392,10 +399,12 @@ mod tests {
         std::fs::write(dir.0.join("one.txt"), "x").unwrap();
         // The first frame that sees the event only collects it
         assert!(pump(&mut app, &ctx, |x| !x.watching.pending.is_empty()), "no event arrived");
+        let seen = Instant::now();
         assert!(names(&app).is_empty(), "applied before it went quiet: {:?}", names(&app));
-        std::thread::sleep(QUIET + Duration::from_millis(20));
-        app.poll_watch(&ctx);
-        assert_eq!(names(&app), ["one.txt"]);
+        // More events of the same write may still come (a busy machine delays them) and put the moment off: whenever it
+        // comes, it is not before things went quiet for QUIET
+        assert!(pump(&mut app, &ctx, |x| names(x) == ["one.txt"]), "{:?}", names(&app));
+        assert!(seen.elapsed() >= QUIET, "applied {:?} after the first event", seen.elapsed());
         assert!(app.watching.pending.is_empty() && app.watching.first.is_none() && app.watching.last.is_none(), "the batch is cleared");
     }
 
