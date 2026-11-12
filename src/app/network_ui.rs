@@ -16,18 +16,28 @@ pub(crate) enum OpenIn {
     NewWindow,
 }
 
+/// Where the windows were before `leave_mount` took them out of a mount, to bring them back when the server
+/// could not be let go of.
+#[derive(Clone, Default)]
+pub(super) struct Left {
+    /// The folder of the tab on screen, when it was inside the mount.
+    current: Option<PathBuf>,
+    /// The parked tabs that were inside it: `(tab id, folder)`.
+    tabs: Vec<(u64, PathBuf)>,
+}
+
 pub(super) enum NetMsg {
     Listed(Vec<Mount>),
     Ask { id: u64, prompt: Prompt },
     Done { id: u64, result: Result<PathBuf, Option<String>> },
-    Gone { local: PathBuf, name: String, result: Result<(), String> },
+    Gone { local: PathBuf, name: String, left: Left, result: Result<(), String> },
     Forgot { name: String, result: Result<(), String> },
     /// A mount that was let go of to be connected again.
     /// A server's folder was asked about: `local` is it when it is there.
     Checked { id: u64, local: Option<PathBuf>, is_dir: bool, next: Next },
     /// An item on a server was renamed (or not): `path` is the old path.
     Renamed { path: PathBuf, target: PathBuf, new_name: String, result: Result<(), String> },
-    Reconnect { local: PathBuf, name: String, address: Address, back: Option<PathBuf>, tabs: Vec<(u64, PathBuf)>, result: Result<(), String> },
+    Reconnect { local: PathBuf, name: String, address: Address, back: Option<PathBuf>, tabs: Vec<(u64, PathBuf)>, left: Left, result: Result<(), String> },
 }
 
 /// A connection on its way.
@@ -54,7 +64,7 @@ struct Pending {
 type Renamer = Arc<dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync>;
 
 pub(super) struct NetState {
-    tx: mpsc::Sender<NetMsg>,
+    pub(super) tx: mpsc::Sender<NetMsg>,
     rx: mpsc::Receiver<NetMsg>,
     pub(super) servers: Servers,
     /// Why the saved servers started empty, until the window has said so.
@@ -73,7 +83,7 @@ pub(super) struct NetState {
     listing: bool,
     last: Instant,
     /// Mount folders being disconnected.
-    leaving: HashSet<PathBuf>,
+    pub(super) leaving: HashSet<PathBuf>,
     /// Whether the connected servers still answer.
     probes: Probes,
     /// Logins and questions of connections that wait for the window to have room for them: no dialog is shown over
@@ -502,7 +512,7 @@ impl CompressionApp {
                 NetMsg::Ask { id, prompt } => self.show_prompt(id, prompt),
                 NetMsg::Done { id, result } => self.connected(ctx, id, result),
                 NetMsg::Checked { id, local, is_dir, next } => self.checked(ctx, id, local, is_dir, next),
-                NetMsg::Gone { local, name, result } => {
+                NetMsg::Gone { local, name, left, result } => {
                     self.net.leaving.remove(&local);
                     match result {
                         Ok(()) => {
@@ -511,16 +521,23 @@ impl CompressionApp {
                             }
                             self.set_toast(trf("Disconnected from “{}”", &[&name]));
                         }
-                        Err(err) => self.set_toast(trf("Could not disconnect “{}”: {}", &[&name, &err])),
+                        Err(err) => {
+                            // The server is still there: the windows go back to it
+                            self.bring_back(left);
+                            self.set_toast(trf("Could not disconnect “{}”: {}", &[&name, &err]));
+                        }
                     }
                     self.request_network_listing(ctx, true);
                 }
-                NetMsg::Reconnect { local, name, address, back, tabs, result } => {
+                NetMsg::Reconnect { local, name, address, back, tabs, left, result } => {
                     self.net.leaving.remove(&local);
                     self.request_network_listing(ctx, true);
                     match result {
                         Ok(()) => self.open_address_back(address, back, tabs),
-                        Err(err) => self.set_toast(trf("Could not disconnect “{}”: {}", &[&name, &err])),
+                        Err(err) => {
+                            self.bring_back(left);
+                            self.set_toast(trf("Could not disconnect “{}”: {}", &[&name, &err]));
+                        }
                     }
                 }
                 NetMsg::Renamed { path, target, new_name, result } => match result {
@@ -924,12 +941,12 @@ impl CompressionApp {
         if !self.net.leaving.insert(mount.local.clone()) {
             return;
         }
-        // Nothing may hold the folder open: leave it first
-        self.leave_mount(&mount.local);
+        // Nothing may hold the folder open: leave it first (and come back if it cannot be let go of)
+        let left = self.leave_mount_remembering(&mount.local);
         let (tx, ctx) = (self.net.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let result = network::disconnect(&mount);
-            let _ = tx.send(NetMsg::Gone { local: mount.local.clone(), name: mount.name.clone(), result });
+            let _ = tx.send(NetMsg::Gone { local: mount.local.clone(), name: mount.name.clone(), left, result });
             ctx.request_repaint();
         });
     }
@@ -949,11 +966,11 @@ impl CompressionApp {
         let back = self.current_path.strip_prefix(&mount.local).ok().filter(|inside| !inside.as_os_str().is_empty()).map(Path::to_path_buf);
         // ... and the tabs parked in it to theirs
         let tabs = self.parked_in(&mount.local);
-        self.leave_mount(&mount.local);
+        let left = self.leave_mount_remembering(&mount.local);
         let (tx, ctx) = (self.net.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let result = network::disconnect(&mount);
-            let _ = tx.send(NetMsg::Reconnect { local: mount.local.clone(), name: mount.name.clone(), address, back, tabs, result });
+            let _ = tx.send(NetMsg::Reconnect { local: mount.local.clone(), name: mount.name.clone(), address, back, tabs, left, result });
             ctx.request_repaint();
         });
     }
@@ -961,6 +978,33 @@ impl CompressionApp {
     /// The parked tabs that are in the mount: `(tab id, folder below its top)`.
     fn parked_in(&self, local: &Path) -> Vec<(u64, PathBuf)> {
         self.tabs.iter().filter_map(|slot| Some((slot.id, slot.saved.as_ref()?.folder().strip_prefix(local).ok()?.to_path_buf()))).collect()
+    }
+
+    /// `leave_mount`, noting where the windows were so that `bring_back` can return them.
+    pub(super) fn leave_mount_remembering(&mut self, local: &Path) -> Left {
+        let left = Left {
+            current: self.current_path.starts_with(local).then(|| self.current_path.clone()),
+            tabs: self.tabs.iter().filter_map(|slot| slot.saved.as_ref().filter(|state| state.is_inside(local)).map(|state| (slot.id, state.folder().to_path_buf()))).collect(),
+        };
+        self.leave_mount(local);
+        left
+    }
+
+    /// The mount could not be let go of and is still there: the windows `leave_mount` moved go back into it. A window
+    /// the person has used since (it is no longer where it was put) stays where it is.
+    fn bring_back(&mut self, left: Left) {
+        let home = home_folder();
+        if let Some(folder) = left.current
+            && self.current_path == home
+            && self.back_history.last() == Some(&folder)
+        {
+            self.go_back();
+        }
+        for (id, folder) in left.tabs {
+            if let Some(state) = self.tabs.iter_mut().find(|slot| slot.id == id).and_then(|slot| slot.saved.as_mut()).filter(|state| state.folder() == home) {
+                state.set_folder(folder);
+            }
+        }
     }
 
     /// Take every tab out of the folders of the mount, which is about to be let go of: the one on screen

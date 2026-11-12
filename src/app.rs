@@ -8226,6 +8226,68 @@ mod tests {
     }
 
     #[test]
+    fn the_windows_go_back_into_a_mount_that_could_not_be_let_go_of_but_not_when_it_was_and_not_when_they_moved_on() {
+        use crate::fs::network::MountKind::Helper;
+        use super::network_ui::NetMsg;
+        let work = window_dir("leave_and_back");
+        let mount = server_for_reconnect(&work, "box", Helper, true);
+        let (a, b, other) = (mount.local.join("a"), mount.local.join("b"), work.join("other"));
+        for dir in [&a, &b, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let home = dirs::home_dir().unwrap();
+        let mut w = Window::new(other.clone());
+        let ctx = w.ctx.clone();
+        w.app.new_tab(a.clone());
+        w.app.new_tab(other.clone());
+        w.app.new_tab(b.clone());
+        w.run(Vec::new(), 20);
+        let before = w.app.session().0;
+        assert_eq!(before, vec![other.clone(), a.clone(), other.clone(), b.clone()]);
+
+        // The mount is let go of: every window leaves it
+        let left = w.app.leave_mount_remembering(&mount.local);
+        assert_eq!(w.app.session().0, vec![other.clone(), home.clone(), other.clone(), home.clone()]);
+        // ... it could not be: they come back, on screen and parked
+        w.app.net.leaving.insert(mount.local.clone());
+        w.app.net.tx.send(NetMsg::Gone { local: mount.local.clone(), name: "box".into(), left: left.clone(), result: Err("busy".into()) }).unwrap();
+        w.app.poll_network(&ctx);
+        assert_eq!(w.app.session().0, before);
+        assert!(w.app.status_toast.as_ref().is_some_and(|t| t.message.starts_with("Could not disconnect “box”")));
+
+        // ... it was: they stay where they were put
+        let left = w.app.leave_mount_remembering(&mount.local);
+        w.app.net.tx.send(NetMsg::Gone { local: mount.local.clone(), name: "box".into(), left, result: Ok(()) }).unwrap();
+        w.app.poll_network(&ctx);
+        assert_eq!(w.app.session().0, vec![other.clone(), home.clone(), other.clone(), home.clone()]);
+
+        // A window the person has moved on in meanwhile stays where it is
+        let mut w = Window::new(other.clone());
+        let ctx = w.ctx.clone();
+        w.app.new_tab(b.clone());
+        w.run(Vec::new(), 20);
+        let left = w.app.leave_mount_remembering(&mount.local);
+        w.app.navigate_to(other.clone());
+        w.run(Vec::new(), 10);
+        w.app.net.tx.send(NetMsg::Gone { local: mount.local.clone(), name: "box".into(), left, result: Err("busy".into()) }).unwrap();
+        w.app.poll_network(&ctx);
+        assert_eq!(w.app.session().0.last(), Some(&other));
+
+        // The same for a reconnect that failed
+        let mut w = Window::new(other.clone());
+        let ctx = w.ctx.clone();
+        w.app.new_tab(b.clone());
+        w.run(Vec::new(), 20);
+        let left = w.app.leave_mount_remembering(&mount.local);
+        assert_eq!(w.app.session().0.last(), Some(&home));
+        let address = mount.address.clone().unwrap();
+        w.app.net.tx.send(NetMsg::Reconnect { local: mount.local.clone(), name: "box".into(), address, back: None, tabs: Vec::new(), left, result: Err("busy".into()) }).unwrap();
+        w.app.poll_network(&ctx);
+        assert_eq!(w.app.session().0.last(), Some(&b));
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
     fn disconnecting_and_reconnecting_both_take_the_tabs_out_of_the_mount_first() {
         use crate::fs::network::MountKind::Helper;
         for reconnect in [false, true] {
