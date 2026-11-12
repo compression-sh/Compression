@@ -274,11 +274,19 @@ pub fn problem(entries: &[Entry], names: &[String]) -> Option<String> {
     let renamed: HashSet<&Path> = entries.iter().map(|e| e.path.as_path()).collect();
     for (entry, new) in entries.iter().zip(names) {
         let target = entry.path.with_file_name(new);
-        if target != entry.path && target.symlink_metadata().is_ok() && !renamed.contains(target.as_path()) {
+        if target != entry.path && target.symlink_metadata().is_ok() && !renamed.contains(target.as_path()) && !same_file_in_other_case(&entry.path, &target) {
             return Some(trf("“{}” already exists", &[&new]));
         }
     }
     None
+}
+
+/// Whether `target` is `path` itself, spelled in another case, on a file system that does not tell case apart: the same
+/// file (device and inode) under a name that only differs in case. Renaming to it is a change of case, not a clash.
+fn same_file_in_other_case(path: &Path, target: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let same_name = matches!((path.file_name(), target.file_name()), (Some(a), Some(b)) if a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase());
+    same_name && matches!((path.symlink_metadata(), target.symlink_metadata()), (Ok(a), Ok(b)) if (a.dev(), a.ino()) == (b.dev(), b.ino()))
 }
 
 /// An item to rename: where it is, and the path it is to get.
@@ -749,5 +757,26 @@ mod tests {
         assert_eq!(applied.done.len(), 3);
         assert_eq!(seen.into_inner(), vec![(1, 3), (2, 3), (3, 3)]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_change_of_case_is_no_clash_and_is_applied_on_a_file_system_that_does_not_tell_case_apart() {
+        crate::compat::tests::in_casefold_folder(concat!(module_path!(), "::a_change_of_case_is_no_clash_and_is_applied_on_a_file_system_that_does_not_tell_case_apart"), |dir| {
+            for n in ["IMG_0001.JPG", "IMG_0002.JPG", "img_0003.jpg"] {
+                std::fs::write(dir.join(n), n).unwrap();
+            }
+            let entries: Vec<Entry> = ["IMG_0001.JPG", "IMG_0002.JPG"].iter().map(|n| Entry { path: dir.join(n), is_dir: false, date: String::new() }).collect();
+            let names = vec!["IMG_0001.jpg".to_owned(), "IMG_0002.jpg".to_owned()];
+            assert_eq!(problem(&entries, &names), None, "the same file in another case is not a name that is taken");
+            let (done, error) = apply(&entries, &names);
+            assert_eq!((done.len(), error), (2, None));
+            let mut now: Vec<String> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            now.sort();
+            assert_eq!(now, ["IMG_0001.jpg", "IMG_0002.jpg", "img_0003.jpg"]);
+            assert_eq!(std::fs::read_to_string(dir.join("IMG_0001.jpg")).unwrap(), "IMG_0001.JPG");
+            // Another file that only differs in case is still a clash
+            let other = vec![Entry { path: dir.join("IMG_0001.jpg"), is_dir: false, date: String::new() }];
+            assert!(problem(&other, &["IMG_0003.JPG".to_owned()]).is_some());
+        });
     }
 }

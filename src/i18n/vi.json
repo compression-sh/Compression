@@ -934,6 +934,7 @@
   "The archive could not be listed": "Không thể liệt kê nội dung tệp nén",
   "“{}” could not get its name back and is now called “{}”": "“{}” không lấy lại được tên cũ và giờ có tên “{}”",
   "The settings could not be saved when Compression was last closed: {}": "Không lưu được cài đặt khi Compression đóng lần trước: {}",
+  "Could not rename: the item is kept as “{}”": "Không đổi tên được: mục được giữ lại với tên “{}”",
   "The settings file could not be read ({}). It was kept as “{}”, and the default settings are used.": "Không đọc được tệp cài đặt ({}). Tệp đã được giữ lại thành “{}”, và cài đặt mặc định đang được dùng.",
   "it has an error": "tệp có lỗi",
   "The settings file could not be read, and could not be kept aside: {}": "Không đọc được tệp cài đặt và cũng không thể để riêng nó ra: {}",

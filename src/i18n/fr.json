@@ -934,6 +934,7 @@
   "The archive could not be listed": "Le contenu de l’archive n’a pas pu être listé",
   "“{}” could not get its name back and is now called “{}”": "« {} » n’a pas pu reprendre son nom et s’appelle maintenant « {} »",
   "The settings could not be saved when Compression was last closed: {}": "Les réglages n’ont pas pu être enregistrés à la dernière fermeture de Compression : {}",
+  "Could not rename: the item is kept as “{}”": "Impossible de renommer : l’élément est conservé sous « {} »",
   "The settings file could not be read ({}). It was kept as “{}”, and the default settings are used.": "Le fichier des réglages n’a pas pu être lu ({}). Il a été conservé sous « {} », et les réglages par défaut sont utilisés.",
   "it has an error": "il contient une erreur",
   "The settings file could not be read, and could not be kept aside: {}": "Le fichier des réglages n’a pas pu être lu ni mis de côté : {}",

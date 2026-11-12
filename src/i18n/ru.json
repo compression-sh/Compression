@@ -934,6 +934,7 @@
   "The archive could not be listed": "Не удалось получить список содержимого архива",
   "“{}” could not get its name back and is now called “{}”": "«{}» не удалось вернуть прежнее имя, теперь он называется «{}»",
   "The settings could not be saved when Compression was last closed: {}": "Не удалось сохранить настройки при последнем закрытии Compression: {}",
+  "Could not rename: the item is kept as “{}”": "Не удалось переименовать: элемент сохранён как «{}»",
   "The settings file could not be read ({}). It was kept as “{}”, and the default settings are used.": "Не удалось прочитать файл настроек ({}). Он сохранён как «{}», используются настройки по умолчанию.",
   "it has an error": "в нём ошибка",
   "The settings file could not be read, and could not be kept aside: {}": "Не удалось прочитать файл настроек и отложить его в сторону: {}",

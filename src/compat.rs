@@ -71,7 +71,47 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 ///
 /// The kernel does this in one step (`renameat2` with `RENAME_NOREPLACE`). A file system that cannot (the kernel says
 /// ENOSYS, EINVAL or EOPNOTSUPP) is refused, see `without_noreplace`.
+///
+/// A name that differs from the old one only in case, on a file system that does not tell case apart (FAT, exFAT, a
+/// casefolded folder), is the same entry to the kernel, which answers EEXIST. Such a rename goes by a name of its own in
+/// between, see `rename_by_own_name`.
 pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    match rename_noreplace_once(from, to) {
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists && same_entry_in_same_folder(from, to) => rename_by_own_name(from, to, err),
+        other => other,
+    }
+}
+
+/// Whether `to` is the very entry `from` under another spelling: the same folder, the same file (device and inode),
+/// another name. On a file system that tells case apart this is a hard link; `rename_by_own_name` then finds the name
+/// still taken and changes nothing.
+fn same_entry_in_same_folder(from: &Path, to: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    from != to
+        && from.parent() == to.parent()
+        && matches!((from.symlink_metadata(), to.symlink_metadata()), (Ok(a), Ok(b)) if (a.dev(), a.ino()) == (b.dev(), b.ino()))
+}
+
+/// Renames `from` to `to` by a name of its own in between: `from` steps aside, then takes `to`. When `to` is still taken
+/// after that (a hard link, or something made meanwhile) it is not replaced: `from` gets its old name back and `taken`,
+/// the first answer, is the error. A hard stop in between leaves a `.compression-rename-*` entry that holds the item.
+fn rename_by_own_name(from: &Path, to: &Path, taken: io::Error) -> io::Result<()> {
+    let aside = (0..100u32)
+        .map(|n| from.with_file_name(format!(".compression-rename-{}-case-{n}", std::process::id())))
+        .find(|p| p.symlink_metadata().is_err())
+        .ok_or(taken)?;
+    rename_noreplace_once(from, &aside)?;
+    match rename_noreplace_once(&aside, to) {
+        Ok(()) => Ok(()),
+        Err(err) => match rename_noreplace_once(&aside, from) {
+            Ok(()) => Err(err),
+            Err(_) => Err(io::Error::other(crate::i18n::trf("Could not rename: the item is kept as “{}”", &[&aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()]))),
+        },
+    }
+}
+
+/// One `renameat2(RENAME_NOREPLACE)`, or the refusal of `without_noreplace` where the file system cannot do it.
+fn rename_noreplace_once(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(test)]
     if tests::forced(from, to) {
         return without_noreplace(from, to, io::Error::from_raw_os_error(libc::EINVAL));
@@ -234,6 +274,72 @@ pub(crate) mod tests {
         rename_noreplace(&dir.join("a"), &dir.join("c")).unwrap();
         assert_eq!(dir.join("c").metadata().unwrap().ino(), ino);
         assert_eq!(rename_noreplace(&dir.join("c"), &dir.join("b")).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs `check` in a folder that does not tell case apart, the way FAT or exFAT do not: a casefolded tmpfs, mounted
+    /// in a user namespace of its own over `/tmp`, so nothing of it is left afterwards. The test binary runs only `test`
+    /// once more in there (`COMPRESSION_CASEFOLD_DIR` says where). Where the system allows no user namespaces or has no
+    /// casefolded tmpfs, the test says so on stderr and checks nothing.
+    pub(crate) fn in_casefold_folder(test: &str, check: impl FnOnce(&Path)) {
+        if let Some(dir) = std::env::var_os("COMPRESSION_CASEFOLD_DIR") {
+            check(Path::new(&dir));
+            return;
+        }
+        const MOUNT: &str = "mount -t tmpfs -o casefold=utf8-12.1.0 none /tmp && mkdir /tmp/f && chattr +F /tmp/f";
+        let probe = std::process::Command::new("unshare").args(["-rm", "sh", "-c", MOUNT]).output();
+        if !probe.as_ref().is_ok_and(|o| o.status.success()) {
+            eprintln!("{test}: no casefolded folder can be made here, nothing checked ({probe:?})");
+            return;
+        }
+        let name = test.split_once("::").map_or(test, |(_, rest)| rest);
+        let script = format!("{MOUNT} && COMPRESSION_CASEFOLD_DIR=/tmp/f exec \"$0\" --exact \"$1\" --nocapture --test-threads 1");
+        let out = std::process::Command::new("unshare")
+            .args(["-rm", "sh", "-c", &script])
+            .arg(std::env::current_exe().unwrap())
+            .arg(name)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && text.contains("1 passed"), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_change_of_case_renames_on_a_file_system_that_does_not_tell_case_apart() {
+        in_casefold_folder(concat!(module_path!(), "::a_change_of_case_renames_on_a_file_system_that_does_not_tell_case_apart"), |dir| {
+            std::fs::write(dir.join("a.txt"), "content").unwrap();
+            std::fs::create_dir(dir.join("Docs")).unwrap();
+            std::fs::write(dir.join("Docs/inside"), "x").unwrap();
+            std::fs::write(dir.join("b.txt"), "other").unwrap();
+            // The kernel itself refuses: to it the new name is the old entry
+            assert!(dir.join("A.TXT").exists(), "the folder does tell case apart");
+            rename_noreplace(&dir.join("a.txt"), &dir.join("A.txt")).unwrap();
+            rename_noreplace(&dir.join("Docs"), &dir.join("docs")).unwrap();
+            assert_eq!(names_in(dir), ["A.txt", "b.txt", "docs"]);
+            assert_eq!(std::fs::read_to_string(dir.join("A.txt")).unwrap(), "content");
+            assert_eq!(std::fs::read_to_string(dir.join("docs/inside")).unwrap(), "x");
+            // Another file under the name is still a name that is taken, and nothing changes
+            assert_eq!(rename_noreplace(&dir.join("A.txt"), &dir.join("B.TXT")).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(names_in(dir), ["A.txt", "b.txt", "docs"]);
+            assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "other");
+        });
+    }
+
+    #[test]
+    fn a_hard_link_under_another_name_stays_a_taken_name_and_nothing_changes() {
+        let dir = std::env::temp_dir().join(format!("compression_compat_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "1").unwrap();
+        std::fs::hard_link(dir.join("a"), dir.join("A")).unwrap();
+        assert_eq!(rename_noreplace(&dir.join("a"), &dir.join("A")).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(names_in(&dir), ["A", "a"], "both names are where they were, and nothing is left aside");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
