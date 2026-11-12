@@ -1479,8 +1479,9 @@ pub fn menu_item(
         label_room -= galley.size().x + 12.0;
         ui.painter().galley(Pos2::new(rect.right() - 16.0 - galley.size().x, rect.center().y - galley.size().y / 2.0), galley, theme.subtext1);
     }
-    paint_label(ui, rect.left() + INSET_LABEL, rect.center().y, label, FONT_BODY, color, label_room);
-    response
+    let shortened = paint_label(ui, rect.left() + INSET_LABEL, rect.center().y, label, FONT_BODY, color, label_room);
+    // A label that still does not fit (the menu is as wide as the window) is whole in the tooltip
+    if shortened { response.on_hover_text(label) } else { response }
 }
 
 /// Menu entry that opens more entries to its side; `open` keeps it lit while its flyout is showing.

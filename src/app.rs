@@ -5161,6 +5161,23 @@ impl CompressionApp {
         crate::keymap::hint(&self.settings.keybinds, act, self.settings.vim_keys)
     }
 
+    /// The width of the menu: `MENU_WIDTH`, or more when an entry (its label and its shortcut) needs it,
+    /// as with a wider font or a longer translation; never wider than the window.
+    fn menu_width(&self, ctx: &egui::Context, groups: &[Vec<MenuEntry>]) -> f32 {
+        let (body, caption) = (egui::FontId::proportional(material::FONT_BODY), egui::FontId::proportional(material::FONT_CAPTION));
+        let measure = |text: &str, font: &egui::FontId| ctx.fonts_mut(|fonts| fonts.layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE).size().x);
+        let widest = groups
+            .iter()
+            .flatten()
+            .map(|(_, label, action)| {
+                let hint = self.menu_hint(action).map_or(0.0, |hint| measure(&hint, &caption) + 12.0);
+                // What `menu_item` leaves for the label, plus the margin of the menu's frame
+                material::INSET_LABEL + 14.0 + measure(label, &body) + hint + 16.0 + 2.0
+            })
+            .fold(0.0, f32::max);
+        widest.max(MENU_WIDTH).min((ctx.content_rect().width() - 16.0).max(MENU_WIDTH.min(240.0)))
+    }
+
     fn render_menu(&mut self, ctx: &egui::Context) {
         if let Some(menu) = self.menu.as_mut()
             && let Some(Ok(label)) = menu.label_rx.as_ref().map(|rx| rx.try_recv()) {
@@ -5172,22 +5189,23 @@ impl CompressionApp {
         let t = material::animate(ctx, egui::Id::unique("context_menu_anim"), self.menu.is_some());
         let live = self.menu.as_ref().map(|m| (m.pos, m.target.clone(), m.open_label.clone()));
         let interactive = live.is_some();
-        let (origin, groups, open_label) = if let Some((pos, target, open_label)) = live {
+        let (origin, groups, open_label, menu_width) = if let Some((pos, target, open_label)) = live {
             let mut groups = self.menu_entries(&target);
             groups.retain(|g| !g.is_empty());
+            let menu_width = self.menu_width(ctx, &groups);
             let count: usize = groups.iter().map(Vec::len).sum();
             let dividers = groups.len().saturating_sub(1);
             let gaps = (count + dividers).saturating_sub(1);
             let screen = ctx.content_rect();
             let height = (count as f32 * material::ENTRY_HEIGHT + dividers as f32 * 9.0 + gaps as f32 * 2.0 + 16.0).min(screen.height() - 16.0);
             let origin = egui::pos2(
-                pos.x.min(screen.right() - MENU_WIDTH - 8.0).max(8.0),
+                pos.x.min(screen.right() - menu_width - 8.0).max(8.0),
                 pos.y.min(screen.bottom() - height - 8.0).max(8.0),
             );
             self.menu_ghost = Some(MenuGhost { origin, groups: groups.clone(), open_label: open_label.clone() });
-            (origin, groups, open_label)
+            (origin, groups, open_label, menu_width)
         } else if let Some(ghost) = self.menu_ghost.as_ref().filter(|_| t > 0.0) {
-            (ghost.origin, ghost.groups.clone(), ghost.open_label.clone())
+            (ghost.origin, ghost.groups.clone(), ghost.open_label.clone(), self.menu_width(ctx, &ghost.groups))
         } else {
             self.menu_ghost = None;
             return;
@@ -5211,7 +5229,7 @@ impl CompressionApp {
                     .shadow(ctx.global_style().visuals.window_shadow)
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
-                        ui.set_width(MENU_WIDTH - 16.0);
+                        ui.set_width(menu_width - 16.0);
                         ui.spacing_mut().item_spacing.y = 2.0;
                         // Fits the entries, or the window when they don't, then scrolls; the
                         // minimum keeps the area from staying at the size it had last frame
@@ -5282,8 +5300,9 @@ impl CompressionApp {
             if let Some(row_top) = row_top {
                 let screen = ctx.content_rect();
                 let height = (entries.len() as f32 * material::ENTRY_HEIGHT + (entries.len() as f32 - 1.0) * 2.0 + 16.0).min(screen.height() - 16.0);
+                let fly_width = self.menu_width(ctx, std::slice::from_ref(entries));
                 let right_x = rect.right() + 2.0;
-                let x = if right_x + MENU_WIDTH <= screen.right() - 8.0 { right_x } else { (rect.left() - 2.0 - MENU_WIDTH).max(8.0) };
+                let x = if right_x + fly_width <= screen.right() - 8.0 { right_x } else { (rect.left() - 2.0 - fly_width).max(8.0) };
                 let y = (row_top - 8.0).min(screen.bottom() - height - 8.0).max(8.0);
                 let hints: Vec<Option<String>> = entries.iter().map(|(_, _, a)| self.menu_hint(a)).collect();
                 let fly = egui::Area::new(egui::Id::unique("context_submenu").with(g).with(idx))
@@ -5296,7 +5315,7 @@ impl CompressionApp {
                             .shadow(ctx.global_style().visuals.window_shadow)
                             .inner_margin(egui::Margin::same(8))
                             .show(ui, |ui| {
-                                ui.set_width(MENU_WIDTH - 16.0);
+                                ui.set_width(fly_width - 16.0);
                                 ui.spacing_mut().item_spacing.y = 2.0;
                                 egui::ScrollArea::vertical().max_height(screen.height() - 32.0).min_scrolled_height(screen.height() - 32.0).auto_shrink([false, true]).show(ui, |ui| {
                                     for (i, (icon, label, action)) in entries.iter().enumerate() {
@@ -7596,6 +7615,36 @@ mod tests {
             w.run(vec![egui::Event::PointerMoved(short_at)], 40);
             assert_eq!(count(&w, "short.txt"), before_short, "{mode:?}: a tooltip for a name that fits: {:?}", w.last);
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_menu_is_as_wide_as_its_widest_entry_needs_but_never_beyond_the_window() {
+        let root = window_dir("menuwidth");
+        let w = Window::new(root.clone());
+        let ctx = w.ctx.clone();
+        // The usual entries fit the usual width
+        let main = w.app.menu_entries(&MenuTarget::Main);
+        assert_eq!(w.app.menu_width(&ctx, &main), MENU_WIDTH);
+        // A longer label (a wider font, a longer translation) widens it, with room for the shortcut as well
+        let long = "A menu entry whose label is much longer than any of the usual ones";
+        let entry: MenuEntry = (icons::FOLDER, long, MenuAction::Refresh);
+        let wide = w.app.menu_width(&ctx, &[vec![entry]]);
+        assert!(wide > MENU_WIDTH, "{wide}");
+        let hint = w.app.menu_hint(&MenuAction::Refresh).expect("Refresh has a shortcut");
+        let (mut label_w, mut hint_w) = (0.0, 0.0);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            label_w = ui.painter().layout_no_wrap(long.to_owned(), egui::FontId::proportional(material::FONT_BODY), egui::Color32::WHITE).size().x;
+            hint_w = ui.painter().layout_no_wrap(hint.clone(), egui::FontId::proportional(material::FONT_CAPTION), egui::Color32::WHITE).size().x;
+        });
+        out.textures_delta.clear();
+        // What `menu_item` leaves for the label: the row without its inset, the shortcut and its gap
+        assert!(wide - 16.0 - material::INSET_LABEL - 14.0 - (hint_w + 12.0) >= label_w, "the label does not fit: {wide} for {label_w} and {hint_w}");
+        // But not wider than the window
+        let absurd = "x".repeat(2000);
+        let entry: MenuEntry = (icons::FOLDER, Box::leak(absurd.into_boxed_str()), MenuAction::Refresh);
+        let capped = w.app.menu_width(&ctx, &[vec![entry]]);
+        assert!(capped <= ctx.content_rect().width() - 16.0 + 0.01 && capped >= MENU_WIDTH, "{capped}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
