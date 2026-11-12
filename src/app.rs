@@ -344,6 +344,7 @@ impl Dialog {
                 | Dialog::EditServer { .. }
                 | Dialog::NetQuestion { .. }
                 | Dialog::Conflict { .. }
+                | Dialog::LowSpace { .. }
         )
     }
 }
@@ -11122,6 +11123,17 @@ mod tests {
         w.key(egui::Key::Escape);
         w.until("the job to end", |w| !w.app.engine.running());
         assert!(!ok.load(SeqCst));
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // A click beside the card is no answer: the question stays and the job waits for one
+        let (mut w, root, ok) = window_with_the_space_question("space_outside");
+        w.click(egui::pos2(5.0, 5.0), egui::PointerButton::Primary);
+        w.run(Vec::new(), 5);
+        assert!(matches!(w.app.dialog, Some(Dialog::LowSpace { .. })), "the question was closed by a click beside it");
+        assert!(w.app.engine.running() && !ok.load(SeqCst));
+        w.click(w.at("Continue anyway"), egui::PointerButton::Primary);
+        w.until("the job to end", |w| !w.app.engine.running());
+        assert!(ok.load(SeqCst));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
