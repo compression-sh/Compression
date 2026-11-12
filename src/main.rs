@@ -237,26 +237,85 @@ fn target_path(target: &Target, cwd: &Path) -> PathBuf {
     if fs::places::is_virtual(&path) { path } else { cwd.join(path) }
 }
 
+/// What this window opens first: a path (made absolute against where the launch was made; whether it is a file or a
+/// folder is for whoever looks at the disk to say), or a server to connect to.
+#[derive(Debug, PartialEq)]
+enum First {
+    Path(PathBuf),
+    Server(String),
+}
+
+/// What a launch comes to for a window. No disk, no process, no display: this is the part of opening a window that can
+/// be looked at on its own.
+#[derive(Default)]
+struct Resolved {
+    /// The file dialog this window is.
+    chooser: Option<chooser::Spec>,
+    /// The launch is a dialog request that `chooser::Spec` cannot read after all.
+    dialog_unreadable: bool,
+    /// Why the arguments made no sense. A resident process tells it and opens a plain window.
+    error: Option<String>,
+    first: Option<First>,
+    /// The targets that get a window of their own, as the words to start that window with.
+    windows: Vec<String>,
+    /// The targets that become tabs of this window, as paths.
+    tabs: Vec<PathBuf>,
+}
+
+/// Works out what a window is to do for `launch`, made in the working folder `cwd` (which a resident process does not
+/// share with whoever launched).
+fn resolve_launch(launch: Launch, cwd: &Path) -> Resolved {
+    let mut resolved = Resolved::default();
+    let targets = match launch {
+        Launch::Chooser(words) => {
+            match chooser::Spec::parse(&words) {
+                Some(spec) => resolved.chooser = Some(spec),
+                None => resolved.dialog_unreadable = true,
+            }
+            return resolved;
+        }
+        Launch::Open(targets) => targets,
+        Launch::Error(why) => {
+            resolved.error = Some(why);
+            return resolved;
+        }
+        Launch::Info(_) | Launch::Portal | Launch::Resident => return resolved,
+    };
+    let (first, windows, tabs) = place(&targets);
+    resolved.first = first.map(|target| match target {
+        // A server address opens the usual start folder and connects; the server's folder follows once it is reachable
+        Target::Address(address) => First::Server(address.clone()),
+        other => First::Path(target_path(other, cwd)),
+    });
+    resolved.windows = windows.iter().map(|t| match t {
+        Target::Path(w) | Target::Uri(w) | Target::Address(w) => w.clone(),
+    }).collect();
+    resolved.tabs = tabs.iter().map(|t| target_path(t, cwd)).collect();
+    resolved
+}
+
+/// The command that starts another window of this program for `word`, in the folder `cwd` the launch was made in.
+/// After `--`, so that a name that looks like an option is still a name there.
+fn window_command(exe: &Path, word: &str, cwd: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(exe);
+    command.arg("--").arg(word).current_dir(cwd);
+    command
+}
+
 /// Open a window for one launch and run it until it closes.
 fn open_window(mut request: instance::Request) -> eframe::Result {
     let args: Vec<OsString> = std::mem::take(&mut request.args).into_iter().map(OsString::from).collect();
     // A resident process reads what it was sent the same way: a request that makes no sense is told on stderr and
     // gets a plain window, not none, for the launch that handed it over is waiting for one
-    let (chooser, targets) = match parse_launch(&args) {
-        Launch::Chooser(words) => match chooser::Spec::parse(&words) {
-            Some(spec) => (Some(spec), Vec::new()),
-            None => {
-                eprintln!("compression: the file dialog request could not be read");
-                std::process::exit(chooser::EXIT_FAILED);
-            }
-        },
-        Launch::Open(targets) => (None, targets),
-        Launch::Error(why) => {
-            eprintln!("compression: {why}");
-            (None, Vec::new())
-        }
-        Launch::Info(_) | Launch::Portal | Launch::Resident => (None, Vec::new()),
-    };
+    let resolved = resolve_launch(parse_launch(&args), &request.cwd);
+    if resolved.dialog_unreadable {
+        eprintln!("compression: the file dialog request could not be read");
+        std::process::exit(chooser::EXIT_FAILED);
+    }
+    if let Some(why) = &resolved.error {
+        eprintln!("compression: {why}");
+    }
+    let Resolved { chooser, first, windows, tabs: more_tabs, .. } = resolved;
 
     let settings = settings::Settings::load();
     i18n::set_language(i18n::resolve(&settings.language));
@@ -267,30 +326,22 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
     let mut select = None;
     // Tabs of the last session, which only a normal launch without a folder argument brings back
     let mut session = None;
-    let (first, windows, tabs) = place(&targets);
-    // A server address opens the usual start folder and connects; the server's folder follows once it is reachable
     let (given, server) = match first {
-        Some(Target::Address(address)) => (None, Some(address.clone())),
-        Some(target) => (Some(target.clone()), None),
+        Some(First::Server(address)) => (None, Some(address)),
+        Some(First::Path(path)) => (Some(path), None),
         None => (None, None),
     };
     // Several items dropped on the launcher at once: the first fills this window, each of the next (up to
     // `MAX_WINDOWS`) gets its own, and the others are tabs of this one
-    for target in windows {
-        // After `--`, so that a name that looks like an option is still a name there
-        let word = match target {
-            Target::Path(w) | Target::Uri(w) | Target::Address(w) => w,
-        };
-        let _ = std::env::current_exe().and_then(|exe| instance::spawn_reaped(std::process::Command::new(exe).arg("--").arg(word).current_dir(&request.cwd)));
+    for word in &windows {
+        let _ = std::env::current_exe().and_then(|exe| instance::spawn_reaped(&mut window_command(&exe, word, &request.cwd)));
     }
-    let more_tabs: Vec<PathBuf> = tabs.iter().map(|t| target_path(t, &request.cwd)).collect();
     // Tabs to keep beside a folder given on the command line, so that launch does not replace the saved session
     let mut kept_session = None;
-    let initial_path = if let Some(arg) = given {
+    let initial_path = if let Some(path) = given {
         if chooser.is_none() && settings.start_location == settings::StartLocation::RestoreTabs {
             kept_session = Some(settings.restorable_session().0);
         }
-        let path = target_path(&arg, &request.cwd);
         match path.parent() {
             Some(parent) if path.exists() && !path.is_dir() => {
                 select = Some(path.clone());
@@ -580,5 +631,147 @@ mod tests {
         let plain = vec![OsString::from("/tmp"), bad];
         assert_eq!(without_environment(plain.clone()), plain);
         assert_eq!(without_environment(Vec::new()), Vec::<OsString>::new());
+    }
+
+    fn open(words: &[&str]) -> Launch {
+        parse_launch(&os(words))
+    }
+
+    #[test]
+    fn a_path_is_made_absolute_against_where_the_launch_was_made_and_a_virtual_one_and_an_absolute_one_are_not() {
+        let cwd = Path::new("/work/here");
+        let resolved = resolve_launch(open(&["sub/x", "/abs/y"]), cwd);
+        assert_eq!(resolved.first, Some(First::Path(PathBuf::from("/work/here/sub/x"))));
+        assert_eq!(resolved.tabs, Vec::<PathBuf>::new());
+        assert_eq!(resolved.windows, ["/abs/y"], "the words for the next window are as they were given");
+        let resolved = resolve_launch(open(&["/abs/y"]), cwd);
+        assert_eq!(resolved.first, Some(First::Path(PathBuf::from("/abs/y"))));
+        let resolved = resolve_launch(open(&["compression:recent"]), cwd);
+        assert_eq!(resolved.first, Some(First::Path(PathBuf::from("compression:recent"))), "Recent is no folder to join");
+        // The old name of it is the new one
+        let resolved = resolve_launch(open(&["ski:bookmarks"]), cwd);
+        assert_eq!(resolved.first, Some(First::Path(PathBuf::from("compression:bookmarks"))));
+        // Nothing given: the window starts where the settings say
+        assert_eq!(resolve_launch(open(&[]), cwd).first, None);
+        assert_eq!(resolve_launch(open(&["--"]), cwd).first, None);
+    }
+
+    #[test]
+    fn a_file_uri_is_decoded_down_to_its_bytes() {
+        let resolved = resolve_launch(open(&["file:///tmp/a%20b%FFc", "file:/tmp/z", "file://localhost/tmp/w"]), Path::new("/work"));
+        let bytes = |p: &Option<First>| match p {
+            Some(First::Path(path)) => std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).to_vec(),
+            other => panic!("not a path: {other:?}"),
+        };
+        assert_eq!(bytes(&resolved.first), b"/tmp/a b\xffc", "a name that is not UTF-8 reaches the window exactly");
+        // The others get windows of their own, as the words they came in
+        assert_eq!(resolved.windows, ["file:/tmp/z", "file://localhost/tmp/w"]);
+    }
+
+    #[test]
+    fn a_server_address_is_a_server_to_connect_to_and_not_a_path() {
+        let cwd = Path::new("/work");
+        let resolved = resolve_launch(open(&["sftp://me@host/srv", "a"]), cwd);
+        assert_eq!(resolved.first, Some(First::Server("sftp://me@host/srv".into())));
+        assert_eq!(resolved.windows, ["a"]);
+        // As a later target it gets a window of its own, or is a tab: as the words it came in, or as it is
+        let many: Vec<String> = std::iter::once("first".to_owned()).chain((0..8).map(|n| format!("sftp://h/{n}"))).collect();
+        let words: Vec<&str> = many.iter().map(String::as_str).collect();
+        let resolved = resolve_launch(open(&words), cwd);
+        assert_eq!(resolved.windows.len(), 7);
+        assert_eq!(resolved.tabs, vec![PathBuf::from("sftp://h/7")], "the address of a tab stays an address");
+    }
+
+    #[test]
+    fn the_first_target_fills_the_window_seven_more_get_their_own_and_the_rest_are_tabs_made_absolute() {
+        let words: Vec<String> = (0..11).map(|n| format!("d{n}")).collect();
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        let resolved = resolve_launch(open(&refs), Path::new("/w"));
+        assert_eq!(resolved.first, Some(First::Path(PathBuf::from("/w/d0"))));
+        assert_eq!(resolved.windows, ["d1", "d2", "d3", "d4", "d5", "d6", "d7"]);
+        assert_eq!(resolved.tabs, vec![PathBuf::from("/w/d8"), PathBuf::from("/w/d9"), PathBuf::from("/w/d10")]);
+        assert!(resolved.chooser.is_none() && resolved.error.is_none() && !resolved.dialog_unreadable);
+    }
+
+    #[test]
+    fn a_dialog_request_makes_a_dialog_and_one_that_cannot_be_read_is_told_apart() {
+        let resolved = resolve_launch(open(&["--chooser", "--mode", "save", "--name", "a.txt"]), Path::new("/w"));
+        assert!(resolved.chooser.as_ref().is_some_and(|spec| spec.mode == chooser::Mode::Save));
+        assert!(resolved.first.is_none() && resolved.windows.is_empty() && resolved.tabs.is_empty() && !resolved.dialog_unreadable);
+        // `parse_launch` has read it already; a launch that gets here unread (the types allow it) is said so
+        let unread = resolve_launch(Launch::Chooser(os(&["--chooser", "--mode", "nonsense"]).iter().map(|w| w.to_string_lossy().into_owned()).collect()), Path::new("/w"));
+        assert!(unread.dialog_unreadable && unread.chooser.is_none());
+    }
+
+    #[test]
+    fn a_launch_that_makes_no_sense_gives_a_plain_window_and_says_why_and_the_others_give_none_of_the_fields() {
+        let resolved = resolve_launch(open(&["--bogus"]), Path::new("/w"));
+        assert!(resolved.error.as_deref().is_some_and(|why| why.contains("unknown option")));
+        assert!(resolved.first.is_none() && resolved.windows.is_empty() && resolved.tabs.is_empty() && resolved.chooser.is_none());
+        for launch in [Launch::Portal, Launch::Resident, Launch::Info("x".into())] {
+            let resolved = resolve_launch(launch, Path::new("/w"));
+            assert!(resolved.first.is_none() && resolved.error.is_none() && resolved.chooser.is_none() && !resolved.dialog_unreadable);
+        }
+    }
+
+    #[test]
+    fn another_window_is_started_after_two_dashes_in_the_folder_of_the_launch() {
+        for word in ["/tmp/a", "-x", "--help", "file:///a%20b", "sftp://h/x", "with space"] {
+            let command = window_command(Path::new("/usr/bin/compression"), word, Path::new("/work/here"));
+            assert_eq!(command.get_program(), "/usr/bin/compression");
+            assert_eq!(command.get_args().collect::<Vec<_>>(), ["--", word], "a name like an option must stay a name: {word}");
+            assert_eq!(command.get_current_dir(), Some(Path::new("/work/here")));
+        }
+    }
+
+    #[test]
+    fn whatever_words_are_given_the_meaning_of_a_launch_follows_the_rules() {
+        // Every sequence of up to four words from a pool that holds each kind of word there is
+        let pool = ["--", "-x", "--chooser", "--mode", "open", "/tmp", "", "file://h/x", "sftp://h/", "--portal", "--resident", "--version", "-h", "a"];
+        let mut cases = vec![Vec::new()];
+        let mut checked = 0;
+        while let Some(words) = cases.pop() {
+            if words.len() < 4 {
+                for word in pool {
+                    let mut longer = words.clone();
+                    longer.push(word);
+                    cases.push(longer);
+                }
+            }
+            let launch = parse_launch(&os(&words));
+            let options = words.iter().position(|w| *w == "--").unwrap_or(words.len());
+            let info = words.first().is_some_and(|w| ["--version", "-V", "--help", "-h"].contains(w));
+            let says = |what: &str| format!("{what}: {words:?}");
+            assert_eq!(matches!(launch, Launch::Info(_)), info, "{}", says("information only as the first word"));
+            assert_eq!(matches!(launch, Launch::Portal), words == ["--portal"], "{}", says("the portal runs alone"));
+            assert_eq!(matches!(launch, Launch::Resident), words == ["--resident"], "{}", says("the resident runs alone"));
+            if matches!(launch, Launch::Chooser(_)) {
+                assert!(words[..options].contains(&"--chooser"), "{}", says("a dialog says so"));
+            }
+            if words[..options].contains(&"--chooser") && !info {
+                assert!(matches!(launch, Launch::Chooser(_) | Launch::Error(_)), "{}", says("a dialog request is a dialog or an error"));
+            }
+            match &launch {
+                Launch::Error(why) => assert!(!why.is_empty(), "{}", says("an error says why")),
+                Launch::Open(targets) => {
+                    assert!(targets.len() <= MAX_TARGETS, "{}", says("not too many"));
+                    assert_eq!(targets.len(), words.len() - usize::from(options < words.len()), "{}", says("every word that is not the `--` is a target"));
+                    assert!(words[..options].iter().all(|w| !w.starts_with('-')), "{}", says("an option is no target"));
+                    for target in targets {
+                        match target {
+                            Target::Path(w) | Target::Address(w) => assert!(!w.is_empty(), "{}", says("no empty target")),
+                            Target::Uri(w) => assert!(chooser::from_uri(w).is_some(), "{}", says("a uri is of this computer")),
+                        }
+                    }
+                    // And what a window makes of it holds together
+                    let resolved = resolve_launch(parse_launch(&os(&words)), Path::new("/w"));
+                    assert!(resolved.windows.len() < MAX_WINDOWS, "{}", says("seven windows at most beside this one"));
+                    assert_eq!(usize::from(resolved.first.is_some()) + resolved.windows.len() + resolved.tabs.len(), targets.len(), "{}", says("every target is somewhere"));
+                }
+                _ => {}
+            }
+            checked += 1;
+        }
+        assert!(checked > 40_000, "{checked}");
     }
 }
