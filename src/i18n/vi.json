@@ -922,5 +922,7 @@
   "The selected items are in different folders. Open the folder first to compress them": "Các mục đã chọn nằm trong những thư mục khác nhau. Hãy mở thư mục trước để nén chúng",
   "Not included, because they are in other folders ({}): {}{}": "Không được đưa vào vì nằm trong thư mục khác ({}): {}{}",
   "Created “{}” · {} not included, because they are in other folders": "Đã tạo “{}” · {} mục không được đưa vào vì nằm trong thư mục khác",
-  "Cancelled after {}": "Đã hủy sau {}"
+  "Cancelled after {}": "Đã hủy sau {}",
+  "The clipboard did not answer": "Bảng nhớ tạm không phản hồi",
+  "The folder changed while the clipboard was read": "Thư mục đã đổi trong lúc đọc bảng nhớ tạm"
 }

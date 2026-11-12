@@ -922,5 +922,7 @@
   "The selected items are in different folders. Open the folder first to compress them": "Les éléments choisis sont dans des dossiers différents. Ouvrez d’abord le dossier pour les compresser",
   "Not included, because they are in other folders ({}): {}{}": "Non inclus, car ils sont dans d’autres dossiers ({}) : {}{}",
   "Created “{}” · {} not included, because they are in other folders": "« {} » créé · {} non inclus, car ils sont dans d’autres dossiers",
-  "Cancelled after {}": "Annulé après {}"
+  "Cancelled after {}": "Annulé après {}",
+  "The clipboard did not answer": "Le presse-papiers n’a pas répondu",
+  "The folder changed while the clipboard was read": "Le dossier a changé pendant la lecture du presse-papiers"
 }

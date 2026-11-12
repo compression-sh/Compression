@@ -96,6 +96,34 @@ fn admin_entry(path: &Path) -> Option<MenuEntry> {
         .then(|| (icons::SHIELD, tr("Open as administrator"), MenuAction::OpenAsAdmin(path.to_path_buf())))
 }
 
+/// How long a paste waits for the program that holds the clipboard before it gives up.
+const CLIPBOARD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The most threads reading the clipboard at once: one that hangs stays until its owner answers.
+const MAX_CLIPBOARD_READERS: usize = 3;
+
+/// A paste on its way: where it was asked for, when, and what the thread reading the clipboard will send.
+struct PendingPaste {
+    dest: PathBuf,
+    started: std::time::Instant,
+    rx: mpsc::Receiver<crate::clipboard::Snapshot>,
+}
+
+/// A paste into a text field on its way: for which window, and what the thread will send.
+struct PendingText {
+    viewport: egui::ViewportId,
+    started: std::time::Instant,
+    rx: mpsc::Receiver<Option<String>>,
+}
+
+/// Counts a clipboard reader as long as it lives, however its thread ends.
+struct Reading(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 struct ContextMenu {
     pos: egui::Pos2,
     target: MenuTarget,
@@ -538,6 +566,18 @@ pub struct CompressionApp {
     pub(crate) system_theme: SerpantinumTheme,
     /// Follows the files a theme comes from; `None` when none could be watched.
     theme_watch: Option<crate::theme_watch::ThemeWatch>,
+    /// A paste that waits for what the system clipboard holds (read on a thread of its own).
+    pending_paste: Option<PendingPaste>,
+    /// A text paste into a text field that waits for the clipboard's text.
+    pending_text: Option<PendingText>,
+    /// How many threads are reading the clipboard now (a thread that hangs counts until it ends).
+    clipboard_readers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// How long a paste waits for the clipboard; tests shorten it.
+    clipboard_wait: std::time::Duration,
+    /// What reads the clipboard for a paste (`clipboard::snapshot`); tests put others here.
+    clipboard_snapshot: std::sync::Arc<dyn Fn(bool) -> crate::clipboard::Snapshot + Send + Sync>,
+    /// What reads the clipboard's text when the window has no data device of its own (`clipboard::get_text`).
+    clipboard_text: std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>,
     /// What the system clipboard offered when the folder menu was opened; `None` until the probe answers
     /// (or when it could not tell), and then the entry stays usable.
     clipboard_offer: Option<crate::clipboard::Offer>,
@@ -771,6 +811,12 @@ impl CompressionApp {
             system_theme: SerpantinumTheme::load(),
             theme_watch: crate::theme_watch::ThemeWatch::new(ctx),
             theme_problems_told: Vec::new(),
+            pending_paste: None,
+            pending_text: None,
+            clipboard_readers: std::sync::Arc::default(),
+            clipboard_wait: CLIPBOARD_WAIT,
+            clipboard_snapshot: std::sync::Arc::new(crate::clipboard::snapshot),
+            clipboard_text: std::sync::Arc::new(crate::clipboard::get_text),
             clipboard_offer: None,
             clipboard_probe: crate::clipboard::offer,
             clipboard_probe_rx: None,
@@ -1398,23 +1444,97 @@ impl CompressionApp {
         if network::is_remote(path) { path.to_path_buf() } else { path.canonicalize().unwrap_or_else(|_| path.to_path_buf()) }
     }
 
+    /// Paste into the folder shown. What the system clipboard holds (files copied in another application count too, and
+    /// win when they are newer than ours; a picture is saved as a file) is read on a thread of its own, because the
+    /// program that holds it may take its time or never answer: the window carries on, and takes the answer in when it
+    /// comes (`poll_clipboard`). One paste is waited for at a time.
     fn paste(&mut self) {
-        // Files copied in another application count too, and win when they are newer than ours
-        let external = crate::clipboard::get_files().filter(|(paths, _)| paths.iter().all(|p| network::is_remote(p) || p.exists()));
-        self.paste_with(external);
+        if !self.can_modify_here() {
+            self.set_toast(tr("Open a regular folder to paste into"));
+            return;
+        }
+        if self.pending_paste.is_some() {
+            return;
+        }
+        let Some(reading) = self.start_reading() else { return };
+        let (tx, rx) = mpsc::channel();
+        let (source, ctx, want_image) = (self.clipboard_snapshot.clone(), self.ctx.clone(), self.clipboard.is_none());
+        let started = std::thread::Builder::new().name("clipboard-paste".into()).spawn(move || {
+            let _reading = reading;
+            let _ = tx.send(source(want_image));
+            ctx.request_repaint();
+        });
+        if started.is_err() {
+            self.set_toast(tr("The clipboard did not answer"));
+            return;
+        }
+        self.pending_paste = Some(PendingPaste { dest: self.current_path.clone(), started: std::time::Instant::now(), rx });
     }
 
-    /// `paste`, with what the system clipboard holds (files of another application, or of this window, which put
-    /// them there too) given. Only what is this window's own clipboard is followed by it: its job decides what stays
-    /// (`paste_finished`); files of another application leave it alone.
+    /// Counts a new clipboard reader, unless too many are stuck already (then the window says so).
+    fn start_reading(&mut self) -> Option<Reading> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.clipboard_readers.load(SeqCst) >= MAX_CLIPBOARD_READERS {
+            self.set_toast(tr("The clipboard did not answer"));
+            return None;
+        }
+        self.clipboard_readers.fetch_add(1, SeqCst);
+        Some(Reading(self.clipboard_readers.clone()))
+    }
+
+    /// Once per frame: takes in what the thread reading the clipboard for a paste has to say, or gives up on it when
+    /// it takes too long (what it finds later is thrown away).
+    pub(super) fn poll_clipboard(&mut self) {
+        let Some(pending) = &self.pending_paste else { return };
+        match pending.rx.try_recv() {
+            Ok(snapshot) => {
+                let dest = pending.dest.clone();
+                self.pending_paste = None;
+                self.paste_snapshot(&dest, snapshot);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                let waited = pending.started.elapsed();
+                if waited >= self.clipboard_wait {
+                    self.pending_paste = None;
+                    self.set_toast(tr("The clipboard did not answer"));
+                } else {
+                    self.ctx.request_repaint_after(self.clipboard_wait - waited);
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending_paste = None;
+                self.set_toast(tr("The clipboard did not answer"));
+            }
+        }
+    }
+
+    /// The paste `paste` asked for, with what the clipboard held. It goes into the folder shown now: when that is not
+    /// the one it was asked for in, the window says so.
+    fn paste_snapshot(&mut self, asked_in: &Path, snapshot: crate::clipboard::Snapshot) {
+        self.paste_into(snapshot.files, snapshot.image);
+        if self.current_path != asked_in {
+            self.set_toast(tr("The folder changed while the clipboard was read"));
+        }
+    }
+
+    /// `paste` with what the system clipboard holds (files of another application, or of this window, which put
+    /// them there too) given, and no picture.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn paste_with(&mut self, external: Option<(Vec<PathBuf>, bool)>) {
+        self.paste_into(external, None);
+    }
+
+    /// Pastes `external` (the files on the system clipboard), or this window's own clipboard, or `image`, into the
+    /// folder shown. Only what is this window's own clipboard is followed by it: its job decides what stays
+    /// (`paste_finished`); files of another application leave it alone.
+    fn paste_into(&mut self, external: Option<(Vec<PathBuf>, bool)>, image: Option<Vec<u8>>) {
         let own = self.clipboard.clone();
         let (paths, cut, tracked) = match (external, own) {
             (Some((paths, cut)), Some(own)) if own.paths == paths && own.cut == cut => (paths, cut, true),
             (Some((paths, cut)), _) => (paths, cut, false),
             (None, Some(own)) => (own.paths, own.cut, true),
             (None, None) => {
-                if self.can_modify_here() && let Some(png) = crate::clipboard::get_image_png() {
+                if self.can_modify_here() && let Some(png) = image {
                     self.paste_image(&png);
                 } else {
                     self.set_toast(tr("Nothing to paste"));
@@ -2705,23 +2825,39 @@ impl eframe::App for CompressionApp {
         [0.0; 4]
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        // egui-winit's clipboard shortcuts are off (main.rs): the shortcuts become clipboard events
-        // here, a paste carrying the system clipboard's text. This runs for every window, Settings
-        // and the pickers too
-        for event in &mut raw_input.events {
-            let egui::Event::Key { key, pressed: true, modifiers, .. } = *event else { continue };
-            let command = modifiers.command_only();
-            *event = if key == egui::Key::Paste || (command && key == egui::Key::V) || (modifiers.shift_only() && key == egui::Key::Insert) {
-                egui::Event::Paste(self.system_text().unwrap_or_default().replace("\r\n", "\n"))
-            } else if key == egui::Key::Copy || (command && key == egui::Key::C) {
-                egui::Event::Copy
-            } else if key == egui::Key::Cut || (command && key == egui::Key::X) {
-                egui::Event::Cut
-            } else {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // egui-winit's clipboard shortcuts are off (main.rs): the shortcuts become clipboard events here. This runs
+        // for every window, Settings and the pickers too.
+        // A paste into a text field needs the clipboard's text, which another program may be slow to send: it is read on
+        // a thread of its own and comes as the event of a frame a little later (`text_for`). Where no text field has the
+        // focus the text is not needed, and the event only asks the window to paste files (`paste`).
+        let viewport = raw_input.viewport_id;
+        let text_field = ctx.egui_wants_keyboard_input();
+        let mut events = Vec::with_capacity(raw_input.events.len() + 1);
+        for event in std::mem::take(&mut raw_input.events) {
+            let egui::Event::Key { key, pressed: true, modifiers, .. } = event else {
+                events.push(event);
                 continue;
             };
+            let command = modifiers.command_only();
+            if key == egui::Key::Paste || (command && key == egui::Key::V) || (modifiers.shift_only() && key == egui::Key::Insert) {
+                if text_field {
+                    self.request_text(viewport);
+                } else {
+                    events.push(egui::Event::Paste(String::new()));
+                }
+            } else if key == egui::Key::Copy || (command && key == egui::Key::C) {
+                events.push(egui::Event::Copy);
+            } else if key == egui::Key::Cut || (command && key == egui::Key::X) {
+                events.push(egui::Event::Cut);
+            } else {
+                events.push(event);
+            }
         }
+        if let Some(text) = self.text_for(viewport, text_field) {
+            events.push(egui::Event::Paste(text.replace("\r\n", "\n")));
+        }
+        raw_input.events = events;
         if std::mem::take(&mut self.release_pointer) {
             // Far off, so the release cannot count as a click
             let pos = egui::pos2(-10_000.0, -10_000.0);
@@ -2757,6 +2893,7 @@ impl eframe::App for CompressionApp {
         self.sync_selection(false);
         self.poll_jobs();
         self.poll_opened();
+        self.poll_clipboard();
         self.poll_defaults();
         self.poll_free_space();
         if self.poll_reload() {
@@ -2961,10 +3098,77 @@ impl CompressionApp {
         }
     }
 
-    fn system_text(&mut self) -> Option<String> {
-        match &mut self.wl_dnd {
-            Some(wl) => wl.text(),
-            None => crate::clipboard::get_text(),
+    /// Asks for the clipboard's text for a text field of the window `viewport`, without waiting for it.
+    fn request_text(&mut self, viewport: egui::ViewportId) {
+        enum Source {
+            Pipe(std::os::fd::OwnedFd),
+            Text(std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>),
+        }
+        if self.pending_text.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let source = match self.wl_dnd.as_mut().map(|wl| wl.begin_text()) {
+            // Held by this process, or nothing there: the answer is at hand
+            Some(crate::wayland_dnd::TextRead::Ready(text)) => {
+                let _ = tx.send(Some(text));
+                None
+            }
+            Some(crate::wayland_dnd::TextRead::None) => {
+                let _ = tx.send(None);
+                None
+            }
+            Some(crate::wayland_dnd::TextRead::Pipe(pipe)) => Some(Source::Pipe(pipe)),
+            None => Some(Source::Text(self.clipboard_text.clone())),
+        };
+        if let Some(source) = source {
+            let Some(reading) = self.start_reading() else { return };
+            let ctx = self.ctx.clone();
+            let started = std::thread::Builder::new().name("clipboard-text".into()).spawn(move || {
+                let _reading = reading;
+                let text = match source {
+                    Source::Pipe(pipe) => crate::clipboard::read_pipe(pipe).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+                    Source::Text(read) => read(),
+                };
+                let _ = tx.send(text);
+                ctx.request_repaint_of(viewport);
+            });
+            if started.is_err() {
+                self.set_toast(tr("The clipboard did not answer"));
+                return;
+            }
+        }
+        self.pending_text = Some(PendingText { viewport, started: std::time::Instant::now(), rx });
+    }
+
+    /// The text a paste into a text field of `viewport` was waiting for, if it has come. Nothing comes of it when that
+    /// field no longer has the focus, or when the window it was for is not the one asking; one that waited too long is
+    /// given up on.
+    fn text_for(&mut self, viewport: egui::ViewportId, text_field: bool) -> Option<String> {
+        let (asked_in, started) = self.pending_text.as_ref().map(|p| (p.viewport, p.started))?;
+        let waited = started.elapsed();
+        let expired = waited >= self.clipboard_wait;
+        if asked_in != viewport && !expired {
+            return None;
+        }
+        match self.pending_text.as_ref()?.rx.try_recv() {
+            Ok(text) => {
+                self.pending_text = None;
+                if asked_in == viewport { text.filter(|_| text_field) } else { None }
+            }
+            Err(mpsc::TryRecvError::Empty) if expired => {
+                self.pending_text = None;
+                self.set_toast(tr("The clipboard did not answer"));
+                None
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.ctx.request_repaint_after(self.clipboard_wait - waited);
+                None
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending_text = None;
+                None
+            }
         }
     }
 }
@@ -9476,6 +9680,346 @@ mod tests {
             assert_eq!(archive_entries(&archive), ["a.txt", "b.txt"], "{extension}");
             assert!(w.app.dialog.is_none());
         }
+    }
+
+    use crate::clipboard::Snapshot;
+    use std::sync::Mutex;
+
+    type SnapshotReader = Arc<dyn Fn(bool) -> Snapshot + Send + Sync>;
+    type Calls = Arc<std::sync::atomic::AtomicUsize>;
+
+    /// A clipboard reader for the tests: it answers `snapshot` after `delay`, counts its calls, and notes whether a
+    /// picture was asked for.
+    fn reader(snapshot: impl Fn() -> Snapshot + Send + Sync + 'static, delay: u64) -> (SnapshotReader, Calls, Arc<Mutex<Vec<bool>>>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wanted = Arc::new(Mutex::new(Vec::new()));
+        let (counted, noted) = (calls.clone(), wanted.clone());
+        let read: Arc<dyn Fn(bool) -> Snapshot + Send + Sync> = Arc::new(move |image| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            noted.lock().unwrap().push(image);
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+            snapshot()
+        });
+        (read, calls, wanted)
+    }
+
+    /// A clipboard reader that does not answer until it is let through (or for ten seconds).
+    fn hanging_reader(snapshot: impl Fn() -> Snapshot + Send + Sync + 'static) -> (SnapshotReader, Calls, std::sync::mpsc::Sender<()>) {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let (hold, calls) = (Mutex::new(hold), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let counted = calls.clone();
+        let read: Arc<dyn Fn(bool) -> Snapshot + Send + Sync> = Arc::new(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = hold.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10));
+            snapshot()
+        });
+        (read, calls, release)
+    }
+
+    fn files_of(root: &Path, names: &[&str], cut: bool) -> Snapshot {
+        Snapshot { files: Some((names.iter().map(|n| root.join(n)).collect(), cut)), image: None }
+    }
+
+    fn lots_of(calls: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_paste_returns_at_once_when_the_clipboard_owner_hangs_then_says_so_and_a_late_answer_pastes_nothing() {
+        let (mut w, root) = window_with_a_cut("paste_hangs", "unrelated");
+        w.app.clipboard = None;
+        let (read, calls, release) = hanging_reader({ let root = root.clone(); move || files_of(&root, &["src/a"], false) });
+        w.app.clipboard_snapshot = read;
+        w.app.clipboard_wait = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        w.app.paste();
+        assert!(started.elapsed() < std::time::Duration::from_millis(100), "the paste waited: {:?}", started.elapsed());
+        assert!(w.app.pending_paste.is_some());
+        // The window goes on, and after the wait it says the clipboard did not answer
+        w.until("the message", |w| w.app.toast_message() == Some("The clipboard did not answer"));
+        assert!(w.app.pending_paste.is_none());
+        // What the owner sends afterwards is thrown away: nothing is pasted
+        release.send(()).unwrap();
+        wait_until(|| lots_of(&calls) == 1 && w.app.clipboard_readers.load(std::sync::atomic::Ordering::SeqCst) == 0);
+        w.run(Vec::new(), 20);
+        assert!(!root.join("dst/a").exists() && !w.app.engine.running() && w.app.engine.jobs.is_empty(), "a late answer pasted");
+        assert_eq!(w.app.toast_message(), Some("The clipboard did not answer"));
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("not reached");
+    }
+
+    #[test]
+    fn a_slow_owner_is_waited_for_without_stopping_the_window_and_the_files_are_pasted_in_the_end() {
+        let (mut w, root) = window_with_a_cut("paste_slow", "unrelated");
+        w.app.clipboard = None;
+        let (read, calls, wanted) = reader({ let root = root.clone(); move || files_of(&root, &["src/a", "src/b"], false) }, 100);
+        w.app.clipboard_snapshot = read;
+        let started = std::time::Instant::now();
+        w.app.paste();
+        assert!(started.elapsed() < std::time::Duration::from_millis(60), "{:?}", started.elapsed());
+        assert!(!root.join("dst/a").exists(), "nothing yet");
+        w.run(Vec::new(), 5);
+        w.until("the files were pasted", |_| root.join("dst/a").exists() && root.join("dst/b").exists());
+        assert!(root.join("src/a").exists(), "a copy leaves the sources");
+        assert_eq!((lots_of(&calls), wanted.lock().unwrap().clone()), (1, vec![true]), "asked once, for a picture too, as nothing is held here");
+        finish_jobs(&mut w.app);
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn a_cut_read_from_the_clipboard_is_moved_and_done_with_through_the_job_as_before() {
+        let (mut w, root) = window_with_a_cut("paste_cut", "unrelated");
+        let (read, _, wanted) = reader({ let root = root.clone(); move || files_of(&root, &["src/a", "src/b"], true) }, 0);
+        w.app.clipboard_snapshot = read;
+        w.app.paste();
+        w.until("the move", |_| root.join("dst/a").exists() && root.join("dst/b").exists());
+        finish_jobs(&mut w.app);
+        assert!(!root.join("src/a").exists() && !root.join("src/b").exists(), "moved");
+        assert!(w.app.clipboard.is_none(), "the cut is done with when the move ended");
+        assert_eq!(wanted.lock().unwrap().clone(), vec![false], "a picture is not asked for while this window holds something");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn this_windows_own_clipboard_is_pasted_when_the_system_holds_no_files() {
+        let (mut w, root) = window_with_a_cut("paste_own", "unrelated");
+        w.app.clipboard = Some(Clipboard { paths: vec![root.join("src/a")], cut: false, moving: None });
+        let (read, _, _) = reader(Snapshot::default, 0);
+        w.app.clipboard_snapshot = read;
+        w.app.paste();
+        w.until("the copy", |_| root.join("dst/a").exists());
+        finish_jobs(&mut w.app);
+        assert!(root.join("src/a").exists() && w.app.clipboard.is_some(), "a copy stays on the clipboard");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn a_second_paste_while_one_waits_is_ignored() {
+        let (mut w, root) = window_with_a_cut("paste_twice", "unrelated");
+        w.app.clipboard = None;
+        let (read, calls, release) = hanging_reader({ let root = root.clone(); move || files_of(&root, &["src/a"], false) });
+        w.app.clipboard_snapshot = read;
+        w.app.paste();
+        w.app.paste();
+        w.app.paste();
+        wait_until(|| lots_of(&calls) >= 1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(lots_of(&calls), 1, "one question at a time");
+        release.send(()).unwrap();
+        w.until("pasted once", |_| root.join("dst/a").exists());
+        finish_jobs(&mut w.app);
+        assert_eq!(lots_of(&calls), 1);
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn at_most_three_readers_hang_at_once_and_the_fourth_paste_says_so_without_starting_one() {
+        let (mut w, root) = window_with_a_cut("paste_readers", "unrelated");
+        w.app.clipboard = None;
+        let (read, calls, release) = hanging_reader({ let root = root.clone(); move || files_of(&root, &["src/a"], false) });
+        w.app.clipboard_snapshot = read;
+        w.app.clipboard_wait = std::time::Duration::from_millis(80);
+        for n in 1..=3 {
+            w.app.paste();
+            wait_until(|| lots_of(&calls) == n);
+            w.until("given up", |w| w.app.pending_paste.is_none());
+        }
+        assert_eq!(w.app.clipboard_readers.load(std::sync::atomic::Ordering::SeqCst), 3);
+        w.app.set_toast(String::new());
+        w.app.paste();
+        assert_eq!(w.app.toast_message(), Some("The clipboard did not answer"));
+        assert!(w.app.pending_paste.is_none());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(lots_of(&calls), 3, "no fourth reader");
+        // When the owners answer, the readers end and a paste works again
+        for _ in 0..3 {
+            release.send(()).unwrap();
+        }
+        wait_until(|| w.app.clipboard_readers.load(std::sync::atomic::Ordering::SeqCst) == 0);
+        let (read, _, _) = reader({ let root = root.clone(); move || files_of(&root, &["src/b"], false) }, 0);
+        w.app.clipboard_snapshot = read;
+        w.app.paste();
+        w.until("pasted", |_| root.join("dst/b").exists());
+        finish_jobs(&mut w.app);
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn when_the_folder_changed_meanwhile_the_files_go_into_the_folder_shown_now_and_the_window_says_so() {
+        let (mut w, root) = window_with_a_cut("paste_moved_on", "unrelated");
+        w.app.clipboard = None;
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        let (read, _, _) = reader({ let root = root.clone(); move || files_of(&root, &["src/a"], false) }, 150);
+        w.app.clipboard_snapshot = read;
+        w.app.paste();
+        w.app.current_path = root.join("elsewhere");
+        // The window says so when the answer comes (the end of the copy has a message of its own after that)
+        w.until("the answer", |w| w.app.pending_paste.is_none());
+        assert_eq!(w.app.toast_message(), Some("The folder changed while the clipboard was read"));
+        w.until("pasted", |_| root.join("elsewhere/a").exists());
+        finish_jobs(&mut w.app);
+        assert!(!root.join("dst/a").exists(), "not into the folder it was asked in");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn a_paste_in_a_list_of_results_or_in_the_trash_does_not_ask_the_clipboard() {
+        let (mut w, root) = window_with_a_cut("paste_nowhere", "unrelated");
+        let (read, calls, _) = reader(Snapshot::default, 0);
+        w.app.clipboard_snapshot = read;
+        w.app.search_query = "a".to_owned();
+        w.app.paste();
+        assert_eq!(w.app.toast_message(), Some("Open a regular folder to paste into"));
+        w.app.search_query.clear();
+        w.app.set_toast(String::new());
+        w.app.current_path = crate::fs::trash::files_dir().expect("a trash folder");
+        w.app.paste();
+        assert_eq!(w.app.toast_message(), Some("Open a regular folder to paste into"));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(lots_of(&calls), 0, "the clipboard was not asked");
+        assert!(w.app.pending_paste.is_none());
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn a_picture_on_the_clipboard_is_saved_and_nothing_at_all_is_told() {
+        let (mut w, root) = window_with_a_cut("paste_picture", "unrelated");
+        w.app.clipboard = None;
+        let png = b"\x89PNG not a real picture".to_vec();
+        let (read, _, wanted) = reader({ let png = png.clone(); move || Snapshot { files: None, image: Some(png.clone()) } }, 0);
+        w.app.clipboard_snapshot = read;
+        w.app.paste();
+        w.until("the picture", |_| root.join("dst/Pasted image.png").exists());
+        assert_eq!(std::fs::read(root.join("dst/Pasted image.png")).unwrap(), png);
+        assert_eq!(wanted.lock().unwrap().clone(), vec![true]);
+        // Nothing on it: it says so
+        let (read, _, _) = reader(Snapshot::default, 0);
+        w.app.clipboard_snapshot = read;
+        w.app.set_toast(String::new());
+        w.app.paste();
+        w.until("the message", |w| w.app.toast_message() == Some("Nothing to paste"));
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    /// The raw input of a frame of `viewport` that holds Ctrl+V, as the window's hook sees it.
+    fn ctrl_v(viewport: egui::ViewportId) -> egui::RawInput {
+        let key = egui::Event::Key { key: egui::Key::V, physical_key: Some(egui::Key::V), pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND };
+        egui::RawInput { viewport_id: viewport, events: vec![key], ..Default::default() }
+    }
+
+    fn pastes(raw: &egui::RawInput) -> Vec<String> {
+        raw.events.iter().filter_map(|e| if let egui::Event::Paste(text) = e { Some(text.clone()) } else { None }).collect()
+    }
+
+    /// A text source for the tests: its text after `delay`, and a count of its calls.
+    fn text_source(text: &'static str, delay: u64) -> (Arc<dyn Fn() -> Option<String> + Send + Sync>, Calls) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let read: Arc<dyn Fn() -> Option<String> + Send + Sync> = Arc::new(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+            Some(text.to_owned())
+        });
+        (read, calls)
+    }
+
+    #[test]
+    fn ctrl_v_with_no_text_field_asks_for_files_and_does_not_read_the_text() {
+        let root = window_dir("hook_no_field");
+        let mut w = Window::new(root.clone());
+        let (read, calls) = text_source("never", 0);
+        w.app.clipboard_text = read;
+        w.run(Vec::new(), 3);
+        assert!(!w.ctx.egui_wants_keyboard_input());
+        let mut raw = ctrl_v(egui::ViewportId::ROOT);
+        eframe::App::raw_input_hook(&mut w.app, &w.ctx, &mut raw);
+        assert_eq!(pastes(&raw), [String::new()], "an empty paste event, to ask for files");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(lots_of(&calls), 0, "the text was not read");
+        assert!(w.app.pending_text.is_none());
+    }
+
+    #[test]
+    fn ctrl_v_in_a_text_field_does_not_wait_for_the_text_and_it_arrives_later_in_the_same_window_with_unix_line_ends() {
+        let root = window_dir("hook_field");
+        std::fs::write(root.join("alpha"), "x").unwrap();
+        let mut w = Window::new(root.clone());
+        w.app.show_search = true;
+        w.app.focus_search = true;
+        w.run(Vec::new(), 8);
+        assert!(w.ctx.egui_wants_keyboard_input(), "the search field should have the focus");
+        let (read, calls) = text_source("one\r\ntwo", 150);
+        w.app.clipboard_text = read;
+        let started = std::time::Instant::now();
+        let mut raw = ctrl_v(egui::ViewportId::ROOT);
+        eframe::App::raw_input_hook(&mut w.app, &w.ctx, &mut raw);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100), "the hook waited: {:?}", started.elapsed());
+        assert!(pastes(&raw).is_empty(), "the text is not there yet, and the key is not left as it was");
+        assert!(!raw.events.iter().any(|e| matches!(e, egui::Event::Key { .. })));
+        // Another window asks for its input: the text is not for it
+        let mut other = egui::RawInput { viewport_id: egui::ViewportId::from_hash_of("other window"), ..Default::default() };
+        wait_until(|| lots_of(&calls) == 1);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        eframe::App::raw_input_hook(&mut w.app, &w.ctx, &mut other);
+        assert!(pastes(&other).is_empty(), "another window got the text");
+        // The window that asked gets it, once
+        let mut later = egui::RawInput { viewport_id: egui::ViewportId::ROOT, ..Default::default() };
+        eframe::App::raw_input_hook(&mut w.app, &w.ctx, &mut later);
+        assert_eq!(pastes(&later), ["one\ntwo"]);
+        let mut again = egui::RawInput { viewport_id: egui::ViewportId::ROOT, ..Default::default() };
+        eframe::App::raw_input_hook(&mut w.app, &w.ctx, &mut again);
+        assert!(pastes(&again).is_empty(), "only once");
+    }
+
+    #[test]
+    fn a_text_that_comes_after_the_field_lost_the_focus_or_after_the_wait_is_not_pasted() {
+        let root = window_dir("hook_late");
+        let mut w = Window::new(root.clone());
+        w.app.show_search = true;
+        w.app.focus_search = true;
+        w.run(Vec::new(), 8);
+        assert!(w.ctx.egui_wants_keyboard_input());
+        let (read, calls) = text_source("late", 100);
+        w.app.clipboard_text = read;
+        let mut raw = ctrl_v(egui::ViewportId::ROOT);
+        eframe::App::raw_input_hook(&mut w.app, &w.ctx, &mut raw);
+        wait_until(|| lots_of(&calls) == 1);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // No field has the focus any more when it arrives
+        w.app.show_search = false;
+        w.app.search_query.clear();
+        w.key(egui::Key::Escape);
+        w.run(Vec::new(), 8);
+        assert!(!w.ctx.egui_wants_keyboard_input());
+        let mut later = egui::RawInput { viewport_id: egui::ViewportId::ROOT, ..Default::default() };
+        eframe::App::raw_input_hook(&mut w.app, &w.ctx, &mut later);
+        assert!(pastes(&later).is_empty());
+        assert!(w.app.pending_text.is_none());
+
+        // And one that takes longer than the wait is given up on, and said so
+        w.app.show_search = true;
+        w.app.focus_search = true;
+        w.run(Vec::new(), 8);
+        let (read, _) = text_source("too late", 400);
+        w.app.clipboard_text = read;
+        w.app.clipboard_wait = std::time::Duration::from_millis(100);
+        let mut raw = ctrl_v(egui::ViewportId::ROOT);
+        eframe::App::raw_input_hook(&mut w.app, &w.ctx, &mut raw);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let mut next = egui::RawInput { viewport_id: egui::ViewportId::ROOT, ..Default::default() };
+        eframe::App::raw_input_hook(&mut w.app, &w.ctx, &mut next);
+        assert!(pastes(&next).is_empty());
+        assert_eq!(w.app.toast_message(), Some("The clipboard did not answer"));
+        assert!(w.app.pending_text.is_none());
     }
 
     #[test]

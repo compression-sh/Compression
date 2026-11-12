@@ -162,6 +162,30 @@ pub fn get_files() -> Option<(Vec<PathBuf>, bool)> {
     if on_wayland() { get_wayland() } else { get_x11() }
 }
 
+/// What the system clipboard held when a paste asked: files, or (when nothing else was there and a picture was
+/// wanted) a picture as PNG bytes.
+#[derive(Debug, Default, PartialEq)]
+pub struct Snapshot {
+    pub files: Option<(Vec<PathBuf>, bool)>,
+    pub image: Option<Vec<u8>>,
+}
+
+/// Reads what a paste needs from the system clipboard. It waits for the program that holds the clipboard, as long as
+/// that takes (on Wayland each read is limited to a few seconds, on X11 it is not), so it belongs on a thread of its
+/// own and its caller gives up on it by the clock (see `CompressionApp::paste`).
+pub fn snapshot(want_image: bool) -> Snapshot {
+    // Files of this computer that are gone are no files to paste; ones on a server are not looked at here
+    let files = get_files().filter(|(paths, _)| paths.iter().all(|p| crate::fs::network::is_remote(p) || p.exists()));
+    let image = if files.is_none() && want_image { get_image_png() } else { None };
+    Snapshot { files, image }
+}
+
+/// What comes through `pipe` (the reading end of what a clipboard owner was asked to send), within the limits of a
+/// read from the clipboard: at most 16 MiB and a few seconds. `None` when nothing whole came.
+pub fn read_pipe(pipe: std::os::fd::OwnedFd) -> Option<Vec<u8>> {
+    read_limited(&mut std::fs::File::from(pipe), READ_LIMIT, READ_TIMEOUT)
+}
+
 /// Puts plain text on the system clipboard, for windows that have no data device of their own
 /// (X11, or a Wayland compositor without one for this window).
 pub fn set_text(text: String) -> bool {
@@ -414,6 +438,28 @@ mod tests {
         assert_eq!(percent_decode("file:/tmp/a%20b"), percent_decode("file:///tmp/a%20b"));
         assert_eq!(percent_decode("file:relative"), None);
         assert_eq!(percent_decode("file://other-host/tmp/example"), None);
+    }
+
+    #[test]
+    fn the_text_a_holder_writes_to_the_pipe_is_read_on_a_thread_and_a_holder_that_does_not_is_given_up_on() {
+        use std::io::Write;
+        use std::os::fd::OwnedFd;
+        // A holder that writes its text and closes the pipe
+        let (read, mut write) = pipe();
+        let reader = std::thread::spawn(move || read_pipe(OwnedFd::from(read)));
+        write.write_all("Grüße\r\n".as_bytes()).unwrap();
+        drop(write);
+        assert_eq!(reader.join().unwrap().as_deref(), Some("Grüße\r\n".as_bytes()));
+        // One that keeps the pipe and never writes: the reader ends by the clock (a few seconds), and the caller is
+        // free all along, since it is a thread that waits
+        let (read, write) = pipe();
+        let started = std::time::Instant::now();
+        let reader = std::thread::spawn(move || read_pipe(OwnedFd::from(read)));
+        assert!(!reader.is_finished(), "the reader waits for the holder");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(reader.join().unwrap(), None);
+        assert!(started.elapsed() >= READ_TIMEOUT - Duration::from_millis(200) && started.elapsed() < READ_TIMEOUT + Duration::from_secs(2), "{:?}", started.elapsed());
+        drop(write);
     }
 
     #[test]

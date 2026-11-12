@@ -207,6 +207,16 @@ struct State {
 }
 
 /// The window's handle on the process's data device, which goes back to `KEPT` when the window closes.
+/// What asking for the clipboard's text gave.
+pub enum TextRead {
+    /// There is no text on the clipboard.
+    None,
+    /// This process holds it.
+    Ready(String),
+    /// Another program holds it and was asked to write it here.
+    Pipe(OwnedFd),
+}
+
 pub struct WaylandDnd(Option<Box<Device>>);
 
 thread_local! {
@@ -461,43 +471,27 @@ impl Device {
         true
     }
 
-    /// The text on the clipboard, if any. Waits a little for the program that holds it to send it.
-    pub fn text(&mut self) -> Option<String> {
+    /// Asks for the text on the clipboard, without waiting for it: the text itself when this process holds it, or the
+    /// reading end of a pipe the holder was asked to write it to (read it on a thread, `clipboard::read_pipe`).
+    pub fn begin_text(&mut self) -> TextRead {
         let mut cx = std::task::Context::from_waker(&self.waker);
         let _ = self.queue.poll_dispatch_pending(&mut cx, &mut self.state);
-        let offer = self.state.selection.as_ref()?;
-        let mimes = &self.state.offers.get(&offer.id())?.mimes;
+        let Some(offer) = self.state.selection.as_ref() else { return TextRead::None };
+        let Some(mimes) = self.state.offers.get(&offer.id()).map(|o| &o.mimes) else { return TextRead::None };
         if mimes.iter().any(|m| m == OWN_TEXT_MIME) && let Some(clip) = &self.state.clip {
-            return Some(clip.text.clone());
+            return TextRead::Ready(clip.text.clone());
         }
-        let mime = TEXT_MIMES.iter().find(|t| mimes.iter().any(|m| m == *t))?;
+        let Some(mime) = TEXT_MIMES.iter().find(|t| mimes.iter().any(|m| m == *t)) else { return TextRead::None };
         let mut fds = [0 as RawFd; 2];
         // SAFETY: pipe2 fills two descriptors we then own
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return None;
+            return TextRead::None;
         }
         let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         offer.receive((*mime).to_owned(), write.as_fd());
         let _ = self.connection.flush();
         drop(write);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        let mut data = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
-            let mut pfd = libc::pollfd { fd: read.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            // SAFETY: one valid pollfd
-            if left == 0 || unsafe { libc::poll(&mut pfd, 1, left) } <= 0 {
-                break;
-            }
-            // SAFETY: reads into a buffer of the given length from a descriptor we own
-            let n = unsafe { libc::read(read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 || data.len() > 16 << 20 {
-                break;
-            }
-            data.extend_from_slice(&buf[..n as usize]);
-        }
-        Some(String::from_utf8_lossy(&data).into_owned())
+        TextRead::Pipe(read)
     }
 
     /// The drag image, drawn into a shared-memory buffer.
