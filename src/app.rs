@@ -48,7 +48,7 @@ use crate::fs::templates::{self, Template};
 use crate::fs::ops::{self, ArchiveFormat};
 use crate::fs::scanner::{SortBy, SortOrder};
 use crate::plugins::{Badge, Plugins, Tone};
-use crate::settings::{Density, Settings};
+use crate::settings::{Density, Settings, TrustedProgram};
 use crate::thumbs::Thumbnails;
 use crate::ui::{
     icons,
@@ -234,6 +234,9 @@ pub(crate) enum ConfirmAction {
     ReplaceFile { queue: Vec<PathBuf>, answer: Vec<PathBuf> },
     /// A plugin entry that asked "are you sure?": the plugin, the entry and its files.
     Plugin(&'static str, String, Vec<PathBuf>),
+    /// Run a program file (an AppImage) that was opened. `always` is the "run without asking" box; `make_executable`
+    /// says the file has no execute bit yet and gets it for its owner first.
+    RunProgram { path: PathBuf, always: bool, make_executable: bool },
 }
 
 /// Action offered by a toast, such as undoing a move to the trash.
@@ -758,6 +761,11 @@ fn restore_job(w: &mut engine::Worker, paths: &[PathBuf]) -> engine::Outcome {
 
 /// How long the folder of an item to be trashed may take to answer before its drive counts as not answering.
 const TRASH_LOOK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether `path` names an AppImage, a program in one file, by its ending (in any case).
+fn is_app_image(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("appimage"))
+}
 
 fn rename_error(err: &std::io::Error, new_name: &str) -> String {
     match err.kind() {
@@ -1359,6 +1367,11 @@ impl CompressionApp {
 
     fn open_file(&mut self, path: &Path) {
         recent::record(path);
+        // A program the person opens is run, after asking once, the way Nautilus asks: "Run" or not. Not on a server
+        if is_app_image(path) && !network::is_remote(path) && path.symlink_metadata().is_ok_and(|m| m.is_file()) {
+            self.open_program(path);
+            return;
+        }
         let chosen = self.open_overrides.get(path).cloned();
         if let Some(id) = chosen {
             let app = self.installed_apps().iter().find(|a| a.id == id).cloned();
@@ -1392,6 +1405,63 @@ impl CompressionApp {
                 ctx.request_repaint();
             }
         });
+    }
+
+    /// Runs the program at `path` when the person trusts it as it is now (and it may be run), and asks first otherwise.
+    fn open_program(&mut self, path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = path.metadata().is_ok_and(|m| m.permissions().mode() & 0o100 != 0);
+        let trusted = TrustedProgram::of(path).is_some_and(|now| self.settings.trusted_programs.contains(&now));
+        if trusted && executable {
+            self.run_program(path);
+            return;
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut body = tr("This is a program. Run it only if it comes from a source you trust.").to_owned();
+        if !executable {
+            body.push(' ');
+            body.push_str(tr("It is not marked as executable: running it makes it executable for you."));
+        }
+        self.dialog = Some(Dialog::Confirm {
+            title: trf("Run “{}”?", &[&name]),
+            body,
+            confirm: tr("Run").to_owned(),
+            action: ConfirmAction::RunProgram { path: path.to_path_buf(), always: false, make_executable: !executable },
+        });
+    }
+
+    /// What "Run" in the question does: the execute bit for the owner if it was missing, the trust if it was asked for,
+    /// and then the program.
+    fn confirm_program(&mut self, path: &Path, always: bool, make_executable: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        if make_executable {
+            let made = path.metadata().and_then(|m| {
+                let mode = m.permissions().mode();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o100))
+            });
+            if let Err(err) = made {
+                self.set_toast(trf("Could not run {}: {}", &[&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), &crate::fs::describe::io_error(&err)]));
+                return;
+            }
+        }
+        if always && let Some(now) = TrustedProgram::of(path) {
+            self.settings.trusted_programs.retain(|t| t.path != now.path);
+            self.settings.trusted_programs.push(now);
+            self.save_settings_now();
+        }
+        self.run_program(path);
+    }
+
+    /// Starts the program at `path` in its own folder, detached from the window (its exit is collected).
+    fn run_program(&mut self, path: &Path) {
+        let mut command = std::process::Command::new(path);
+        command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        if let Some(dir) = path.parent() {
+            command.current_dir(dir);
+        }
+        if let Err(err) = crate::instance::spawn_reaped(&mut command) {
+            self.set_toast(trf("Could not run {}: {}", &[&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), &crate::fs::describe::io_error(&err)]));
+        }
     }
 
     /// Once per frame: take in what the thread opening a file has to say.
@@ -6380,7 +6450,13 @@ impl CompressionApp {
         let mut close = material::dialog_header(ui, title, None, &theme, "confirm_close");
         ui.label(egui::RichText::new(body.as_str()).size(material::FONT_BODY).color(theme.subtext0));
 
-        let affirming = matches!(action, ConfirmAction::ReplaceFile { .. } | ConfirmAction::TreatAsServer(_));
+        if let ConfirmAction::RunProgram { always, .. } = action {
+            ui.add_space(4.0);
+            if material::check_row(ui, "run_always", icons::CHECK, tr("Always run this file without asking"), &theme, *always).clicked() {
+                *always = !*always;
+            }
+        }
+        let affirming = matches!(action, ConfirmAction::ReplaceFile { .. } | ConfirmAction::TreatAsServer(_) | ConfirmAction::RunProgram { .. });
         let icon = if affirming { icons::CHECK } else { icons::DELETE_FOREVER };
         let footer = material::dialog_footer(ui, &theme, FooterSpec { danger: true, ..FooterSpec::new("confirm", icon, confirm) });
         close |= footer.cancel;
@@ -6390,6 +6466,7 @@ impl CompressionApp {
                 ConfirmAction::EmptyTrash => self.empty_trash(),
                 ConfirmAction::TreatAsServer(folder) => self.treat_folder_as_server(folder, true),
                 ConfirmAction::Plugin(plugin, id, paths) => self.run_plugin_confirmed(ui.ctx(), plugin, &id, &paths),
+                ConfirmAction::RunProgram { path, always, make_executable } => self.confirm_program(&path, always, make_executable),
                 ConfirmAction::ReplaceFile { mut queue, answer } => {
                     if queue.is_empty() {
                         self.chooser_answer_with(&answer);
@@ -11340,6 +11417,90 @@ mod tests {
         w.key(egui::Key::Enter);
         let home = dirs::home_dir().unwrap();
         w.until("home", |w| w.app.current_path == home);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An AppImage stand-in: a script that adds a line to `ran` beside it each time it runs.
+    fn fake_app_image(dir: &Path, executable: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("Tool-x86_64.AppImage");
+        std::fs::write(&path, "#!/bin/sh\necho run >> ran\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 })).unwrap();
+        path
+    }
+
+    fn runs(dir: &Path, want: usize) -> bool {
+        for _ in 0..300 {
+            if std::fs::read_to_string(dir.join("ran")).is_ok_and(|t| t.lines().count() == want) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn an_app_image_runs_after_one_question_and_without_one_once_trusted_as_it_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = window_dir("app_image");
+        let program = fake_app_image(&dir, false);
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(dir.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        // Not executable yet: asked, with a word about it, and nothing runs before the answer
+        app.open_file(&program);
+        let Some(Dialog::Confirm { action: ConfirmAction::RunProgram { make_executable: true, always: false, .. }, body, .. }) = &app.dialog else { panic!("no question: {:?}", app.dialog.is_some()) };
+        assert!(body.contains("not marked as executable"), "{body}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!dir.join("ran").exists());
+        // Run: it becomes executable for its owner and runs, once
+        app.dialog = None;
+        app.confirm_program(&program, false, true);
+        assert!(runs(&dir, 1));
+        assert_ne!(program.metadata().unwrap().permissions().mode() & 0o100, 0);
+        // Not trusted: the next time asks again
+        app.open_file(&program);
+        assert!(matches!(app.dialog, Some(Dialog::Confirm { action: ConfirmAction::RunProgram { make_executable: false, .. }, .. })));
+        app.dialog = None;
+        // "Always run": it runs, and the time after it runs without a question
+        app.confirm_program(&program, true, false);
+        assert!(runs(&dir, 2));
+        assert_eq!(app.settings.trusted_programs.len(), 1);
+        app.open_file(&program);
+        assert!(app.dialog.is_none(), "a trusted program was asked about");
+        assert!(runs(&dir, 3));
+        // Changed since: asked about again
+        std::fs::write(&program, "#!/bin/sh\necho run >> ran\necho changed\n").unwrap();
+        app.open_file(&program);
+        assert!(matches!(app.dialog, Some(Dialog::Confirm { action: ConfirmAction::RunProgram { .. }, .. })), "a changed program ran unasked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_app_image_is_opened_with_one_click_or_two_as_the_setting_says() {
+        let dir = window_dir("app_image_click");
+        fake_app_image(&dir, true);
+        for single in [false, true] {
+            let mut w = Window::new(dir.clone());
+            w.app.settings.single_click_open = single;
+            w.run(Vec::new(), 5);
+            let at = w.at("Tool-x86_64.AppImage");
+            let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            w.run(vec![egui::Event::PointerMoved(at)], 2);
+            w.run(vec![button(true)], 1);
+            w.run(vec![button(false)], 8);
+            let asked = |w: &Window| matches!(w.app.dialog, Some(Dialog::Confirm { action: ConfirmAction::RunProgram { .. }, .. }));
+            assert_eq!(asked(&w), single, "one click, single click opening {single}");
+            if !single {
+                // Two clicks in quick succession (each frame is 50 ms here)
+                for pressed in [true, false, true, false] {
+                    w.run(vec![button(pressed)], 1);
+                }
+                w.run(Vec::new(), 5);
+                assert!(asked(&w), "a double click asks");
+            }
+        }
+        assert!(!dir.join("ran").exists(), "nothing ran without an answer");
+        assert!(is_app_image(Path::new("/x/a.AppImage")) && is_app_image(Path::new("/x/a.appimage")) && !is_app_image(Path::new("/x/appimage.txt")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

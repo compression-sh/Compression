@@ -94,6 +94,9 @@ pub struct Settings {
     /// Folders (mount points) the person chose to treat as servers, though Compression does not know them as such:
     /// nothing in the window waits for them, they get no previews, and nothing on them is replaced. Only set by hand.
     pub remote_folders: Vec<PathBuf>,
+    /// Programs (AppImages) the person said to run without asking, each as it was then: a file that changed since is
+    /// asked about again.
+    pub trusted_programs: Vec<TrustedProgram>,
     pub show_extensions: bool,
     pub relative_dates: bool,
     pub decimal_units: bool,
@@ -284,6 +287,7 @@ impl Default for Settings {
             show_thumbnails: true,
             remote_previews: false,
             remote_folders: Vec::new(),
+            trusted_programs: Vec::new(),
             show_extensions: true,
             relative_dates: true,
             decimal_units: false,
@@ -303,6 +307,24 @@ pub const SCROLL_SPEED_DEFAULT: f32 = 1.0;
 /// What the slider in the settings covers; `settings.json` may hold any value in `SCROLL_SPEED_RANGE`.
 pub const SCROLL_SPEED_SLIDER: std::ops::RangeInclusive<f32> = 0.25..=2.25;
 pub const SCROLL_SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.1..=5.0;
+
+/// A program file the person trusts to run without a question, as it was when they said so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedProgram {
+    pub path: PathBuf,
+    pub size: u64,
+    /// Modification time in seconds since the epoch.
+    pub modified: i64,
+}
+
+impl TrustedProgram {
+    /// The program at `path` as it is now; `None` when it cannot be looked at.
+    pub fn of(path: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = path.symlink_metadata().ok()?;
+        Some(Self { path: path.to_path_buf(), size: meta.len(), modified: meta.mtime() })
+    }
+}
 
 pub(crate) fn file() -> Option<PathBuf> {
     crate::fs::admin::config_override().or_else(dirs::config_dir).map(|d| d.join("compression").join("settings.json"))
