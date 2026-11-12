@@ -39,6 +39,8 @@ jpeg-decoder = { version = "0.3", default-features = false }
 png = "0.18"
 md5 = "0.7"
 percent-encoding = "2"
+# Reads the magic of the installed shared-mime-info (no data of its own): already a dependency of wl-clipboard-rs
+tree_magic_mini = "3.2"
 notify = { version = "8", default-features = false }
 
 # Thin LTO and 16 codegen units compile much faster than fat LTO in one unit, at about the same run-time speed

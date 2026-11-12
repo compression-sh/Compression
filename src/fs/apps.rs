@@ -613,37 +613,85 @@ fn mime_globs() -> &'static MimeGlobs {
 /// MIME type of a file from its name alone, the way the shared-mime-info database assigns it
 /// (longest matching extension first, then the heaviest pattern); `None` when no pattern matches.
 pub fn mime_of_name(name: &str) -> Option<String> {
+    mimes_of_name(name).into_iter().next()
+}
+
+/// The MIME types the name of a file can stand for, the best first. More than one when patterns of the same weight and
+/// length match (`.ts` is a video and a Qt translation): then only the content can tell (see `mime_of_file`).
+fn mimes_of_name(name: &str) -> Vec<String> {
     let globs = mime_globs();
     let lower = name.to_lowercase();
-    let mut best: Option<(u32, usize, &str)> = None;
+    let mut best: Option<(u32, usize)> = None;
+    let mut mimes: Vec<&str> = Vec::new();
+    let mut offer = |weight: u32, len: usize, mime: &'static str| match best.map(|b| (weight, len).cmp(&b)) {
+        None | Some(std::cmp::Ordering::Greater) => {
+            best = Some((weight, len));
+            mimes = vec![mime];
+        }
+        Some(std::cmp::Ordering::Equal) if !mimes.contains(&mime) => mimes.push(mime),
+        _ => {}
+    };
     for (weight, mime, glob) in &globs.other {
         // A pattern of the database is one pattern on the whole name: no commas, and plain text is no substring
-        if super::glob::wildcard(glob, &lower) && best.is_none_or(|(w, l, _)| (*weight, glob.len()) > (w, l)) {
-            best = Some((*weight, glob.len(), mime));
+        if super::glob::wildcard(glob, &lower) {
+            offer(*weight, glob.len(), mime);
         }
     }
     // `a.tar.gz` is tried as `tar.gz` before `gz`
     for (i, _) in lower.match_indices('.') {
         if let Some(found) = globs.by_extension.get(&lower[i + 1..]) {
-            let (weight, mime) = found.iter().max_by_key(|(w, _)| *w)?;
             let len = lower.len() - i;
-            if best.is_none_or(|(w, l, _)| (*weight, len) > (w, l)) {
-                best = Some((*weight, len, mime));
+            for (weight, mime) in found {
+                offer(*weight, len, mime);
             }
             break;
         }
     }
-    best.map(|(_, _, mime)| mime.to_owned())
+    mimes.into_iter().map(str::to_owned).collect()
 }
 
-/// Whether a file named `name` is of the type `pattern` (`image/png`, or `image/*` for a family),
-/// counting the types it derives from: a `.docx` is an `application/zip`.
-pub fn name_is_mime(name: &str, pattern: &str) -> bool {
+/// How much of a file is read to tell its type by its content.
+const MAGIC_BYTES: u64 = 64 * 1024;
+
+/// The MIME type of the file at `path`: from its name when that is clear, and from its first bytes (the magic of the
+/// shared-mime-info database) when the name has no type or more than one, as GTK does. Only regular files on this
+/// computer are read; a server is not asked for the bytes of every unnamed file.
+pub fn mime_of_file(path: &Path) -> Option<String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut named = mimes_of_name(&name);
+    if named.len() == 1 || super::network::is_remote(path) {
+        return named.into_iter().next();
+    }
+    let Some(bytes) = first_bytes(path) else { return named.into_iter().next() };
+    if named.is_empty() {
+        return Some(tree_magic_mini::from_u8(&bytes).to_owned());
+    }
+    // Of the types the name allows, the one the content has; the first when none fits
+    let fitting = named.iter().position(|mime| tree_magic_mini::match_u8(mime, &bytes)).unwrap_or(0);
+    Some(named.swap_remove(fitting))
+}
+
+/// The start of a regular file, without waiting on a pipe or following a link (see `ops::open_regular_file`).
+fn first_bytes(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = super::ops::open_regular_file(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAGIC_BYTES).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// Whether the file at `path` is of the type `pattern` (`image/png`, or `image/*` for a family), counting the types it
+/// derives from (a `.docx` is an `application/zip`); its content tells its type where the name does not (`mime_of_file`).
+pub fn file_is_mime(path: &Path, pattern: &str) -> bool {
+    mime_is(mime_of_file(path), pattern)
+}
+
+fn mime_is(mime: Option<String>, pattern: &str) -> bool {
     // Without a database nothing can be told apart, and hiding every file is worse than showing all
     if mime_globs().by_extension.is_empty() {
         return true;
     }
-    let mime = mime_of_name(name).unwrap_or_else(|| "application/octet-stream".to_owned());
+    let mime = mime.unwrap_or_else(|| "application/octet-stream".to_owned());
     let chain = mime_chain(&mime);
     match pattern.strip_suffix("/*") {
         Some(family) => chain.iter().any(|m| m.split_once('/').is_some_and(|(f, _)| f == family)),

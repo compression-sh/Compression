@@ -38,7 +38,7 @@ impl Filter {
             // One pattern on the whole name, as GTK reads a filter's glob: a comma is a character (`*,v` is RCS files),
             // and text without wildcards is the name itself, not part of it. Letters match in either case.
             Pattern::Glob(g) => crate::fs::glob::wildcard(&g.to_lowercase(), &name.to_lowercase()),
-            Pattern::Mime(m) => crate::fs::apps::name_is_mime(&name, m),
+            Pattern::Mime(m) => crate::fs::apps::file_is_mime(path, m),
         })
     }
 }
@@ -384,6 +384,40 @@ mod tests {
         let p = PathBuf::from("/home/a b/ü#1.txt");
         assert_eq!(from_uri(&uri(&p)), Some(p));
         assert_eq!(uri(Path::new("/a b")), "file:///a%20b");
+    }
+
+    #[test]
+    fn a_file_without_a_telling_name_is_told_apart_by_its_content() {
+        // Skipped where no shared-mime-info is installed, which then shows everything by design
+        if crate::fs::apps::mime_of_name("a.png").is_none() || !Path::new("/usr/share/mime/magic").exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("compression_chooser_magic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mime = |m: &str| Filter { label: String::new(), patterns: vec![Pattern::Mime(m.into())] };
+        // No extension: a PNG by its signature, and text that is not one
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R'];
+        png.extend([0u8; 32]);
+        std::fs::write(dir.join("scan"), &png).unwrap();
+        std::fs::write(dir.join("notes"), "just some words\n").unwrap();
+        assert!(mime("image/png").accepts(&dir.join("scan")));
+        assert!(mime("image/*").accepts(&dir.join("scan")));
+        assert!(!mime("image/*").accepts(&dir.join("notes")));
+        // `.ts` is a video and a Qt translation alike by its name: the content decides
+        let mut video = Vec::new();
+        for _ in 0..8 {
+            video.push(0x47);
+            video.extend([0u8; 187]);
+        }
+        std::fs::write(dir.join("clip.ts"), &video).unwrap();
+        std::fs::write(dir.join("app_de.ts"), "<?xml version=\"1.0\"?>\n<!DOCTYPE TS>\n<TS version=\"2.1\" language=\"de\">\n</TS>\n").unwrap();
+        assert!(mime("video/*").accepts(&dir.join("clip.ts")));
+        assert!(!mime("video/*").accepts(&dir.join("app_de.ts")), "the translation is no video");
+        assert!(mime("text/vnd.trolltech.linguist").accepts(&dir.join("app_de.ts")));
+        // A name that tells is taken at its word, without reading the file
+        assert!(mime("image/png").accepts(&dir.join("not-there.png")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

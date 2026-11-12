@@ -654,6 +654,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "tree_magic_mini",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
