@@ -276,8 +276,11 @@ pub struct Worker {
     events: mpsc::Sender<Event>,
     ctx: egui::Context,
     job: u64,
-    /// The answer given with "apply to all".
-    remembered: Option<Decision>,
+    /// The answer given with "apply to all", for a folder that meets a folder...
+    remembered_folders: Option<Decision>,
+    /// ...and for every other clash. "Merge" is an answer for folders only: the files that clash inside them are still
+    /// asked about, as Nautilus does, unless an answer for them was given with "apply to all" too.
+    remembered_files: Option<Decision>,
     /// Files with more than one name that this job has copied: `(device, inode)` of the original, and the copy made
     /// (with its own inode), so that another name of the same file becomes another name of that copy.
     links: Mutex<std::collections::HashMap<(u64, u64), (PathBuf, u64)>>,
@@ -293,11 +296,8 @@ impl Worker {
     fn decide(&mut self, source: &Path, target: &Path) -> io::Result<Decision> {
         let (source_info, target_info) = (EntryInfo::of(source), EntryInfo::of(target));
         let both_dirs = source_info.is_dir && target_info.is_dir;
-        if let Some(decision) = self.remembered {
-            return Ok(match decision {
-                Decision::Merge if !both_dirs => Decision::Replace,
-                other => other,
-            });
+        if let Some(decision) = if both_dirs { self.remembered_folders } else { self.remembered_files } {
+            return Ok(decision);
         }
         let (reply, answer) = mpsc::channel();
         let request = ConflictRequest { job: self.job, target: target.to_path_buf(), source_info, target_info, reply };
@@ -307,7 +307,14 @@ impl Worker {
             Some((Decision::Cancel, _)) | None => Err(cancelled()),
             Some((decision, all)) => {
                 if all {
-                    self.remembered = Some(decision);
+                    // A merge is remembered for folders; any other answer for the files, and for the folders too
+                    // unless they have an answer already
+                    if decision == Decision::Merge {
+                        self.remembered_folders = Some(decision);
+                    } else {
+                        self.remembered_files = Some(decision);
+                        self.remembered_folders.get_or_insert(decision);
+                    }
                 }
                 Ok(decision)
             }
@@ -481,7 +488,7 @@ impl Engine {
     fn launch(&mut self, id: u64, work: Work) {
         let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) else { return };
         job.state = JobState::Running;
-        let mut worker = Worker { shared: job.shared.clone(), events: self.tx.clone(), ctx: self.ctx.clone(), job: id, remembered: None, links: Mutex::default(), attrs_lost: AtomicU64::new(0), acl_lost: AtomicU64::new(0), group_lost: AtomicU64::new(0) };
+        let mut worker = Worker { shared: job.shared.clone(), events: self.tx.clone(), ctx: self.ctx.clone(), job: id, remembered_folders: None, remembered_files: None, links: Mutex::default(), attrs_lost: AtomicU64::new(0), acl_lost: AtomicU64::new(0), group_lost: AtomicU64::new(0) };
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
@@ -1455,6 +1462,88 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         (done.expect("the job never finished"), asked)
+    }
+
+    /// `run`, answering each question with what `answer` says for it, and listing the targets asked about.
+    fn run_answering(op: Op, pairs: Vec<(PathBuf, PathBuf)>, answer: impl Fn(&ConflictRequest) -> (Decision, bool)) -> (Outcome, Vec<PathBuf>) {
+        let mut e = engine();
+        e.spawn(JobKind::Copy, String::new(), String::new(), move |w| transfer(w, op, pairs));
+        let (mut done, mut asked) = (None, Vec::new());
+        for _ in 0..500 {
+            for event in e.poll() {
+                match event {
+                    Event::Conflict(request) => {
+                        asked.push(request.target.clone());
+                        let (decision, all) = answer(&request);
+                        request.answer(decision, all);
+                    }
+                    Event::Done { outcome, .. } => done = Some(outcome),
+                    _ => {}
+                }
+            }
+            if !e.running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (done.expect("the job never finished"), asked)
+    }
+
+    /// `src/data` and `dest/data`, both with `a.txt` and `b.txt`, and `src/more` and `dest/more`, both with `c.txt`; the
+    /// files in `src` say "new", those in `dest` "old". `src/more` also has `d.txt`.
+    fn two_folders_that_clash(name: &str) -> (PathBuf, Vec<(PathBuf, PathBuf)>) {
+        let base = sandbox(name);
+        for (side, text) in [("src", "new"), ("dest", "old")] {
+            for (folder, file) in [("data", "a.txt"), ("data", "b.txt"), ("more", "c.txt")] {
+                std::fs::create_dir_all(base.join(side).join(folder)).unwrap();
+                std::fs::write(base.join(side).join(folder).join(file), text).unwrap();
+            }
+        }
+        // Only on one side: it arrives when `more` is merged, not when it is skipped
+        std::fs::write(base.join("src/more/d.txt"), "new").unwrap();
+        let pairs = ["data", "more"].iter().map(|f| (base.join("src").join(f), base.join("dest").join(f))).collect();
+        (base, pairs)
+    }
+
+    #[test]
+    fn merging_for_all_still_asks_about_each_file_that_clashes_inside() {
+        let (base, pairs) = two_folders_that_clash("merge_all_files");
+        let (outcome, asked) = run_answering(Op::Copy, pairs, |r| if r.target_info.is_dir { (Decision::Merge, true) } else { (Decision::Skip, false) });
+        assert!(outcome.ok, "{}", outcome.message);
+        let dest = base.join("dest");
+        // The first folder is asked about, the second is merged as answered; every file is a question of its own
+        let mut asked = asked;
+        asked[1..3].sort();
+        assert_eq!(asked, [dest.join("data"), dest.join("data/a.txt"), dest.join("data/b.txt"), dest.join("more/c.txt")]);
+        for file in ["data/a.txt", "data/b.txt", "more/c.txt"] {
+            assert_eq!(std::fs::read_to_string(dest.join(file)).unwrap(), "old", "{file} was skipped, not replaced");
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn an_answer_for_all_files_inside_merged_folders_keeps_the_merge_for_the_folders() {
+        let (base, pairs) = two_folders_that_clash("merge_all_skip_all");
+        let (outcome, asked) = run_answering(Op::Copy, pairs, |r| if r.target_info.is_dir { (Decision::Merge, true) } else { (Decision::Skip, true) });
+        assert!(outcome.ok, "{}", outcome.message);
+        let dest = base.join("dest");
+        assert_eq!(asked.len(), 2, "one question for the folders, one for the files: {asked:?}");
+        assert!(asked[0] == dest.join("data") && asked[1].parent() == Some(dest.join("data").as_path()), "{asked:?}");
+        // `more` is merged, not skipped as a whole; its file that clashes is skipped
+        assert_eq!(std::fs::read_to_string(dest.join("more/c.txt")).unwrap(), "old");
+        assert!(dest.join("more/d.txt").exists(), "the folder was skipped instead of merged");
+        assert_eq!(std::fs::read_to_string(dest.join("data/b.txt")).unwrap(), "old");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn replacing_for_all_without_a_merge_still_answers_folders_and_files() {
+        let (base, pairs) = two_folders_that_clash("replace_all");
+        let (outcome, asked) = run_answering(Op::Copy, pairs, |_| (Decision::Replace, true));
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(std::fs::read_to_string(base.join("dest/more/c.txt")).unwrap(), "new");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     fn is_root() -> bool {
