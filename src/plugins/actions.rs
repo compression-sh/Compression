@@ -55,6 +55,9 @@ pub struct Definition {
 }
 
 struct Entry {
+    /// The file the action comes from, by name: what the menu and its settings know it by. Its place in the list would
+    /// change when an action is added, and a menu opened before that would run another one.
+    id: String,
     def: Definition,
     /// Menu labels are `&'static str`; `intern` leaks each distinct text once, so reloading is free.
     label: &'static str,
@@ -251,7 +254,8 @@ fn read_entry(path: &Path) -> Result<Option<Entry>, String> {
         return Ok(None);
     };
     let name = if def.name.trim().is_empty() { stem } else { def.name.clone() };
-    Ok(Some(Entry { label: intern(&name), def, script }))
+    let id = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Ok(Some(Entry { id, label: intern(&name), def, script }))
 }
 
 impl Definition {
@@ -351,16 +355,11 @@ impl Plugin for Actions {
     }
 
     fn menu_items(&self, selection: &[FileItem]) -> Vec<MenuItem> {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.def.applies(selection))
-            .map(|(i, e)| MenuItem::new(i.to_string(), e.label, icons::TERMINAL).group(tr("Actions")))
-            .collect()
+        self.entries.iter().filter(|e| e.def.applies(selection)).map(|e| MenuItem::new(e.id.clone(), e.label, icons::TERMINAL).group(tr("Actions"))).collect()
     }
 
     fn run(&mut self, id: &str, paths: &[PathBuf], dir: &Path) -> Reaction {
-        let Some(entry) = id.parse::<usize>().ok().and_then(|i| self.entries.get(i)) else { return Reaction::None };
+        let Some(entry) = self.entries.iter().find(|e| e.id == id) else { return Reaction::None };
         let mut command = match &entry.script {
             Some(script) => {
                 let mut c = Command::new(script);
@@ -481,7 +480,7 @@ mod tests {
         assert_eq!(defined(r#"{"command":"true"}"#).unwrap().limits(), DEFAULT_LIMITS);
         assert_eq!(defined(r#"{"command":"true","timeout":null,"max_output_mb":null}"#).unwrap().limits(), DEFAULT_LIMITS);
         // A script has no definition to put them in
-        assert_eq!(Entry { def: Definition::default(), label: "s", script: Some(PathBuf::from("/x")) }.def.limits(), DEFAULT_LIMITS);
+        assert_eq!(Entry { id: "s".into(), def: Definition::default(), label: "s", script: Some(PathBuf::from("/x")) }.def.limits(), DEFAULT_LIMITS);
     }
 
     #[test]
@@ -535,7 +534,7 @@ mod tests {
         std::fs::write(dir.join("a.json"), r#"{"name":"Slow","command":"sleep 30","timeout":1}"#).unwrap();
         let mut actions = Actions::in_dir_for(Some(dir.clone()), false);
         let started = Instant::now();
-        actions.run("0", &[PathBuf::from("x")], &dir);
+        actions.run("a.json", &[PathBuf::from("x")], &dir);
         let message = actions.done_rx.recv_timeout(Duration::from_secs(20)).unwrap();
         assert!(started.elapsed() < Duration::from_secs(15), "it ran for its 30 seconds");
         assert_eq!(message, trf("{} failed: {}", &[&"Slow", &trf("it took longer than {} s", &[&"1"])]));
@@ -581,7 +580,7 @@ mod tests {
         let mut actions = Actions::in_dir(Some(dir.clone()));
         assert_eq!(actions.entries.len(), 2);
         assert!(!actions.busy());
-        actions.run("0", &[PathBuf::from("one"), PathBuf::from("two words")], &dir);
+        actions.run("a.json", &[PathBuf::from("one"), PathBuf::from("two words")], &dir);
         let message = actions.done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(message.contains("List"), "{message}");
         let out = std::fs::read_to_string(dir.join("out.txt")).unwrap();
@@ -686,6 +685,25 @@ mod tests {
         assert_eq!(read_entry(&file).err().as_deref(), Some("not valid JSON (line 3)"));
         std::fs::write(&file, "{ \"command\": 5 }").unwrap();
         assert_eq!(read_entry(&file).err().as_deref(), Some("a value has the wrong type (line 1)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_action_is_known_by_its_file_so_one_added_meanwhile_does_not_change_what_runs() {
+        let dir = std::env::temp_dir().join(format!("compression-actions-by-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m.json"), r#"{"name":"Mine","command":"echo mine > ran.txt"}"#).unwrap();
+        let mut actions = Actions::in_dir_for(Some(dir.clone()), false);
+        let item = crate::fs::file_item::FileItem::from_path(&dir.join("m.json")).unwrap();
+        let ids: Vec<String> = actions.menu_items(std::slice::from_ref(&item)).into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, ["m.json"]);
+        // An action that sorts before it appears while the menu is open
+        std::fs::write(dir.join("a.json"), r#"{"name":"Other","command":"echo other > ran.txt"}"#).unwrap();
+        actions.reload();
+        actions.run(&ids[0], &[], &dir);
+        let _ = actions.done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("ran.txt")).unwrap().trim(), "mine");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
