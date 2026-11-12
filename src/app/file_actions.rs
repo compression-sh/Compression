@@ -40,7 +40,8 @@ impl CompressionApp {
             let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { continue };
             let link_name = trf("Link to {}", &[&name.to_string_lossy()]);
             let link = ops::unique_path(parent, std::ffi::OsStr::new(&link_name), "link");
-            let target = path.canonicalize().unwrap_or_else(|_| path.clone());
+            // The item itself, as chosen: a link to a link points to that link, not to where it leads
+            let target = std::path::absolute(path).unwrap_or_else(|_| path.clone());
             match std::os::unix::fs::symlink(&target, &link) {
                 Ok(()) => made.push(link),
                 Err(err) => failed.push(crate::fs::describe::failed(&name.to_string_lossy(), &err)),
@@ -52,7 +53,14 @@ impl CompressionApp {
             }
             return;
         }
-        self.reload_items();
+        // Only the new links are read, not the whole folder (which may be on a server); links made beside the items of a
+        // search or of Recent are not part of that list
+        if !self.is_mixed_listing() {
+            let here = self.current_path.clone();
+            for link in made.iter().filter(|l| l.parent() == Some(here.as_path())) {
+                self.add_listed(link);
+            }
+        }
         self.selection = made.iter().filter_map(|l| self.items.iter().position(|i| &i.path == l)).collect();
         self.selected_index = self.selection.iter().next().copied();
         self.anchor = self.selected_index;
@@ -178,5 +186,35 @@ impl CompressionApp {
             None if self.can_modify_here() => self.open_menu(ctx, egui::pos2(screen.center().x, screen.top() + 140.0), MenuTarget::Folder),
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_link_points_to_the_chosen_item_and_appears_without_the_folder_being_read_again() {
+        let base = std::env::temp_dir().join(format!("compression_make_links_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let base = base.canonicalize().unwrap();
+        std::fs::write(base.join("real.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(base.join("real.txt"), base.join("alias")).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        // A file that appears behind the window's back is not picked up: the folder is not read again
+        std::fs::write(base.join("unseen.txt"), "x").unwrap();
+        app.make_links(vec![base.join("alias"), base.join("real.txt")]);
+        let link = base.join("Link to alias");
+        assert_eq!(std::fs::read_link(&link).unwrap(), base.join("alias"), "the link leads to the chosen link, not past it");
+        assert_eq!(std::fs::read_link(base.join("Link to real.txt")).unwrap(), base.join("real.txt"));
+        let names: Vec<&str> = app.items.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"Link to alias") && names.contains(&"Link to real.txt"), "{names:?}");
+        assert!(!names.contains(&"unseen.txt"), "the folder was read again: {names:?}");
+        let selected: Vec<&str> = app.selection.iter().map(|&i| app.items[i].name.as_str()).collect();
+        assert_eq!(selected.len(), 2, "{selected:?}");
+        assert_eq!(app.history.undo_label(), Some("Link to 2 items"));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
