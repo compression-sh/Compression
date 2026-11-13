@@ -9,6 +9,7 @@ use std::sync::mpsc;
 
 use eframe::egui;
 
+use super::tag_reach::{self, Identity, Meta, Metas, Reach};
 use super::{FileOpEvent, Mark, MenuItem, Plugin, PropertyGroup, Reaction, SidebarEntry, intern};
 use crate::fs::file_item::FileItem;
 use crate::fs::xattr;
@@ -99,10 +100,9 @@ impl Registry {
         dirs::data_dir().map(|d| d.join("compression").join("tag-paths.json"))
     }
 
+    /// Read as it is: where its files are now is found out on a thread (`Tags::start_check`), never here.
     fn load() -> Self {
-        let mut registry: Registry = Self::file().map(|f| crate::fs::stored::load_json(&f)).unwrap_or_default();
-        registry.validate(|p| read_tags(p).ok());
-        registry
+        Self::file().map(|f| crate::fs::stored::load_json(&f)).unwrap_or_default()
     }
 
     fn save(&self) {
@@ -114,20 +114,6 @@ impl Registry {
         if let Ok(json) = serde_json::to_string(self) {
             let _ = crate::fs::stored::save(&file, json);
         }
-    }
-
-    /// Drops paths that are gone and takes the tags from disk (`read` gives None when unreadable).
-    /// A file that is not there now (its drive is not plugged in, its server not connected) keeps what is known of it:
-    /// that is no reason to forget its tags.
-    pub fn validate(&mut self, read: impl Fn(&Path) -> Option<Vec<String>>) {
-        for (path, tags) in self.0.iter_mut() {
-            if path.symlink_metadata().is_ok()
-                && let Some(fresh) = read(path)
-            {
-                *tags = fresh;
-            }
-        }
-        self.0.retain(|_, tags| !tags.is_empty());
     }
 
     /// Returns whether anything changed.
@@ -272,6 +258,50 @@ pub struct Tags {
     folder_rx: Option<mpsc::Receiver<FolderRead>>,
     prompt: Option<Prompt>,
     messages: Vec<String>,
+    /// Beside each remembered file: its file system, and whether its tags wait to be written to it.
+    metas: Metas,
+    /// Where each remembered file was found by the last check; one not checked yet counts as away.
+    reach: HashMap<PathBuf, Reach>,
+    /// The check that runs, and whether it forgets what it finds gone (the cleanup the person confirmed).
+    check_rx: Option<mpsc::Receiver<(bool, Vec<Checked>)>>,
+    identity: Identity,
+    /// The person asked to forget the files that are gone and is asked to confirm.
+    confirm_cleanup: bool,
+    /// When the last check was started.
+    last_check: Option<std::time::Instant>,
+}
+
+/// What a check found of one remembered file.
+struct Checked {
+    path: PathBuf,
+    reach: Reach,
+    /// The file system it is on, when it is there.
+    fs: Option<String>,
+    /// Its tags as read from it, when it is there and nothing waited to be written.
+    read: Option<Vec<String>>,
+    /// The tags that waited were written to it.
+    wrote: bool,
+}
+
+/// Finds out, off the window's thread, where `entries` (path, tags in the index, what is kept beside them) are. A file
+/// that is there gets the tags that waited for it written, or has its own tags read.
+fn check(entries: Vec<(PathBuf, Vec<String>, Meta)>, identity: Identity, server_wait: std::time::Duration) -> Vec<Checked> {
+    entries
+        .into_iter()
+        .map(|(path, tags, meta)| {
+            let reach = tag_reach::classify(&path, Some(&meta), identity, server_wait);
+            let (mut fs, mut read, mut wrote) = (None, None, false);
+            if reach == Reach::Here {
+                fs = identity(&path);
+                if meta.pending {
+                    wrote = write_tags(&path, &tags).is_ok();
+                } else {
+                    read = read_tags(&path).ok();
+                }
+            }
+            Checked { path, reach, fs, read, wrote }
+        })
+        .collect()
 }
 
 fn colors_file() -> Option<PathBuf> {
@@ -281,11 +311,180 @@ fn colors_file() -> Option<PathBuf> {
 impl Tags {
     pub fn load() -> Self {
         let colors = colors_file().map(|f| crate::fs::stored::load_json(&f)).unwrap_or_default();
-        Self::with(Registry::load(), colors)
+        let mut tags = Self::with(Registry::load(), colors);
+        tags.metas = Metas::load();
+        tags.start_check(None, false);
+        tags
     }
 
     fn with(registry: Registry, colors: BTreeMap<String, [u8; 3]>) -> Self {
-        Self { registry, colors, cache: HashMap::new(), dir: None, generation: 0, folder_rx: None, prompt: None, messages: Vec::new() }
+        Self {
+            registry,
+            colors,
+            cache: HashMap::new(),
+            dir: None,
+            generation: 0,
+            folder_rx: None,
+            prompt: None,
+            messages: Vec::new(),
+            metas: Metas::default(),
+            reach: HashMap::new(),
+            check_rx: None,
+            identity: tag_reach::fs_identity,
+            confirm_cleanup: false,
+            last_check: None,
+        }
+    }
+
+    /// Finds out on a thread where the remembered files are (`paths`, or all of them). With `forget`, the files found
+    /// gone then are forgotten: only their tags in the index, never the files.
+    fn start_check(&mut self, paths: Option<Vec<PathBuf>>, forget: bool) {
+        let entries: Vec<(PathBuf, Vec<String>, Meta)> = self
+            .registry
+            .0
+            .iter()
+            .filter(|(p, _)| paths.as_ref().is_none_or(|only| only.contains(p)))
+            .map(|(p, tags)| (p.clone(), tags.clone(), self.metas.0.get(p).cloned().unwrap_or_default()))
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        let identity = self.identity;
+        std::thread::spawn(move || {
+            let _ = tx.send((forget, check(entries, identity, tag_reach::SERVER_WAIT)));
+        });
+        self.check_rx = Some(rx);
+        self.last_check = Some(std::time::Instant::now());
+    }
+
+    /// Takes in what a check found; true when something changed.
+    fn take_check(&mut self) -> bool {
+        let Some(rx) = &self.check_rx else { return false };
+        let (forget, found) = match rx.try_recv() {
+            Ok(found) => found,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.check_rx = None;
+                return false;
+            }
+        };
+        self.check_rx = None;
+        let (mut dirty, mut metas_dirty) = (false, false);
+        for item in found {
+            self.reach.insert(item.path.clone(), item.reach);
+            match item.reach {
+                Reach::Here => {
+                    let meta = self.metas.0.entry(item.path.clone()).or_default();
+                    if item.fs.is_some() && meta.fs != item.fs {
+                        meta.fs = item.fs;
+                        metas_dirty = true;
+                    }
+                    if item.wrote {
+                        meta.pending = false;
+                        metas_dirty = true;
+                        // Written: a file left with no tag leaves the index now
+                        if self.registry.0.get(&item.path).is_some_and(Vec::is_empty) {
+                            dirty |= self.registry.record(&item.path, &[]);
+                        }
+                    }
+                    // A file whose tags waited keeps those of the index, also when writing them failed this time
+                    if let Some(read) = item.read.filter(|_| !meta.pending) {
+                        dirty |= self.registry.record(&item.path, &read);
+                    }
+                }
+                Reach::Gone if forget => dirty |= self.registry.record(&item.path, &[]),
+                _ => {}
+            }
+        }
+        // What the index forgot needs nothing kept beside it
+        let before = self.metas.0.len();
+        self.metas.0.retain(|p, _| self.registry.0.contains_key(p));
+        metas_dirty |= self.metas.0.len() != before;
+        self.reach.retain(|p, _| self.registry.0.contains_key(p));
+        if dirty {
+            self.registry.save();
+        }
+        if dirty || metas_dirty {
+            self.metas.save();
+        }
+        true
+    }
+
+    /// Where `path` is, by the last check; a remembered file not checked yet counts as away, a file the index does not
+    /// know (one on show in a folder) as here.
+    fn reach_of(&self, path: &Path) -> Reach {
+        match self.reach.get(path) {
+            Some(reach) => *reach,
+            None if self.registry.0.contains_key(path) => Reach::Away,
+            None => Reach::Here,
+        }
+    }
+
+    /// How many files have the tag `name`: there, away (or not known yet), and gone.
+    fn counts(&self, name: &str) -> (usize, usize, usize) {
+        self.registry.with_tag(name).iter().fold((0, 0, 0), |(here, away, gone), p| match self.reach_of(p) {
+            Reach::Here => (here + 1, away, gone),
+            Reach::Away => (here, away + 1, gone),
+            Reach::Gone => (here, away, gone + 1),
+        })
+    }
+
+    /// "3 files · 2 not available now · 1 no longer there", the parts that are not 0 (the first always).
+    fn count_text(&self, name: &str) -> String {
+        let (here, away, gone) = self.counts(name);
+        let mut text = trn(here, "{} file", "{} files");
+        if away > 0 {
+            text.push_str(&format!(" · {}", trn(away, "{} not available now", "{} not available now")));
+        }
+        if gone > 0 {
+            text.push_str(&format!(" · {}", trn(gone, "{} no longer there", "{} no longer there")));
+        }
+        text
+    }
+
+    /// The tagged files that are gone: said, and their tags forgotten only when the person confirms it. While the page is
+    /// open the files are checked again now and then, on a thread, so what it says stays true.
+    fn gone_files_section(&mut self, ui: &mut egui::Ui, theme: &SerpantinumTheme) {
+        if self.check_rx.is_none() && self.last_check.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(10)) {
+            self.start_check(None, false);
+        }
+        let gone = self.gone();
+        if gone.is_empty() {
+            self.confirm_cleanup = false;
+            return;
+        }
+        let checking = self.check_rx.is_some();
+        material::hint_label_inset(ui, &trn(gone.len(), "{} tagged file is no longer there: its drive is connected, and the file is not.", "{} tagged files are no longer there: their drive is connected, and the files are not."), theme, 14);
+        if !self.confirm_cleanup {
+            if material::button(ui, "tags_forget_gone", Some(icons::TAG), tr("Forget their tags…"), theme, material::ButtonKind::Tonal, !checking).clicked() {
+                self.confirm_cleanup = true;
+            }
+            return;
+        }
+        material::hint_label_inset(ui, &trn(gone.len(), "The tags of {} file that is gone are forgotten. No file is touched.", "The tags of {} files that are gone are forgotten. No file is touched."), theme, 14);
+        let (mut forget, mut cancel) = (false, false);
+        ui.horizontal(|ui| {
+            forget = material::button(ui, "tags_forget_confirm", Some(icons::DELETE_FOREVER), tr("Forget"), theme, material::ButtonKind::Danger, !checking).clicked();
+            cancel = material::button(ui, "tags_forget_cancel", None, tr("Cancel"), theme, material::ButtonKind::Text, true).clicked();
+        });
+        if forget {
+            self.forget_gone();
+        } else if cancel {
+            self.confirm_cleanup = false;
+        }
+    }
+
+    /// The cleanup the person confirmed: each file found gone is looked at again first, and only what is still gone is
+    /// forgotten (its tags in the index; the files are never touched).
+    fn forget_gone(&mut self) {
+        self.confirm_cleanup = false;
+        let gone = self.gone();
+        if !gone.is_empty() {
+            self.start_check(Some(gone), true);
+        }
+    }
+
+    /// The remembered files that are gone, by the last check.
+    fn gone(&self) -> Vec<PathBuf> {
+        self.reach.iter().filter(|(_, r)| **r == Reach::Gone).map(|(p, _)| p.clone()).collect()
     }
 
     pub fn color(&self, name: &str) -> [u8; 3] {
@@ -322,20 +521,54 @@ impl Tags {
         if let Some((_, key)) = key_of(path) {
             self.cache.insert(path.to_path_buf(), Entry { key, tags: tags.clone() });
         }
-        if self.registry.record(path, &tags) {
+        let changed = self.registry.record(path, &tags);
+        // Written to the file just now: nothing waits for it, and the file system it is on is known
+        self.reach.insert(path.to_path_buf(), Reach::Here);
+        let fs = (self.identity)(path);
+        let meta = self.metas.0.entry(path.to_path_buf()).or_default();
+        let meta_changed = meta.pending || (fs.is_some() && meta.fs != fs);
+        meta.pending = false;
+        if fs.is_some() {
+            meta.fs = fs;
+        }
+        if tags.is_empty() {
+            self.metas.0.remove(path);
+        }
+        if changed {
             self.registry.save();
+        }
+        if changed || meta_changed {
+            self.metas.save();
         }
     }
 
     /// Changes the tags of every path with `change`; the first failure is the one reported.
+    /// A remembered file that cannot be reached now is changed in the index only, and its new tags wait to be written to
+    /// it (`check` writes them once it is there), so that the old ones do not come back from the file. A file that
+    /// fails is said, and the others are still changed.
     fn edit(&mut self, paths: &[PathBuf], change: impl Fn(&mut Vec<String>)) {
         let mut touched = 0;
+        let mut waiting = false;
         for path in paths {
+            if self.reach_of(path) != Reach::Here
+                && let Some(known) = self.registry.0.get(path).cloned()
+            {
+                let mut tags = known.clone();
+                change(&mut tags);
+                if tags != known {
+                    // Kept also when no tag is left: the file still has the old ones until they are written
+                    self.registry.0.insert(path.clone(), tags);
+                    self.metas.0.entry(path.clone()).or_default().pending = true;
+                    waiting = true;
+                    touched += 1;
+                }
+                continue;
+            }
             let mut tags = match read_tags(path) {
                 Ok(tags) => tags,
                 Err(err) => {
                     self.messages.push(describe(&err, &file_name(path)));
-                    return;
+                    continue;
                 }
             };
             let before = tags.clone();
@@ -345,10 +578,15 @@ impl Tags {
             }
             if let Err(err) = write_tags(path, &tags) {
                 self.messages.push(describe(&err, &file_name(path)));
-                return;
+                continue;
             }
             self.remember(path, tags);
             touched += 1;
+        }
+        if waiting {
+            // A tag list that is now empty still waits to be written (the file keeps the old tags until then)
+            self.registry.save();
+            self.metas.save();
         }
         if touched == 0 && paths.len() > 1 {
             self.messages.push(tr("Nothing changed").to_owned());
@@ -433,23 +671,31 @@ impl Plugin for Tags {
     }
 
     fn poll(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.take_check();
         if let Some(rx) = &self.folder_rx {
             match rx.try_recv() {
                 Ok((generation, dir, read)) if generation == self.generation => {
                     self.folder_rx = None;
                     self.cache.retain(|p, _| p.parent() != Some(dir.as_path()));
                     let mut dirty = false;
+                    let mut to_check = Vec::new();
                     for (path, entry) in &read {
+                        // A file whose tags wait to be written keeps those of the index: the check writes them
+                        if self.metas.0.get(path).is_some_and(|m| m.pending) {
+                            to_check.push(path.clone());
+                            continue;
+                        }
                         dirty |= self.registry.record(path, &entry.tags);
+                        self.reach.insert(path.clone(), Reach::Here);
                     }
-                    // Remembered files of this folder that are gone
-                    let gone: Vec<PathBuf> = self.registry.0.keys().filter(|p| p.parent() == Some(dir.as_path()) && !read.contains_key(*p)).cloned().collect();
-                    for path in gone {
-                        dirty |= self.registry.record(&path, &[]);
-                    }
+                    // Remembered files of this folder that were not in it: not forgotten here (it may be another drive
+                    // at the same place); the check tells away from gone
+                    to_check.extend(self.registry.0.keys().filter(|p| p.parent() == Some(dir.as_path()) && !read.contains_key(*p)).cloned());
                     if dirty {
                         self.registry.save();
+                    }
+                    if !to_check.is_empty() && self.check_rx.is_none() {
+                        self.start_check(Some(to_check), false);
                     }
                     self.cache.extend(read);
                     changed = true;
@@ -462,7 +708,7 @@ impl Plugin for Tags {
     }
 
     fn busy(&self) -> bool {
-        self.folder_rx.is_some()
+        self.folder_rx.is_some() || self.check_rx.is_some()
     }
 
     fn marks(&self, item: &FileItem) -> Vec<Mark> {
@@ -535,13 +781,10 @@ impl Plugin for Tags {
 
     fn window_subtitle(&self) -> Option<String> {
         let prompt = self.prompt.as_ref()?;
-        let count = match &prompt.editing {
-            Some(name) => self.registry.with_tag(name).len(),
-            None => prompt.paths.len(),
-        };
         match (&prompt.editing, prompt.paths.as_slice()) {
+            (Some(name), _) => Some(self.count_text(name)),
             (None, [one]) => Some(file_name(one)),
-            _ => Some(trn(count, "{} file", "{} files")),
+            (None, paths) => Some(trn(paths.len(), "{} file", "{} files")),
         }
     }
 
@@ -640,6 +883,15 @@ impl Plugin for Tags {
             FileOpEvent::Moved(pairs) => {
                 for (from, to) in pairs {
                     dirty |= self.registry.rename(from, to);
+                    if self.metas.rename(from, to) {
+                        self.metas.save();
+                    }
+                    let moved: Vec<PathBuf> = self.reach.keys().filter(|p| p.starts_with(from)).cloned().collect();
+                    for old in moved {
+                        if let Some(reach) = self.reach.remove(&old) {
+                            self.reach.insert(to.join(old.strip_prefix(from).unwrap_or(Path::new(""))), reach);
+                        }
+                    }
                     // A moved folder takes everything cached below it along
                     let moved: Vec<PathBuf> = self.cache.keys().filter(|p| p.starts_with(from)).cloned().collect();
                     for old in moved {
@@ -651,8 +903,13 @@ impl Plugin for Tags {
                 }
             }
             FileOpEvent::Removed(paths) => {
+                // Deleted by Compression itself (or moved to the trash, from where a restore reads the tags again)
                 for path in paths {
                     dirty |= self.registry.remove_tree(path);
+                    if self.metas.remove_tree(path) {
+                        self.metas.save();
+                    }
+                    self.reach.retain(|p, _| !p.starts_with(path));
                     self.cache.retain(|p, _| !p.starts_with(path));
                 }
             }
@@ -704,6 +961,7 @@ impl Plugin for Tags {
             self.colors.insert(name, rgb);
             self.save_colors();
         }
+        self.gone_files_section(ui, theme);
         ui.add_space(4.0);
     }
 
@@ -716,25 +974,238 @@ impl Plugin for Tags {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_tags_of_a_file_on_a_drive_that_is_not_there_now_stay_known() {
-        let dir = std::env::temp_dir().join(format!("compression_tags_away_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("here.txt"), "x").unwrap();
-        std::fs::write(dir.join("untagged.txt"), "x").unwrap();
-        let mut registry = Registry::default();
-        registry.record(&dir.join("here.txt"), &["work".to_owned()]);
-        registry.record(&dir.join("untagged.txt"), &["old".to_owned()]);
-        registry.record(&dir.join("stick/away.txt"), &["photos".to_owned()]);
-        // What is there is read again; what is not there now keeps its tags
-        registry.validate(|p| if p.ends_with("untagged.txt") { Some(Vec::new()) } else { Some(vec!["work".to_owned()]) });
-        assert!(registry.0.contains_key(&dir.join("stick/away.txt")), "the file on the drive that is away was forgotten");
-        assert_eq!(registry.0.get(&dir.join("stick/away.txt")).map(|t| t.as_slice()), Some(&["photos".to_owned()][..]));
-        assert!(!registry.0.contains_key(&dir.join("untagged.txt")), "a file that is there and has no tags any more is dropped");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
     use crate::fs::xattr::{self, tests::scratch_file};
+
+    /// A made-up drive: a folder whose `.fsid` file says the UUID of the file system it stands for.
+    fn drive(at: &Path, id: &str) {
+        std::fs::create_dir_all(at).unwrap();
+        std::fs::write(at.join(".fsid"), id).unwrap();
+    }
+
+    /// The identity of what `path` is on, by the made-up drives (`drive`); anything else is the system's disk.
+    fn made_up_identity(path: &Path) -> Option<String> {
+        path.ancestors().find_map(|a| std::fs::read_to_string(a.join(".fsid")).ok()).or_else(|| Some("system".to_owned()))
+    }
+
+    /// A plugin on the made-up drives, with nothing remembered yet.
+    fn tags_on_made_up_drives() -> Tags {
+        let mut tags = Tags::with(Registry::default(), BTreeMap::new());
+        tags.identity = made_up_identity;
+        tags
+    }
+
+    /// The folder `dir` read as when it is shown, until the reading has been taken in.
+    fn read_folder_of(tags: &mut Tags, dir: &Path) {
+        tags.directory_changed(dir);
+        for _ in 0..500 {
+            tags.poll();
+            if tags.folder_rx.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the folder was not read");
+    }
+
+    fn checked(tags: &mut Tags) {
+        tags.start_check(None, false);
+        settle(tags);
+    }
+
+    fn settle(tags: &mut Tags) {
+        for _ in 0..500 {
+            tags.poll();
+            if tags.check_rx.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the check did not end");
+    }
+
+    /// A folder for the made-up drives, on a file system that keeps tags; `None` (said) where there is none.
+    fn base(name: &str) -> Option<PathBuf> {
+        let Some((dir, _)) = crate::fs::xattr::tests::scratch_file(name) else {
+            eprintln!("SKIPPED: this file system keeps no tags");
+            return None;
+        };
+        Some(dir)
+    }
+
+    #[test]
+    fn the_tags_of_a_file_on_a_drive_that_is_unplugged_stay_through_a_save_and_are_there_when_it_is_back() {
+        let Some(base) = base("tags_unplugged") else { return };
+        let (stick, stash) = (base.join("mnt/STICK"), base.join("stash"));
+        drive(&stick, "A");
+        let file = stick.join("photo.jpg");
+        std::fs::write(&file, "x").unwrap();
+        write_tags(&file, &["holiday".to_owned()]).unwrap();
+        let mut tags = tags_on_made_up_drives();
+        tags.remember(&file, vec!["holiday".to_owned()]);
+        assert_eq!(tags.metas.0.get(&file).and_then(|m| m.fs.as_deref()), Some("A"));
+        // Unplugged: away, kept, and kept through a save and a new start
+        std::fs::rename(&stick, &stash).unwrap();
+        checked(&mut tags);
+        assert_eq!(tags.reach_of(&file), Reach::Away);
+        let (registry, metas) = (serde_json::to_string(&tags.registry).unwrap(), serde_json::to_string(&tags.metas).unwrap());
+        let mut again = Tags::with(serde_json::from_str(&registry).unwrap(), BTreeMap::new());
+        again.metas = serde_json::from_str(&metas).unwrap();
+        again.identity = made_up_identity;
+        checked(&mut again);
+        assert_eq!(again.registry.with_tag("holiday"), vec![file.clone()]);
+        // Plugged in again
+        std::fs::create_dir_all(base.join("mnt")).unwrap();
+        std::fs::rename(&stash, &stick).unwrap();
+        checked(&mut again);
+        assert_eq!(again.reach_of(&file), Reach::Here);
+        assert_eq!(again.registry.with_tag("holiday"), vec![file]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn another_drive_at_the_same_place_does_not_make_a_file_gone_and_a_deleted_one_on_its_own_drive_is() {
+        let Some(base) = base("tags_other_drive") else { return };
+        let stick = base.join("mnt/STICK");
+        drive(&stick, "A");
+        let (kept, deleted) = (stick.join("kept.txt"), stick.join("deleted.txt"));
+        for f in [&kept, &deleted] {
+            std::fs::write(f, "x").unwrap();
+            write_tags(f, &["work".to_owned()]).unwrap();
+        }
+        let mut tags = tags_on_made_up_drives();
+        tags.remember(&kept, vec!["work".to_owned()]);
+        tags.remember(&deleted, vec!["work".to_owned()]);
+        // Its own drive is there, the file is not: gone
+        std::fs::remove_file(&deleted).unwrap();
+        checked(&mut tags);
+        assert_eq!((tags.reach_of(&kept), tags.reach_of(&deleted)), (Reach::Here, Reach::Gone));
+        // Another drive at the same place, without the files: away, never gone; a folder read there forgets nothing
+        std::fs::remove_dir_all(&stick).unwrap();
+        drive(&stick, "B");
+        read_folder_of(&mut tags, &stick);
+        checked(&mut tags);
+        assert_eq!((tags.reach_of(&kept), tags.reach_of(&deleted)), (Reach::Away, Reach::Away));
+        tags.forget_gone();
+        settle(&mut tags);
+        assert_eq!(tags.registry.with_tag("work").len(), 2, "something was forgotten on another drive");
+        // A file remembered before the file systems were known is never taken for gone
+        drive(&base.join("old"), "C");
+        let old = base.join("old/note.txt");
+        tags.registry.record(&old, &["work".to_owned()]);
+        checked(&mut tags);
+        assert_eq!(tags.reach_of(&old), Reach::Away);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_or_whose_server_does_not_answer_keeps_its_tags() {
+        let dir = std::env::temp_dir().join(format!("compression_tags_unclear_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (locked, server) = (dir.join("locked"), dir.join("server"));
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::create_dir_all(&server).unwrap();
+        let mut tags = tags_on_made_up_drives();
+        tags.registry.record(&locked.join("a.txt"), &["x".to_owned()]);
+        tags.registry.record(&server.join("b.txt"), &["x".to_owned()]);
+        for p in [locked.join("a.txt"), server.join("b.txt")] {
+            tags.metas.0.insert(p, Meta { fs: Some("system".to_owned()), pending: false });
+        }
+        crate::fs::network::declare_remote_for_tests(&server);
+        crate::fs::mount_health::tests::hang_under(&server);
+        let root = unsafe { libc::geteuid() } == 0;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        tags.start_check(None, false);
+        settle(&mut tags);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fs::mount_health::tests::answer_again(&server);
+        if !root {
+            assert_eq!(tags.reach_of(&locked.join("a.txt")), Reach::Away, "a file that cannot be looked at is not gone");
+        }
+        assert_eq!(tags.reach_of(&server.join("b.txt")), Reach::Away, "a server that does not answer is not a file that is gone");
+        assert_eq!(tags.registry.with_tag("x").len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_the_gone_files_needs_a_yes_forgets_only_their_tags_and_looks_again_first() {
+        let Some(base) = base("tags_cleanup") else { return };
+        let (a, b) = (base.join("mnt/A"), base.join("mnt/B"));
+        drive(&a, "A");
+        drive(&b, "B");
+        let (gone, back, away) = (a.join("gone.txt"), a.join("back.txt"), b.join("away.txt"));
+        for f in [&gone, &back, &away] {
+            std::fs::write(f, "x").unwrap();
+            write_tags(f, &["t".to_owned()]).unwrap();
+        }
+        let mut tags = tags_on_made_up_drives();
+        for f in [&gone, &back, &away] {
+            tags.remember(f, vec!["t".to_owned()]);
+        }
+        std::fs::remove_file(&gone).unwrap();
+        std::fs::remove_file(&back).unwrap();
+        std::fs::rename(&b, base.join("stash")).unwrap();
+        checked(&mut tags);
+        assert_eq!(tags.gone().len(), 2);
+        assert_eq!(tags.count_text("t"), "0 files · 1 not available now · 2 no longer there");
+        // Nothing happens before the person confirms
+        assert_eq!(tags.registry.with_tag("t").len(), 3);
+        // One comes back (with its tag) before the cleanup runs: it is looked at again and stays
+        std::fs::write(&back, "x").unwrap();
+        write_tags(&back, &["t".to_owned()]).unwrap();
+        tags.forget_gone();
+        settle(&mut tags);
+        let left = tags.registry.with_tag("t");
+        assert!(!left.contains(&gone), "the gone file is still remembered");
+        assert!(left.contains(&back), "a file that came back was forgotten");
+        assert!(left.contains(&away), "a file that is only away was forgotten");
+        assert!(base.join("stash/away.txt").exists() && back.exists(), "a file was touched");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_tag_renamed_or_deleted_while_a_file_is_away_is_written_to_it_when_it_is_back_and_never_comes_back() {
+        let Some(base) = base("tags_offline_edit") else { return };
+        let (stick, stash) = (base.join("mnt/STICK"), base.join("stash"));
+        drive(&stick, "A");
+        let (here, away) = (base.join("here.txt"), stick.join("away.txt"));
+        for f in [&here, &away] {
+            std::fs::write(f, "x").unwrap();
+            write_tags(f, &["old".to_owned()]).unwrap();
+        }
+        let mut tags = tags_on_made_up_drives();
+        tags.remember(&here, vec!["old".to_owned()]);
+        tags.remember(&away, vec!["old".to_owned()]);
+        std::fs::rename(&stick, &stash).unwrap();
+        checked(&mut tags);
+        // Renamed while the stick is away: the file that is here is changed at once, the other in the index only
+        tags.rename_tag("old", "new");
+        assert!(tags.messages.is_empty(), "{:?}", tags.messages);
+        assert_eq!(read_tags(&here).unwrap(), vec!["new".to_owned()]);
+        assert_eq!(read_tags(&stash.join("away.txt")).unwrap(), vec!["old".to_owned()], "a file that is away was written");
+        assert_eq!(tags.registry.with_tag("new").len(), 2);
+        assert!(tags.metas.0.get(&away).is_some_and(|m| m.pending));
+        // Back: the new name is written to it, and the old one does not come back, not even from a folder read
+        std::fs::create_dir_all(base.join("mnt")).unwrap();
+        std::fs::rename(&stash, &stick).unwrap();
+        read_folder_of(&mut tags, &stick);
+        assert!(tags.registry.with_tag("old").is_empty(), "a folder read brought the old name back");
+        settle(&mut tags);
+        checked(&mut tags);
+        assert_eq!(read_tags(&away).unwrap(), vec!["new".to_owned()]);
+        assert!(tags.registry.with_tag("old").is_empty());
+        // Deleted while away: after the return the file has no tag, and the index forgets it
+        std::fs::rename(&stick, &stash).unwrap();
+        checked(&mut tags);
+        tags.delete_tag("new");
+        assert!(read_tags(&here).unwrap().is_empty());
+        std::fs::rename(&stash, &stick).unwrap();
+        checked(&mut tags);
+        assert!(read_tags(&away).unwrap().is_empty(), "the deleted tag came back");
+        assert!(tags.registry.0.is_empty(), "{:?}", tags.registry);
+        assert!(tags.metas.0.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn case_folding_covers_non_ascii_names() {
@@ -821,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_keeps_files_that_are_away_drops_untagged_ones_and_follows_renames() {
+    fn registry_forgets_what_it_is_told_to_and_follows_renames() {
         let dir = std::env::temp_dir().join(format!("compression-tag-registry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -829,13 +1300,9 @@ mod tests {
         let mut registry = Registry::default();
         registry.record(&dir.join("sub/a"), &["one".to_owned()]);
         registry.record(&dir.join("gone"), &["one".to_owned(), "two".to_owned()]);
-        // A file that cannot be read keeps its tags; so does one that is not there now (its drive may be away)
-        registry.validate(|_| None);
         assert_eq!(registry.with_tag("one"), vec![dir.join("gone"), dir.join("sub/a")]);
-        // Tags are read from disk again; a file that is there and lost them leaves the registry, one that is away stays
-        registry.validate(|_| Some(Vec::new()));
-        assert_eq!(registry.names(), vec![("one".to_owned(), 1), ("two".to_owned(), 1)]);
         assert!(registry.remove_tree(&dir.join("gone")));
+        assert!(registry.record(&dir.join("sub/a"), &[]));
         assert!(registry.names().is_empty());
 
         registry.record(&dir.join("sub/a"), &["one".to_owned()]);

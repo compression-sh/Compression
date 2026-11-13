@@ -969,5 +969,11 @@
   "“{}” could not be read and was kept as “{}”. It starts empty.": "Không đọc được “{}” nên đã được giữ lại thành “{}”. Danh sách bắt đầu trống.",
   "“{}” could not be read, and could not be kept aside ({}). It is left as it is, and changes are not saved to it.": "Không đọc được “{}” và cũng không thể để riêng ({}). Tệp được giữ nguyên và thay đổi sẽ không được lưu vào đó.",
   "“{}” could not be saved: {}": "Không lưu được “{}”: {}",
-  "“{}” is no longer there. Nothing was pasted.": "“{}” không còn nữa. Không có gì được dán."
+  "“{}” is no longer there. Nothing was pasted.": "“{}” không còn nữa. Không có gì được dán.",
+  "{} not available now": "{} hiện không khả dụng",
+  "{} no longer there": "{} không còn nữa",
+  "{} tagged files are no longer there: their drive is connected, and the files are not.": "{} tệp có thẻ không còn nữa: ổ đĩa đã được kết nối nhưng tệp thì không.",
+  "Forget their tags…": "Quên thẻ của chúng…",
+  "The tags of {} files that are gone are forgotten. No file is touched.": "Thẻ của {} tệp không còn nữa sẽ bị quên. Không tệp nào bị động đến.",
+  "Forget": "Quên"
 }

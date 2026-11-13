@@ -16,6 +16,7 @@ pub mod duplicates;
 pub mod git;
 pub mod progress;
 pub mod quick_look;
+pub mod tag_reach;
 pub mod tags;
 
 /// How a badge or status is coloured; the interface maps it to the current theme.

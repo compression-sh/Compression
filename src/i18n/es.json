@@ -969,5 +969,11 @@
   "“{}” could not be read and was kept as “{}”. It starts empty.": "No se pudo leer «{}» y se guardó como «{}». Empieza vacío.",
   "“{}” could not be read, and could not be kept aside ({}). It is left as it is, and changes are not saved to it.": "No se pudo leer «{}» ni apartar ({}). Se deja como está y los cambios no se guardan en él.",
   "“{}” could not be saved: {}": "No se pudo guardar «{}»: {}",
-  "“{}” is no longer there. Nothing was pasted.": "«{}» ya no existe. No se ha pegado nada."
+  "“{}” is no longer there. Nothing was pasted.": "«{}» ya no existe. No se ha pegado nada.",
+  "{} not available now": "{} no disponible ahora|{} no disponibles ahora",
+  "{} no longer there": "{} ya no existe|{} ya no existen",
+  "{} tagged files are no longer there: their drive is connected, and the files are not.": "{} archivo etiquetado ya no existe: su unidad está conectada y el archivo no.|{} archivos etiquetados ya no existen: su unidad está conectada y los archivos no.",
+  "Forget their tags…": "Olvidar sus etiquetas…",
+  "The tags of {} files that are gone are forgotten. No file is touched.": "Se olvidan las etiquetas de {} archivo que ya no existe. No se toca ningún archivo.|Se olvidan las etiquetas de {} archivos que ya no existen. No se toca ningún archivo.",
+  "Forget": "Olvidar"
 }

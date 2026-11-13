@@ -969,5 +969,11 @@
   "“{}” could not be read and was kept as “{}”. It starts empty.": "Не удалось прочитать «{}», он сохранён как «{}». Список начинается заново.",
   "“{}” could not be read, and could not be kept aside ({}). It is left as it is, and changes are not saved to it.": "Не удалось прочитать «{}» и отложить его ({}). Файл остаётся как есть, изменения в него не сохраняются.",
   "“{}” could not be saved: {}": "Не удалось сохранить «{}»: {}",
-  "“{}” is no longer there. Nothing was pasted.": "«{}» больше нет. Ничего не вставлено."
+  "“{}” is no longer there. Nothing was pasted.": "«{}» больше нет. Ничего не вставлено.",
+  "{} not available now": "{} сейчас недоступен|{} сейчас недоступны|{} сейчас недоступны",
+  "{} no longer there": "{} больше нет|{} больше нет|{} больше нет",
+  "{} tagged files are no longer there: their drive is connected, and the files are not.": "{} файла с тегом больше нет: его диск подключён, а файла нет.|{} файлов с тегами больше нет: их диск подключён, а файлов нет.|{} файлов с тегами больше нет: их диск подключён, а файлов нет.",
+  "Forget their tags…": "Забыть их теги…",
+  "The tags of {} files that are gone are forgotten. No file is touched.": "Теги {} пропавшего файла будут забыты. Файлы не затрагиваются.|Теги {} пропавших файлов будут забыты. Файлы не затрагиваются.|Теги {} пропавших файлов будут забыты. Файлы не затрагиваются.",
+  "Forget": "Забыть"
 }

@@ -969,5 +969,11 @@
   "“{}” could not be read and was kept as “{}”. It starts empty.": "„{}“ konnte nicht gelesen werden und wurde als „{}“ aufbewahrt. Die Liste beginnt leer.",
   "“{}” could not be read, and could not be kept aside ({}). It is left as it is, and changes are not saved to it.": "„{}“ konnte nicht gelesen und nicht beiseitegelegt werden ({}). Die Datei bleibt, wie sie ist, und Änderungen werden nicht darin gespeichert.",
   "“{}” could not be saved: {}": "„{}“ konnte nicht gespeichert werden: {}",
-  "“{}” is no longer there. Nothing was pasted.": "„{}“ ist nicht mehr da. Es wurde nichts eingefügt."
+  "“{}” is no longer there. Nothing was pasted.": "„{}“ ist nicht mehr da. Es wurde nichts eingefügt.",
+  "{} not available now": "{} gerade nicht verfügbar|{} gerade nicht verfügbar",
+  "{} no longer there": "{} nicht mehr vorhanden|{} nicht mehr vorhanden",
+  "{} tagged files are no longer there: their drive is connected, and the files are not.": "{} markierte Datei ist nicht mehr vorhanden: Ihr Laufwerk ist verbunden, die Datei nicht.|{} markierte Dateien sind nicht mehr vorhanden: Ihr Laufwerk ist verbunden, die Dateien nicht.",
+  "Forget their tags…": "Ihre Tags vergessen …",
+  "The tags of {} files that are gone are forgotten. No file is touched.": "Die Tags von {} verschwundenen Datei werden vergessen. Keine Datei wird angefasst.|Die Tags von {} verschwundenen Dateien werden vergessen. Keine Datei wird angefasst.",
+  "Forget": "Vergessen"
 }
