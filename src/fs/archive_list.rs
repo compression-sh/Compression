@@ -204,7 +204,8 @@ fn list_7z(path: &Path, cap: usize, deadline: Instant, cancel: &AtomicBool) -> R
         return Err(Failure::NoTool("7z"));
     }
     let mut child = Command::new(ops::seven_zip())
-        .args(["l", "-slt", "--"])
+        // `-spd`: the archive's name is a name, not a wildcard that could take in other archives beside it
+        .args(["l", "-slt", "-spd", "--"])
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -334,6 +335,26 @@ pub fn tree(entries: &[ArchiveEntry]) -> Vec<Node> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_7z_listing_shows_the_archive_named_and_no_other_a_wildcard_would_match() {
+        let dir = std::env::temp_dir().join(format!("compression_list_7z_name_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(tool) = ["7z", "7za"].into_iter().find(|t| crate::fs::ops::have(t)) else {
+            eprintln!("SKIPPED: no 7z installed, the 7z listing was not tested");
+            return;
+        };
+        std::fs::write(dir.join("one.txt"), "one").unwrap();
+        std::fs::write(dir.join("evil.txt"), "evil").unwrap();
+        for (archive, file) in [("a*.7z", "one.txt"), ("aEVIL.7z", "evil.txt")] {
+            assert!(std::process::Command::new(tool).current_dir(&dir).args(["a", "-y", "-spd", "--"]).arg(dir.join(archive)).arg(file).output().unwrap().status.success());
+        }
+        let listing = list(&dir.join("a*.7z"), &AtomicBool::new(false)).unwrap();
+        let names: Vec<&str> = listing.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(names, ["one.txt"], "the listing mixed in another archive");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use crate::fs::ops::{ArchiveFormat, compress};
 
     fn scratch(name: &str) -> std::path::PathBuf {

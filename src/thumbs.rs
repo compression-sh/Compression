@@ -839,7 +839,7 @@ fn seven_zip_comic_page(path: &Path) -> Option<image::DynamicImage> {
     }
     let tool = ["7z", "7zz", "7za"].into_iter().find(|t| Command::new(t).arg("-h").output().is_ok())?;
     let mut list = Command::new(tool);
-    list.args(["l", "-ba", "-slt", "-sccUTF-8", "--"]).arg(path);
+    list.args(["l", "-ba", "-slt", "-sccUTF-8", "-spd", "--"]).arg(path);
     let listing = String::from_utf8(run_with_timeout(list)?).ok()?;
     let first = listing
         .lines()
@@ -851,11 +851,11 @@ fn seven_zip_comic_page(path: &Path) -> Option<image::DynamicImage> {
     image::load_from_memory(&run_with_timeout(seven_zip_extract(tool, path, &first))?).ok()
 }
 
-/// `7z e -so -- archive entry`: after `--` a name is a name and never a switch, whatever the
-/// archive calls its entry (`-aoa.png`).
+/// `7z e -so -spd -- archive entry`: after `--` a name is a name and never a switch, whatever the
+/// archive calls its entry (`-aoa.png`), and `-spd` keeps `*` and `?` in it from matching other entries.
 fn seven_zip_extract(tool: &str, archive: &Path, entry: &str) -> std::process::Command {
     let mut extract = std::process::Command::new(tool);
-    extract.args(["e", "-so", "-y", "--"]).arg(archive).arg(entry);
+    extract.args(["e", "-so", "-y", "-spd", "--"]).arg(archive).arg(entry);
     extract
 }
 
@@ -1193,10 +1193,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_7z_entry_is_taken_by_its_name_and_not_as_a_wildcard() {
+        let Some(tool) = ["7z", "7za"].into_iter().find(|t| crate::fs::ops::have(t)) else {
+            eprintln!("SKIPPED: no 7z installed, extracting a 7z entry was not tested");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("compression_thumb_7z_entry_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("p*"), "A").unwrap();
+        std::fs::write(dir.join("pz"), "B").unwrap();
+        let archive = dir.join("pages.7z");
+        assert!(std::process::Command::new(tool).current_dir(&dir).args(["a", "-y", "-spd", "--"]).arg(&archive).args(["p*", "pz"]).output().unwrap().status.success());
+        let out = seven_zip_extract(tool, &archive, "p*").output().unwrap();
+        assert_eq!(out.stdout, b"A", "more than the one entry came out");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn an_archive_entry_is_always_a_name_and_never_a_switch() {
         let command = seven_zip_extract("7z", Path::new("/tmp/a.cb7"), "-aoa.png");
         let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, ["e", "-so", "-y", "--", "/tmp/a.cb7", "-aoa.png"]);
+        assert_eq!(args, ["e", "-so", "-y", "-spd", "--", "/tmp/a.cb7", "-aoa.png"]);
         // Everything that can be taken for a switch comes after the `--`
         let at = args.iter().position(|a| a == "--").unwrap();
         assert!(args[..at].iter().all(|a| a == "e" || a.starts_with("-s") || a == "-y"));

@@ -684,7 +684,8 @@ pub fn compress(sources: &[PathBuf], out: &Path, format: ArchiveFormat, control:
         }
         ArchiveFormat::SevenZ => {
             let mut cmd = Command::new(seven_zip());
-            cmd.current_dir(&base).arg("a").arg("-y").arg(out).args(&names);
+            // `--` ends the switches and the `@listfile` reading, `-spd` the wildcards (`*`, `?`): every name is a file
+            cmd.current_dir(&base).arg("a").arg("-y").arg("-spd").arg("--").arg(out).args(&names);
             run_tool(cmd, control)
         }
     };
@@ -818,7 +819,8 @@ fn unpack(archive: &Path, dest: &Path, control: &Control) -> io::Result<()> {
         let mut cmd = Command::new(seven_zip());
         let mut out = std::ffi::OsString::from("-o");
         out.push(dest);
-        cmd.arg("x").arg("-y").arg(out).arg(archive);
+        // `-spd`: the archive's name is a name, not a wildcard that could take in other archives beside it
+        cmd.arg("x").arg("-y").arg("-spd").arg(out).arg("--").arg(archive);
         run_tool(cmd, control)
     } else {
         Err(io::Error::other(tr("No tool installed to unpack this kind of archive (install 7z)")))
@@ -1030,7 +1032,7 @@ fn unpack_compressed_tar(program: &str, archive: &Path, dest: &Path, control: &C
 /// The listing of an archive by 7z (`l -slt`), until the job is cancelled.
 fn seven_zip_listing(archive: &Path, control: &Control) -> io::Result<String> {
     let mut cmd = Command::new(seven_zip());
-    cmd.arg("l").arg("-slt").arg("--").arg(archive);
+    cmd.arg("l").arg("-slt").arg("-spd").arg("--").arg(archive);
     match process::run_capped_with(cmd, None, TOOL_OUTPUT_LIMIT, NO_TIME_LIMIT, &|| (control.cancelled)()) {
         Ok(output) if output.success => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
         Ok(output) => Err(io::Error::other(String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or(tr("The program failed")).to_owned())),
@@ -1108,6 +1110,99 @@ pub fn extract_beside(archive: &Path, control: &Control) -> io::Result<PathBuf> 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Two 7z archives side by side, made by 7z itself: `a*.7z` holding `one.txt`, and `aEVIL.7z` holding `evil.txt`,
+    /// which a wildcard in the first one's name would match. `None` without 7z.
+    fn archives_a_wildcard_would_mix(dir: &Path) -> Option<PathBuf> {
+        let tool = ["7z", "7za"].into_iter().find(|t| have(t))?;
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("one.txt"), "one").unwrap();
+        std::fs::write(src.join("evil.txt"), "evil").unwrap();
+        for (archive, file) in [("a*.7z", "one.txt"), ("aEVIL.7z", "evil.txt")] {
+            let made = std::process::Command::new(tool).current_dir(&src).args(["a", "-y", "-spd", "--"]).arg(dir.join(archive)).arg(file).output().unwrap();
+            assert!(made.status.success());
+        }
+        Some(dir.join("a*.7z"))
+    }
+
+    #[test]
+    fn unpacking_with_7z_takes_the_archive_name_as_it_is_and_not_as_a_wildcard() {
+        let dir = dir("seven_zip_archive_name");
+        let Some(archive) = archives_a_wildcard_would_mix(&dir) else {
+            eprintln!("SKIPPED: no 7z installed, unpacking with 7z was not tested");
+            return;
+        };
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let stage = extract_staged(&archive, &dest, &Control::unlimited()).unwrap();
+        let mut got: Vec<String> = std::fs::read_dir(&stage).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        got.sort();
+        assert_eq!(got, ["one.txt"], "another archive was unpacked too");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The names of the entries of a 7z archive, byte for byte, and whether any is encrypted (`7z l -slt`).
+    fn seven_zip_entries(archive: &Path) -> (Vec<Vec<u8>>, bool) {
+        let out = std::process::Command::new(seven_zip()).args(["l", "-slt", "--"]).arg(archive).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let mut names = Vec::new();
+        let mut encrypted = false;
+        // The entries follow the line of dashes; the archive's own block comes before it
+        let text = &out.stdout;
+        let start = text.windows(12).position(|w| w == b"\n----------\n").map_or(0, |p| p + 12);
+        for line in text[start..].split(|b| *b == b'\n') {
+            if let Some(name) = line.strip_prefix(b"Path = ") {
+                names.push(name.to_vec());
+            }
+            encrypted |= line == b"Encrypted = +";
+        }
+        names.sort();
+        (names, encrypted)
+    }
+
+    #[test]
+    fn packing_with_7z_takes_every_name_as_a_file_name_and_leaves_the_originals_alone() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        if !have("7z") && !have("7za") {
+            eprintln!("SKIPPED: no 7z installed, packing with 7z was not tested");
+            return;
+        }
+        let dir = dir("seven_zip_names");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // Names 7z would read as switches, a list file, wildcards; a space; bytes that are not UTF-8
+        let chosen: Vec<std::ffi::OsString> = ["keep.txt", "-sdel", "-pSECRET", "-r", "@list", "*", "a?c", "a b.txt"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .chain([std::ffi::OsString::from_vec(b"bad-\xe4.txt".to_vec())])
+            .collect();
+        for (n, name) in chosen.iter().enumerate() {
+            std::fs::write(src.join(name), format!("content {n}")).unwrap();
+        }
+        // Not chosen: what a list file or a wildcard would pull in
+        std::fs::write(src.join("list"), "secret.txt\n").unwrap();
+        std::fs::write(src.join("secret.txt"), "not chosen").unwrap();
+        std::fs::write(src.join("abc"), "not chosen").unwrap();
+        let before: Vec<(std::ffi::OsString, Vec<u8>)> = std::fs::read_dir(&src).unwrap().map(|e| e.unwrap()).map(|e| (e.file_name(), std::fs::read(e.path()).unwrap())).collect();
+
+        let out = dir.join("out.7z");
+        let sources: Vec<PathBuf> = chosen.iter().map(|n| src.join(n)).collect();
+        compress(&sources, &out, ArchiveFormat::SevenZ, &Control::unlimited()).unwrap();
+
+        // Every original is there, as it was
+        for (name, bytes) in &before {
+            assert_eq!(std::fs::read(src.join(name)).ok().as_ref(), Some(bytes), "{name:?} was deleted or changed");
+        }
+        assert_eq!(std::fs::read_dir(&src).unwrap().count(), before.len(), "a file appeared or went");
+        // The archive holds exactly the chosen files, under their own names, not encrypted
+        let (names, encrypted) = seven_zip_entries(&out);
+        let mut expected: Vec<Vec<u8>> = chosen.iter().map(|n| n.as_bytes().to_vec()).collect();
+        expected.sort();
+        assert_eq!(names, expected, "the archive holds other entries than the chosen files");
+        assert!(!encrypted, "the archive was encrypted");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use std::time::Instant;
 
     #[test]
