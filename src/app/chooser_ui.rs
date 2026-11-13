@@ -352,4 +352,33 @@ mod tests {
         assert_eq!(names, ["photo.png", "scan"], "the filter took files by their content");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn the_filter_of_the_dialog_also_holds_when_a_list_with_a_server_entry_is_read_on_a_thread() {
+        let dir = std::env::temp_dir().join(format!("compression_chooser_marks_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("server")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        std::fs::write(dir.join("notes.txt"), "words").unwrap();
+        std::fs::write(dir.join("photo.png"), "x").unwrap();
+        if crate::fs::apps::mime_of_name("a.png").is_none() {
+            return;
+        }
+        // A server among the bookmarks: the list is read on a thread (see `reload_items`)
+        crate::fs::network::declare_remote_for_tests(&dir.join("server"));
+        let mut app = app_in(&dir, &["--chooser", "--mode", "open", "--filter", "Images\tm:image/*"]);
+        app.bookmarks = vec![dir.join("notes.txt"), dir.join("photo.png"), dir.join("server")];
+        app.current_path = PathBuf::from(crate::fs::places::BOOKMARKS_PATH);
+        app.reload_items();
+        for _ in 0..300 {
+            if !app.poll_reload() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut names: Vec<&str> = app.items.iter().map(|i| i.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["photo.png", "server"], "the text file is not an image");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

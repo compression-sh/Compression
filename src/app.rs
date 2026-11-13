@@ -716,8 +716,6 @@ pub struct CompressionApp {
     type_ahead: (String, std::time::Instant),
 }
 
-/// The items of the Recent and Bookmarks views for `paths`: what is still there, and passes the hidden-files setting and
-/// the type filter. Asks the file system about every path, so it runs on a thread when a server is among them.
 /// See `CompressionApp::dialog_filter`.
 #[derive(Clone)]
 enum DialogFilter {
@@ -749,6 +747,8 @@ impl DialogFilter {
     }
 }
 
+/// The items of the Recent and Bookmarks views for `paths`: what is still there, and passes the hidden-files setting and
+/// the type filter. Asks the file system about every path, so it runs on a thread when a server is among them.
 fn recent_listing(paths: Vec<PathBuf>, show_hidden: bool, filter: TypeFilter) -> Vec<FileItem> {
     const LIMIT: usize = 150;
     paths
@@ -1219,10 +1219,10 @@ impl CompressionApp {
         if paths.iter().any(|p| network::is_remote(p)) {
             // A server in the list may not answer: its entries are asked about on a thread, and the window keeps the
             // listing it has until they are in (`poll_reload`)
-            let (show_hidden, filter) = (self.show_hidden, self.type_filter);
+            let (show_hidden, filter, dialog) = (self.show_hidden, self.type_filter, self.dialog_filter());
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(Ok(recent_listing(paths, show_hidden, filter)));
+                let _ = tx.send(dialog.apply(Ok(recent_listing(paths, show_hidden, filter))));
             });
             self.pending_reload = Some((self.current_path.clone(), rx));
             return;
