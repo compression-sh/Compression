@@ -129,6 +129,11 @@ impl CompressionApp {
 
     /// Unmount a device; `eject` also powers a removable drive off.
     pub(super) fn unmount_drive(&mut self, ctx: &egui::Context, dev: String, name: String, mount: PathBuf, eject: bool) {
+        // A job may be writing to the drive; the system refuses a drive that is busy, but not between two files
+        if self.engine.running() {
+            self.set_toast(if eject { tr("Wait for the running jobs to finish, then eject") } else { tr("Wait for the running jobs to finish, then unmount") });
+            return;
+        }
         if !self.drive_state.busy.insert(dev.clone()) {
             return;
         }

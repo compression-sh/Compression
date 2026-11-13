@@ -11414,6 +11414,34 @@ mod tests {
     }
 
     #[test]
+    fn disconnecting_unmounting_and_ejecting_wait_while_a_job_runs() {
+        use crate::fs::network::MountKind::Helper;
+        let work = window_dir("leave_while_job");
+        let mut w = Window::new(work.clone());
+        let ctx = w.ctx.clone();
+        let mount = server_for_reconnect(&work, "busy", Helper, true);
+        w.app.net.mounts = vec![mount.clone()];
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        w.app.engine.spawn(JobKind::Other, "holding".into(), String::new(), move |_| {
+            let _ = hold.recv();
+            Outcome::done(String::new())
+        });
+        let toast = |w: &mut Window| w.app.status_toast.take().map(|t| t.message).unwrap_or_default();
+        w.app.run_action(&ctx, MenuAction::Disconnect(mount.local.clone()));
+        assert_eq!(toast(&mut w), tr("Wait for the running jobs to finish, then disconnect"));
+        assert!(w.app.net.leaving.is_empty(), "the disconnect was started anyway");
+        let drive = (String::from("/dev/compression-test-none"), String::from("Stick"), work.join("stick"));
+        w.app.run_action(&ctx, MenuAction::Unmount(drive.0.clone(), drive.1.clone(), drive.2.clone()));
+        assert_eq!(toast(&mut w), tr("Wait for the running jobs to finish, then unmount"));
+        w.app.run_action(&ctx, MenuAction::Eject(drive.0.clone(), drive.1.clone(), drive.2.clone()));
+        assert_eq!(toast(&mut w), tr("Wait for the running jobs to finish, then eject"));
+        assert!(w.app.drive_state.busy.is_empty(), "an unmount was started anyway");
+        release.send(()).unwrap();
+        w.until("the job to end", |w| !w.app.engine.running());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
     fn reconnect_waits_while_a_job_runs_and_otherwise_lets_go_and_says_why_if_it_cannot() {
         use crate::fs::network::MountKind::Helper;
         let work = window_dir("reconnect_run");

@@ -958,5 +958,8 @@
   "it has an error": "sie enthält einen Fehler",
   "The settings file could not be read, and could not be kept aside: {}": "Die Einstellungsdatei konnte nicht gelesen und auch nicht beiseitegelegt werden: {}",
   "Pasted {} into {}": "{} in {} eingefügt",
-  "“{}” contains characters that can't be kept here. Type the new name in full.": "„{}“ enthält Zeichen, die hier nicht erhalten bleiben können. Gib den neuen Namen vollständig ein."
+  "“{}” contains characters that can't be kept here. Type the new name in full.": "„{}“ enthält Zeichen, die hier nicht erhalten bleiben können. Gib den neuen Namen vollständig ein.",
+  "Wait for the running jobs to finish, then disconnect": "Warte, bis die laufenden Aufträge fertig sind, und trenne dann",
+  "Wait for the running jobs to finish, then unmount": "Warte, bis die laufenden Aufträge fertig sind, und hänge dann aus",
+  "Wait for the running jobs to finish, then eject": "Warte, bis die laufenden Aufträge fertig sind, und wirf dann aus"
 }

@@ -1100,6 +1100,11 @@ impl CompressionApp {
     }
 
     pub(super) fn disconnect(&mut self, ctx: &egui::Context, mount: Mount) {
+        // As for Reconnect: a job may be using the server, and letting go of it would cut the job off
+        if self.engine.running() {
+            self.set_toast(tr("Wait for the running jobs to finish, then disconnect"));
+            return;
+        }
         if !self.net.leaving.insert(mount.local.clone()) {
             return;
         }
