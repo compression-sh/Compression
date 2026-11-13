@@ -5270,6 +5270,9 @@ impl CompressionApp {
         if old == new_name {
             return Ok(());
         }
+        if batch_rename::loses_bytes(path, new_name) {
+            return Err(batch_rename::loses_bytes_error(path));
+        }
         let target = path.with_file_name(new_name);
         if network::is_remote(path) {
             // A rename that is out is not asked for twice: the second would find the old name gone
@@ -8007,6 +8010,28 @@ mod tests {
         drop(app);
         assert!(!note.exists());
         UNSAVED_NOTE_FOR_TESTS.with(|n| *n.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn renaming_a_name_that_is_not_utf8_never_puts_a_replacement_character_in_its_place() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let base = window_dir("rename_not_utf8");
+        let latin1 = base.join(std::ffi::OsString::from_vec(b"Bericht-\xe4.txt".to_vec()));
+        std::fs::write(&latin1, "x").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let shown = latin1.file_name().unwrap().to_string_lossy().into_owned();
+        // Enter on the name as it is shown: nothing happens
+        app.rename_entry(&latin1, &shown).unwrap();
+        // A change that keeps the part that cannot be shown is refused, and the file keeps its name byte for byte
+        let err = app.rename_entry(&latin1, &format!("2024-{shown}")).unwrap_err();
+        assert!(err.contains("can't be kept"), "{err}");
+        assert!(latin1.exists());
+        assert!(std::fs::read_dir(&base).unwrap().all(|e| !e.unwrap().file_name().as_bytes().contains(&0xef)), "a replacement character reached the disk");
+        // A name typed anew is the name typed
+        app.rename_entry(&latin1, "Bericht.txt").unwrap();
+        assert!(base.join("Bericht.txt").exists() && !latin1.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -957,5 +957,6 @@
   "The settings file could not be read ({}). It was kept as “{}”, and the default settings are used.": "No se pudo leer el archivo de ajustes ({}). Se guardó como “{}” y se usan los ajustes predeterminados.",
   "it has an error": "tiene un error",
   "The settings file could not be read, and could not be kept aside: {}": "No se pudo leer el archivo de ajustes ni apartarlo: {}",
-  "Pasted {} into {}": "{} pegado en {}"
+  "Pasted {} into {}": "{} pegado en {}",
+  "“{}” contains characters that can't be kept here. Type the new name in full.": "«{}» contiene caracteres que aquí no se pueden conservar. Escribe el nombre nuevo completo."
 }

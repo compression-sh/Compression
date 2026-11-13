@@ -957,5 +957,6 @@
   "The settings file could not be read ({}). It was kept as “{}”, and the default settings are used.": "Không đọc được tệp cài đặt ({}). Tệp đã được giữ lại thành “{}”, và cài đặt mặc định đang được dùng.",
   "it has an error": "tệp có lỗi",
   "The settings file could not be read, and could not be kept aside: {}": "Không đọc được tệp cài đặt và cũng không thể để riêng nó ra: {}",
-  "Pasted {} into {}": "Đã dán {} vào {}"
+  "Pasted {} into {}": "Đã dán {} vào {}",
+  "“{}” contains characters that can't be kept here. Type the new name in full.": "“{}” chứa ký tự không thể giữ nguyên ở đây. Hãy nhập đầy đủ tên mới."
 }

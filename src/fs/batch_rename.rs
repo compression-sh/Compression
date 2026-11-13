@@ -263,8 +263,23 @@ fn expand(template: &str, stem: &str, number: i64, date: &str, folder: &str, ext
         .replace(TOKEN_NAME, stem)
 }
 
+/// Whether giving `path` the name `new` would lose part of its name: the name is not UTF-8, so it is shown (and edited)
+/// with "�" for the bytes that are not, and `new` still has such a "�" in it. Writing that would put the character itself
+/// on the disk in place of the bytes. A name left as it is, or typed anew without the "�", loses nothing.
+pub fn loses_bytes(path: &Path, new: &str) -> bool {
+    path.file_name().is_some_and(|old| old.to_str().is_none() && old.to_string_lossy() != new && new.contains('\u{FFFD}'))
+}
+
+/// What `loses_bytes` refuses, in words.
+pub fn loses_bytes_error(path: &Path) -> String {
+    trf("“{}” contains characters that can't be kept here. Type the new name in full.", &[&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()])
+}
+
 /// Why the result cannot be applied, if it cannot. Looks at names only, not at the disk.
 pub fn problem(entries: &[Entry], names: &[String]) -> Option<String> {
+    if let Some((entry, _)) = entries.iter().zip(names).find(|(e, n)| loses_bytes(&e.path, n)) {
+        return Some(loses_bytes_error(&entry.path));
+    }
     let mut seen = HashSet::new();
     for (entry, new) in entries.iter().zip(names) {
         if new.trim().is_empty() || new == "." || new == ".." || new.contains('/') {
@@ -334,6 +349,10 @@ pub fn apply_with(
     progress: &dyn Fn(usize, usize),
 ) -> Applied {
     use std::collections::HashSet;
+    // Refused as a whole, before anything is renamed, whoever asks (the dialog asks `problem` first)
+    if let Some((entry, _)) = entries.iter().zip(names).find(|(e, n)| loses_bytes(&e.path, n)) {
+        return Applied { error: Some(loses_bytes_error(&entry.path)), ..Applied::default() };
+    }
     let changes: Vec<(PathBuf, PathBuf)> = entries
         .iter()
         .zip(names)
@@ -403,6 +422,42 @@ pub fn apply_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_never_given_a_replacement_character_and_the_preview_says_why() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let dir = std::env::temp_dir().join(format!("compression_rename_not_utf8_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let latin1 = dir.join(std::ffi::OsString::from_vec(b"Bericht-\xe4.txt".to_vec()));
+        std::fs::write(&latin1, "x").unwrap();
+        std::fs::write(dir.join("plain.txt"), "y").unwrap();
+        let entries = vec![Entry { path: latin1.clone(), is_dir: false, date: String::new() }, Entry { path: dir.join("plain.txt"), is_dir: false, date: String::new() }];
+        let mut rules = Rules::new();
+        rules.prefix = "2024-".to_owned();
+        let names = preview(&entries, &rules);
+        // The preview tells before anything is done
+        let why = problem(&entries, &names).expect("the preview must refuse");
+        assert!(why.contains("can't be kept"), "{why}");
+        // And the renaming itself refuses as a whole, whoever calls it: nothing is renamed
+        let (done, error) = apply(&entries, &names);
+        assert!(done.is_empty() && error.is_some_and(|e| e.contains("can't be kept")));
+        assert!(latin1.exists() && dir.join("plain.txt").exists());
+        // Left as it is, the name is no problem; a name made anew is taken as made
+        let unchanged = vec![latin1.file_name().unwrap().to_string_lossy().into_owned(), "2024-plain.txt".to_owned()];
+        assert_eq!(problem(&entries, &unchanged), None);
+        let (done, error) = apply(&entries, &unchanged);
+        assert_eq!((done.len(), error), (1, None));
+        assert!(latin1.exists(), "the name that was not changed keeps its bytes");
+        let anew = vec!["001.txt".to_owned(), "002.txt".to_owned()];
+        let entries = vec![Entry { path: latin1.clone(), is_dir: false, date: String::new() }];
+        assert_eq!(problem(&entries, &anew[..1]), None);
+        let (done, error) = apply(&entries, &anew[..1]);
+        assert_eq!((done.len(), error), (1, None));
+        assert!(dir.join("001.txt").exists());
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().as_bytes().contains(&0xef)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn without_noreplace_support_a_batch_is_refused_and_every_name_is_put_back() {

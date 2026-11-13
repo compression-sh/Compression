@@ -957,5 +957,6 @@
   "The settings file could not be read ({}). It was kept as “{}”, and the default settings are used.": "Не удалось прочитать файл настроек ({}). Он сохранён как «{}», используются настройки по умолчанию.",
   "it has an error": "в нём ошибка",
   "The settings file could not be read, and could not be kept aside: {}": "Не удалось прочитать файл настроек и отложить его в сторону: {}",
-  "Pasted {} into {}": "{} вставлен в {}"
+  "Pasted {} into {}": "{} вставлен в {}",
+  "“{}” contains characters that can't be kept here. Type the new name in full.": "«{}» содержит символы, которые здесь не удаётся сохранить. Введите новое имя полностью."
 }
