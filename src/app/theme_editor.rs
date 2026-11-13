@@ -67,12 +67,19 @@ impl CompressionApp {
         if name.is_empty() {
             return;
         }
-        let id = draft.id.unwrap_or_else(|| unique_id(&name, &theme::user_themes()));
-        // Only a theme that is on disk counts as saved: otherwise the card stays open with the reason
-        if let Err(err) = theme::save_user_theme(&CustomTheme { id: id.clone(), name, colors: draft.colors }) {
-            self.theme_draft_error(trf("Could not save the theme: {}", &[&crate::fs::describe::io_error(&err)]));
-            return;
-        }
+        // Only a theme that is on disk counts as saved: otherwise the card stays open with the reason. A new theme takes a
+        // file no one has (`create_user_theme`); a theme that was saved before is written over in its own file
+        let saved = match draft.id {
+            Some(id) => theme::save_user_theme(&CustomTheme { id: id.clone(), name, colors: draft.colors }).map(|()| id),
+            None => theme::create_user_theme(&unique_id(&name, &theme::user_themes()), name, draft.colors),
+        };
+        let id = match saved {
+            Ok(id) => id,
+            Err(err) => {
+                self.theme_draft_error(trf("Could not save the theme: {}", &[&crate::fs::describe::io_error(&err)]));
+                return;
+            }
+        };
         theme::reload_user_themes();
         self.settings.theme = format!("custom:{id}");
         self.close_theme_editor();
@@ -81,9 +88,18 @@ impl CompressionApp {
 
     fn delete_theme_draft(&mut self) {
         let Some(id) = self.theme_draft.as_ref().and_then(|d| d.id.clone()) else { return };
-        if let Err(err) = theme::delete_user_theme(&id) {
-            self.theme_draft_error(trf("Could not delete the theme: {}", &[&crate::fs::describe::io_error(&err)]));
-            return;
+        let name = self.theme_draft.as_ref().map(|d| format!("“{}”", d.name.trim())).unwrap_or_default();
+        // To the trash, with the way back, as for any file; what the trash cannot take stays, with the reason
+        match theme::trash_user_theme(&id) {
+            Ok(Some(trashed)) => {
+                self.history.record(crate::fs::history::UndoEntry::new(trf("Move of {} to trash", &[&name]), vec![crate::fs::history::Edit::Restore(trashed)]));
+                self.set_toast_action(trf("Moved {} to trash", &[&name]), ToastAction::Undo);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.theme_draft_error(trf("Could not delete the theme: {}", &[&crate::fs::describe::io_error(&err)]));
+                return;
+            }
         }
         theme::reload_user_themes();
         if self.settings.theme == format!("custom:{id}") {
@@ -665,6 +681,26 @@ mod tests {
     }
 
     #[test]
+    fn a_new_theme_never_writes_over_a_file_that_is_there_even_one_that_cannot_be_read() {
+        let reading = Reading::new("editor_broken_same_id");
+        let dir = reading.0 .0.join("themes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = "{ \"name\": \"Mine\", \"base\": \"#102030\", oops }";
+        std::fs::write(dir.join("mine.json"), broken).unwrap();
+        THEMES_DIR_FOR_TESTS.with(|d| *d.borrow_mut() = Some(dir.clone()));
+        let mut app = app_in(&reading.0 .0);
+        naming(&mut app, "Mine");
+        app.save_theme_draft();
+        assert_eq!(std::fs::read_to_string(dir.join("mine.json")).unwrap(), broken, "the broken file was written over");
+        // The new theme has a name of its own, and is the one chosen
+        assert!(!app.theme_editor, "{:?}", app.theme_draft.as_ref().and_then(|d| d.error.clone()));
+        assert_eq!(app.settings.theme, "custom:mine-2");
+        assert!(dir.join("mine-2.json").is_file());
+        let leftovers: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with('.')).collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
     fn a_theme_that_could_not_be_written_is_not_called_saved() {
         let reading = Reading::new("editor_save");
         let blocker = reading.0.put("blocker", "a file is in the way");
@@ -686,6 +722,29 @@ mod tests {
         assert!(!app.theme_editor);
         assert_eq!(app.settings.theme, "custom:mine");
         assert!(reading.0 .0.join("themes/mine.json").is_file());
+    }
+
+    #[test]
+    fn a_deleted_theme_goes_to_the_trash_and_undo_brings_it_back() {
+        let reading = Reading::new("editor_trash");
+        let text = r##"{ "name": "Mine", "base": "#102030" }"##;
+        let file = reading.0.put("mine.json", text);
+        crate::ui::theme::reload_user_themes();
+        let mut app = app_in(&reading.0 .0);
+        app.settings.theme = "custom:mine".to_owned();
+        app.open_theme_editor(Some("mine"));
+        app.delete_theme_draft();
+        assert!(!file.exists());
+        assert!(!app.theme_editor);
+        assert_eq!(app.settings.theme, "system");
+        // Said, with the way back
+        let toast = app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+        assert!(toast.contains("trash"), "{toast}");
+        assert!(app.history.undo_label().is_some(), "no undo for the deleted theme");
+        let entry = app.history.pop_undo().expect("an undo entry");
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text, "undo brings the same file back");
     }
 
     #[test]

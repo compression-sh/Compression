@@ -383,16 +383,55 @@ pub fn save_user_theme(theme: &CustomTheme) -> std::io::Result<()> {
     crate::fs::atomic::write(&theme_file(&dir, &theme.id), json)
 }
 
-/// Removes the theme's file. A file that is gone already is what was asked for.
-pub fn delete_user_theme(id: &str) -> std::io::Result<()> {
+/// Writes a new theme to a file no one has, and returns its id: `base`, else `base-2`, `base-3`, … A file that is there
+/// is never written over, also one that cannot be read (it may be a theme being fixed by hand). The theme is written
+/// whole under a name of its own first and then given its name without replacing anything, so a file that appears
+/// meanwhile is not written over either; then the next name is taken.
+pub fn create_user_theme(base: &str, name: String, colors: ThemeColors) -> std::io::Result<String> {
+    use std::io::Write;
     if crate::fs::admin::is_admin() {
         return Err(not_as_administrator());
     }
-    let Some(dir) = user_themes_dir() else { return Ok(()) };
-    match fs::remove_file(theme_file(&dir, id)) {
-        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
-        _ => Ok(()),
+    let dir = user_themes_dir().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, tr("There is no folder for the themes")))?;
+    fs::create_dir_all(&dir)?;
+    for n in 1..1000u32 {
+        let id = if n == 1 { base.to_owned() } else { format!("{base}-{n}") };
+        let target = theme_file(&dir, &id);
+        if target.symlink_metadata().is_ok() {
+            continue;
+        }
+        let json = serde_json::to_string_pretty(&CustomTheme { id: id.clone(), name: name.clone(), colors: colors.clone() }).map_err(std::io::Error::other)?;
+        let temp = dir.join(format!(".{id}.json.new-{}", std::process::id()));
+        let written = fs::OpenOptions::new().write(true).create_new(true).open(&temp).and_then(|mut file| {
+            file.write_all(json.as_bytes())?;
+            file.sync_all()
+        });
+        let placed = written.and_then(|()| crate::compat::rename_noreplace(&temp, &target));
+        match placed {
+            Ok(()) => return Ok(id),
+            Err(err) => {
+                let _ = fs::remove_file(&temp);
+                if err.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(err);
+                }
+            }
+        }
     }
+    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+}
+
+/// Moves the theme's file to the trash and returns where it went, so an undo can bring it back; `None` when it is gone
+/// already, which is what was asked for. A file the trash cannot take stays where it is: it is never deleted for good.
+pub fn trash_user_theme(id: &str) -> std::io::Result<Option<PathBuf>> {
+    if crate::fs::admin::is_admin() {
+        return Err(not_as_administrator());
+    }
+    let Some(dir) = user_themes_dir() else { return Ok(None) };
+    let file = theme_file(&dir, id);
+    if file.symlink_metadata().is_err() {
+        return Ok(None);
+    }
+    crate::fs::trash::trash_without_fallback(&file).map(Some)
 }
 
 /// A palette bundled in `assets/themes`; the file name is its id.
@@ -875,6 +914,26 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn a_new_theme_takes_the_next_free_name_and_leaves_every_file_that_is_there_alone() {
+        let dir = std::env::temp_dir().join(format!("compression_create_theme_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.json"), "not json at all").unwrap();
+        std::fs::create_dir_all(dir.join("x-2.json")).unwrap();
+        THEMES_DIR_FOR_TESTS.with(|d| *d.borrow_mut() = Some(dir.clone()));
+        let id = create_user_theme("x", "X".into(), ThemeColors::default()).unwrap();
+        THEMES_DIR_FOR_TESTS.with(|d| *d.borrow_mut() = None);
+        assert_eq!(id, "x-3");
+        assert_eq!(std::fs::read_to_string(dir.join("x.json")).unwrap(), "not json at all");
+        assert!(dir.join("x-2.json").is_dir());
+        let theme: CustomTheme = serde_json::from_str(&std::fs::read_to_string(dir.join("x-3.json")).unwrap()).unwrap();
+        assert_eq!(theme.name, "X");
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names.len(), 3, "a temporary file was left: {names:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn the_system_theme_follows_the_desktop_unless_serpantinum_is_installed() {
         use super::super::appearance::Appearance;
         let empty = std::env::temp_dir().join(format!("compression_system_theme_{}", std::process::id()));
@@ -1278,9 +1337,9 @@ pub(crate) mod tests {
         assert!(std::fs::read_to_string(&file).unwrap().contains("\"name\": \"Mine\""));
         // Nothing half-written is left beside it
         assert_eq!(std::fs::read_dir(&reading.0 .0).unwrap().count(), 1);
-        delete_user_theme("mine").unwrap();
+        assert!(trash_user_theme("mine").unwrap().is_some());
         assert!(!file.exists());
-        delete_user_theme("mine").unwrap();
+        assert_eq!(trash_user_theme("mine").unwrap(), None);
 
         // A folder that cannot be made: something that is not a folder is in the way
         let blocker = reading.0.put("blocker", "a file");
@@ -1297,7 +1356,7 @@ pub(crate) mod tests {
         let reading = Reading::new("remove");
         let file = reading.0.put("mine.json", GOOD);
         std::fs::set_permissions(&reading.0 .0, std::os::unix::fs::PermissionsExt::from_mode(0o555)).unwrap();
-        let err = delete_user_theme("mine").unwrap_err();
+        let err = trash_user_theme("mine").unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EACCES));
         assert!(file.exists());
         // A write that cannot happen leaves the old file as it was
