@@ -149,6 +149,15 @@ impl CompressionApp {
         });
     }
 
+    /// Opens `dir`, made first if it is not there yet (the templates and actions folders are made on first use). When
+    /// it cannot be made, that is said, and nothing is opened.
+    pub(crate) fn open_made_folder(&mut self, dir: PathBuf) {
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => self.pending_open = Some(dir),
+            Err(err) => self.set_toast(trf("The folder “{}” could not be made: {}", &[&dir.display(), &crate::fs::describe::io_error(&err)])),
+        }
+    }
+
     pub(crate) fn persist_settings(&mut self) {
         self.settings.view_mode = self.view_mode;
         self.settings.sort_by = self.sort_by;
@@ -1012,9 +1021,7 @@ impl CompressionApp {
                 button(ui, "open_templates", Some(icons::FOLDER_OPEN), tr("Open templates folder"), &theme, ButtonKind::Tonal, shown.is_some()).clicked()
             });
             if open && let Some(dir) = shown {
-                // The folder is created on first use, so there is always somewhere to put templates
-                let _ = std::fs::create_dir_all(&dir);
-                self.pending_open = Some(dir);
+                self.open_made_folder(dir);
             }
         });
     }
@@ -1049,8 +1056,7 @@ impl CompressionApp {
                     button(ui, "open_actions", Some(icons::FOLDER_OPEN), tr("Open actions folder"), &theme, ButtonKind::Tonal, dir.is_some()).clicked()
                 });
                 if open && let Some(dir) = dir {
-                    let _ = std::fs::create_dir_all(&dir);
-                    self.pending_open = Some(dir);
+                    self.open_made_folder(dir);
                 }
                 self.plugins.settings("actions", ui, &theme);
             });
@@ -1732,6 +1738,24 @@ fn category_row(
 mod tests {
     use super::*;
     use crate::settings::{Settings, SCROLL_SPEED_DEFAULT};
+
+    #[test]
+    fn a_folder_that_cannot_be_made_is_said_and_not_opened() {
+        let base = std::env::temp_dir().join(format!("compression_made_folder_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("blocker"), "a file").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.open_made_folder(base.join("blocker/templates"));
+        assert!(app.pending_open.is_none(), "a folder that could not be made was opened");
+        let said = app.toast_message().unwrap_or_default().to_owned();
+        assert!(said.starts_with("The folder “") && said.contains("could not be made"), "{said}");
+        app.open_made_folder(base.join("templates"));
+        assert_eq!(app.pending_open, Some(base.join("templates")));
+        assert!(base.join("templates").is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     static CHECK_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
     static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

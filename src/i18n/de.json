@@ -980,5 +980,6 @@
   "The font “{}” could not be read ({}). Adwaita Sans is used instead.": "Die Schrift „{}“ konnte nicht gelesen werden ({}). Stattdessen wird Adwaita Sans verwendet.",
   "“{}” is not a font Compression can use. Adwaita Sans is used instead.": "„{}“ ist keine Schrift, die Compression verwenden kann. Stattdessen wird Adwaita Sans verwendet.",
   "Which drive “{}” is on could not be told, so it was not ejected. Unmount it instead.": "Auf welchem Laufwerk „{}“ liegt, ließ sich nicht feststellen, deshalb wurde es nicht ausgeworfen. Hängen Sie es stattdessen aus.",
-  "“{}” runs in a terminal, and no terminal that can run it was found. Choose one in Settings → Behavior.": "„{}“ läuft in einem Terminal, und es wurde kein Terminal gefunden, das es starten kann. Wählen Sie eines unter Einstellungen → Verhalten."
+  "“{}” runs in a terminal, and no terminal that can run it was found. Choose one in Settings → Behavior.": "„{}“ läuft in einem Terminal, und es wurde kein Terminal gefunden, das es starten kann. Wählen Sie eines unter Einstellungen → Verhalten.",
+  "The folder “{}” could not be made: {}": "Der Ordner „{}“ konnte nicht angelegt werden: {}"
 }

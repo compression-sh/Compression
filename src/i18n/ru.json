@@ -980,5 +980,6 @@
   "The font “{}” could not be read ({}). Adwaita Sans is used instead.": "Не удалось прочитать шрифт «{}» ({}). Вместо него используется Adwaita Sans.",
   "“{}” is not a font Compression can use. Adwaita Sans is used instead.": "«{}» — не шрифт, который Compression может использовать. Вместо него используется Adwaita Sans.",
   "Which drive “{}” is on could not be told, so it was not ejected. Unmount it instead.": "Не удалось определить, на каком диске находится «{}», поэтому он не извлечён. Вместо этого отключите его.",
-  "“{}” runs in a terminal, and no terminal that can run it was found. Choose one in Settings → Behavior.": "«{}» запускается в терминале, но подходящий терминал не найден. Выберите его в Настройки → Поведение."
+  "“{}” runs in a terminal, and no terminal that can run it was found. Choose one in Settings → Behavior.": "«{}» запускается в терминале, но подходящий терминал не найден. Выберите его в Настройки → Поведение.",
+  "The folder “{}” could not be made: {}": "Не удалось создать папку «{}»: {}"
 }
