@@ -257,6 +257,43 @@ mod tests {
     }
 
     #[test]
+    fn a_suggested_save_name_stays_in_the_folder_shown_and_a_typed_path_still_goes_where_it_says() {
+        let work = std::env::temp_dir().join(format!("compression_chooser_suggested_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("shown/sub")).unwrap();
+        let shown = work.join("shown");
+        // What a program suggests (the portal's current_name, or --name on the command line) is a name in the folder
+        // shown, whatever path it carries
+        for (suggested, answer) in [
+            ("report.txt", Some("report.txt")),
+            ("../outside.txt", Some("outside.txt")),
+            ("/etc/passwd", Some("passwd")),
+            ("~/.bashrc", Some(".bashrc")),
+            ("~/.config/autostart/x.desktop", Some("x.desktop")),
+            ("sub/deeper.txt", Some("deeper.txt")),
+            ("..", None),
+            ("/", None),
+        ] {
+            let app = app_in(&shown, &["--chooser", "--mode", "save", "--name", suggested]);
+            let ch = app.chooser.as_ref().unwrap();
+            assert_eq!(ch.name_input, answer.unwrap_or(""), "the name field for {suggested:?}");
+            assert_eq!(app.chooser_answer(), answer.map(|n| vec![app.current_path.join(n)]), "the answer for {suggested:?}");
+        }
+        // What the person types is a path, as before: in a folder below, absolute, or in the home folder
+        let mut app = app_in(&shown, &["--chooser", "--mode", "save"]);
+        let typed = |app: &mut CompressionApp, text: &str| app.chooser.as_mut().unwrap().name_input = text.to_owned();
+        typed(&mut app, "sub/x.txt");
+        assert_eq!(app.chooser_answer(), Some(vec![app.current_path.join("sub/x.txt")]));
+        typed(&mut app, "/tmp/y.txt");
+        assert_eq!(app.chooser_answer(), Some(vec![PathBuf::from("/tmp/y.txt")]));
+        typed(&mut app, "~/z.txt");
+        assert_eq!(app.chooser_answer(), Some(vec![dirs::home_dir().unwrap().join("z.txt")]));
+        typed(&mut app, "../up.txt");
+        assert_eq!(app.chooser_answer(), Some(vec![app.current_path.join("../up.txt")]));
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
     fn answers_follow_the_mode() {
         let work = std::env::temp_dir().join(format!("compression_chooser_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work);
@@ -282,15 +319,17 @@ mod tests {
         let app = app_in(&work, &["--chooser", "--mode", "save"]);
         assert_eq!(app.chooser_answer(), None);
 
-        // A typed path decides where the file goes, and a filter never renames it
-        let app = app_in(&work, &["--chooser", "--mode", "save", "--name", "sub/x", "--filter", "PNG\tg:*.png"]);
+        // A path typed into the field decides where the file goes, and a filter never renames it
+        let type_in = |app: &mut CompressionApp, text: &str| app.chooser.as_mut().unwrap().name_input = text.to_owned();
+        let mut app = app_in(&work, &["--chooser", "--mode", "save", "--filter", "PNG\tg:*.png"]);
+        type_in(&mut app, "sub/x");
         assert_eq!(app.chooser_answer(), Some(vec![app.current_path.join("sub/x")]));
 
         // A typed folder is gone into, not answered with
-        let app = app_in(&work, &["--chooser", "--mode", "save", "--name", "sub/"]);
+        type_in(&mut app, "sub/");
         assert_eq!(app.chooser_answer(), None);
         assert_eq!(app.chooser_typed_dir(), Some(app.current_path.join("sub")));
-        let app = app_in(&work, &["--chooser", "--mode", "save", "--name", "/tmp/y.txt"]);
+        type_in(&mut app, "/tmp/y.txt");
         assert_eq!(app.chooser_answer(), Some(vec![PathBuf::from("/tmp/y.txt")]));
 
         let _ = std::fs::remove_dir_all(&work);

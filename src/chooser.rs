@@ -125,8 +125,9 @@ impl Spec {
                 "--title" => spec.title = it.next().cloned().filter(|s| !s.is_empty()),
                 "--accept" => spec.accept_label = it.next().cloned().filter(|s| !s.is_empty()),
                 "--folder" => spec.folder = it.next().map(PathBuf::from),
-                "--name" => spec.name = it.next().cloned().filter(|s| !s.is_empty()),
-                // Only the last component counts: a name is never a way out of the chosen folder
+                // Only the last component counts, for a suggested name as for a file: what a program proposes is never a
+                // way out of the folder shown. A path the person types into the field later still goes where it says
+                "--name" => spec.name = it.next().and_then(|n| Path::new(n).file_name()).map(|n| n.to_string_lossy().into_owned()),
                 "--file" => spec.files.extend(it.next().and_then(|f| Path::new(f).file_name()).map(|n| n.to_string_lossy().into_owned())),
                 "--parent" => spec.parent = it.next().cloned().filter(|s| !s.is_empty()),
                 "--app-id" => spec.app_id = it.next().cloned().filter(|s| !s.is_empty()),
