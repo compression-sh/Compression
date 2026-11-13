@@ -626,6 +626,8 @@ pub fn icon_button_tinted(
     let disabled_color = theme.with_alpha(theme.subtext1, 70);
     let color = lerp_color(disabled_color, active_color, en_t);
     paint_icon(ui.painter(), rect.center(), icon, ICON_MD, color);
+    // The tooltip is the only words the button has, so a screen reader says it
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, tooltip));
 
     if tooltip.is_empty() { response } else { response.on_hover_text(tooltip) }
 }
@@ -881,6 +883,7 @@ pub fn button(
         x += 24.0;
     }
     ui.painter().text(Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, label, font, color);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
     response
 }
 
@@ -1111,6 +1114,8 @@ fn nav_item_sense(
     let lift = if usage.is_some() { 4.0 } else { 0.0 };
     let shortened = paint_label(ui, rect.left() + INSET_LABEL, rect.center().y - lift, label, FONT_BODY, color, label_width);
     ui.ctx().data_mut(|d| d.insert_temp(response.id.with("shortened"), shortened));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ListItem, true, label));
+    ui.ctx().accesskit_node_builder(response.id, |node| node.set_selected(selected));
     let Some(used) = usage else {
         return response;
     };
@@ -1487,6 +1492,7 @@ pub fn menu_item(
         ui.painter().galley(Pos2::new(rect.right() - 16.0 - galley.size().x, rect.center().y - galley.size().y / 2.0), galley, theme.subtext1);
     }
     let shortened = paint_label(ui, rect.left() + INSET_LABEL, rect.center().y, label, FONT_BODY, color, label_room);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::MenuItem, true, label));
     // A label that still does not fit (the menu is as wide as the window) is whole in the tooltip
     if shortened { response.on_hover_text(label) } else { response }
 }
@@ -1732,6 +1738,7 @@ pub fn switch_row_with(
     };
 
     paint_switch(ui, Pos2::new(rect.right() - 36.0, rect.center().y), t, fx.press, theme);
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Switch, true, on, label));
     // What does not fit is in the tooltip
     match description {
         Some(desc) if shortened => response.on_hover_text(format!("{label}\n{desc}")),
@@ -2774,5 +2781,52 @@ mod tests {
             v4 < v3 && v4 > v3 - 0.25,
             "mid-flight reversal should be continuous from {v3}, got {v4}"
         );
+    }
+}
+
+#[cfg(test)]
+mod accessibility_tests {
+    use super::*;
+
+    /// A node as a screen reader gets it: its role, name, and whether it is on (toggled), selected or disabled.
+    type Node = (egui::Role, Option<String>, Option<egui::accesskit::Toggled>, bool, bool);
+
+    /// What egui hands a screen reader for the widget `add` draws, after a few frames.
+    fn accessible(add: impl Fn(&mut egui::Ui)) -> Vec<Node> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut found = Vec::new();
+        for n in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))), time: Some(n as f64 * 0.05), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| add(ui));
+            out.textures_delta.clear();
+            if let Some(update) = out.platform_output.accesskit_update {
+                found = update
+                    .nodes
+                    .iter()
+                    .filter(|(_, node)| !matches!(node.role(), egui::Role::Window | egui::Role::GenericContainer))
+                    .map(|(_, node)| (node.role(), node.label().map(str::to_owned), node.toggled(), node.is_selected() == Some(true), node.is_disabled()))
+                    .collect();
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_screen_reader_is_told_what_the_buttons_rows_and_switches_are() {
+        use egui::Role;
+        use egui::accesskit::Toggled;
+        let theme = SerpantinumTheme::default();
+        let copy = Some("Copy".to_owned());
+        assert_eq!(accessible(|ui| { button(ui, "b", Some(icons::COPY), "Copy", &theme, ButtonKind::Tonal, true); }), [(Role::Button, copy.clone(), None, false, false)]);
+        assert_eq!(accessible(|ui| { button(ui, "b", None, "Copy", &theme, ButtonKind::Filled, false); }), [(Role::Button, copy.clone(), None, false, true)]);
+        assert_eq!(accessible(|ui| { icon_button(ui, "i", icons::CLOSE, &theme, true, "Close"); }), [(Role::Button, Some("Close".to_owned()), None, false, false)]);
+        assert_eq!(accessible(|ui| { menu_item(ui, "m", icons::COPY, "Copy", Some("Ctrl+C"), &theme); }), [(Role::MenuItem, copy, None, false, false)]);
+        let general = Some("General".to_owned());
+        assert_eq!(accessible(|ui| { nav_item(ui, "n", icons::COG, "General", &theme, true); }), [(Role::ListItem, general.clone(), None, true, false)]);
+        assert_eq!(accessible(|ui| { nav_item_roving(ui, "n", icons::COG, "General", &theme, false, true); }), [(Role::ListItem, general, None, false, false)]);
+        let hidden = Some("Show hidden".to_owned());
+        assert_eq!(accessible(|ui| { switch_row(ui, "s", icons::COG, "Show hidden", &theme, true); }), [(Role::Switch, hidden.clone(), Some(Toggled::True), false, false)]);
+        assert_eq!(accessible(|ui| { switch_row(ui, "s", icons::COG, "Show hidden", &theme, false); }), [(Role::Switch, hidden, Some(Toggled::False), false, false)]);
     }
 }
