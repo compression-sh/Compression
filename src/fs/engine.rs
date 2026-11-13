@@ -602,7 +602,7 @@ impl Engine {
     /// A job that runs or waits for its turn and needs one of `resources`; one that waits for an answer to a question
     /// still runs. A job that was stopped needs them until it has ended.
     pub fn needing(&self, resources: &[crate::fs::resources::Resource]) -> Option<&Job> {
-        self.jobs.iter().find(|j| matches!(j.state, JobState::Running | JobState::Waiting) && j.uses.iter().any(|r| resources.contains(r)))
+        self.jobs.iter().find(|j| matches!(j.state, JobState::Running | JobState::Waiting) && crate::fs::resources::overlaps(resources, &j.uses))
     }
 
     /// Forget finished jobs that have been on show long enough.

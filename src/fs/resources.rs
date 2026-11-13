@@ -13,6 +13,9 @@ pub enum Resource {
     FileSystem(u64),
     /// A server (or a phone or camera GVfs mounted), by the folder it is mounted on.
     Server(PathBuf),
+    /// A whole drive, by its kernel name (`sdb`): every file system on it, also one mounted after it was held. What
+    /// ejecting a drive holds; a job never needs it by this name, but by its file systems (see `overlaps`).
+    Drive(String),
 }
 
 /// What `path` needs. A path that is not there yet (where a copy goes) is on the file system of the nearest folder above
@@ -23,6 +26,16 @@ pub fn of(path: &Path) -> Option<Resource> {
     }
     use std::os::unix::fs::MetadataExt;
     path.ancestors().find_map(|p| p.metadata().or_else(|_| p.symlink_metadata()).ok()).map(|m| Resource::FileSystem(m.dev()))
+}
+
+/// Whether something a job needs (`needed`) is among what is `held`: the same file system or server, or a file system
+/// on a held drive. The drive of a file system is only looked up while a drive is held.
+pub fn overlaps(held: &[Resource], needed: &[Resource]) -> bool {
+    needed.iter().any(|n| {
+        held.iter().any(|h| {
+            h == n || matches!((h, n), (Resource::Drive(drive), Resource::FileSystem(dev)) if crate::fs::drives::drives_of_file_system(*dev).contains(drive))
+        })
+    })
 }
 
 /// What all of `paths` need, each once.
@@ -67,5 +80,21 @@ mod tests {
         crate::fs::network::declare_remote_for_tests(&server);
         assert_eq!(of(&server.join("deep/file")), Some(Resource::Server(server.clone())));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_held_drive_covers_every_file_system_on_it_and_nothing_else() {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(shm), Ok(proc)) = (std::fs::metadata("/dev/shm"), std::fs::metadata("/proc")) else { return };
+        // /dev/shm stands in for a partition of the drive "compression-test-res"; /proc is on no drive
+        crate::fs::drives::declare_file_system_drive_for_tests(shm.dev(), "compression-test-res");
+        let drive = [Resource::Drive("compression-test-res".into())];
+        assert!(overlaps(&drive, &[Resource::FileSystem(shm.dev())]));
+        assert!(!overlaps(&drive, &[Resource::FileSystem(proc.dev())]));
+        assert!(!overlaps(&[Resource::Drive("another".into())], &[Resource::FileSystem(shm.dev())]));
+        // The same resource is the same, held as itself
+        assert!(overlaps(&[Resource::FileSystem(proc.dev())], &[Resource::FileSystem(proc.dev())]));
+        assert!(overlaps(&[Resource::Server("/m".into())], &[Resource::Server("/m".into())]));
+        assert!(!overlaps(&[Resource::Server("/m".into())], &[Resource::Server("/n".into())]));
     }
 }

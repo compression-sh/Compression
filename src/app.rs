@@ -11760,6 +11760,9 @@ mod tests {
         let ctx = w.ctx.clone();
         // A copy from A to B: A (its source) and B (its target) wait for it, C does not
         let (copy, release) = holding_job(&mut w, "Copying 3 items", &[a.join("photos"), b.join("new-folder")]);
+        for stick in ["a", "b", "c"] {
+            crate::fs::drives::declare_device_drive_for_tests(&format!("/dev/compression-test-{stick}"), &format!("compression-test-drive-{stick}"));
+        }
         let unmount = |w: &mut Window, dev: &str, name: &str, at: &Path, eject: bool| {
             let action = if eject { MenuAction::Eject(dev.into(), name.into(), at.to_path_buf()) } else { MenuAction::Unmount(dev.into(), name.into(), at.to_path_buf()) };
             w.app.run_action(&ctx, action);
@@ -11818,6 +11821,48 @@ mod tests {
         assert_eq!(w.app.job_needing(&crate::fs::resources::of_all([&b])), None);
         assert_eq!(std::fs::read_to_string(a.join("same.txt")).unwrap(), "old");
         let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn ejecting_holds_the_whole_drive_also_a_partition_mounted_meanwhile_and_lets_go_when_it_failed() {
+        use std::os::unix::fs::MetadataExt;
+        let work = window_dir("eject_race");
+        let Some([a, b, c]) = three_drives(&work) else { return };
+        // The stick is mounted at C. B (/dev/shm) stands for another partition of it: one the listing at the click does
+        // not show (made up, so there is none), as when it is mounted just then
+        let (dev, drive) = ("/dev/compression-test-race", "compression-test-drive-race");
+        crate::fs::drives::declare_device_drive_for_tests(dev, drive);
+        crate::fs::drives::declare_file_system_drive_for_tests(b.metadata().unwrap().dev(), drive);
+        let mut w = Window::new(work.clone());
+        let ctx = w.ctx.clone();
+        let eject = MenuAction::Eject(dev.into(), "Stick".into(), c.clone());
+        // A job already running on that other partition: the drive is still needed, nothing is let go of
+        let (job, release) = holding_job(&mut w, "Copying", &[b.join("x")]);
+        w.app.run_action(&ctx, eject.clone());
+        assert_eq!(said(&mut w), "“Stick” is still needed by “Copying”. Wait until it is done, then eject.");
+        assert!(w.app.drive_state.busy.is_empty() && w.app.releasing.is_empty());
+        release.send(()).unwrap();
+        w.until("the copy to end", |w| !w.app.engine.jobs.iter().any(|j| j.id == job && j.state == crate::fs::engine::JobState::Running));
+        // Ejecting: no job starts on any file system of the drive, also one the click did not know of; others stay free
+        w.app.run_action(&ctx, eject);
+        assert!(w.app.drive_state.busy.contains(dev));
+        assert!(w.app.start_job(JobKind::Copy, "Copying".into(), String::new(), None, &[b.join("y")], |_| Outcome::done(String::new())).is_none());
+        assert_eq!(said(&mut w), "“Stick” is being disconnected or unmounted. Try again once that is done.");
+        assert!(w.app.start_job(JobKind::Copy, "Copying".into(), String::new(), None, &[a.join("y")], |_| Outcome::done(String::new())).is_some(), "a drive that is not ejected was held");
+        // The made-up stick cannot be unmounted: no "can be removed", and the drive is free again
+        w.until("the answer", |w| {
+            let c = w.ctx.clone();
+            w.app.poll_drives(&c);
+            w.app.drive_state.busy.is_empty()
+        });
+        assert!(!said(&mut w).contains("can be removed safely"));
+        assert!(w.app.releasing.is_empty());
+        assert!(w.app.start_job(JobKind::Copy, "Copying".into(), String::new(), None, &[b.join("z")], |_| Outcome::done(String::new())).is_some());
+        // A device whose drive cannot be told is not ejected at all
+        w.app.run_action(&ctx, MenuAction::Eject("/dev/compression-test-unknown".into(), "Card".into(), c.clone()));
+        assert_eq!(said(&mut w), "Which drive “Card” is on could not be told, so it was not ejected. Unmount it instead.");
+        assert!(w.app.drive_state.busy.is_empty() && w.app.releasing.is_empty());
         let _ = std::fs::remove_dir_all(&work);
     }
 

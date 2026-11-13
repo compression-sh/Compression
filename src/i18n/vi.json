@@ -978,5 +978,6 @@
   "Forget": "Quên",
   "Folders deeper than {} levels were not searched.": "Không tìm trong các thư mục sâu hơn {} cấp.",
   "The font “{}” could not be read ({}). Adwaita Sans is used instead.": "Không thể đọc phông chữ “{}” ({}). Adwaita Sans được dùng thay thế.",
-  "“{}” is not a font Compression can use. Adwaita Sans is used instead.": "“{}” không phải là phông chữ Compression có thể dùng. Adwaita Sans được dùng thay thế."
+  "“{}” is not a font Compression can use. Adwaita Sans is used instead.": "“{}” không phải là phông chữ Compression có thể dùng. Adwaita Sans được dùng thay thế.",
+  "Which drive “{}” is on could not be told, so it was not ejected. Unmount it instead.": "Không xác định được “{}” nằm trên ổ nào nên nó chưa được đẩy ra. Hãy gỡ gắn kết nó thay vào đó."
 }

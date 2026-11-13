@@ -226,6 +226,90 @@ fn mount_points_in(json: &str) -> Vec<PathBuf> {
     out
 }
 
+/// The drive (its kernel name, as `sdb`) that the block device `device` (`/dev/sdb1`, `/dev/mapper/…`) is on; `None`
+/// when that cannot be told, or when it stands on more than one drive.
+pub fn drive_of_device(device: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(drive) = TEST_DEVICE_DRIVES.read().unwrap().get(device) {
+        return Some(drive.clone());
+    }
+    let real = Path::new(device).canonicalize().ok()?;
+    let mut drives = drives_of_block(&real.file_name()?.to_string_lossy(), Path::new("/sys"), 0);
+    (drives.len() == 1).then(|| drives.remove(0))
+}
+
+/// The drives the file system with device number `dev` lives on: those of the block device it was mounted from,
+/// through device mapper (LUKS, LVM) down to the drives below. The device is looked up in the mount table, which names
+/// it also for file systems whose own number names no device (btrfs). Empty for one on no drive (tmpfs, a server) or
+/// one that cannot be told.
+pub fn drives_of_file_system(dev: u64) -> Vec<String> {
+    #[cfg(test)]
+    if let Some(drives) = TEST_FILE_SYSTEM_DRIVES.read().unwrap().get(&dev) {
+        return drives.clone();
+    }
+    let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else { return Vec::new() };
+    let Some(source) = source_in_mountinfo(&table, dev) else { return Vec::new() };
+    let Ok(real) = Path::new(&source).canonicalize() else { return Vec::new() };
+    real.file_name().map(|name| drives_of_block(&name.to_string_lossy(), Path::new("/sys"), 0)).unwrap_or_default()
+}
+
+/// The device a file system with number `dev` was mounted from, in the text of `/proc/self/mountinfo`.
+fn source_in_mountinfo(table: &str, dev: u64) -> Option<String> {
+    let wanted = format!("{}:{}", libc::major(dev), libc::minor(dev));
+    table.lines().find_map(|line| {
+        let mut fields = line.split(' ');
+        if fields.nth(2)? != wanted {
+            return None;
+        }
+        // After the optional fields, a lone "-", then the type and the source
+        let mut after = line.split(" - ").nth(1)?.split(' ');
+        let source = after.nth(1)?;
+        source.starts_with("/dev/").then(|| source.replace("\\040", " "))
+    })
+}
+
+/// The drives the block device `name` is on, as `sys` (`/sys`) tells: a partition is on its drive, a device that
+/// stands on others (device mapper) on theirs, any other device is a drive itself.
+fn drives_of_block(name: &str, sys: &Path, depth: usize) -> Vec<String> {
+    let Ok(real) = sys.join("class/block").join(name).canonicalize() else { return Vec::new() };
+    if depth > 8 {
+        return Vec::new();
+    }
+    let mut below: Vec<String> = std::fs::read_dir(real.join("slaves")).map(|entries| entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    below.sort();
+    if !below.is_empty() {
+        let mut drives: Vec<String> = Vec::new();
+        for drive in below.iter().flat_map(|b| drives_of_block(b, sys, depth + 1)) {
+            if !drives.contains(&drive) {
+                drives.push(drive);
+            }
+        }
+        return drives;
+    }
+    if real.join("partition").exists() {
+        return real.parent().and_then(|p| p.file_name()).map(|n| vec![n.to_string_lossy().into_owned()]).unwrap_or_default();
+    }
+    vec![name.to_owned()]
+}
+
+#[cfg(test)]
+static TEST_DEVICE_DRIVES: std::sync::RwLock<std::collections::BTreeMap<String, String>> = std::sync::RwLock::new(std::collections::BTreeMap::new());
+#[cfg(test)]
+static TEST_FILE_SYSTEM_DRIVES: std::sync::RwLock<std::collections::BTreeMap<u64, Vec<String>>> = std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// Tests: the block device `device` (a made-up one) is on `drive`.
+#[cfg(test)]
+pub(crate) fn declare_device_drive_for_tests(device: &str, drive: &str) {
+    TEST_DEVICE_DRIVES.write().unwrap().insert(device.to_owned(), drive.to_owned());
+}
+
+/// Tests: the file system with number `dev` is on `drive`, as a partition of it would be.
+#[cfg(test)]
+pub(crate) fn declare_file_system_drive_for_tests(dev: u64, drive: &str) {
+    // Added to, so tests that run side by side and each make up a drive for the same file system keep theirs
+    TEST_FILE_SYSTEM_DRIVES.write().unwrap().entry(dev).or_default().push(drive.to_owned());
+}
+
 /// Unmounts every file system of the drive `dev` is part of (`dev` first), then powers the drive off so it can be
 /// unplugged. When one cannot be unmounted, the drive is not powered off and the error is returned: what was
 /// unmounted before stays unmounted, nothing is forced.
@@ -248,8 +332,10 @@ fn eject_with(dev: &str, run: &mut Runner) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `dev` is mounted; when that cannot be told, it counts as mounted, so a failed unmount is never taken for
+/// one that was not needed.
 fn is_mounted_with(dev: &str, run: &mut Runner) -> bool {
-    run("lsblk", &["-no", "MOUNTPOINTS", dev]).is_ok_and(|s| !s.trim().is_empty())
+    run("lsblk", &["-no", "MOUNTPOINTS", dev]).map_or(true, |s| !s.trim().is_empty())
 }
 
 /// The devices in `lsblk -J -o PATH,MOUNTPOINTS` output that are mounted, of the devices and all their children.
@@ -388,6 +474,12 @@ mod tests {
         drive.lsblk_works = false;
         assert_eq!(eject_with("/dev/sdb1", &mut |p, a| drive.run(p, a)), Ok(()));
         assert!(drive.calls.contains(&"udisksctl power-off -b /dev/sdb1".to_owned()), "{:?}", drive.calls);
+        // Without lsblk a failed unmount cannot be told from one that was not needed: it stays a failure
+        let mut drive = FakeDrive::new(&["/dev/sdb1"]);
+        drive.lsblk_works = false;
+        drive.busy.push("/dev/sdb1");
+        assert_eq!(eject_with("/dev/sdb1", &mut |p, a| drive.run(p, a)), Err("Error unmounting /dev/sdb1: target is busy".to_owned()));
+        assert!(!drive.powered_off());
     }
 
     #[test]
@@ -400,6 +492,49 @@ mod tests {
         ]}]}"#;
         assert_eq!(mounted_devices_in(json), ["/dev/sdb1", "/dev/mapper/luks-1"]);
         assert!(mounted_devices_in("not json").is_empty());
+    }
+
+    #[test]
+    fn a_file_system_is_told_by_the_drive_it_was_mounted_from_through_partitions_and_device_mapper() {
+        // A /sys of its own: sdb with partitions sdb1 and sdb4, a LUKS volume dm-0 on sdb4, and a drive sdc without partitions
+        let sys = std::env::temp_dir().join(format!("compression_drives_sys_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sys);
+        let devices = sys.join("devices");
+        for dir in ["pci/block/sdb/sdb1", "pci/block/sdb/sdb4", "pci/block/sdb/slaves", "pci/block/sdc/slaves", "virtual/block/dm-0/slaves", "virtual/block/dm-1/slaves"] {
+            std::fs::create_dir_all(devices.join(dir)).unwrap();
+        }
+        for part in ["sdb1", "sdb4"] {
+            std::fs::write(devices.join("pci/block/sdb").join(part).join("partition"), "1").unwrap();
+        }
+        std::fs::write(devices.join("virtual/block/dm-0/slaves/sdb4"), "").unwrap();
+        // dm-1 stands on two drives (LVM over sdb1 and sdc)
+        std::fs::write(devices.join("virtual/block/dm-1/slaves/sdb1"), "").unwrap();
+        std::fs::write(devices.join("virtual/block/dm-1/slaves/sdc"), "").unwrap();
+        std::fs::create_dir_all(sys.join("class/block")).unwrap();
+        for (name, at) in [("sdb", "pci/block/sdb"), ("sdb1", "pci/block/sdb/sdb1"), ("sdb4", "pci/block/sdb/sdb4"), ("sdc", "pci/block/sdc"), ("dm-0", "virtual/block/dm-0"), ("dm-1", "virtual/block/dm-1")] {
+            std::os::unix::fs::symlink(devices.join(at), sys.join("class/block").join(name)).unwrap();
+        }
+        assert_eq!(drives_of_block("sdb1", &sys, 0), ["sdb"]);
+        assert_eq!(drives_of_block("sdb", &sys, 0), ["sdb"]);
+        assert_eq!(drives_of_block("sdc", &sys, 0), ["sdc"]);
+        assert_eq!(drives_of_block("dm-0", &sys, 0), ["sdb"], "LUKS on a partition is on its drive");
+        assert_eq!(drives_of_block("dm-1", &sys, 0), ["sdb", "sdc"]);
+        assert!(drives_of_block("nvme9n1", &sys, 0).is_empty(), "not there: no drive");
+        std::fs::remove_dir_all(&sys).unwrap();
+    }
+
+    #[test]
+    fn the_device_of_a_file_system_is_read_from_the_mount_table_also_for_btrfs() {
+        let table = "\
+22 1 259:2 / / rw,relatime shared:1 - btrfs /dev/nvme0n1p2 rw,subvol=/@
+95 22 0:45 / /run/media/me/Stick rw,nosuid shared:50 - btrfs /dev/sdb2 rw
+96 22 8:17 / /run/media/me/My\\040Photos rw shared:51 - vfat /dev/sdb1 rw
+97 22 0:46 / /dev/shm rw shared:52 - tmpfs tmpfs rw
+";
+        assert_eq!(source_in_mountinfo(table, libc::makedev(0, 45)).as_deref(), Some("/dev/sdb2"), "btrfs: the number names no device, the table does");
+        assert_eq!(source_in_mountinfo(table, libc::makedev(8, 17)).as_deref(), Some("/dev/sdb1"));
+        assert_eq!(source_in_mountinfo(table, libc::makedev(0, 46)), None, "tmpfs is on no drive");
+        assert_eq!(source_in_mountinfo(table, libc::makedev(9, 9)), None);
     }
 
     #[test]

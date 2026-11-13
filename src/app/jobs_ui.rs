@@ -97,7 +97,7 @@ impl CompressionApp {
         work: impl FnOnce(&mut crate::fs::engine::Worker) -> Outcome + Send + 'static,
     ) -> Option<u64> {
         let needed = crate::fs::resources::of_all(uses);
-        if let Some((_, _, name)) = self.releasing.iter().find(|(_, resources, _)| resources.iter().any(|r| needed.contains(r))) {
+        if let Some((_, _, name)) = self.releasing.iter().find(|(_, resources, _)| crate::fs::resources::overlaps(resources, &needed)) {
             self.set_toast(trf("“{}” is being disconnected or unmounted. Try again once that is done.", &[name]));
             return None;
         }

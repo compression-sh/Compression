@@ -131,12 +131,20 @@ impl CompressionApp {
     /// Unmount a device; `eject` also powers a removable drive off.
     pub(super) fn unmount_drive(&mut self, ctx: &egui::Context, dev: String, name: String, mount: PathBuf, eject: bool) {
         // A job that needs the drive is waited for: the system refuses a drive that is busy, but not between two files.
-        // Ejecting powers the whole drive off, so a job on another of its partitions needs it too
+        // Ejecting powers the whole drive off, so a job on another of its partitions needs it too, and so does one on a
+        // partition mounted while it is being ejected: the drive itself is held, by its name, until the answer
         let mut points = vec![mount.clone()];
+        let mut whole = None;
         if eject {
+            let Some(drive) = drives::drive_of_device(&dev) else {
+                self.set_toast(trf("Which drive “{}” is on could not be told, so it was not ejected. Unmount it instead.", &[&name]));
+                return;
+            };
             points.extend(drives::mount_points_of_drive(&dev));
+            whole = Some(crate::fs::resources::Resource::Drive(drive));
         }
-        let resources = crate::fs::resources::of_all(points.iter().filter(|p| !p.as_os_str().is_empty()));
+        let mut resources = crate::fs::resources::of_all(points.iter().filter(|p| !p.as_os_str().is_empty()));
+        resources.extend(whole);
         if let Some(job) = self.job_needing(&resources) {
             self.set_toast(if eject {
                 trf("“{}” is still needed by “{}”. Wait until it is done, then eject.", &[&name, &job])
