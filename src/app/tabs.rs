@@ -3,6 +3,26 @@
 use super::*;
 use crate::fs::search::Search;
 
+/// The home folder with its links followed, as the paths of the window have it.
+static HOME_RESOLVED: (std::sync::OnceLock<Option<PathBuf>>, std::sync::Once) = (std::sync::OnceLock::new(), std::sync::Once::new());
+
+/// The home folder as `resolve` finds it, asked once, on a thread of its own: following the links of a home on a
+/// network file system takes as long as that server, and a tab's name is drawn in every frame. Until the answer is
+/// there, the home folder as the system names it (`$HOME`, no file system asked). The home folder of a running
+/// window does not change, so an answer is never out of date.
+fn home_as_resolved(cell: &'static (std::sync::OnceLock<Option<PathBuf>>, std::sync::Once), resolve: fn() -> Option<PathBuf>) -> Option<PathBuf> {
+    let (answer, asked) = cell;
+    asked.call_once(|| {
+        std::thread::spawn(move || {
+            let _ = answer.set(resolve());
+        });
+    });
+    match answer.get() {
+        Some(found) => found.clone().or_else(dirs::home_dir),
+        None => dirs::home_dir(),
+    }
+}
+
 /// Everything that belongs to one tab: where it is, what is selected, its history and its search.
 pub(super) struct TabState {
     current_path: PathBuf,
@@ -410,7 +430,7 @@ impl CompressionApp {
             (icons::RECENT, tr("Recent").to_owned())
         } else if trash::is_trash_folder(path) {
             (icons::TRASH, tr("Trash").to_owned())
-        } else if Some(path.as_path()) == dirs::home_dir().and_then(|h| h.canonicalize().ok()).as_deref() {
+        } else if Some(path.as_path()) == home_as_resolved(&HOME_RESOLVED, || dirs::home_dir().and_then(|h| h.canonicalize().ok())).as_deref() {
             (icons::HOME, tr("Home").to_owned())
         } else if let Some(mount) = crate::fs::network::mount_of(path).filter(|m| m.local == *path) {
             (icons::SERVER_NETWORK, self.server_label(&mount))
@@ -539,6 +559,44 @@ impl CompressionApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static HELD_HOME: (std::sync::OnceLock<Option<PathBuf>>, std::sync::Once) = (std::sync::OnceLock::new(), std::sync::Once::new());
+    static HOME_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+    fn held_home() -> Option<PathBuf> {
+        let (lock, opened) = &HOME_GATE;
+        let mut open = lock.lock().unwrap();
+        while !*open {
+            open = opened.wait(open).unwrap();
+        }
+        Some(PathBuf::from("/resolved/home"))
+    }
+
+    #[test]
+    fn the_home_folder_is_followed_once_off_the_window_and_the_name_of_a_tab_never_waits_for_it() {
+        // Following the links waits, as on a network file system that does not answer: the tab's name does not
+        let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // A name that waited for the answer would hang the test: the gate is opened after 30 s, and the name then
+        // comes too late with the followed path
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            let (lock, opened) = &HOME_GATE;
+            *lock.lock().unwrap() = true;
+            opened.notify_all();
+        });
+        for _ in 0..3 {
+            assert_eq!(home_as_resolved(&HELD_HOME, held_home), dirs::home_dir(), "until the answer is there, $HOME");
+        }
+        {
+            let (lock, opened) = &HOME_GATE;
+            *lock.lock().unwrap() = true;
+            opened.notify_all();
+        }
+        while home_as_resolved(&HELD_HOME, held_home) != Some(PathBuf::from("/resolved/home")) {
+            assert!(std::time::Instant::now() < watchdog, "the answer never came");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 
     /// An app with tabs on folders `t0..t{n-1}` (in this order), the last one shown.
     fn app_with(n: usize, name: &str) -> (CompressionApp, Vec<PathBuf>, egui::Context, PathBuf) {
