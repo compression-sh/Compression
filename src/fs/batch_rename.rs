@@ -449,7 +449,7 @@ mod tests {
         let (done, error) = apply(&entries, &unchanged);
         assert_eq!((done.len(), error), (1, None));
         assert!(latin1.exists(), "the name that was not changed keeps its bytes");
-        let anew = vec!["001.txt".to_owned(), "002.txt".to_owned()];
+        let anew = ["001.txt".to_owned(), "002.txt".to_owned()];
         let entries = vec![Entry { path: latin1.clone(), is_dir: false, date: String::new() }];
         assert_eq!(problem(&entries, &anew[..1]), None);
         let (done, error) = apply(&entries, &anew[..1]);
