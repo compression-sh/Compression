@@ -1302,6 +1302,12 @@ impl CompressionApp {
 
     fn show_listing(&mut self, listing: std::io::Result<Vec<FileItem>>) {
         self.loading = false;
+        // The selection is held by its files, not by its places in the list: a file that came or went before them must
+        // not move it onto another file (one that is gone is simply no longer selected)
+        if self.restore_selection.is_none() && !self.selection.is_empty() {
+            let focus = self.selected_index.and_then(|i| self.items.get(i)).map(|i| i.path.clone());
+            self.restore_selection = Some((self.selected_paths(), focus, false));
+        }
         match listing {
             // Without what the file dialog does not show: left out where the listing was read (`DialogFilter::apply`)
             Ok(items) => {
@@ -8098,6 +8104,28 @@ mod tests {
         let (_, error) = crate::fs::history::apply(entry);
         assert_eq!(error, None);
         assert!(fine.join("b.txt").exists(), "undo brings it back");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reading_the_folder_again_keeps_the_same_files_selected_and_never_others() {
+        let base = window_dir("reload_keeps_selection");
+        for f in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(base.join(f), "x").unwrap();
+        }
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.select_path(&base.join("b.txt"));
+        // A file appears before it in the listing, and the folder is read again (as when the open folder was reported gone)
+        std::fs::write(base.join("aa.txt"), "x").unwrap();
+        app.reload_items();
+        let names = |app: &CompressionApp| app.selected_paths().iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(names(&app), ["b.txt"], "the selection moved to another file");
+        assert_eq!(app.selected_index.and_then(|i| app.items.get(i)).map(|i| i.name.clone()).as_deref(), Some("b.txt"));
+        // The selected file is gone: nothing is selected in its place
+        std::fs::remove_file(base.join("b.txt")).unwrap();
+        app.reload_items();
+        assert!(names(&app).is_empty(), "{:?}", names(&app));
         let _ = std::fs::remove_dir_all(&base);
     }
 
