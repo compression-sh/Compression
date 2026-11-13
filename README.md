@@ -20,7 +20,7 @@ sudo dnf install ./compression-*.x86_64.rpm             # Fedora, openSUSE
 sudo tar -xzf compression-*-x86_64-linux.tar.gz -C /    # any other distribution
 ```
 
-Docker, building from source, Nix and the NixOS module are covered in [Installation](https://github.com/compression-sh/Compression/wiki/Installation).
+Docker, building from source, Nix and the NixOS module are covered in [Installation](https://github.com/compression-sh/Compression/wiki/Installation); the home-manager module in [docs/guide.md](docs/guide.md#home-manager).
 
 ## Documentation
 
@@ -31,6 +31,8 @@ The [wiki](https://github.com/compression-sh/Compression/wiki/) documents every 
 - [Plugins](https://github.com/compression-sh/Compression/wiki/Plugins): Git, Checksums, Tags, Duplicate Finder, Compare Folders, Quick Look, [Custom Actions](https://github.com/compression-sh/Compression/wiki/Custom-Actions) (your own commands, with a time and output limit)
 - [Settings](https://github.com/compression-sh/Compression/wiki/Settings), [Keyboard Shortcuts](https://github.com/compression-sh/Compression/wiki/Keyboard-Shortcuts), [Themes and Appearance](https://github.com/compression-sh/Compression/wiki/Themes-and-Appearance) (built-in themes, theme editor, transparency, languages)
 - [Troubleshooting](https://github.com/compression-sh/Compression/wiki/Troubleshooting)
+
+What was added or changed since the wiki was last updated is in [docs/guide.md](docs/guide.md).
 
 Found a bug? Open an [issue](https://github.com/compression-sh/Compression/issues) with your distribution and whether you use Wayland or X11.
 
