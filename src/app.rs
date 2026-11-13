@@ -8646,25 +8646,29 @@ mod tests {
         let file = work.join("history").join("recent.json");
         crate::fs::recent::TEST_FILE.with(|f| *f.borrow_mut() = Some(file.clone()));
         let mut w = Window::new(work.clone());
-        w.app.write_delay = std::time::Duration::from_millis(250);
+        // When the pause is over is told by the clock in `recent` (tested there with a clock of its own); here the
+        // pause is made long while the person steps through the folders, and over once they stop
+        w.app.write_delay = std::time::Duration::from_secs(3600);
         for dir in &dirs {
-            w.app.navigate_to(dir.clone());
-            w.run(Vec::new(), 3);
+            w.go(dir.clone());
         }
+        w.run(Vec::new(), 3);
         assert!(!file.exists(), "the history is written at every step");
         assert!(crate::fs::recent::has_waiting());
         // After the pause it is written, once, with all the steps, the last one first
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        w.run(Vec::new(), 3);
-        let text = std::fs::read_to_string(&file).expect("nothing was written after the pause");
+        w.app.write_delay = std::time::Duration::ZERO;
+        w.until("the history written after the pause", |_| file.exists());
+        let text = std::fs::read_to_string(&file).unwrap();
         let at = |dir: &PathBuf| text.find(&dir.to_string_lossy().into_owned()).unwrap_or_else(|| panic!("{} is missing: {text}", dir.display()));
         assert!(at(&dirs[3]) < at(&dirs[2]) && at(&dirs[2]) < at(&dirs[1]) && at(&dirs[1]) < at(&dirs[0]), "{text}");
         assert!(!crate::fs::recent::has_waiting());
-        // Nothing new: nothing is written again
-        let written = std::fs::metadata(&file).unwrap().modified().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Nothing new: nothing is written again. A write puts a new file in place (`atomic::write`), so the file
+        // itself, not only its time, tells
+        use std::os::unix::fs::MetadataExt;
+        let written = std::fs::metadata(&file).unwrap();
         w.run(Vec::new(), 5);
-        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), written);
+        let now = std::fs::metadata(&file).unwrap();
+        assert_eq!((now.ino(), now.mtime_nsec(), now.mtime()), (written.ino(), written.mtime_nsec(), written.mtime()), "written again");
         crate::fs::recent::TEST_FILE.with(|f| *f.borrow_mut() = None);
         let _ = std::fs::remove_dir_all(&work);
     }
@@ -9173,8 +9177,7 @@ mod tests {
         }
         std::fs::write(root.join("dst").join(taken), "old").unwrap();
         let mut w = Window::new(root.clone());
-        w.app.navigate_to(root.join("dst"));
-        w.run(Vec::new(), 15);
+        w.go(root.join("dst"));
         w.app.clipboard = cut(&[&root.join("src/a"), &root.join("src/b")]);
         (w, root)
     }
@@ -9251,8 +9254,7 @@ mod tests {
         // Nothing can be taken out of `two`: the second item fails, the first goes
         std::fs::set_permissions(root.join("two"), std::fs::Permissions::from_mode(0o555)).unwrap();
         let mut w = Window::new(root.clone());
-        w.app.navigate_to(root.join("dst"));
-        w.run(Vec::new(), 15);
+        w.go(root.join("dst"));
         w.app.clipboard = cut(&[&free, &stuck]);
         w.app.paste_with(None);
         finish_jobs(&mut w.app);
@@ -9299,8 +9301,7 @@ mod tests {
         std::fs::write(&mine, "m").unwrap();
         std::fs::write(&theirs, "t").unwrap();
         let mut w = Window::new(root.clone());
-        w.app.navigate_to(root.join("dst"));
-        w.run(Vec::new(), 15);
+        w.go(root.join("dst"));
         let own = Clipboard { paths: vec![mine.clone()], cut: false, moving: None };
         w.app.clipboard = Some(own.clone());
         w.app.paste_with(Some((vec![theirs.clone()], true)));
@@ -9319,8 +9320,7 @@ mod tests {
         let file = root.join("here/f");
         std::fs::write(&file, "x").unwrap();
         let mut w = Window::new(root.clone());
-        w.app.navigate_to(root.join("here"));
-        w.run(Vec::new(), 15);
+        w.go(root.join("here"));
         let original = cut(&[&file]);
         for way in ["the button", "Enter", "Esc", "a click beside it"] {
             w.app.clipboard = original.clone();
@@ -10103,15 +10103,24 @@ mod tests {
             self.shapes.iter().find(|(t, _)| t == text).unwrap_or_else(|| panic!("{text:?} is not on screen: {:?}", self.last)).1.center()
         }
 
+        /// Runs frames until `done`. What it waits for is a state of the window or of a job, not a time; the limit only
+        /// keeps a test that is broken from running for ever, and is far above what a busy computer needs.
         fn until(&mut self, what: &str, mut done: impl FnMut(&mut Self) -> bool) {
-            for _ in 0..300 {
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < limit {
                 self.run(Vec::new(), 1);
                 if done(self) {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            panic!("{what}: not reached");
+            panic!("{what}: not reached in 30 s");
+        }
+
+        /// Goes to `folder` and waits until the window is there: going is answered on a thread of its own.
+        fn go(&mut self, folder: PathBuf) {
+            self.app.navigate_to(folder.clone());
+            self.until(&format!("arriving in {}", folder.display()), |w| w.app.current_path == folder);
         }
     }
 
@@ -10817,8 +10826,7 @@ mod tests {
         // Another tab while the clipboard is read
         let (read, _, _) = reader({ let root = root.clone(); move || files_of(&root, &["src/b"], false) }, 150);
         w.app.clipboard_snapshot = read;
-        w.app.navigate_to(root.join("dst"));
-        w.run(Vec::new(), 5);
+        w.go(root.join("dst"));
         w.app.paste();
         w.app.new_tab(root.join("elsewhere"));
         w.until("pasted", |_| root.join("dst/b").exists());
@@ -10832,8 +10840,7 @@ mod tests {
         let (mut w, root) = window_with_a_cut("paste_folder_gone", "unrelated");
         std::fs::create_dir_all(root.join("doomed")).unwrap();
         std::fs::create_dir_all(root.join("elsewhere")).unwrap();
-        w.app.navigate_to(root.join("doomed"));
-        w.run(Vec::new(), 5);
+        w.go(root.join("doomed"));
         // A cut, read late; the folder it was asked in is gone by then
         let (read, _, _) = reader({ let root = root.clone(); move || files_of(&root, &["src/a"], true) }, 150);
         w.app.clipboard_snapshot = read;
@@ -11580,8 +11587,7 @@ mod tests {
                     other.clone()
                 }
                 1 => {
-                    w.app.navigate_to(other.clone());
-                    w.run(Vec::new(), 10);
+                    w.go(other.clone());
                     w.app.navigate_to(home.clone());
                     home.clone()
                 }

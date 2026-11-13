@@ -1876,25 +1876,43 @@ mod tests {
 
     #[test]
     fn a_hanging_mount_costs_a_thread_and_the_window_is_not_held_up() {
+        // The question hangs until the test lets it go, as a mount that does not answer does. The window is not held up
+        // when every click returns while it hangs: that is told by what happened, not by a clock
         let asked = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started) = mpsc::channel::<u64>();
+        let (release_tx, release) = mpsc::channel::<()>();
+        let release = Arc::new(std::sync::Mutex::new(release));
         let (tx, rx) = mpsc::channel();
-        let mut checks = Vec::new();
-        let started = Instant::now();
-        for id in 1..=20u64 {
-            if let Admit::Start(next) = admit(&mut checks, check(id, "/m/a", Some("/m"), Some(id)), folder("/m/a", id, id)) {
-                let asked = asked.clone();
-                spawn_check(id, next, tx.clone(), egui::Context::default(), move |_| {
-                    asked.fetch_add(1, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_millis(400));
-                    (Some(PathBuf::from("/m/a")), true)
-                });
-            }
+        let (clicks_done, clicks) = mpsc::channel();
+        {
+            let (asked, release) = (asked.clone(), release.clone());
+            std::thread::spawn(move || {
+                let mut checks = Vec::new();
+                let mut questions = 0;
+                for id in 1..=20u64 {
+                    if let Admit::Start(next) = admit(&mut checks, check(id, "/m/a", Some("/m"), Some(id)), folder("/m/a", id, id)) {
+                        questions += 1;
+                        let (asked, release, started_tx) = (asked.clone(), release.clone(), started_tx.clone());
+                        spawn_check(id, next, tx.clone(), egui::Context::default(), move |_| {
+                            asked.fetch_add(1, Ordering::SeqCst);
+                            let _ = started_tx.send(id);
+                            let _ = release.lock().unwrap().recv();
+                            (Some(PathBuf::from("/m/a")), true)
+                        });
+                    }
+                }
+                let _ = clicks_done.send(questions);
+            });
         }
-        assert!(started.elapsed() < Duration::from_millis(200), "{:?}", started.elapsed());
+        // A limit far above any computer's noise, so a window that waited for the hanging question fails, and does not hang
+        let limit = Duration::from_secs(30);
+        assert_eq!(clicks.recv_timeout(limit), Ok(1), "the clicks waited for the question, or asked more than once");
+        assert_eq!(started.recv_timeout(limit), Ok(1), "the question was not asked");
         assert!(rx.try_recv().is_err(), "nothing has answered yet");
-        std::thread::sleep(Duration::from_millis(100));
         assert_eq!(asked.load(Ordering::SeqCst), 1, "20 clicks, one question");
-        assert!(matches!(rx.recv_timeout(Duration::from_secs(3)), Ok(NetMsg::Checked { id: 1, is_dir: true, .. })));
+        release_tx.send(()).unwrap();
+        assert!(matches!(rx.recv_timeout(limit), Ok(NetMsg::Checked { id: 1, is_dir: true, .. })));
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
     }
 
     #[test]
