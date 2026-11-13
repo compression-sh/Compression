@@ -125,9 +125,8 @@ pub(crate) fn builtin_entry(id: &str) -> Option<(&'static str, &'static str)> {
 
 /// The name an entry has when it stands alone although it was made for a submenu ("New tab" under "Open in"): a submenu
 /// left with one entry shows that entry, under a name that says all of it.
-/// Built-in entries have a name of their own for that; the entries of the built-in "More actions" and "Select" say all
-/// there is already. Any other (of a plugin's submenu, of one the person named) takes its submenu's name in front:
-/// "Git: Stage", "Mine: Copy".
+/// Some built-in entries have a name of their own for that; the others say all there is already. `submenu` is the name of
+/// a submenu that is not built in (a plugin's, one the person named): it goes in front, "Git: Stage", "Mine: Copy".
 fn full_label(id: &str, label: &'static str, submenu: Option<&str>) -> &'static str {
     match id {
         "new_tab" => tr("Open in new tab"),
@@ -136,7 +135,7 @@ fn full_label(id: &str, label: &'static str, submenu: Option<&str>) -> &'static 
         "icon_image" => tr("Custom icon: image…"),
         "icon_glyph" => tr("Custom icon: glyph…"),
         _ => match submenu {
-            Some(name) if name != tr("More actions") && name != tr("Select") && !name.is_empty() => crate::plugins::intern(&trf("{}: {}", &[&name, &label])),
+            Some(name) if !name.is_empty() => crate::plugins::intern(&trf("{}: {}", &[&name, &label])),
             _ => label,
         },
     }
@@ -311,7 +310,9 @@ pub(super) fn apply(groups: Vec<Vec<MenuEntry>>, layout: &MenuLayout, plugin_gro
                         // One entry left: it stands for itself, under its whole name
                         1 => {
                             let (id, (icon, label, action)) = children.remove(0);
-                            placed.push((icon, full_label(&id, label, Some(submenu_label(name, plugin_groups))), action));
+                            // Told by its key, not by its name in one language or another
+                            let own = (!name.starts_with("builtin:")).then(|| submenu_label(name, plugin_groups));
+                            placed.push((icon, full_label(&id, label, own), action));
                         }
                         _ => {
                             let icon = children[0].1.0;
@@ -334,11 +335,13 @@ pub(super) fn apply(groups: Vec<Vec<MenuEntry>>, layout: &MenuLayout, plugin_gro
         let piece: Vec<MenuEntry> = if !ours.is_empty() && ours.iter().all(|&i| unknown(i)) {
             vec![node]
         } else {
-            // The submenu it came out of is named in front of it (see `full_label`)
+            // A plugin's entry has the plugin's submenu named in front of it (see `full_label`); the menus' own submenus
+            // hold only built-in entries, which have names of their own
             let from = matches!(node.2, MenuAction::Submenu(_)).then_some(node.1);
             ours.iter().filter(|&&i| unknown(i)).map(|&i| {
                 let (icon, label, action) = made[i].entry.clone();
-                (icon, full_label(made[i].id.as_deref().unwrap_or_default(), label, from), action)
+                let id = made[i].id.as_deref().unwrap_or_default();
+                (icon, full_label(id, label, from.filter(|_| id.starts_with("plugin:"))), action)
             }).collect()
         };
         if piece.is_empty() {
@@ -808,6 +811,29 @@ mod tests {
         assert_eq!(labels(&out)[0], ["Git: Stage", "Mine: Copy", "Duplicate"]);
         // What the layout does not name and left a plugin's submenu: the same
         assert_eq!(labels(&out)[1], ["Git: Show diff"]);
+    }
+
+    #[test]
+    fn a_lone_built_in_entry_keeps_its_own_name_whatever_built_in_submenu_it_was_in() {
+        let p = PathBuf::from("/x/dir");
+        let made = vec![
+            vec![(icons::NEW_TAB, tr("Open in"), MenuAction::Submenu(vec![
+                (icons::NEW_TAB, tr("New tab"), MenuAction::OpenInNewTab(p.clone())),
+                (icons::SHIELD, tr("Open as administrator"), MenuAction::OpenAsAdmin(p.clone())),
+            ]))],
+            vec![(icons::INFO, tr("Properties"), MenuAction::Properties(p.clone()))],
+        ];
+        // The layout keeps only "Open as administrator" in "Open in"
+        let layout = MenuLayout {
+            groups: vec![
+                vec![MenuNode::Submenu { name: "builtin:open_in".into(), hidden: false, entries: vec![MenuLeaf { id: "new_tab".into(), hidden: true }, MenuLeaf { id: "admin".into(), hidden: false }] }],
+                vec![entry("properties")],
+            ],
+        };
+        assert_eq!(labels(&apply(made.clone(), &layout, &[]))[0], ["Open as administrator"]);
+        // Left out of "Open in" by a layout that names only "New tab": the same
+        let layout = MenuLayout { groups: vec![vec![entry("new_tab")], vec![entry("properties")]] };
+        assert_eq!(labels(&apply(made, &layout, &[]))[1], ["Open as administrator"]);
     }
 
     #[test]
