@@ -771,7 +771,6 @@
   "Not answering": "Antwortet nicht",
   "Not connected": "Nicht verbunden",
   "Reconnect": "Neu verbinden",
-  "Wait for the running jobs to finish, then reconnect": "Warte, bis die laufenden Aufträge fertig sind, und verbinde dann neu",
   "Connect": "Verbinden",
   "Edit…": "Bearbeiten …",
   "Remove from sidebar": "Aus der Seitenleiste entfernen",
@@ -958,8 +957,11 @@
   "The settings file could not be read, and could not be kept aside: {}": "Die Einstellungsdatei konnte nicht gelesen und auch nicht beiseitegelegt werden: {}",
   "Pasted {} into {}": "{} in {} eingefügt",
   "“{}” contains characters that can't be kept here. Type the new name in full.": "„{}“ enthält Zeichen, die hier nicht erhalten bleiben können. Gib den neuen Namen vollständig ein.",
-  "Wait for the running jobs to finish, then disconnect": "Warte, bis die laufenden Aufträge fertig sind, und trenne dann",
-  "Wait for the running jobs to finish, then unmount": "Warte, bis die laufenden Aufträge fertig sind, und hänge dann aus",
-  "Wait for the running jobs to finish, then eject": "Warte, bis die laufenden Aufträge fertig sind, und wirf dann aus",
-  "“{}” is not available now. Its drive may not be connected.": "„{}“ ist gerade nicht verfügbar. Vielleicht ist das Laufwerk nicht verbunden."
+  "“{}” is not available now. Its drive may not be connected.": "„{}“ ist gerade nicht verfügbar. Vielleicht ist das Laufwerk nicht verbunden.",
+  "“{}” is still needed by “{}”. Wait until it is done, then disconnect.": "„{}“ wird noch von „{}“ gebraucht. Warte, bis das fertig ist, und trenne dann.",
+  "“{}” is still needed by “{}”. Wait until it is done, then reconnect.": "„{}“ wird noch von „{}“ gebraucht. Warte, bis das fertig ist, und verbinde dann neu.",
+  "“{}” is still needed by “{}”. Wait until it is done, then unmount.": "„{}“ wird noch von „{}“ gebraucht. Warte, bis das fertig ist, und hänge dann aus.",
+  "“{}” is still needed by “{}”. Wait until it is done, then eject.": "„{}“ wird noch von „{}“ gebraucht. Warte, bis das fertig ist, und wirf dann aus.",
+  "“{}” is being disconnected or unmounted. Try again once that is done.": "„{}“ wird gerade getrennt oder ausgehängt. Versuche es erneut, wenn das fertig ist.",
+  "The server is being disconnected. Try again once that is done.": "Der Server wird gerade getrennt. Versuche es erneut, wenn das fertig ist."
 }

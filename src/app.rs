@@ -496,6 +496,9 @@ pub struct CompressionApp {
     watching: watching::Watching,
     /// Files plugin jobs were started to remove, by job.
     job_removals: HashMap<u64, Vec<PathBuf>>,
+    /// Drives and servers being let go of (unmounted, ejected, disconnected): who lets go (`drive:<dev>`, `server:<folder>`),
+    /// what they are and the name the person knows them by. A job that needs one of them is not started meanwhile.
+    releasing: Vec<(String, Vec<crate::fs::resources::Resource>, String)>,
     /// Trash jobs under way: what to ask about and select when each has ended (`finish_trash_job`).
     trash_jobs: HashMap<u64, TrashJob>,
     /// Questions that came while another dialog was open, shown in turn.
@@ -869,6 +872,7 @@ impl CompressionApp {
             restore_selection: None,
             watching: watching::Watching::new(ctx),
             job_removals: HashMap::new(),
+            releasing: Vec::new(),
             trash_jobs: HashMap::new(),
             waiting_questions: VecDeque::new(),
             sizes_before_always: crate::settings::FolderSizeMode::OnDemand,
@@ -1787,7 +1791,7 @@ impl CompressionApp {
                 return;
             }
         }
-        let job = self.transfer(if cut { TransferOp::Move } else { TransferOp::Copy }, paths.clone(), dest);
+        let Some(job) = self.transfer(if cut { TransferOp::Move } else { TransferOp::Copy }, paths.clone(), dest) else { return };
         if cut {
             // The cut stays (and shows) until the job has said what it moved
             self.pasting.insert(job, paths);
@@ -1815,14 +1819,16 @@ impl CompressionApp {
     }
 
     /// Copy, move or extract `items` into `dest` on a worker thread.
-    fn transfer(&mut self, op: TransferOp, items: Vec<PathBuf>, dest: PathBuf) -> u64 {
+    /// `None` when the job is not started (a drive or server it needs is being let go of; that is said).
+    fn transfer(&mut self, op: TransferOp, items: Vec<PathBuf>, dest: PathBuf) -> Option<u64> {
         let label = Self::describe_count(&items);
         let target = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dest.display().to_string());
         let detail = trf("to “{}”", &[&target]);
         match op {
             TransferOp::Extract => {
                 let title = trf("Extracting {}…", &[&label]);
-                self.engine.spawn(JobKind::Extract, title, detail, move |w| engine::extract_into(w, items, dest))
+                let uses: Vec<PathBuf> = items.iter().cloned().chain([dest.clone()]).collect();
+                self.start_job(JobKind::Extract, title, detail, None, &uses, move |w| engine::extract_into(w, items, dest))
             }
             TransferOp::Copy | TransferOp::Move => {
                 let pairs: Vec<(PathBuf, PathBuf)> = items.iter().filter_map(|p| p.file_name().map(|n| (p.clone(), dest.join(n)))).collect();
@@ -1832,7 +1838,8 @@ impl CompressionApp {
                     (JobKind::Move, Op::Move, trf("Moving {}", &[&label]))
                 };
                 let key = self.queue_key(engine_op, &items, &dest);
-                self.engine.spawn_queued(kind, title, detail, key, move |w| engine::transfer(w, engine_op, pairs))
+                let uses: Vec<PathBuf> = items.iter().cloned().chain([dest.clone()]).collect();
+                self.start_job(kind, title, detail, key, &uses, move |w| engine::transfer(w, engine_op, pairs))
             }
         }
     }
@@ -1844,7 +1851,8 @@ impl CompressionApp {
         }
         let label = Self::describe_count(&archives);
         let title = trf("Extracting {}…", &[&label]);
-        self.engine.spawn(JobKind::Extract, title, String::new(), move |w| {
+        let uses = archives.clone();
+        self.start_job(JobKind::Extract, title, String::new(), None, &uses, move |w| {
             use std::sync::atomic::Ordering::Relaxed;
             let sizes: Vec<u64> = archives.iter().map(|p| p.metadata().map_or(0, |m| m.len())).collect();
             w.shared.files_total.store(archives.len() as u64, Relaxed);
@@ -5394,7 +5402,8 @@ impl CompressionApp {
         let left = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let title = trn(local.len(), "Moving {} item to the trash", "Moving {} items to the trash");
         let (doomed, found) = (local.clone(), left.clone());
-        let job = self.engine.spawn(JobKind::Delete, title, String::new(), move |w| trash_job(w, &local, &found));
+        let uses = local.clone();
+        let Some(job) = self.start_job(JobKind::Delete, title, String::new(), None, &uses, move |w| trash_job(w, &local, &found)) else { return };
         // Plugins and the sizes hear of what is gone when the job has run (`report_removals`)
         self.job_removals.insert(job, doomed);
         self.trash_jobs.insert(job, TrashJob { remote, left, folder: self.current_path.clone(), next });
@@ -5437,7 +5446,9 @@ impl CompressionApp {
         }
         self.selected_index = None;
         let title = trf("Restoring {}", &[&Self::describe_count(&paths)]);
-        self.engine.spawn(JobKind::History, title, String::new(), move |w| restore_job(w, &paths));
+        // The trash and where each item goes back to
+        let uses: Vec<PathBuf> = paths.iter().cloned().chain(paths.iter().filter_map(|p| trash::origin_of(p))).collect();
+        self.start_job(JobKind::History, title, String::new(), None, &uses, move |w| restore_job(w, &paths));
     }
 
     /// Ask before deleting for good (unless the setting turned the question off).
@@ -5477,7 +5488,8 @@ impl CompressionApp {
         self.selected_index = None;
         let title = trf("Deleting {}", &[&label]);
         let doomed = paths.clone();
-        let job = self.engine.spawn(JobKind::Delete, title, String::new(), move |w| engine::delete_forever(w, paths));
+        let uses = paths.clone();
+        let Some(job) = self.start_job(JobKind::Delete, title, String::new(), None, &uses, move |w| engine::delete_forever(w, paths)) else { return };
         // Plugins and the sizes hear of what is gone when the job has run (`report_removals`), not of what was only
         // asked for: a deletion that fails or is cancelled leaves them as they were
         self.job_removals.insert(job, doomed);
@@ -5486,7 +5498,9 @@ impl CompressionApp {
     fn empty_trash(&mut self) {
         self.selected_index = None;
         let title = tr("Emptying the trash").to_owned();
-        self.engine.spawn(JobKind::Delete, title, String::new(), engine::empty_trash);
+        // The home trash and the trash folders on the drives
+        let uses = trash::all_roots();
+        self.start_job(JobKind::Delete, title, String::new(), None, &uses, engine::empty_trash);
     }
 
     fn run_action(&mut self, ctx: &egui::Context, action: MenuAction) {
@@ -6747,7 +6761,9 @@ impl CompressionApp {
         let (tx, ctx) = (self.net.tx.clone(), self.ctx.clone());
         let rename = self.net.renamer();
         let title = trn(changes.len(), "Renaming of {} item", "Renaming of {} items");
-        self.engine.spawn(JobKind::Rename, title, String::new(), move |w| {
+        let uses: Vec<PathBuf> = changes.iter().map(|(old, _)| old.clone()).collect();
+        let olds = uses.clone();
+        let started = self.start_job(JobKind::Rename, title, String::new(), None, &uses, move |w| {
             use std::sync::atomic::Ordering::Relaxed;
             w.shared.files_total.store(changes.len() as u64, Relaxed);
             let shared = w.shared.clone();
@@ -6773,6 +6789,13 @@ impl CompressionApp {
             };
             outcome.with(effect)
         });
+        if started.is_none() {
+            // Not started (the server is being let go of): nothing is being renamed
+            for old in &olds {
+                self.net.renaming.remove(old);
+            }
+            return Err(tr("The server is being disconnected. Try again once that is done.").to_owned());
+        }
         Ok(())
     }
 
@@ -7265,7 +7288,8 @@ impl CompressionApp {
             let (sources, format, left) = (sources.clone(), *format, left_out.len());
             let shown = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let title = trf("Compressing into {}", &[&shown]);
-            self.engine.spawn(JobKind::Compress, title, String::new(), move |w| {
+            let uses: Vec<PathBuf> = sources.iter().cloned().chain([out.clone()]).collect();
+            self.start_job(JobKind::Compress, title, String::new(), None, &uses, move |w| {
                 use std::sync::atomic::Ordering::Relaxed;
                 let size = ops::tree_bytes(&sources);
                 w.shared.bytes_total.store(size, Relaxed);
@@ -11542,31 +11566,142 @@ mod tests {
         let _ = std::fs::remove_dir_all(&work);
     }
 
-    #[test]
-    fn disconnecting_unmounting_and_ejecting_wait_while_a_job_runs() {
-        use crate::fs::network::MountKind::Helper;
-        let work = window_dir("leave_while_job");
-        let mut w = Window::new(work.clone());
-        let ctx = w.ctx.clone();
-        let mount = server_for_reconnect(&work, "busy", Helper, true);
-        w.app.net.mounts = vec![mount.clone()];
+    /// A job that holds on until `release` is sent or it is stopped, and needs `uses`.
+    fn holding_job(w: &mut Window, title: &str, uses: &[PathBuf]) -> (u64, std::sync::mpsc::Sender<()>) {
         let (release, hold) = std::sync::mpsc::channel::<()>();
-        w.app.engine.spawn(JobKind::Other, "holding".into(), String::new(), move |_| {
-            let _ = hold.recv();
+        let id = w.app.start_job(JobKind::Other, title.to_owned(), String::new(), None, uses, move |worker| {
+            while hold.recv_timeout(std::time::Duration::from_millis(10)).is_err() {
+                if worker.shared.checkpoint().is_err() {
+                    return Outcome::stopped();
+                }
+            }
             Outcome::done(String::new())
         });
-        let toast = |w: &mut Window| w.app.status_toast.take().map(|t| t.message).unwrap_or_default();
-        w.app.run_action(&ctx, MenuAction::Disconnect(mount.local.clone()));
-        assert_eq!(toast(&mut w), tr("Wait for the running jobs to finish, then disconnect"));
-        assert!(w.app.net.leaving.is_empty(), "the disconnect was started anyway");
-        let drive = (String::from("/dev/compression-test-none"), String::from("Stick"), work.join("stick"));
-        w.app.run_action(&ctx, MenuAction::Unmount(drive.0.clone(), drive.1.clone(), drive.2.clone()));
-        assert_eq!(toast(&mut w), tr("Wait for the running jobs to finish, then unmount"));
-        w.app.run_action(&ctx, MenuAction::Eject(drive.0.clone(), drive.1.clone(), drive.2.clone()));
-        assert_eq!(toast(&mut w), tr("Wait for the running jobs to finish, then eject"));
-        assert!(w.app.drive_state.busy.is_empty(), "an unmount was started anyway");
+        (id.expect("the job starts"), release)
+    }
+
+    /// Three file systems to stand for three drives, told apart by their device numbers; `None` where this computer has
+    /// no three such places. Nothing is ever really unmounted: the devices named in the tests do not exist.
+    fn three_drives(work: &Path) -> Option<[PathBuf; 3]> {
+        use std::os::unix::fs::MetadataExt;
+        let a = work.join("on_a");
+        std::fs::create_dir_all(&a).ok()?;
+        let b = PathBuf::from("/dev/shm");
+        let c = PathBuf::from("/proc");
+        let devs: Vec<u64> = [&a, &b, &c].iter().filter_map(|p| p.metadata().ok().map(|m| m.dev())).collect();
+        (devs.len() == 3 && devs[0] != devs[1] && devs[1] != devs[2] && devs[0] != devs[2]).then_some([a, b, c])
+    }
+
+    fn said(w: &mut Window) -> String {
+        w.app.status_toast.take().map(|t| t.message).unwrap_or_default()
+    }
+
+    #[test]
+    fn only_the_drives_a_job_needs_wait_for_it_and_the_others_stay_free() {
+        let work = window_dir("drives_needed");
+        let Some([a, b, c]) = three_drives(&work) else { return };
+        let mut w = Window::new(work.clone());
+        let ctx = w.ctx.clone();
+        // A copy from A to B: A (its source) and B (its target) wait for it, C does not
+        let (copy, release) = holding_job(&mut w, "Copying 3 items", &[a.join("photos"), b.join("new-folder")]);
+        let unmount = |w: &mut Window, dev: &str, name: &str, at: &Path, eject: bool| {
+            let action = if eject { MenuAction::Eject(dev.into(), name.into(), at.to_path_buf()) } else { MenuAction::Unmount(dev.into(), name.into(), at.to_path_buf()) };
+            w.app.run_action(&ctx, action);
+        };
+        unmount(&mut w, "/dev/compression-test-a", "Stick A", &a, false);
+        assert_eq!(said(&mut w), "“Stick A” is still needed by “Copying 3 items”. Wait until it is done, then unmount.");
+        unmount(&mut w, "/dev/compression-test-b", "Stick B", &b, true);
+        assert_eq!(said(&mut w), "“Stick B” is still needed by “Copying 3 items”. Wait until it is done, then eject.");
+        assert!(w.app.drive_state.busy.is_empty(), "nothing was let go of");
+        unmount(&mut w, "/dev/compression-test-c", "Stick C", &c, true);
+        assert!(!said(&mut w).contains("still needed"), "a drive the job does not need was held back");
+        assert!(w.app.drive_state.busy.contains("/dev/compression-test-c"), "the drive the job does not need is let go of");
+        w.until("C's answer", |w| {
+            let c = w.ctx.clone();
+            w.app.poll_drives(&c);
+            w.app.drive_state.busy.is_empty()
+        });
+        // A second job that needs C: now A, B and C all wait
+        let (second, release_second) = holding_job(&mut w, "Verifying sums", &[c.join("x")]);
+        for (dev, name, at) in [("/dev/compression-test-a", "A", &a), ("/dev/compression-test-b", "B", &b), ("/dev/compression-test-c", "C", &c)] {
+            unmount(&mut w, dev, name, at, false);
+            assert!(said(&mut w).starts_with(&format!("“{name}” is still needed by")), "{name} was not held");
+        }
+        // When the copy has ended, A and B are free; C still waits for the second job
         release.send(()).unwrap();
+        w.until("the copy to end", |w| !w.app.engine.jobs.iter().any(|j| j.id == copy && j.state == crate::fs::engine::JobState::Running));
+        assert_eq!(w.app.job_needing(&crate::fs::resources::of_all([&a, &b])), None);
+        assert!(w.app.job_needing(&crate::fs::resources::of_all([&c])).is_some());
+        // A job that was stopped holds the drive until it has really ended, then lets go
+        w.app.engine.cancel(second);
+        assert!(w.app.job_needing(&crate::fs::resources::of_all([&c])).is_some(), "stopped, but not ended yet");
+        w.until("the stop to be done", |w| w.app.engine.jobs.iter().any(|j| j.id == second && j.state != crate::fs::engine::JobState::Running));
+        assert_eq!(w.app.job_needing(&crate::fs::resources::of_all([&c])), None);
+        drop(release_second);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_drive_stays_held_while_its_job_waits_for_an_answer() {
+        let work = window_dir("drive_question");
+        let Some([a, b, _]) = three_drives(&work) else { return };
+        let src = b.join(format!("compression_question_{}", std::process::id()));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("same.txt"), "new").unwrap();
+        std::fs::write(a.join("same.txt"), "old").unwrap();
+        let mut w = Window::new(work.clone());
+        let ctx = w.ctx.clone();
+        w.app.transfer(TransferOp::Copy, vec![src.join("same.txt")], a.clone()).expect("started");
+        w.until("the question", |w| matches!(w.app.dialog, Some(Dialog::Conflict { request: Some(_), .. })));
+        w.app.run_action(&ctx, MenuAction::Unmount("/dev/compression-test-b".into(), "Source".into(), b.clone()));
+        assert!(said(&mut w).starts_with("“Source” is still needed by"), "a job that waits for an answer still needs its drive");
+        // Answered: the job ends and lets go
+        let Some(Dialog::Conflict { request: Some(request), .. }) = w.app.dialog.take() else { panic!("no question") };
+        request.answer(crate::fs::engine::Decision::Skip, false);
         w.until("the job to end", |w| !w.app.engine.running());
+        assert_eq!(w.app.job_needing(&crate::fs::resources::of_all([&b])), None);
+        assert_eq!(std::fs::read_to_string(a.join("same.txt")).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_job_is_not_started_on_a_drive_or_server_that_is_being_let_go_of() {
+        use crate::fs::network::MountKind::Helper;
+        let work = window_dir("drive_race");
+        let Some([a, _, c]) = three_drives(&work) else { return };
+        let mut w = Window::new(work.clone());
+        let ctx = w.ctx.clone();
+        // C is being unmounted (the answer has not come yet): a job that needs C is not started, one on A is
+        w.app.run_action(&ctx, MenuAction::Unmount("/dev/compression-test-c".into(), "Stick C".into(), c.clone()));
+        assert!(!w.app.releasing.is_empty());
+        let none = w.app.start_job(JobKind::Copy, "Copying".into(), String::new(), None, &[c.join("x")], |_| Outcome::done(String::new()));
+        assert!(none.is_none(), "a job was started on a drive that is being let go of");
+        assert_eq!(said(&mut w), "“Stick C” is being disconnected or unmounted. Try again once that is done.");
+        assert!(w.app.start_job(JobKind::Copy, "Copying".into(), String::new(), None, &[a.join("x")], |_| Outcome::done(String::new())).is_some());
+        // Once C's answer is in, jobs may use it again
+        w.until("C's answer", |w| {
+            let c = w.ctx.clone();
+            w.app.poll_drives(&c);
+            w.app.releasing.is_empty()
+        });
+        assert!(w.app.start_job(JobKind::Copy, "Copying".into(), String::new(), None, &[c.join("x")], |_| Outcome::done(String::new())).is_some());
+        // The same for a server, and a server that is not involved stays free
+        let (one, two) = (server_for_reconnect(&work, "one", Helper, false), server_for_reconnect(&work, "two", Helper, false));
+        for m in [&one, &two] {
+            std::fs::create_dir_all(&m.local).unwrap();
+            crate::fs::network::declare_remote_for_tests(&m.local);
+        }
+        let (job, release) = holding_job(&mut w, "Uploading", &[one.local.join("in")]);
+        w.app.net.mounts = vec![one.clone(), two.clone()];
+        w.app.run_action(&ctx, MenuAction::Disconnect(one.local.clone()));
+        assert_eq!(said(&mut w), "“one” is still needed by “Uploading”. Wait until it is done, then disconnect.");
+        assert!(!w.app.net.leaving.contains(&one.local));
+        w.app.run_action(&ctx, MenuAction::Disconnect(two.local.clone()));
+        assert!(w.app.net.leaving.contains(&two.local), "a server the job does not need is let go of");
+        assert!(w.app.start_job(JobKind::Copy, "Copying".into(), String::new(), None, &[two.local.join("x")], |_| Outcome::done(String::new())).is_none());
+        release.send(()).unwrap();
+        w.until("the upload to end", |w| !w.app.engine.jobs.iter().any(|j| j.id == job && j.state == crate::fs::engine::JobState::Running));
         let _ = std::fs::remove_dir_all(&work);
     }
 
@@ -11579,15 +11714,16 @@ mod tests {
         let mount = server_for_reconnect(&work, "gone", Helper, true);
         w.app.net.mounts = vec![mount.clone()];
 
-        // A job is running: nothing is let go of
+        // A job that needs the server is running: nothing is let go of
+        crate::fs::network::declare_remote_for_tests(&mount.local);
         let (release, hold) = std::sync::mpsc::channel::<()>();
-        w.app.engine.spawn(JobKind::Other, "holding".into(), String::new(), move |_| {
+        w.app.start_job(JobKind::Other, "holding".into(), String::new(), None, std::slice::from_ref(&mount.local), move |_| {
             let _ = hold.recv();
             Outcome::done(String::new())
         });
         assert!(w.app.engine.running());
         w.app.run_action(&ctx, MenuAction::Reconnect(mount.local.clone()));
-        assert_eq!(w.app.status_toast.as_ref().map(|t| t.message.clone()), Some(tr("Wait for the running jobs to finish, then reconnect").to_owned()));
+        assert_eq!(w.app.status_toast.as_ref().map(|t| t.message.clone()), Some("“gone” is still needed by “holding”. Wait until it is done, then reconnect.".to_owned()));
         w.app.status_toast = None;
         w.run(Vec::new(), 3);
         // (another test's file watcher may toast meanwhile; what must not come is an answer about this mount)

@@ -22,7 +22,8 @@ impl CompressionApp {
         let label = Self::describe_count(&paths);
         let title = trf("Duplicating {}", &[&label]);
         let key = paths.first().and_then(|p| p.parent()).and_then(|dir| self.queue_key(Op::Copy, &paths, dir));
-        self.engine.spawn_queued(JobKind::Copy, title, String::new(), key, move |w| engine::transfer(w, Op::Copy, pairs));
+        let uses: Vec<PathBuf> = pairs.iter().flat_map(|(from, to)| [from.clone(), to.clone()]).collect();
+        self.start_job(JobKind::Copy, title, String::new(), key, &uses, move |w| engine::transfer(w, Op::Copy, pairs));
     }
 
     /// The disk a copy or move writes to, when the setting asks such jobs to take turns.

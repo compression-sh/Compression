@@ -771,7 +771,6 @@
   "Not answering": "No responde",
   "Not connected": "No conectado",
   "Reconnect": "Volver a conectar",
-  "Wait for the running jobs to finish, then reconnect": "Espera a que terminen las tareas en curso y vuelve a conectar",
   "Connect": "Conectar",
   "Edit…": "Editar…",
   "Remove from sidebar": "Quitar de la barra lateral",
@@ -958,8 +957,11 @@
   "The settings file could not be read, and could not be kept aside: {}": "No se pudo leer el archivo de ajustes ni apartarlo: {}",
   "Pasted {} into {}": "{} pegado en {}",
   "“{}” contains characters that can't be kept here. Type the new name in full.": "«{}» contiene caracteres que aquí no se pueden conservar. Escribe el nombre nuevo completo.",
-  "Wait for the running jobs to finish, then disconnect": "Espera a que terminen las tareas en curso y desconecta después",
-  "Wait for the running jobs to finish, then unmount": "Espera a que terminen las tareas en curso y desmonta después",
-  "Wait for the running jobs to finish, then eject": "Espera a que terminen las tareas en curso y expulsa después",
-  "“{}” is not available now. Its drive may not be connected.": "«{}» no está disponible ahora. Puede que su unidad no esté conectada."
+  "“{}” is not available now. Its drive may not be connected.": "«{}» no está disponible ahora. Puede que su unidad no esté conectada.",
+  "“{}” is still needed by “{}”. Wait until it is done, then disconnect.": "«{}» todavía lo necesita «{}». Espera a que termine y desconecta después.",
+  "“{}” is still needed by “{}”. Wait until it is done, then reconnect.": "«{}» todavía lo necesita «{}». Espera a que termine y vuelve a conectar después.",
+  "“{}” is still needed by “{}”. Wait until it is done, then unmount.": "«{}» todavía lo necesita «{}». Espera a que termine y desmonta después.",
+  "“{}” is still needed by “{}”. Wait until it is done, then eject.": "«{}» todavía lo necesita «{}». Espera a que termine y expulsa después.",
+  "“{}” is being disconnected or unmounted. Try again once that is done.": "«{}» se está desconectando o desmontando. Inténtalo de nuevo cuando termine.",
+  "The server is being disconnected. Try again once that is done.": "El servidor se está desconectando. Inténtalo de nuevo cuando termine."
 }

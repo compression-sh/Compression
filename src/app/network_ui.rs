@@ -631,6 +631,7 @@ impl CompressionApp {
                 NetMsg::Checked { id, local, is_dir, next } => self.checked(ctx, id, local, is_dir, next),
                 NetMsg::Gone { local, name, left, result } => {
                     self.net.leaving.remove(&local);
+                    self.let_go(&format!("server:{}", local.display()));
                     match result {
                         Ok(()) => {
                             if self.current_path.starts_with(&local) {
@@ -648,6 +649,7 @@ impl CompressionApp {
                 }
                 NetMsg::Reconnect { local, name, address, back, tabs, left, result } => {
                     self.net.leaving.remove(&local);
+                    self.let_go(&format!("server:{}", local.display()));
                     self.request_network_listing(ctx, true);
                     match result {
                         Ok(()) => self.open_address_back(address, back, tabs),
@@ -1100,14 +1102,16 @@ impl CompressionApp {
     }
 
     pub(super) fn disconnect(&mut self, ctx: &egui::Context, mount: Mount) {
-        // As for Reconnect: a job may be using the server, and letting go of it would cut the job off
-        if self.engine.running() {
-            self.set_toast(tr("Wait for the running jobs to finish, then disconnect"));
+        // A job that needs the server would be cut off: it is waited for. Other jobs do not hold the server
+        let resources = crate::fs::resources::of_all([&mount.local]);
+        if let Some(job) = self.job_needing(&resources) {
+            self.set_toast(trf("“{}” is still needed by “{}”. Wait until it is done, then disconnect.", &[&mount.name, &job]));
             return;
         }
         if !self.net.leaving.insert(mount.local.clone()) {
             return;
         }
+        self.hold_back(format!("server:{}", mount.local.display()), resources, mount.name.clone());
         // Nothing may hold the folder open: leave it first (and come back if it cannot be let go of)
         let left = self.leave_mount_remembering(&mount.local);
         let (tx, ctx) = (self.net.tx.clone(), ctx.clone());
@@ -1119,16 +1123,18 @@ impl CompressionApp {
     }
 
     /// Let go of a server that is slow or broken and connect it again. Nothing is forced: a mount that
-    /// is in use stays, and the reason comes as a message. Not while a job runs, which may be using it.
+    /// is in use stays, and the reason comes as a message. Not while a job that needs the server runs.
     pub(super) fn reconnect(&mut self, ctx: &egui::Context, mount: Mount) {
         let Some(address) = mount.address.clone().filter(|_| mount.kind != MountKind::System) else { return };
-        if self.engine.running() {
-            self.set_toast(tr("Wait for the running jobs to finish, then reconnect"));
+        let resources = crate::fs::resources::of_all([&mount.local]);
+        if let Some(job) = self.job_needing(&resources) {
+            self.set_toast(trf("“{}” is still needed by “{}”. Wait until it is done, then reconnect.", &[&mount.name, &job]));
             return;
         }
         if !self.net.leaving.insert(mount.local.clone()) {
             return;
         }
+        self.hold_back(format!("server:{}", mount.local.display()), resources, mount.name.clone());
         // Come back to the folder the window is in, not to the top of the server
         let back = self.current_path.strip_prefix(&mount.local).ok().filter(|inside| !inside.as_os_str().is_empty()).map(Path::to_path_buf);
         // ... and the tabs parked in it to theirs

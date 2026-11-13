@@ -750,7 +750,8 @@ impl Plugin for Checksum {
         }
         let tx = self.reports.get_or_insert_with(std::sync::mpsc::channel).0.clone();
         let title = trf("Verifying {}", &[&source]);
-        Reaction::Job(AppJob::new(title, move |w| verify(w, &dir, source, entries, &tx)))
+        let uses = vec![dir.clone()];
+        Reaction::Job(AppJob::new(title, move |w| verify(w, &dir, source, entries, &tx)).using(uses))
     }
 
     fn window_title(&self) -> Option<&'static str> {

@@ -32,6 +32,25 @@ pub struct UndoEntry {
 }
 
 impl UndoEntry {
+    /// Every path the steps read or write, the places trashed items go back to included: what an undo or redo of this
+    /// entry needs to stay mounted while it runs.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for edit in &self.edits {
+            match edit {
+                Edit::Trash(path) => out.push(path.clone()),
+                Edit::Restore(trashed) => {
+                    out.push(trashed.clone());
+                    out.extend(trash::origin_of(trashed));
+                }
+                Edit::Move { from, to } => out.extend([from.clone(), to.clone()]),
+                Edit::Renames(pairs) => out.extend(pairs.iter().flat_map(|(a, b)| [a.clone(), b.clone()])),
+                Edit::Chmod { path, .. } => out.push(path.clone()),
+            }
+        }
+        out
+    }
+
     pub fn new(label: impl Into<String>, edits: Vec<Edit>) -> Self {
         Self { label: label.into(), edits, retries: 0 }
     }

@@ -58,6 +58,7 @@ impl CompressionApp {
                 }
                 DriveMsg::Gone { dev, name, eject, mount, result } => {
                     self.drive_state.busy.remove(&dev);
+                    self.let_go(&format!("drive:{dev}"));
                     match result {
                         Ok(()) => {
                             if self.current_path.starts_with(&mount) {
@@ -129,14 +130,25 @@ impl CompressionApp {
 
     /// Unmount a device; `eject` also powers a removable drive off.
     pub(super) fn unmount_drive(&mut self, ctx: &egui::Context, dev: String, name: String, mount: PathBuf, eject: bool) {
-        // A job may be writing to the drive; the system refuses a drive that is busy, but not between two files
-        if self.engine.running() {
-            self.set_toast(if eject { tr("Wait for the running jobs to finish, then eject") } else { tr("Wait for the running jobs to finish, then unmount") });
+        // A job that needs the drive is waited for: the system refuses a drive that is busy, but not between two files.
+        // Ejecting powers the whole drive off, so a job on another of its partitions needs it too
+        let mut points = vec![mount.clone()];
+        if eject {
+            points.extend(drives::mount_points_of_drive(&dev));
+        }
+        let resources = crate::fs::resources::of_all(points.iter().filter(|p| !p.as_os_str().is_empty()));
+        if let Some(job) = self.job_needing(&resources) {
+            self.set_toast(if eject {
+                trf("“{}” is still needed by “{}”. Wait until it is done, then eject.", &[&name, &job])
+            } else {
+                trf("“{}” is still needed by “{}”. Wait until it is done, then unmount.", &[&name, &job])
+            });
             return;
         }
         if !self.drive_state.busy.insert(dev.clone()) {
             return;
         }
+        self.hold_back(format!("drive:{dev}"), resources, name.clone());
         let (tx, ctx) = (self.drive_state.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let result = if eject { drives::eject(&dev) } else { drives::unmount(&dev) };

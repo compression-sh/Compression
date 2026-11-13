@@ -77,11 +77,19 @@ pub struct Job {
     pub removes: Vec<PathBuf>,
     /// A folder the job writes into; jobs for the same disk take turns (see the setting).
     pub writes_to: Option<PathBuf>,
+    /// What else the job reads or writes: the drives and servers these (and `removes`, `writes_to`) are on are not let go
+    /// of while it runs.
+    pub uses: Vec<PathBuf>,
 }
 
 impl Job {
     pub fn new(title: String, work: impl FnOnce(&mut Worker) -> Outcome + Send + 'static) -> Self {
-        Self { title, work: Box::new(work), removes: Vec::new(), writes_to: None }
+        Self { title, work: Box::new(work), removes: Vec::new(), writes_to: None, uses: Vec::new() }
+    }
+
+    pub fn using(mut self, paths: Vec<PathBuf>) -> Self {
+        self.uses = paths;
+        self
     }
 
     pub fn removing(mut self, paths: Vec<PathBuf>) -> Self {

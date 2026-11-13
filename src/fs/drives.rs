@@ -192,6 +192,33 @@ pub fn unmount(dev: &str) -> Result<(), String> {
     run("udisksctl", &["unmount", "-b", dev]).map(drop).or_else(|e| run("umount", &[dev]).map(drop).map_err(|_| e))
 }
 
+/// The folders the drive that `dev` is part of is mounted on, all its partitions with it: ejecting `dev` powers the
+/// whole drive off. `dev` alone when the drive cannot be told (`lsblk` is missing or does not know it).
+pub fn mount_points_of_drive(dev: &str) -> Vec<PathBuf> {
+    let disk = run("lsblk", &["-no", "pkname", dev]).ok().and_then(|s| s.lines().next().map(str::trim).filter(|s| !s.is_empty()).map(|s| format!("/dev/{s}")));
+    let target = disk.as_deref().unwrap_or(dev);
+    run("lsblk", &["-J", "-o", "MOUNTPOINTS", target]).map(|text| mount_points_in(&text)).unwrap_or_default()
+}
+
+/// Every mount point in `lsblk -J -o MOUNTPOINTS` output, of the devices and all their children.
+fn mount_points_in(json: &str) -> Vec<PathBuf> {
+    fn walk(node: &serde_json::Value, out: &mut Vec<PathBuf>) {
+        if let Some(points) = node.get("mountpoints").and_then(|m| m.as_array()) {
+            out.extend(points.iter().filter_map(|p| p.as_str()).filter(|p| !p.is_empty()).map(PathBuf::from));
+        }
+        for child in node.get("children").and_then(|c| c.as_array()).into_iter().flatten() {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+        for device in value.get("blockdevices").and_then(|d| d.as_array()).into_iter().flatten() {
+            walk(device, &mut out);
+        }
+    }
+    out
+}
+
 /// Unmount, then power the drive off so it can be unplugged.
 pub fn eject(dev: &str) -> Result<(), String> {
     unmount(dev).or_else(|e| if is_mounted(dev) { Err(e) } else { Ok(()) })?;
@@ -222,6 +249,17 @@ pub fn plain_error(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_mounted_partition_of_a_drive_is_found_in_the_listing() {
+        let json = r#"{"blockdevices": [{"mountpoints": [null], "children": [
+            {"mountpoints": ["/run/media/me/PHOTOS"]},
+            {"mountpoints": ["/run/media/me/My Data", "/mnt/also"]},
+            {"mountpoints": [null]}
+        ]}]}"#;
+        assert_eq!(mount_points_in(json), vec![PathBuf::from("/run/media/me/PHOTOS"), PathBuf::from("/run/media/me/My Data"), PathBuf::from("/mnt/also")]);
+        assert!(mount_points_in("not json").is_empty());
+    }
 
     #[test]
     fn a_closed_sign_in_dialog_is_not_an_error_and_other_errors_lose_the_bus_prefix() {

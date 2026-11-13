@@ -368,6 +368,7 @@ impl Compare {
         view.scanned = Some((left.clone(), right.clone()));
         let (tx, cancel, options) = (self.tx.clone(), Arc::clone(&view.cancel), Options { contents: view.contents });
         let title = trf("Comparing {} and {}", &[&name_of(&left), &name_of(&right)]);
+        let uses = vec![left.clone(), right.clone()];
         self.jobs.push(AppJob::new(title, move |w| {
             let progress = OnWorker { worker: w, cancel: &cancel };
             let mut batch = Vec::new();
@@ -389,7 +390,7 @@ impl Compare {
             };
             let _ = tx.send(Msg::Finished { generation, result: result.map_err(|e| crate::fs::describe::io_error(&e)), cancelled });
             outcome
-        }));
+        }).using(uses));
     }
 
     fn copy(&mut self, from_left: bool) {
@@ -401,13 +402,14 @@ impl Compare {
         let (tx, generation) = (self.tx.clone(), view.generation);
         let target = view.scanned.as_ref().map(|(l, r)| if from_left { r.clone() } else { l.clone() });
         let title = trn(pairs.len(), "Copying {} item to the other folder", "Copying {} items to the other folder");
+        let uses: Vec<PathBuf> = pairs.iter().flat_map(|(from, to)| [from.clone(), to.clone()]).collect();
         let mut job = AppJob::new(title, move |w| {
             let outcome = engine::transfer(w, Op::Copy, pairs);
             let _ = tx.send(Msg::Refresh { generation });
             outcome
         });
         job.writes_to = target;
-        self.jobs.push(job);
+        self.jobs.push(job.using(uses));
     }
 
     fn trash(&mut self, left: bool) {

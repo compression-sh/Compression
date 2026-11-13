@@ -253,6 +253,8 @@ pub struct Job {
     /// Bytes per second, smoothed.
     pub speed: f64,
     sample: (Instant, u64),
+    /// The drives and servers the job needs while it runs or waits (`set_uses`): letting go of one waits for it.
+    pub uses: Vec<crate::fs::resources::Resource>,
 }
 
 impl Job {
@@ -463,7 +465,9 @@ impl Engine {
         self.jobs.iter().any(|j| matches!(j.state, JobState::Running | JobState::Waiting))
     }
 
-    /// Start `work` on a thread of its own. `title` names it in the popover, `detail` says where to.
+    /// Start `work` on a thread of its own. `title` names it in the popover, `detail` says where to. The window starts its
+    /// jobs with `start_job`, which also notes what they need; this is for tests of the engine.
+    #[cfg(test)]
     pub fn spawn(&mut self, kind: JobKind, title: String, detail: String, work: impl FnOnce(&mut Worker) -> Outcome + Send + 'static) -> u64 {
         self.spawn_queued(kind, title, detail, None, work)
     }
@@ -477,7 +481,7 @@ impl Engine {
         let now = Instant::now();
         let must_wait = queue_key.is_some_and(|key| self.jobs.iter().any(|j| j.queue_key == Some(key) && j.state == JobState::Running));
         let state = if must_wait { JobState::Waiting } else { JobState::Running };
-        self.jobs.push(Job { id, kind, title, detail, shared, state, queue_key, message: String::new(), finished: None, speed: 0.0, sample: (now, 0) });
+        self.jobs.push(Job { id, kind, title, detail, shared, state, queue_key, message: String::new(), finished: None, speed: 0.0, sample: (now, 0), uses: Vec::new() });
         if must_wait {
             self.waiting.push((id, Box::new(work)));
         } else {
@@ -586,6 +590,19 @@ impl Engine {
                 job.sample = (now, done);
             }
         }
+    }
+
+    /// What job `id` needs (see `Job::uses`). Set by the window right after the job was started, in the same frame.
+    pub fn set_uses(&mut self, id: u64, uses: Vec<crate::fs::resources::Resource>) {
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+            job.uses = uses;
+        }
+    }
+
+    /// A job that runs or waits for its turn and needs one of `resources`; one that waits for an answer to a question
+    /// still runs. A job that was stopped needs them until it has ended.
+    pub fn needing(&self, resources: &[crate::fs::resources::Resource]) -> Option<&Job> {
+        self.jobs.iter().find(|j| matches!(j.state, JobState::Running | JobState::Waiting) && j.uses.iter().any(|r| resources.contains(r)))
     }
 
     /// Forget finished jobs that have been on show long enough.

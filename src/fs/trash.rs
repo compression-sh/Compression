@@ -282,6 +282,23 @@ pub fn restore(trashed: &Path) -> io::Result<PathBuf> {
 
 /// `restore`, moving the item back with `mover` (see `trash_with`).
 pub fn restore_with(trashed: &Path, mover: Mover<'_>) -> io::Result<PathBuf> {
+    let (original, record) = original_place(trashed)?;
+    let folder = original.parent().ok_or_else(|| io::Error::other(tr("Its original place is not valid")))?;
+    std::fs::create_dir_all(folder)?;
+    let target = unique_path(folder, original.file_name().unwrap_or_default(), "restored");
+    // When the copy is whole but the trashed item cannot be removed, the record stays with what is left of it
+    mover(trashed, &target)?;
+    let _ = std::fs::remove_file(record);
+    Ok(target)
+}
+
+/// Where the trashed item `trashed` came from, as its record says; `None` when it has no record that can be read.
+pub fn origin_of(trashed: &Path) -> Option<PathBuf> {
+    original_place(trashed).ok().map(|(original, _)| original)
+}
+
+/// Where `trashed` came from, and its record.
+fn original_place(trashed: &Path) -> io::Result<(PathBuf, PathBuf)> {
     if trashed.parent().and_then(Path::file_name).is_none_or(|n| n != "files") {
         return Err(io::Error::other(tr("The trash has no record of where this came from")));
     }
@@ -298,13 +315,7 @@ pub fn restore_with(trashed: &Path, mover: Mover<'_>) -> io::Result<PathBuf> {
         Some(topdir) if original.is_relative() => topdir.join(original),
         _ => original,
     };
-    let folder = original.parent().ok_or_else(|| io::Error::other(tr("Its original place is not valid")))?;
-    std::fs::create_dir_all(folder)?;
-    let target = unique_path(folder, original.file_name().unwrap_or_default(), "restored");
-    // When the copy is whole but the trashed item cannot be removed, the record stays with what is left of it
-    mover(trashed, &target)?;
-    let _ = std::fs::remove_file(record);
-    Ok(target)
+    Ok((original, record))
 }
 
 /// Delete an item for good; for trashed items this also drops their record, and an item whose own folders

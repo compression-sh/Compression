@@ -84,6 +84,44 @@ fn moved_sources(outcome: &Outcome) -> Vec<std::path::PathBuf> {
 }
 
 impl CompressionApp {
+    /// Starts a job that needs `uses` (its sources, targets and whatever else it reads or writes) to stay where they are,
+    /// and notes the drives and servers they are on, so that none of them is let go of while the job runs or waits. A
+    /// job is not started while a drive or server it needs is being let go of: that is said, and `None` returned.
+    pub(super) fn start_job(
+        &mut self,
+        kind: JobKind,
+        title: String,
+        detail: String,
+        queue_key: Option<u64>,
+        uses: &[PathBuf],
+        work: impl FnOnce(&mut crate::fs::engine::Worker) -> Outcome + Send + 'static,
+    ) -> Option<u64> {
+        let needed = crate::fs::resources::of_all(uses);
+        if let Some((_, _, name)) = self.releasing.iter().find(|(_, resources, _)| resources.iter().any(|r| needed.contains(r))) {
+            self.set_toast(trf("“{}” is being disconnected or unmounted. Try again once that is done.", &[name]));
+            return None;
+        }
+        let id = self.engine.spawn_queued(kind, title, detail, queue_key, work);
+        self.engine.set_uses(id, needed);
+        Some(id)
+    }
+
+    /// The title of a job that still needs one of `resources`, which therefore must not be let go of yet.
+    pub(super) fn job_needing(&self, resources: &[crate::fs::resources::Resource]) -> Option<String> {
+        self.engine.needing(resources).map(|job| job.title.clone())
+    }
+
+    /// `resources` are being let go of by `who`; a job that needs one is not started until `let_go` is called.
+    pub(super) fn hold_back(&mut self, who: String, resources: Vec<crate::fs::resources::Resource>, name: String) {
+        self.releasing.retain(|(w, _, _)| *w != who);
+        self.releasing.push((who, resources, name));
+    }
+
+    /// What `who` was letting go of is gone, or stayed: jobs may use it again.
+    pub(super) fn let_go(&mut self, who: &str) {
+        self.releasing.retain(|(w, _, _)| w != who);
+    }
+
     /// Called once per frame: take in what finished jobs report and open the next question.
     pub(super) fn poll_jobs(&mut self) {
         self.engine.sample();
@@ -212,9 +250,14 @@ impl CompressionApp {
         };
         let label = entry.label.clone();
         let title = if redo { trf("Redoing {}…", &[&label]) } else { trf("Undoing {}…", &[&label]) };
-        let id = self.engine.spawn(JobKind::History, title, String::new(), move |w| {
+        let (uses, kept) = (entry.paths(), entry.clone());
+        let Some(id) = self.start_job(JobKind::History, title, String::new(), None, &uses, move |w| {
             history_outcome(redo, &label, history::apply_entry_with(entry, &|from, to| engine::move_item(w, from, to)))
-        });
+        }) else {
+            // Not started: the steps go back where they were, for another try
+            if redo { self.history.push_redo(kept) } else { self.history.push_undo(kept) }
+            return;
+        };
         self.history_job = Some(id);
     }
 

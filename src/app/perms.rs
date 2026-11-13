@@ -115,7 +115,8 @@ impl CompressionApp {
     /// files the same read and write bits while keeping their own execute bits.
     pub(super) fn apply_mode_to_contents(&mut self, root: PathBuf, mode: u32) {
         let title = trf("Changing permissions in {}", &[&root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()]);
-        self.engine.spawn(JobKind::Permissions, title, String::new(), move |w| {
+        let uses = [root.clone()];
+        self.start_job(JobKind::Permissions, title, String::new(), None, &uses, move |w| {
             let mut edits = Vec::new();
             let mut skipped = Vec::new();
             let result = chmod_contents(&w.shared, &root, mode, &mut edits, &mut skipped);

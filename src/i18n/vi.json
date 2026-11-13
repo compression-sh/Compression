@@ -771,7 +771,6 @@
   "Not answering": "Không phản hồi",
   "Not connected": "Chưa kết nối",
   "Reconnect": "Kết nối lại",
-  "Wait for the running jobs to finish, then reconnect": "Hãy đợi các tác vụ đang chạy xong rồi kết nối lại",
   "Connect": "Kết nối",
   "Edit…": "Sửa…",
   "Remove from sidebar": "Xóa khỏi thanh bên",
@@ -958,8 +957,11 @@
   "The settings file could not be read, and could not be kept aside: {}": "Không đọc được tệp cài đặt và cũng không thể để riêng nó ra: {}",
   "Pasted {} into {}": "Đã dán {} vào {}",
   "“{}” contains characters that can't be kept here. Type the new name in full.": "“{}” chứa ký tự không thể giữ nguyên ở đây. Hãy nhập đầy đủ tên mới.",
-  "Wait for the running jobs to finish, then disconnect": "Hãy đợi các tác vụ đang chạy hoàn tất rồi ngắt kết nối",
-  "Wait for the running jobs to finish, then unmount": "Hãy đợi các tác vụ đang chạy hoàn tất rồi gỡ gắn kết",
-  "Wait for the running jobs to finish, then eject": "Hãy đợi các tác vụ đang chạy hoàn tất rồi đẩy ra",
-  "“{}” is not available now. Its drive may not be connected.": "“{}” hiện không khả dụng. Có thể ổ đĩa của nó chưa được kết nối."
+  "“{}” is not available now. Its drive may not be connected.": "“{}” hiện không khả dụng. Có thể ổ đĩa của nó chưa được kết nối.",
+  "“{}” is still needed by “{}”. Wait until it is done, then disconnect.": "“{}” vẫn đang được “{}” sử dụng. Hãy đợi xong rồi ngắt kết nối.",
+  "“{}” is still needed by “{}”. Wait until it is done, then reconnect.": "“{}” vẫn đang được “{}” sử dụng. Hãy đợi xong rồi kết nối lại.",
+  "“{}” is still needed by “{}”. Wait until it is done, then unmount.": "“{}” vẫn đang được “{}” sử dụng. Hãy đợi xong rồi gỡ gắn kết.",
+  "“{}” is still needed by “{}”. Wait until it is done, then eject.": "“{}” vẫn đang được “{}” sử dụng. Hãy đợi xong rồi đẩy ra.",
+  "“{}” is being disconnected or unmounted. Try again once that is done.": "“{}” đang được ngắt kết nối hoặc gỡ gắn kết. Hãy thử lại khi xong.",
+  "The server is being disconnected. Try again once that is done.": "Máy chủ đang được ngắt kết nối. Hãy thử lại khi xong."
 }

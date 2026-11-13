@@ -771,7 +771,6 @@
   "Not answering": "Ne répond pas",
   "Not connected": "Non connecté",
   "Reconnect": "Se reconnecter",
-  "Wait for the running jobs to finish, then reconnect": "Attendez la fin des tâches en cours, puis reconnectez-vous",
   "Connect": "Se connecter",
   "Edit…": "Modifier…",
   "Remove from sidebar": "Retirer du panneau latéral",
@@ -958,8 +957,11 @@
   "The settings file could not be read, and could not be kept aside: {}": "Le fichier des réglages n’a pas pu être lu ni mis de côté : {}",
   "Pasted {} into {}": "{} collé dans {}",
   "“{}” contains characters that can't be kept here. Type the new name in full.": "« {} » contient des caractères qui ne peuvent pas être conservés ici. Saisissez le nouveau nom en entier.",
-  "Wait for the running jobs to finish, then disconnect": "Attendez la fin des tâches en cours, puis déconnectez",
-  "Wait for the running jobs to finish, then unmount": "Attendez la fin des tâches en cours, puis démontez",
-  "Wait for the running jobs to finish, then eject": "Attendez la fin des tâches en cours, puis éjectez",
-  "“{}” is not available now. Its drive may not be connected.": "« {} » n’est pas disponible pour le moment. Son lecteur n’est peut-être pas connecté."
+  "“{}” is not available now. Its drive may not be connected.": "« {} » n’est pas disponible pour le moment. Son lecteur n’est peut-être pas connecté.",
+  "“{}” is still needed by “{}”. Wait until it is done, then disconnect.": "« {} » est encore utilisé par « {} ». Attendez la fin, puis déconnectez.",
+  "“{}” is still needed by “{}”. Wait until it is done, then reconnect.": "« {} » est encore utilisé par « {} ». Attendez la fin, puis reconnectez.",
+  "“{}” is still needed by “{}”. Wait until it is done, then unmount.": "« {} » est encore utilisé par « {} ». Attendez la fin, puis démontez.",
+  "“{}” is still needed by “{}”. Wait until it is done, then eject.": "« {} » est encore utilisé par « {} ». Attendez la fin, puis éjectez.",
+  "“{}” is being disconnected or unmounted. Try again once that is done.": "« {} » est en cours de déconnexion ou de démontage. Réessayez une fois terminé.",
+  "The server is being disconnected. Try again once that is done.": "Le serveur est en cours de déconnexion. Réessayez une fois terminé."
 }

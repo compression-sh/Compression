@@ -771,7 +771,6 @@
   "Not answering": "Не отвечает",
   "Not connected": "Не подключено",
   "Reconnect": "Подключить заново",
-  "Wait for the running jobs to finish, then reconnect": "Дождитесь завершения текущих задач и подключитесь заново",
   "Connect": "Подключиться",
   "Edit…": "Изменить…",
   "Remove from sidebar": "Убрать с боковой панели",
@@ -958,8 +957,11 @@
   "The settings file could not be read, and could not be kept aside: {}": "Не удалось прочитать файл настроек и отложить его в сторону: {}",
   "Pasted {} into {}": "{} вставлен в {}",
   "“{}” contains characters that can't be kept here. Type the new name in full.": "«{}» содержит символы, которые здесь не удаётся сохранить. Введите новое имя полностью.",
-  "Wait for the running jobs to finish, then disconnect": "Дождитесь завершения текущих задач, затем отключитесь",
-  "Wait for the running jobs to finish, then unmount": "Дождитесь завершения текущих задач, затем отмонтируйте",
-  "Wait for the running jobs to finish, then eject": "Дождитесь завершения текущих задач, затем извлеките",
-  "“{}” is not available now. Its drive may not be connected.": "«{}» сейчас недоступен. Возможно, его диск не подключён."
+  "“{}” is not available now. Its drive may not be connected.": "«{}» сейчас недоступен. Возможно, его диск не подключён.",
+  "“{}” is still needed by “{}”. Wait until it is done, then disconnect.": "«{}» ещё нужен задаче «{}». Дождитесь её завершения, затем отключитесь.",
+  "“{}” is still needed by “{}”. Wait until it is done, then reconnect.": "«{}» ещё нужен задаче «{}». Дождитесь её завершения, затем переподключитесь.",
+  "“{}” is still needed by “{}”. Wait until it is done, then unmount.": "«{}» ещё нужен задаче «{}». Дождитесь её завершения, затем отмонтируйте.",
+  "“{}” is still needed by “{}”. Wait until it is done, then eject.": "«{}» ещё нужен задаче «{}». Дождитесь её завершения, затем извлеките.",
+  "“{}” is being disconnected or unmounted. Try again once that is done.": "«{}» сейчас отключается или отмонтируется. Повторите, когда это завершится.",
+  "The server is being disconnected. Try again once that is done.": "Сервер сейчас отключается. Повторите, когда это завершится."
 }

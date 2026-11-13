@@ -26,3 +26,4 @@ pub mod complete;
 pub mod network;
 pub mod mount_health;
 pub mod secrets;
+pub mod resources;

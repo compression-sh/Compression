@@ -430,6 +430,7 @@ impl Duplicates {
             removing: false,
         });
         let title = tr("Looking for duplicate files").to_owned();
+        let uses = roots.clone();
         Reaction::Job(AppJob::new(title, move |w| {
             let progress = OnWorker { worker: w, cancel: &cancel };
             let result = find(&roots, &progress);
@@ -440,7 +441,7 @@ impl Duplicates {
             };
             let _ = tx.send(Msg::Found { generation, result: result.map_err(|e| crate::fs::describe::io_error(&e)), cancelled });
             outcome
-        }))
+        }).using(uses))
     }
 
     fn start_removal(&mut self) {
