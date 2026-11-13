@@ -2171,6 +2171,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&top);
     }
 
+    /// For `when_following_the_path_itself_is_slow…`: every resolution waits until `let_resolutions_go`.
+    static RESOLUTION_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+    static RESOLUTION_BY_WATCHDOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn held_resolution(next: &Next) -> (Option<PathBuf>, bool) {
+        let (lock, opened) = &RESOLUTION_GATE;
+        let mut open = lock.lock().unwrap();
+        while !*open {
+            open = opened.wait(open).unwrap();
+        }
+        drop(open);
+        ask_server(next)
+    }
+
+    fn let_resolutions_go() {
+        let (lock, opened) = &RESOLUTION_GATE;
+        *lock.lock().unwrap() = true;
+        opened.notify_all();
+    }
+
     fn slow_resolution(next: &Next) -> (Option<PathBuf>, bool) {
         // The step that used to run on the window's thread: following links and asking what the path is
         std::thread::sleep(Duration::from_millis(700));
@@ -2184,18 +2204,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&local);
         std::fs::create_dir_all(local.join("real/sub")).unwrap();
         std::os::unix::fs::symlink(local.join("real"), local.join("link")).unwrap();
-        app.net.ask = slow_resolution;
+        // Following the path waits until the test lets it go, as on a slow file system. The entry points do not wait
+        // for it when they all return while it waits; a watchdog lets it go after 30 s so a broken test does not hang,
+        // and then the test fails. No time is measured
+        app.net.ask = held_resolution;
+        let (cancel, cancelled) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if cancelled.recv_timeout(Duration::from_secs(30)).is_err() {
+                RESOLUTION_BY_WATCHDOG.store(true, Ordering::SeqCst);
+                let_resolutions_go();
+            }
+        });
         let before = app.current_path.clone();
-        let started = Instant::now();
         app.navigate_to(local.join("link"));
         app.navigate_to(local.join("link/sub"));
         app.new_tab(local.join("link"));
         app.go_up();
         app.navigate_to(PathBuf::from("/nonexistent_for_compression_test"));
-        let spent = started.elapsed();
-        assert!(spent < Duration::from_millis(400), "the entry points waited for the resolution: {spent:?}");
+        assert!(!RESOLUTION_BY_WATCHDOG.load(Ordering::SeqCst), "the entry points waited for the resolution");
         // Only what needs no asking has happened: a new tab (as given) and the step up from it; the typed paths wait
         assert_ne!(app.current_path, local.join("link"), "{before:?}");
+        let _ = cancel.send(());
+        let_resolutions_go();
         // The answers arrive later, each from its own thread, and only then is anything resolved
         let mut resolved = 0;
         while !app.net.checking.is_empty() {
