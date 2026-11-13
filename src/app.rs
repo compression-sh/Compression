@@ -9764,6 +9764,30 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_from_another_program_that_says_copy_never_takes_its_files_away() {
+        use crate::wayland_dnd::Dropped;
+        let work = window_dir("system_drop");
+        for dir in ["src", "dst"] {
+            std::fs::create_dir_all(work.join(dir)).unwrap();
+        }
+        for name in ["kept", "moved"] {
+            std::fs::write(work.join("src").join(name), name).unwrap();
+        }
+        let mut w = Window::new(work.clone());
+        let none = egui::Modifiers::NONE;
+        // Copy (also what a drop without a told action becomes, see `wayland_dnd::drop_copies`): on the same drive too
+        let drop = |name: &str, copy| Dropped { pos: (0.0, 0.0), paths: vec![work.join("src").join(name)], copy, own: false };
+        w.app.take_system_drop(drop("kept", true), work.join("dst"), none);
+        finish_jobs(&mut w.app);
+        assert!(work.join("src/kept").exists() && work.join("dst/kept").exists(), "a copy took the file away");
+        // A move that was agreed on, on the same drive, moves
+        w.app.take_system_drop(drop("moved", false), work.join("dst"), none);
+        finish_jobs(&mut w.app);
+        assert!(!work.join("src/moved").exists() && work.join("dst/moved").exists());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
     fn another_window_moving_on_is_taken_up_without_a_message() {
         let ctx = egui::Context::default();
         let mut app = CompressionApp::new(std::env::temp_dir(), SerpantinumTheme::default(), Settings::default(), &ctx);

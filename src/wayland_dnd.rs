@@ -378,10 +378,7 @@ impl Device {
             } else if d.reader.done() || d.own {
                 let d = self.state.dropping.take().unwrap();
                 let paths = Self::paths_of(&d, &self.state.out);
-                // Before version 3 there are no actions: a drop is a move
-                let action = if d.offer.version() >= 3 { d.action } else { DndAction::Move };
-                let copy = action == DndAction::Copy;
-                if action == DndAction::Copy || action == DndAction::Move {
+                if let Some(copy) = drop_copies(d.offer.version(), d.action) {
                     if d.offer.version() >= 3 {
                         d.offer.finish();
                     }
@@ -702,6 +699,23 @@ fn write_all_within(fd: OwnedFd, mut data: &[u8], timeout: std::time::Duration) 
     Ok(())
 }
 
+/// What a drop with the `action` told for an offer of protocol `version` does: `Some(true)` copies, `Some(false)` may
+/// move (the window then goes by the drives, see `CompressionApp::copies`), `None` drops nothing. Before version 3
+/// no action is told at all, and nothing allows taking the files away from where they are: they are copied.
+fn drop_copies(version: u32, action: DndAction) -> Option<bool> {
+    if version < 3 {
+        return Some(true);
+    }
+    if action == DndAction::Copy {
+        Some(true)
+    } else if action == DndAction::Move {
+        Some(false)
+    } else {
+        // None told, or "ask", which this window never offers: the drop is not taken
+        None
+    }
+}
+
 fn dnd_action(action: WEnum<DndAction>) -> DndAction {
     match action {
         WEnum::Value(a) => a,
@@ -891,6 +905,25 @@ impl Dispatch<WlDataSource, ()> for State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drop_moves_only_when_a_move_was_agreed_on() {
+        // Before version 3 no action is told: copied, whatever the offer holds
+        for version in [1, 2] {
+            for action in [DndAction::Move, DndAction::Copy, DndAction::empty(), DndAction::Ask] {
+                assert_eq!(drop_copies(version, action), Some(true), "version {version}, {action:?}");
+            }
+        }
+        // Told, from version 3 on
+        for version in [3, 4] {
+            assert_eq!(drop_copies(version, DndAction::Copy), Some(true));
+            assert_eq!(drop_copies(version, DndAction::Move), Some(false));
+            // Nothing agreed on (the source took the drag back, or none fits), or "ask": nothing is dropped
+            assert_eq!(drop_copies(version, DndAction::empty()), None);
+            assert_eq!(drop_copies(version, DndAction::Ask), None);
+            assert_eq!(drop_copies(version, dnd_action(WEnum::Unknown(64))), None, "an action this build does not know");
+        }
+    }
 
     /// A pipe: the end to read from (not blocking, as the reader of a drop has it) and the end to write to.
     fn pipe() -> (OwnedFd, OwnedFd) {
