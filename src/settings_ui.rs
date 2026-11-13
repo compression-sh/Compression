@@ -54,12 +54,22 @@ fn categories() -> [(usize, &'static str, &'static str); CATEGORY_COUNT as usize
         (1, icons::TUNE, tr("Appearance")),
         (2, icons::FOLDER_OPEN, tr("Files & View")),
         (SIDEBAR_TAB, icons::SIDEBAR, tr("Sidebar")),
+        (CONTEXT_MENU_TAB, icons::MENU, tr("Context menu")),
         (4, icons::CURSOR, tr("Behavior")),
         (5, icons::KEYBOARD, tr("Keybindings")),
         (6, icons::APPS, tr("Applications")),
         (7, icons::TEMPLATE, tr("Plugins")),
-        (CONTEXT_MENU_TAB, icons::MENU, tr("Context menu")),
     ]
+}
+
+/// The page `step` places down the sidebar from `tab` (up when negative): within the list when `wrap` is false,
+/// round from the last to the first when it is true. Pages are numbered for good, not by their place in the list.
+fn category_after(tab: usize, step: i32, wrap: bool) -> usize {
+    let list = categories();
+    let count = list.len() as i32;
+    let at = list.iter().position(|c| c.0 == tab).unwrap_or(0) as i32 + step;
+    let at = if wrap { at.rem_euclid(count) } else { at.clamp(0, count - 1) };
+    list[at as usize].0
 }
 
 impl CompressionApp {
@@ -154,7 +164,7 @@ impl CompressionApp {
             }
             _ => 0,
         };
-        let next = (state.tab as i32 + step).clamp(0, categories.len() as i32 - 1) as usize;
+        let next = category_after(state.tab, step, false);
         if next != state.tab {
             state.tab = next;
             ctx.data_mut(|d| d.insert_temp(focus_id, next));
@@ -179,7 +189,7 @@ impl CompressionApp {
                 }
             });
             if switch != 0 {
-                *tab = (*tab as i32 + switch).rem_euclid(CATEGORY_COUNT) as usize;
+                *tab = category_after(*tab, switch, true);
                 ctx.data_mut(|d| d.insert_temp(category_focus_id(), *tab));
             }
         }
@@ -1866,6 +1876,77 @@ mod tests {
     }
 
 
+
+    // --- Order of the sidebar and of the icon styles
+
+    #[test]
+    fn context_menu_comes_right_after_sidebar_and_keeps_its_page_number() {
+        let names: Vec<&str> = categories().iter().map(|c| c.2).collect();
+        assert_eq!(names, ["General", "Appearance", "Files & View", "Sidebar", "Context menu", "Behavior", "Keybindings", "Applications", "Plugins"]);
+        // A page is known by its number (saved, and asked for by `open_settings_at`), not by its place
+        assert_eq!(categories()[4].0, CONTEXT_MENU_TAB);
+        assert_eq!(CONTEXT_MENU_TAB, 8);
+        let mut numbers: Vec<usize> = categories().iter().map(|c| c.0).collect();
+        numbers.sort();
+        assert_eq!(numbers, (0..CATEGORY_COUNT as usize).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn up_down_and_ctrl_page_walk_the_list_as_it_is_shown() {
+        assert_eq!(category_after(SIDEBAR_TAB, 1, false), CONTEXT_MENU_TAB);
+        assert_eq!(category_after(CONTEXT_MENU_TAB, 1, false), 4, "Behavior follows");
+        assert_eq!(category_after(4, -1, false), CONTEXT_MENU_TAB);
+        assert_eq!(category_after(7, 1, false), 7, "the arrows stop at Plugins, the last");
+        assert_eq!(category_after(0, -1, false), 0);
+        assert_eq!(category_after(7, 1, true), 0, "Ctrl+PageDown goes round");
+        assert_eq!(category_after(0, -1, true), 7);
+    }
+
+    #[test]
+    fn ctrl_page_down_on_the_sidebar_page_opens_the_context_menu_page() {
+        let (mut app, mut state, dir) = defaults_window("ctrl_page", Vec::new());
+        state.tab = SIDEBAR_TAB;
+        let ctx = app.ctx.clone();
+        for n in 0..2 {
+            let events = if n == 0 {
+                vec![egui::Event::Key { key: egui::Key::PageDown, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL }]
+            } else {
+                Vec::new()
+            };
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 1400.0))), time: Some(n as f64 * 0.05), events, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| app.settings_page(ui, &mut state));
+            out.textures_delta.clear();
+        }
+        assert_eq!(state.tab, CONTEXT_MENU_TAB);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn arrow_down_on_the_sidebar_entry_moves_to_context_menu_and_on_to_behavior() {
+        let (mut app, mut state, dir) = defaults_window("arrows", Vec::new());
+        state.tab = SIDEBAR_TAB;
+        let ctx = app.ctx.clone();
+        // A freshly opened window gives the chosen category the focus
+        material::set_dialog_fresh(&ctx, true);
+        let mut time = 0.0;
+        let mut frame = |app: &mut CompressionApp, state: &mut SettingsState, events: Vec<egui::Event>| {
+            time += 0.05;
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(260.0, 900.0))), time: Some(time), events, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| app.settings_sidebar(ui, state));
+            out.textures_delta.clear();
+        };
+        frame(&mut app, &mut state, Vec::new());
+        material::set_dialog_fresh(&ctx, false);
+        frame(&mut app, &mut state, Vec::new());
+        let down = || vec![egui::Event::Key { key: egui::Key::ArrowDown, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }];
+        frame(&mut app, &mut state, down());
+        frame(&mut app, &mut state, Vec::new());
+        assert_eq!(state.tab, CONTEXT_MENU_TAB);
+        frame(&mut app, &mut state, down());
+        frame(&mut app, &mut state, Vec::new());
+        assert_eq!(state.tab, 4, "Behavior");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // --- Default applications are set by a worker and shown only once the system confirms them
 
