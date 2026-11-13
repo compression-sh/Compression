@@ -1717,6 +1717,22 @@ fn choice_label(choice: &str) -> String {
     }
 }
 
+/// Tests only (not in the program): waits until the listing of the mounts the window asked for has come, then holds
+/// further listings back (as if one were on its way), so mounts a test makes up are not replaced by the real ones of
+/// this computer. The window asks again every few seconds (`REFRESH`) by itself. The 30 s are a watchdog.
+#[cfg(test)]
+impl CompressionApp {
+    pub(crate) fn hold_network_listing_once_it_came(&mut self, ctx: &egui::Context) {
+        let limit = Instant::now() + Duration::from_secs(30);
+        while self.net.listing {
+            assert!(Instant::now() < limit, "the listing of the mounts never came");
+            self.poll_network(ctx);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.net.listing = true;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

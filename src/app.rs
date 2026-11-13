@@ -11463,6 +11463,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(work.join("up")).unwrap();
         let mut w = Window::new(work.clone());
+        // The real listing the window asked for at start would replace the made-up mounts when it comes later
+        let ctx = w.ctx.clone();
+        w.app.hold_network_listing_once_it_came(&ctx);
         let address = |host: &str| Address::parse(&format!("sftp://me@{host}/")).unwrap();
         let mount = |name: &str, host: Option<&str>| Mount { name: name.into(), address: host.map(address), local: work.join(name), kind: MountKind::Helper };
         w.app.net.servers.saved = vec![
@@ -11471,7 +11474,6 @@ mod tests {
             Server { name: "down".into(), address: address("down.example") },
         ];
         w.app.net.mounts = vec![mount("up", Some("up.example")), mount("down", Some("down.example")), mount("phone", None), mount("stray", Some("stray.example"))];
-        let ctx = w.ctx.clone();
         // Each server is asked on a thread of its own: both that do not answer have to have said so, not just the
         // first. The 30 s only keep a broken test from running for ever
         let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -11502,6 +11504,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(work.join("up")).unwrap();
         let mut w = Window::new(work.clone());
+        // As above: the real listing must not replace the made-up mounts
+        let ctx = w.ctx.clone();
+        w.app.hold_network_listing_once_it_came(&ctx);
         let theme = w.app.theme;
         let address = |host: &str| Address::parse(&format!("sftp://me@{host}/")).unwrap();
         let mount = |name: &str, host: &str| Mount { name: name.into(), address: Some(address(host)), local: work.join(name), kind: MountKind::Helper };
