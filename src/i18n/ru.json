@@ -981,5 +981,6 @@
   "“{}” is not a font Compression can use. Adwaita Sans is used instead.": "«{}» — не шрифт, который Compression может использовать. Вместо него используется Adwaita Sans.",
   "Which drive “{}” is on could not be told, so it was not ejected. Unmount it instead.": "Не удалось определить, на каком диске находится «{}», поэтому он не извлечён. Вместо этого отключите его.",
   "“{}” runs in a terminal, and no terminal that can run it was found. Choose one in Settings → Behavior.": "«{}» запускается в терминале, но подходящий терминал не найден. Выберите его в Настройки → Поведение.",
-  "The folder “{}” could not be made: {}": "Не удалось создать папку «{}»: {}"
+  "The folder “{}” could not be made: {}": "Не удалось создать папку «{}»: {}",
+  "Tilix can only be handed names that are valid text (UTF-8), and one of these is not. Choose another terminal in Settings → Behavior.": "Tilix можно передавать только имена в виде допустимого текста (UTF-8), а одно из них таким не является. Выберите другой терминал в Настройки → Поведение."
 }

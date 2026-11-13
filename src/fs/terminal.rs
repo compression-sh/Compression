@@ -96,7 +96,8 @@ const RUNS: &[(&str, &[&str])] = &[
     ("alacritty", &["-e"]),
     ("foot", &[]),
     ("wezterm", &["start", "--"]),
-    // tilix is left out: its `-e` takes the command as one line of text to split, not as the words it is made of
+    // Tilix takes the command as one line it splits (g_shell_parse_argv), see `tilix_line`
+    ("tilix", &["-e"]),
     ("terminator", &["-x"]),
     ("mate-terminal", &["-x"]),
     ("urxvt", &["-e"]),
@@ -120,7 +121,29 @@ pub fn run<S: AsRef<std::ffi::OsStr>>(command: &[S], custom: &str) -> Option<io:
         .or_else(|| RUNS.iter().map(|(name, _)| *name).find(|name| on_path(name)).map(str::to_owned))?;
     let name = Path::new(&chosen).file_name()?.to_string_lossy().into_owned();
     let before = runs_with(&name)?;
+    if name == "tilix" {
+        let line = match tilix_line(command) {
+            Ok(line) => line,
+            Err(err) => return Some(Err(err)),
+        };
+        return Some(start(Command::new(&chosen).args(before).arg(line)).map(|_| ()));
+    }
     Some(start(Command::new(&chosen).args(before).args(command)).map(|_| ()))
+}
+
+/// The one line Tilix is given after `-e`: each word in single quotes (a quote in it as `'\''`). Tilix takes a single
+/// argument after `-e` as it is (several it joins, quoting only those with a space) and splits it with GLib's
+/// `g_shell_parse_argv`, which turns this back into exactly these words; nothing in it is run by a shell. Its `-e` is
+/// text (UTF-8), so a word that is not is refused rather than changed.
+fn tilix_line<S: AsRef<std::ffi::OsStr>>(command: &[S]) -> io::Result<String> {
+    let mut words = Vec::with_capacity(command.len());
+    for word in command {
+        let Some(word) = word.as_ref().to_str() else {
+            return Err(io::Error::other(crate::i18n::tr("Tilix can only be handed names that are valid text (UTF-8), and one of these is not. Choose another terminal in Settings → Behavior.")));
+        };
+        words.push(format!("'{}'", word.replace('\'', "'\\''")));
+    }
+    Ok(words.join(" "))
 }
 
 /// The arguments that tell the terminal `name` to run the command that follows them; `None` for one not known to.
@@ -171,9 +194,11 @@ pub(crate) mod tests {
         for (name, before) in CONVENTIONS {
             assert_eq!(runs_with(name), Some(*before), "{name}");
         }
-        assert_eq!(RUNS.len(), CONVENTIONS.len(), "a terminal without a tested convention");
-        // tilix and lxterminal take the command as one line to split; an unknown terminal is not guessed at
-        for name in ["tilix", "lxterminal", "my-own-terminal"] {
+        // Tilix is told with -e and one line of its own (tested apart)
+        assert_eq!(runs_with("tilix"), Some(&["-e"][..]));
+        assert_eq!(RUNS.len(), CONVENTIONS.len() + 1, "a terminal without a tested convention");
+        // lxterminal takes the command as one line it splits on spaces; an unknown terminal is not guessed at
+        for name in ["lxterminal", "my-own-terminal"] {
             assert_eq!(runs_with(name), None, "{name}");
         }
     }
@@ -204,6 +229,50 @@ pub(crate) mod tests {
         std::fs::read(file).unwrap()
     }
 
+    /// The words GLib's `g_shell_parse_argv` (the splitting Tilix does) makes of `line`, through Python's GLib binding;
+    /// `None` where that is not installed.
+    fn glib_split(line: &str) -> Option<Vec<String>> {
+        use std::io::Write;
+        let script = "import sys, gi\ngi.require_version('GLib', '2.0')\nfrom gi.repository import GLib\nok, argv = GLib.shell_parse_argv(sys.stdin.read())\nsys.stdout.write('\\0'.join(argv))";
+        let mut child = Command::new("python3").args(["-I", "-c", script]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+        child.stdin.take()?.write_all(line.as_bytes()).ok()?;
+        let out = child.wait_with_output().ok()?;
+        out.status.success().then(|| String::from_utf8(out.stdout).unwrap().split('\0').map(str::to_owned).collect())
+    }
+
+    #[test]
+    fn tilix_is_given_one_line_that_glib_splits_back_into_exactly_the_words_and_no_name_that_is_not_text() {
+        let dir = std::env::temp_dir().join(format!("compression_terminal_tilix_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tilix = recording_terminal(&dir, "tilix");
+        let open_with: Vec<String> = ["/usr/bin/vim", "+set nu", "", " lead space", "it's", "say \"hi\"", "a\\b", "end\\", "line1\nline2", "tab\there", "-rf", "$(rm -rf ~)", "`id`", "a;b|c&d>e", "*?[x] ~ #x", "ünï €"].map(str::to_owned).to_vec();
+        let ssh = ssh_command(Some("me"), "host.example", Some(2222), "/srv/it's \"here\"/a b");
+        for command in [open_with, ssh] {
+            let _ = std::fs::remove_file(dir.join("tilix.argv"));
+            run(&command, &tilix.to_string_lossy()).expect("tilix was not taken").unwrap();
+            let got = wait_for(&dir.join("tilix.argv"));
+            let args: Vec<&[u8]> = got.strip_suffix(&[0]).unwrap().split(|b| *b == 0).collect();
+            // One argument after -e: the one Tilix takes as it is, without joining words itself
+            assert_eq!(args.len(), 2, "{args:?}");
+            assert_eq!(args[0], b"-e");
+            let line = std::str::from_utf8(args[1]).unwrap();
+            assert_eq!(line, tilix_line(&command).unwrap());
+            match glib_split(line) {
+                Some(words) => assert_eq!(words, command, "GLib splits the line into other words"),
+                None => eprintln!("SKIPPED: no Python GLib binding, the line was not split by GLib here"),
+            }
+        }
+        // A name that is not text: said, and Tilix is not started
+        let _ = std::fs::remove_file(dir.join("tilix.argv"));
+        let odd = [std::ffi::OsString::from("vim"), std::os::unix::ffi::OsStringExt::from_vec(b"/x/\xe4.txt".to_vec())];
+        let err = run(&odd, &tilix.to_string_lossy()).expect("tilix was not taken").unwrap_err();
+        assert!(err.to_string().starts_with("Tilix can only be handed names that are valid text"), "{err}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!dir.join("tilix.argv").exists(), "Tilix was started with a name it cannot take");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn every_terminal_is_really_started_with_the_command_word_for_word_and_byte_for_byte() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -225,10 +294,10 @@ pub(crate) mod tests {
             assert_eq!(wait_for(&dir.join(format!("{name}.argv"))), expected, "{name}");
         }
         // A terminal not known to run a command is not started at all
-        let unknown = recording_terminal(&dir, "tilix");
+        let unknown = recording_terminal(&dir, "lxterminal");
         assert!(run(&command, &unknown.to_string_lossy()).is_none());
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!dir.join("tilix.argv").exists());
+        assert!(!dir.join("lxterminal.argv").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
