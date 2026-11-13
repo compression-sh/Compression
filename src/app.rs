@@ -4360,7 +4360,13 @@ impl CompressionApp {
             Place::save_pins(&self.pins);
         }
         if let Some(path) = open_pinned {
-            self.open_file(&path);
+            // A pin whose drive is not plugged in (or that is gone) stays pinned: opening it says so, and nothing else
+            if !network::is_remote(&path) && path.symlink_metadata().is_err() {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+                self.set_toast(trf("“{}” is not available now. Its drive may not be connected.", &[&name]));
+            } else {
+                self.open_file(&path);
+            }
         }
         if let Some((pos, target)) = menu_at {
             self.open_menu(ui.ctx(), pos, target);
@@ -11518,6 +11524,22 @@ mod tests {
         assert_eq!(job.kind, JobKind::Permissions);
         assert!(job.controllable());
         std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn a_pin_whose_drive_is_away_stays_pinned_and_says_so_when_opened() {
+        let work = window_dir("pin_away");
+        let mut w = Window::new(work.clone());
+        let away = work.join("stick").join("Report.txt");
+        w.app.pins = vec![away.clone()];
+        w.run(Vec::new(), 3);
+        assert!(w.shows("Report.txt"), "the pin is listed");
+        let at = w.at("Report.txt");
+        w.click(at, egui::PointerButton::Primary);
+        let said = w.app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+        assert_eq!(said, "“Report.txt” is not available now. Its drive may not be connected.");
+        assert_eq!(w.app.pins, vec![away], "the pin stays");
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]

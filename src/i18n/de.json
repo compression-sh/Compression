@@ -960,5 +960,6 @@
   "“{}” contains characters that can't be kept here. Type the new name in full.": "„{}“ enthält Zeichen, die hier nicht erhalten bleiben können. Gib den neuen Namen vollständig ein.",
   "Wait for the running jobs to finish, then disconnect": "Warte, bis die laufenden Aufträge fertig sind, und trenne dann",
   "Wait for the running jobs to finish, then unmount": "Warte, bis die laufenden Aufträge fertig sind, und hänge dann aus",
-  "Wait for the running jobs to finish, then eject": "Warte, bis die laufenden Aufträge fertig sind, und wirf dann aus"
+  "Wait for the running jobs to finish, then eject": "Warte, bis die laufenden Aufträge fertig sind, und wirf dann aus",
+  "“{}” is not available now. Its drive may not be connected.": "„{}“ ist gerade nicht verfügbar. Vielleicht ist das Laufwerk nicht verbunden."
 }

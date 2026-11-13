@@ -179,9 +179,10 @@ fn load_paths(name: &str) -> Vec<PathBuf> {
 fn load_paths_from(file: &std::path::Path) -> Vec<PathBuf> {
     Some(file)
         .and_then(|f| std::fs::read_to_string(f).ok())
+        // Every entry is kept, also one whose drive is not plugged in or whose server is not connected now: it is not
+        // there for the moment, which is no reason to drop it from the list when the next change is saved. Opening it
+        // says that it is not there
         .and_then(|s| serde_json::from_str::<Vec<PathBuf>>(&s).ok())
-        // Folders on a server stay while it is not connected; opening one connects
-        .map(|paths| paths.into_iter().filter(|p| p.exists() || super::network::address_of(p).is_some()).collect())
         .unwrap_or_default()
 }
 
@@ -310,6 +311,25 @@ fn config_file_to_write(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_folder_on_a_drive_that_is_not_there_now_is_kept_through_loading_and_saving() {
+        let dir = std::env::temp_dir().join(format!("compression_saved_away_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("here")).unwrap();
+        let file = dir.join("bookmarks.json");
+        let stick = dir.join("stick/Photos");
+        std::fs::write(&file, serde_json::to_string(&vec![dir.join("here"), stick.clone()]).unwrap()).unwrap();
+        // The drive is not plugged in: the entry is loaded all the same, and saving another change keeps it
+        let mut loaded = load_paths_from(&file);
+        assert_eq!(loaded, vec![dir.join("here"), stick.clone()]);
+        loaded.push(dir.join("new"));
+        save_paths_to(&file, &loaded);
+        // The drive is back: the entry is still there
+        std::fs::create_dir_all(&stick).unwrap();
+        assert_eq!(load_paths_from(&file), vec![dir.join("here"), stick, dir.join("new")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_tilde_typed_into_the_path_field_is_the_home_folder() {

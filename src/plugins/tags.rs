@@ -120,10 +120,13 @@ impl Registry {
     }
 
     /// Drops paths that are gone and takes the tags from disk (`read` gives None when unreadable).
+    /// A file that is not there now (its drive is not plugged in, its server not connected) keeps what is known of it:
+    /// that is no reason to forget its tags.
     pub fn validate(&mut self, read: impl Fn(&Path) -> Option<Vec<String>>) {
-        self.0.retain(|path, _| path.symlink_metadata().is_ok());
         for (path, tags) in self.0.iter_mut() {
-            if let Some(fresh) = read(path) {
+            if path.symlink_metadata().is_ok()
+                && let Some(fresh) = read(path)
+            {
                 *tags = fresh;
             }
         }
@@ -718,6 +721,25 @@ impl Plugin for Tags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tags_of_a_file_on_a_drive_that_is_not_there_now_stay_known() {
+        let dir = std::env::temp_dir().join(format!("compression_tags_away_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("here.txt"), "x").unwrap();
+        std::fs::write(dir.join("untagged.txt"), "x").unwrap();
+        let mut registry = Registry::default();
+        registry.record(&dir.join("here.txt"), &["work".to_owned()]);
+        registry.record(&dir.join("untagged.txt"), &["old".to_owned()]);
+        registry.record(&dir.join("stick/away.txt"), &["photos".to_owned()]);
+        // What is there is read again; what is not there now keeps its tags
+        registry.validate(|p| if p.ends_with("untagged.txt") { Some(Vec::new()) } else { Some(vec!["work".to_owned()]) });
+        assert!(registry.0.contains_key(&dir.join("stick/away.txt")), "the file on the drive that is away was forgotten");
+        assert_eq!(registry.0.get(&dir.join("stick/away.txt")).map(|t| t.as_slice()), Some(&["photos".to_owned()][..]));
+        assert!(!registry.0.contains_key(&dir.join("untagged.txt")), "a file that is there and has no tags any more is dropped");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use crate::fs::xattr::{self, tests::scratch_file};
 
     #[test]
@@ -805,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_drops_missing_paths_and_follows_renames() {
+    fn registry_keeps_files_that_are_away_drops_untagged_ones_and_follows_renames() {
         let dir = std::env::temp_dir().join(format!("compression-tag-registry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -813,10 +835,13 @@ mod tests {
         let mut registry = Registry::default();
         registry.record(&dir.join("sub/a"), &["one".to_owned()]);
         registry.record(&dir.join("gone"), &["one".to_owned(), "two".to_owned()]);
+        // A file that cannot be read keeps its tags; so does one that is not there now (its drive may be away)
         registry.validate(|_| None);
-        assert_eq!(registry.with_tag("one"), vec![dir.join("sub/a")]);
-        // Tags are read from disk again; a file that lost them leaves the registry
+        assert_eq!(registry.with_tag("one"), vec![dir.join("gone"), dir.join("sub/a")]);
+        // Tags are read from disk again; a file that is there and lost them leaves the registry, one that is away stays
         registry.validate(|_| Some(Vec::new()));
+        assert_eq!(registry.names(), vec![("one".to_owned(), 1), ("two".to_owned(), 1)]);
+        assert!(registry.remove_tree(&dir.join("gone")));
         assert!(registry.names().is_empty());
 
         registry.record(&dir.join("sub/a"), &["one".to_owned()]);

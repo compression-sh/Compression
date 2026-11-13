@@ -960,5 +960,6 @@
   "“{}” contains characters that can't be kept here. Type the new name in full.": "«{}» содержит символы, которые здесь не удаётся сохранить. Введите новое имя полностью.",
   "Wait for the running jobs to finish, then disconnect": "Дождитесь завершения текущих задач, затем отключитесь",
   "Wait for the running jobs to finish, then unmount": "Дождитесь завершения текущих задач, затем отмонтируйте",
-  "Wait for the running jobs to finish, then eject": "Дождитесь завершения текущих задач, затем извлеките"
+  "Wait for the running jobs to finish, then eject": "Дождитесь завершения текущих задач, затем извлеките",
+  "“{}” is not available now. Its drive may not be connected.": "«{}» сейчас недоступен. Возможно, его диск не подключён."
 }

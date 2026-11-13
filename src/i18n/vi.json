@@ -960,5 +960,6 @@
   "“{}” contains characters that can't be kept here. Type the new name in full.": "“{}” chứa ký tự không thể giữ nguyên ở đây. Hãy nhập đầy đủ tên mới.",
   "Wait for the running jobs to finish, then disconnect": "Hãy đợi các tác vụ đang chạy hoàn tất rồi ngắt kết nối",
   "Wait for the running jobs to finish, then unmount": "Hãy đợi các tác vụ đang chạy hoàn tất rồi gỡ gắn kết",
-  "Wait for the running jobs to finish, then eject": "Hãy đợi các tác vụ đang chạy hoàn tất rồi đẩy ra"
+  "Wait for the running jobs to finish, then eject": "Hãy đợi các tác vụ đang chạy hoàn tất rồi đẩy ra",
+  "“{}” is not available now. Its drive may not be connected.": "“{}” hiện không khả dụng. Có thể ổ đĩa của nó chưa được kết nối."
 }
