@@ -34,7 +34,7 @@ The page sits directly below Sidebar. It arranges the menus of a file, of a fold
 - **Paste** goes into the folder it was asked in, also when the clipboard answers late and the window shows another folder or tab by then. If that folder is gone meanwhile, nothing is pasted anywhere.
 - **Cut and paste on X11** moves what was cut in Compression, also names that are not valid UTF-8. X11 does not tell whether files were cut in another program, so pasting those copies them; on Wayland, a cut made in another program is moved.
 - **Renaming** a file whose name is not valid UTF-8 keeps its name byte for byte when it is left as it is. A new name that still holds the "�" the window shows for such bytes is refused; type the new name in full.
-- **Unmount, Eject and Disconnect** wait only for the jobs that need that drive or server, and say which one. Eject counts the other mounted partitions of the same drive too. While a drive or server is being let go of, a job that needs it is not started.
+- **Unmount, Eject and Disconnect** wait only for the jobs that need that drive or server, and say which one. Eject unmounts every partition of the drive before it powers the drive off, and counts their jobs too; when one cannot be unmounted, the drive stays on and the message says which. While a drive or server is being let go of, a job that needs it is not started.
 - **Search** goes eight folders deep and stops at 400 results; when it leaves out deeper folders or stops at the limit, the window says so.
 
 ## Tags
