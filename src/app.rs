@@ -11460,9 +11460,14 @@ mod tests {
         ];
         w.app.net.mounts = vec![mount("up", Some("up.example")), mount("down", Some("down.example")), mount("phone", None), mount("stray", Some("stray.example"))];
         let ctx = w.ctx.clone();
-        for _ in 0..200 {
+        // Each server is asked on a thread of its own: both that do not answer have to have said so, not just the
+        // first. The 30 s only keep a broken test from running for ever
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
             w.app.poll_network(&ctx);
-            if w.app.network_rows().iter().any(|r| r.state == Some(L::Broken)) {
+            let rows = w.app.network_rows();
+            let broken = |name: &str| rows.iter().any(|r| r.name.contains(name) && r.state == Some(L::Broken));
+            if (broken("down") && broken("stray")) || std::time::Instant::now() > limit {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -11491,14 +11496,12 @@ mod tests {
         w.app.net.servers.saved = vec![Server { name: "off".into(), address: address("off.example") }];
         w.app.net.mounts = vec![mount("up", "up.example"), mount("down", "down.example")];
         let ctx = w.ctx.clone();
-        for _ in 0..200 {
-            w.run(Vec::new(), 1);
-            w.app.poll_network(&ctx);
-            if w.app.network_rows().iter().any(|r| r.state == Some(super::network_ui::LinkState::Broken)) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        // "down" is the one server that does not answer; its answer comes from a thread. The 30 s are a watchdog
+        w.until("the answer of down", |w| {
+            let c = w.ctx.clone();
+            w.app.poll_network(&c);
+            w.app.network_rows().iter().any(|r| r.name.contains("down") && r.state == Some(super::network_ui::LinkState::Broken))
+        });
         w.run(Vec::new(), 12);
         // The dot of each row sits at the lower right of its icon, in the row of its name
         let dot_of = |name: &str| {
