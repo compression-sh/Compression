@@ -1,7 +1,12 @@
 //! The "System" icon style: folders and file types drawn with the icon theme the desktop has installed, found the way the
 //! freedesktop icon theme specification says (the theme, then the themes it inherits, then hicolor; the size nearest to
 //! the one drawn; SVG or PNG). What the theme does not have is drawn in the classic style. Themes are read from the
-//! local disk only, once, and every icon is rasterized once per size.
+//! local disk only, once, and every icon is rasterized once per size and palette.
+//!
+//! Icons that are meant to take the colors of the desktop (Breeze and the themes made like it mark their shapes with
+//! the classes `ColorScheme-Text`, `ColorScheme-Accent` and so on and give them light-theme colors only as a default)
+//! get the colors of the palette in use, as KDE gives them its color scheme; `currentColor` with no color of its own is
+//! the text color. Icons drawn in colors of their own keep them.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -248,23 +253,109 @@ pub fn names_for(is_dir: bool, name: &str) -> Vec<String> {
 /// Sizes the icons are rasterized at: the first one that covers the drawn size.
 const TIERS: [u32; 5] = [24, 48, 96, 192, 384];
 
-/// The icon of `path` as a texture of `px` pixels, made once.
-fn texture(ctx: &egui::Context, path: &Path, px: u32) -> Option<egui::TextureHandle> {
-    let id = egui::Id::NULL.with(("system_icon", path, px));
-    if let Some(tex) = ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(id)) {
-        return tex;
+/// The colors an icon is drawn in (see `IconColors::sheet`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct IconColors {
+    text: String,
+    classes: String,
+}
+
+impl IconColors {
+    /// The CSS for an icon: the classes of KDE's color scheme (what KDE's own icon loader fills in), `!important`
+    /// because the icon's own sheet holds light-theme defaults for them; and, unless the icon's root names a `color`
+    /// of its own (CSS would win over that attribute), the text color for `currentColor`.
+    fn sheet(&self, own_color: bool) -> String {
+        if own_color { self.classes.clone() } else { format!("svg {{ color: {}; }}\n{}", self.text, self.classes) }
     }
-    let tex = rasterize(path, px).map(|image| ctx.load_texture(format!("system-icon-{}-{px}", path.display()), image, egui::TextureOptions::LINEAR));
+}
+
+/// Whether the root of the SVG `bytes` gives `currentColor` a color of its own.
+fn names_own_color(bytes: &[u8]) -> bool {
+    let Ok(doc) = std::str::from_utf8(bytes).map_err(|_| ()).and_then(|t| resvg::usvg::roxmltree::Document::parse(t).map_err(|_| ())) else { return false };
+    let root = doc.root_element();
+    root.has_attribute("color") || root.attribute("style").is_some_and(|s| s.split(';').any(|d| d.split(':').next().is_some_and(|n| n.trim() == "color")))
+}
+
+/// The colors of `theme` for the icons.
+pub fn icon_colors(theme: &super::theme::SerpantinumTheme) -> IconColors {
+    let hex = |c: egui::Color32| format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
+    let (text, base, accent) = (hex(theme.text), hex(theme.base), hex(theme.mauve));
+    let classes = [
+        ("Text", &text),
+        ("ViewText", &text),
+        ("ButtonText", &text),
+        ("Contrast", &text),
+        ("Background", &base),
+        ("ViewBackground", &base),
+        ("ButtonBackground", &base),
+        ("Complement", &base),
+        // Text drawn on the accent
+        ("HighlightedText", &base),
+        ("Highlight", &accent),
+        ("Accent", &accent),
+        ("ActiveText", &accent),
+        ("ViewFocus", &accent),
+        ("ViewHover", &accent),
+        ("ButtonFocus", &accent),
+        ("ButtonHover", &accent),
+        ("PositiveText", &hex(theme.green)),
+        ("NeutralText", &hex(theme.yellow)),
+        ("NegativeText", &hex(theme.red)),
+    ];
+    let classes = classes.iter().map(|(class, color)| format!(".ColorScheme-{class} {{ color: {color} !important; }}\n")).collect();
+    IconColors { text, classes }
+}
+
+fn sheet_id() -> egui::Id {
+    egui::Id::NULL.with("system_icon_colors")
+}
+
+/// The palette the icons are drawn in from now on (`ui::theme::apply` sets it with every palette it applies).
+pub fn set_colors(ctx: &egui::Context, theme: &super::theme::SerpantinumTheme) {
+    let colors = std::sync::Arc::new(icon_colors(theme));
+    ctx.data_mut(|d| d.insert_temp(sheet_id(), colors));
+}
+
+fn colors(ctx: &egui::Context) -> std::sync::Arc<IconColors> {
+    ctx.data(|d| d.get_temp::<std::sync::Arc<IconColors>>(sheet_id())).unwrap_or_else(|| std::sync::Arc::new(icon_colors(&Default::default())))
+}
+
+/// The textures made for one palette; another palette starts afresh, and the old textures are freed with it.
+#[derive(Default)]
+struct Textures {
+    colors: std::sync::Arc<IconColors>,
+    made: HashMap<(PathBuf, u32), Option<egui::TextureHandle>>,
+}
+
+/// The icon of `path` as a texture of `px` pixels in the palette in use, made once.
+fn texture(ctx: &egui::Context, path: &Path, px: u32) -> Option<egui::TextureHandle> {
+    let colors = colors(ctx);
+    let cache = ctx.data_mut(|d| d.get_temp_mut_or_default::<std::sync::Arc<Mutex<Textures>>>(egui::Id::NULL.with("system_icon_textures")).clone());
+    let key = (path.to_path_buf(), px);
+    {
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.colors != colors {
+            *cache = Textures { colors: colors.clone(), made: HashMap::new() };
+        }
+        if let Some(tex) = cache.made.get(&key) {
+            return tex.clone();
+        }
+    }
+    let tex = rasterize(path, px, &colors).map(|image| ctx.load_texture(format!("system-icon-{}-{px}", path.display()), image, egui::TextureOptions::LINEAR));
     // A file that cannot be drawn is not tried again in every frame
-    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.colors == colors {
+        cache.made.insert(key, tex.clone());
+    }
     tex
 }
 
-/// An SVG or PNG icon as a square picture of `px` pixels, its proportions kept.
-fn rasterize(path: &Path, px: u32) -> Option<egui::ColorImage> {
+/// An SVG or PNG icon as a square picture of `px` pixels, its proportions kept; an SVG drawn in `colors`.
+fn rasterize(path: &Path, px: u32, colors: &IconColors) -> Option<egui::ColorImage> {
     let bytes = std::fs::read(path).ok()?;
     if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) {
-        let tree = resvg::usvg::Tree::from_data(&bytes, &resvg::usvg::Options::default()).ok()?;
+        let options = resvg::usvg::Options { style_sheet: Some(colors.sheet(names_own_color(&bytes))), ..Default::default() };
+        let tree = resvg::usvg::Tree::from_data(&bytes, &options).ok()?;
         let mut pixmap = resvg::tiny_skia::Pixmap::new(px, px)?;
         let (w, h) = (tree.size().width(), tree.size().height());
         let scale = px as f32 / w.max(h);
@@ -345,13 +436,93 @@ mod tests {
     fn svg_and_png_icons_become_square_pictures_of_the_size_asked_for() {
         let base = themes("raster");
         for file in ["Mine/scalable/mimetypes/text-x-python.svg", "Mine/48x48/mimetypes/text-x-python.png"] {
-            let image = rasterize(&base.join(file), 96).unwrap_or_else(|| panic!("{file}"));
+            let image = rasterize(&base.join(file), 96, &IconColors::default()).unwrap_or_else(|| panic!("{file}"));
             assert_eq!(image.size, [96, 96], "{file}");
             assert!(image.pixels.iter().any(|p| p.a() > 0), "{file} is empty");
         }
         std::fs::write(base.join("broken.svg"), "not svg").unwrap();
-        assert!(rasterize(&base.join("broken.svg"), 48).is_none());
+        assert!(rasterize(&base.join("broken.svg"), 48, &IconColors::default()).is_none());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// An icon made like Breeze's: the left half in the text color, the right half in the accent, both with the
+    /// light-theme defaults the icon itself carries.
+    const SCHEME_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><defs><style type="text/css" id="current-color-scheme">.ColorScheme-Text { color:#232629; } .ColorScheme-Accent { color:#3daee9; }</style></defs><rect width="8" height="16" style="fill:currentColor" class="ColorScheme-Text"/><rect x="8" width="8" height="16" style="fill:currentColor" class="ColorScheme-Accent"/></svg>"##;
+
+    fn palette(light: bool, accent: egui::Color32) -> crate::ui::theme::SerpantinumTheme {
+        crate::ui::theme::SerpantinumTheme {
+            light,
+            text: if light { egui::Color32::from_rgb(20, 20, 30) } else { egui::Color32::from_rgb(230, 225, 233) },
+            base: if light { egui::Color32::from_rgb(250, 250, 250) } else { egui::Color32::from_rgb(15, 13, 19) },
+            mauve: accent,
+            ..Default::default()
+        }
+    }
+
+    fn rgb(image: &egui::ColorImage, x: usize, y: usize) -> [u8; 3] {
+        let p = image.pixels[y * image.size[0] + x];
+        [p.r(), p.g(), p.b()]
+    }
+
+    fn icon_file(name: &str, svg: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("compression_icon_colors_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(name);
+        std::fs::write(&file, svg).unwrap();
+        file
+    }
+
+    #[test]
+    fn icons_made_for_the_color_scheme_take_the_text_and_accent_of_the_palette_light_or_dark() {
+        let file = icon_file("scheme.svg", SCHEME_SVG);
+        for (light, accent) in [(false, egui::Color32::from_rgb(204, 190, 255)), (true, egui::Color32::from_rgb(200, 40, 60))] {
+            let theme = palette(light, accent);
+            let image = rasterize(&file, 32, &icon_colors(&theme)).unwrap();
+            assert_eq!(rgb(&image, 4, 16), [theme.text.r(), theme.text.g(), theme.text.b()], "text, light {light}");
+            assert_eq!(rgb(&image, 28, 16), [accent.r(), accent.g(), accent.b()], "accent, light {light}");
+        }
+        // Without a palette the icon's own defaults would be drawn: dark gray text, Breeze blue
+        let own = rasterize(&file, 32, &IconColors::default()).unwrap();
+        assert_eq!((rgb(&own, 4, 16), rgb(&own, 28, 16)), ([0x23, 0x26, 0x29], [0x3d, 0xae, 0xe9]));
+    }
+
+    #[test]
+    fn current_color_with_no_color_of_its_own_is_the_text_color_and_icons_in_their_own_colors_keep_them() {
+        let bare = icon_file("bare.svg", r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" fill="currentColor"/></svg>"##);
+        let own = icon_file("own.svg", SVG);
+        let named = icon_file("named.svg", r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" color="#10a020"><rect width="16" height="16" fill="currentColor"/></svg>"##);
+        for light in [false, true] {
+            let theme = palette(light, egui::Color32::from_rgb(200, 40, 60));
+            let sheet = icon_colors(&theme);
+            assert_eq!(rgb(&rasterize(&bare, 16, &sheet).unwrap(), 8, 8), [theme.text.r(), theme.text.g(), theme.text.b()], "light {light}");
+            assert_eq!(rgb(&rasterize(&own, 16, &sheet).unwrap(), 8, 8), [0x30, 0x70, 0xff], "light {light}");
+            assert_eq!(rgb(&rasterize(&named, 16, &sheet).unwrap(), 8, 8), [0x10, 0xa0, 0x20], "light {light}");
+        }
+    }
+
+    #[test]
+    fn another_palette_draws_the_icons_again_and_the_same_palette_keeps_them() {
+        let file = icon_file("cached.svg", SCHEME_SVG);
+        let ctx = egui::Context::default();
+        let dark = palette(false, egui::Color32::from_rgb(204, 190, 255));
+        set_colors(&ctx, &dark);
+        let first = texture(&ctx, &file, 24).unwrap();
+        assert_eq!(texture(&ctx, &file, 24).unwrap().id(), first.id(), "one texture per palette");
+        set_colors(&ctx, &palette(true, egui::Color32::from_rgb(200, 40, 60)));
+        let light = texture(&ctx, &file, 24).unwrap();
+        assert_ne!(light.id(), first.id(), "the light palette draws the icon again");
+        set_colors(&ctx, &dark);
+        assert_ne!(texture(&ctx, &file, 24).unwrap().id(), light.id());
+    }
+
+    #[test]
+    fn applying_a_palette_gives_it_to_the_icons_in_its_solid_colors() {
+        let ctx = egui::Context::default();
+        let solid = palette(true, egui::Color32::from_rgb(200, 40, 60));
+        let mut faded = solid;
+        faded.text = egui::Color32::from_rgb(1, 2, 3);
+        crate::ui::theme::apply(&ctx, &faded, &solid);
+        assert_eq!(*colors(&ctx), icon_colors(&solid));
     }
 
     /// How often a settings file of GTK or KDE was read for the theme's name.

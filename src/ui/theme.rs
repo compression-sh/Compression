@@ -851,6 +851,8 @@ pub fn apply(ctx: &egui::Context, theme: &SerpantinumTheme, popup: &SerpantinumT
     ctx.set_theme(mode);
     ctx.set_visuals_of(mode, visuals);
     super::material::set_focus_color(ctx, theme.mauve);
+    // In the solid palette: an icon's background shapes would show through a faded one
+    super::system_icons::set_colors(ctx, popup);
 
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = egui::vec2(6.0, 6.0);
