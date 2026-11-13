@@ -326,23 +326,23 @@ fn split_exec(exec: &str) -> Vec<String> {
 }
 
 pub fn launch(app: &AppEntry, file: &Path) -> std::io::Result<()> {
-    let file = file.to_string_lossy();
+    // The path goes in as it is, byte for byte: a name that is not UTF-8 reaches the program unchanged
     let mut used_file = false;
-    let mut args: Vec<String> = Vec::new();
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
     for arg in split_exec(&app.exec) {
-        let mut out = String::new();
+        let mut out = std::ffi::OsString::new();
         let mut chars = arg.chars();
         while let Some(c) = chars.next() {
             if c != '%' {
-                out.push(c);
+                out.push(c.encode_utf8(&mut [0; 4]));
                 continue;
             }
             match chars.next() {
                 Some('f' | 'F' | 'u' | 'U') => {
-                    out.push_str(&file);
+                    out.push(file.as_os_str());
                     used_file = true;
                 }
-                Some('%') => out.push('%'),
+                Some('%') => out.push("%"),
                 _ => {}
             }
         }
@@ -351,7 +351,7 @@ pub fn launch(app: &AppEntry, file: &Path) -> std::io::Result<()> {
         }
     }
     if !used_file {
-        args.push(file.into_owned());
+        args.push(file.as_os_str().to_owned());
     }
     let Some((program, rest)) = args.split_first() else {
         return Err(std::io::Error::other(crate::i18n::tr("The launcher has no command")));
@@ -707,6 +707,27 @@ fn mime_is(mime: Option<String>, pattern: &str) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn open_with_hands_the_program_the_path_byte_for_byte() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let dir = std::env::temp_dir().join(format!("compression_open_with_bytes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(std::ffi::OsString::from_vec(b"Bericht-\xe4 x.txt".to_vec()));
+        std::fs::write(&file, "x").unwrap();
+        let got = dir.join("got");
+        // A launcher whose program writes down the argument it was given
+        let exec = format!("sh -c \"printf %%s \\\"$1\\\" > {}\" opener %f", got.display());
+        let app = AppEntry { id: "t.desktop".into(), name: "T".into(), exec, mimes: Vec::new(), icon: None };
+        launch(&app, &file).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::metadata(&got).map_or(true, |m| m.len() == 0) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read(&got).unwrap(), file.as_os_str().as_bytes(), "the program got another path");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// An entry for tests of other modules.
     pub(crate) fn entry(id: &str, name: &str) -> AppEntry {
