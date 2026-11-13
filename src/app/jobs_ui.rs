@@ -105,8 +105,14 @@ impl CompressionApp {
                     self.paste_finished(job, &moved, ok);
                     self.finish_job(outcome);
                     self.report_removals(job);
+                    self.finish_trash_job(job);
                 }
             }
+        }
+        if self.dialog.is_none()
+            && let Some(question) = self.waiting_questions.pop_front()
+        {
+            self.dialog = Some(question);
         }
         if self.dialog.is_none()
             && let Some(request) = self.pending_conflicts.pop_front()
@@ -172,6 +178,10 @@ impl CompressionApp {
             } else {
                 self.history.push_undo(entry);
             }
+        }
+        // Nothing to say (a question that comes next says it all)
+        if outcome.message.is_empty() {
+            return;
         }
         let message = if outcome.cancelled || outcome.ok { outcome.message } else { trf("Failed: {}", &[&outcome.message]) };
         if undoable {

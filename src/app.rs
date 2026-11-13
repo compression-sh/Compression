@@ -496,6 +496,10 @@ pub struct CompressionApp {
     watching: watching::Watching,
     /// Files plugin jobs were started to remove, by job.
     job_removals: HashMap<u64, Vec<PathBuf>>,
+    /// Trash jobs under way: what to ask about and select when each has ended (`finish_trash_job`).
+    trash_jobs: HashMap<u64, TrashJob>,
+    /// Questions that came while another dialog was open, shown in turn.
+    waiting_questions: VecDeque<Dialog>,
     /// The folder size mode the View options switch went on from, which turning it off restores.
     sizes_before_always: crate::settings::FolderSizeMode,
     pending_conflicts: VecDeque<ConflictRequest>,
@@ -865,6 +869,8 @@ impl CompressionApp {
             restore_selection: None,
             watching: watching::Watching::new(ctx),
             job_removals: HashMap::new(),
+            trash_jobs: HashMap::new(),
+            waiting_questions: VecDeque::new(),
             sizes_before_always: crate::settings::FolderSizeMode::OnDemand,
             pending_conflicts: VecDeque::new(),
             pending_space: VecDeque::new(),
@@ -1383,34 +1389,11 @@ impl CompressionApp {
         self.plugins.directory_changed(&here);
     }
 
-    /// Take `paths` out of the open folder's listing without reading the folder again.
-    fn remove_listed(&mut self, paths: &[PathBuf]) {
-        for path in paths {
-            self.net.known.forget_under(path);
-        }
-        let paths: HashSet<&Path> = paths.iter().map(PathBuf::as_path).collect();
-        self.edit_listing(|items| items.retain(|i| !paths.contains(i.path.as_path())));
-        self.selected_index = None;
-        self.sync_selection(true);
-        let here = self.current_path.clone();
-        self.plugins.directory_changed(&here);
-    }
-
     /// The paths of the Recent view, or of the Bookmarks view.
     fn recent_paths(&self) -> Vec<PathBuf> {
         if self.in_bookmarks() { self.bookmarks.clone() } else { recent::load() }
     }
 
-    /// Bring the listing up to date after files changed under it.
-    fn refresh_listing(&mut self) {
-        if self.is_mixed_listing() {
-            self.items.retain(|i| network::is_remote(&i.path) || i.path.symlink_metadata().is_ok());
-            self.selected_index = None;
-            self.sync_selection(true);
-        } else {
-            self.reload_items();
-        }
-    }
 
     fn open_file(&mut self, path: &Path) {
         recent::record(path);
@@ -3097,6 +3080,73 @@ fn unsaved_note() -> Option<PathBuf> {
         return None;
     }
     dirs::cache_dir().map(|d| d.join("compression").join("settings-not-saved.txt"))
+}
+
+/// What a trash job leaves for the window: what to ask about and what to select (`CompressionApp::finish_trash_job`).
+struct TrashJob {
+    /// What is on a server: there is no trash for it.
+    remote: Vec<PathBuf>,
+    /// Filled by the job: what it found on a drive without a trash.
+    left: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    /// The folder shown when the job was started, and the item that will slide into the gap there.
+    folder: PathBuf,
+    next: Option<PathBuf>,
+}
+
+/// Moves `paths` to the trash, one at a time, until done or stopped. A folder on a drive that does not answer is asked
+/// once (a move there could hang) and what is in it is left alone; what has no trash is put in `no_trash` for the window
+/// to ask about. What was moved can be undone, also when the job was stopped or something failed.
+fn trash_job(w: &mut engine::Worker, paths: &[PathBuf], no_trash: &std::sync::Mutex<Vec<PathBuf>>) -> Outcome {
+    use std::sync::atomic::Ordering::Relaxed;
+    w.shared.files_total.store(paths.len() as u64, Relaxed);
+    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (mut answering, mut silent_dirs): (Vec<PathBuf>, Vec<PathBuf>) = (Vec::new(), Vec::new());
+    let (mut trashed, mut moved, mut failed, mut silent, mut left) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut stopped = false;
+    for path in paths {
+        if w.shared.checkpoint().is_err() {
+            stopped = true;
+            break;
+        }
+        w.shared.set_current(&name(path));
+        if let Some(dir) = path.parent() {
+            if !answering.iter().any(|d| d == dir) && !silent_dirs.iter().any(|d| d == dir) {
+                if crate::fs::mount_health::answers_within(dir, TRASH_LOOK) { answering.push(dir.to_path_buf()) } else { silent_dirs.push(dir.to_path_buf()) }
+            }
+            if silent_dirs.iter().any(|d| d == dir) {
+                silent.push(name(path));
+                w.file_done();
+                continue;
+            }
+        }
+        match trash::trash_without_fallback(path) {
+            Ok(to) => {
+                trashed.push(to);
+                moved.push(path.clone());
+            }
+            Err(err) if trash::is_no_trash(&err) => left.push(path.clone()),
+            Err(err) => failed.push(format!("{}: {}", name(path), crate::fs::describe::io_error(&err))),
+        }
+        w.file_done();
+    }
+    if let Ok(mut list) = no_trash.lock() {
+        *list = left;
+    }
+    let label = CompressionApp::describe_count(&moved);
+    let effect = if trashed.is_empty() { Effect::None } else { Effect::Record(UndoEntry::new(trf("Move of {} to trash", &[&label]), trashed.into_iter().map(Edit::Restore).collect())) };
+    let silent_note = (!silent.is_empty()).then(|| trf("Not moved to the trash, its drive does not answer: {}", &[&silent.join(", ")]));
+    let mut message = if moved.is_empty() { String::new() } else { trf("Moved {} to trash", &[&label]) };
+    if !failed.is_empty() {
+        // Nothing moved: the job failed, and says so as every job does ("Failed: …"), naming each item and its reason
+        let part = if moved.is_empty() { failed.join(" · ") } else { format!("{}: {}", trf("{} failed", &[&failed.len()]), failed.join(" · ")) };
+        message = if message.is_empty() { part } else { format!("{message} · {part}") };
+    }
+    if let Some(note) = silent_note {
+        message = if message.is_empty() { note } else { format!("{message} · {note}") };
+    }
+    let mut outcome = if stopped { Outcome::stopped() } else if moved.is_empty() && !failed.is_empty() { Outcome::failed(message) } else { Outcome::done(message) };
+    outcome.effect = effect;
+    outcome
 }
 
 /// Writes the settings as the window goes. A failure is printed on stderr and noted in `note` with its reason.
@@ -5316,89 +5366,55 @@ impl CompressionApp {
         self.set_toast_action(trf("Renamed to “{}”", &[&new_name]), ToastAction::Undo);
     }
 
-    /// Move to the trash, with an Undo in the toast.
+    /// Move to the trash, with an Undo in the toast. The moving is a job (a drive may be slow, or a selection big): the
+    /// window goes on, the job shows its progress and can be stopped, and what it moved can be undone even then. What has
+    /// no trash (on a server, or on a drive that has none) is asked about once, when the job has seen it all.
     fn trash_paths(&mut self, paths: Vec<PathBuf>) {
-        // Servers have no trash: what is on one is deleted for good, after asking, as Nautilus does. So is what is on a
-        // drive that has none and cannot be given one: a copy into the home trash would hold the window up
-        let (remote, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| network::is_remote(p));
-        // A drive that has stopped answering (a mount not known as a server) would hold the window in the move: its
-        // folders are asked first, each once, on a thread, and what is in one that does not answer is left alone
-        let mut silent_dirs: Vec<PathBuf> = Vec::new();
-        let mut asked: Vec<PathBuf> = Vec::new();
-        for dir in paths.iter().filter_map(|p| p.parent()) {
-            if !asked.iter().any(|a| a == dir) {
-                asked.push(dir.to_path_buf());
-                if !crate::fs::mount_health::answers_within(dir, TRASH_LOOK) {
-                    silent_dirs.push(dir.to_path_buf());
-                }
-            }
-        }
-        let (silent, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| p.parent().is_some_and(|d| silent_dirs.iter().any(|s| s == d)));
-        let silent_note = (!silent.is_empty()).then(|| {
-            let names: Vec<String> = silent.iter().map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
-            trf("Not moved to the trash, its drive does not answer: {}", &[&names.join(", ")])
-        });
-        if let Some(note) = &silent_note {
-            // Said now; what else happens adds its own words to it below
-            self.set_toast(note.clone());
-        }
-        let (mut trashed, mut failed, mut removed, mut no_trash) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for path in &paths {
-            match trash::trash_without_fallback(path) {
-                Ok(t) => {
-                    trashed.push(t);
-                    removed.push(path.clone());
-                }
-                Err(err) if trash::is_no_trash(&err) => no_trash.push(path.clone()),
-                Err(err) => failed.push(format!("{}: {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), crate::fs::describe::io_error(&err))),
-            }
-        }
-        // One question for everything that has no trash: what is on a server and what is on a drive without one
-        let for_good: Vec<PathBuf> = remote.iter().chain(&no_trash).cloned().collect();
-        if !for_good.is_empty() {
-            let count = Self::describe_count(&for_good);
-            let body = if no_trash.is_empty() {
-                trf("Files on a server can't be moved to the trash. {} will be deleted for good.", &[&count])
-            } else {
-                trf("Files that have no trash on their drive or server can't be moved to the trash. {} will be deleted for good.", &[&count])
-            };
-            self.dialog = Some(Dialog::Confirm { title: tr("Delete permanently?").to_owned(), body, confirm: tr("Delete").to_owned(), action: ConfirmAction::DeleteForever(for_good) });
-        }
-        // Nothing was trashed and nothing failed: the question says it all
-        if trashed.is_empty() && failed.is_empty() {
+        // Servers have no trash: what is on one is deleted for good, after asking, as Nautilus does
+        let (remote, local): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| network::is_remote(p));
+        if local.is_empty() {
+            self.ask_delete_for_good(remote, false);
             return;
         }
-        // What was moved, not what was asked for
-        let label = Self::describe_count(&removed);
-        let next = self.items.iter().position(|i| removed.contains(&i.path));
-        if self.is_mixed_listing() {
-            self.selected_index = None;
-            self.refresh_listing();
+        // The item that slides into the gap is selected once the job is done, to keep the keyboard going as Nautilus does
+        let gap = self.items.iter().position(|i| local.contains(&i.path));
+        let next = gap.and_then(|at| self.items[at..].iter().find(|i| !local.contains(&i.path))).or_else(|| self.items.iter().rev().find(|i| !local.contains(&i.path))).map(|i| i.path.clone());
+        let left = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let title = trn(local.len(), "Moving {} item to the trash", "Moving {} items to the trash");
+        let (doomed, found) = (local.clone(), left.clone());
+        let job = self.engine.spawn(JobKind::Delete, title, String::new(), move |w| trash_job(w, &local, &found));
+        // Plugins and the sizes hear of what is gone when the job has run (`report_removals`)
+        self.job_removals.insert(job, doomed);
+        self.trash_jobs.insert(job, TrashJob { remote, left, folder: self.current_path.clone(), next });
+    }
+
+    /// A trash job has ended: the item that slid into the gap is selected, and what had no trash is asked about.
+    pub(super) fn finish_trash_job(&mut self, job: u64) {
+        let Some(TrashJob { remote, left, folder, next }) = self.trash_jobs.remove(&job) else { return };
+        if self.current_path == folder
+            && let Some(next) = next
+        {
+            self.restore_selection = Some((vec![next.clone()], Some(next), true));
+        }
+        let no_trash = left.lock().map(|l| l.clone()).unwrap_or_default();
+        let has_no_trash = !no_trash.is_empty();
+        self.ask_delete_for_good(remote.into_iter().chain(no_trash).collect(), has_no_trash);
+    }
+
+    /// The one question for everything that has no trash: what is on a server, and what is on a drive without one.
+    fn ask_delete_for_good(&mut self, for_good: Vec<PathBuf>, has_no_trash: bool) {
+        if for_good.is_empty() {
+            return;
+        }
+        let count = Self::describe_count(&for_good);
+        let body = if has_no_trash {
+            trf("Files that have no trash on their drive or server can't be moved to the trash. {} will be deleted for good.", &[&count])
         } else {
-            self.remove_listed(&removed);
-        }
-        // Keep the keyboard going, as Nautilus does: the item that slid into the gap, or the last one.
-        if let Some(at) = next.filter(|_| !removed.is_empty() && !self.items.is_empty()) {
-            let idx = at.min(self.items.len() - 1);
-            self.selected_index = Some(idx);
-            self.sync_selection(true);
-            self.scroll_to_selected = true;
-        }
-        self.forget_sizes(&removed);
-        self.plugins.file_op_done(&crate::plugins::FileOpEvent::Removed(removed));
-        if trashed.is_empty() {
-            let mut message = trf("Could not move to trash: {}", &[&failed.join(" · ")]);
-            message.extend(silent_note.map(|n| format!(" · {n}")));
-            self.set_toast(message);
-            return;
-        }
-        let mut message = trf("Moved {} to trash", &[&label]);
-        if !failed.is_empty() {
-            message.push_str(&format!(" · {}: {}", trf("{} failed", &[&failed.len()]), failed.join(" · ")));
-        }
-        message.extend(silent_note.map(|n| format!(" · {n}")));
-        self.history.record(UndoEntry::new(trf("Move of {} to trash", &[&label]), trashed.into_iter().map(Edit::Restore).collect()));
-        self.set_toast_action(message, ToastAction::Undo);
+            trf("Files on a server can't be moved to the trash. {} will be deleted for good.", &[&count])
+        };
+        let question = Dialog::Confirm { title: tr("Delete permanently?").to_owned(), body, confirm: tr("Delete").to_owned(), action: ConfirmAction::DeleteForever(for_good) };
+        // Another question that is open is not pushed aside: this one comes after it
+        if self.dialog.is_none() { self.dialog = Some(question) } else { self.waiting_questions.push_back(question) }
     }
 
     /// Bring trashed items back, as a job: an item that came from another drive is copied back, which may take long, and
@@ -8051,6 +8067,60 @@ mod tests {
     }
 
     #[test]
+    fn moving_to_the_trash_is_a_job_the_window_does_not_wait_for_and_a_stop_keeps_what_was_moved_undoable() {
+        let base = window_dir("trash_job_stop");
+        let (stuck, fine) = (base.join("stuck"), base.join("fine"));
+        std::fs::create_dir_all(&stuck).unwrap();
+        std::fs::create_dir_all(&fine).unwrap();
+        for f in [fine.join("b.txt"), stuck.join("a.txt"), fine.join("c.txt")] {
+            std::fs::write(f, "x").unwrap();
+        }
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        // The second item's drive takes its time to answer, so the job is still at work when it is stopped
+        crate::fs::mount_health::tests::hang_under(&stuck);
+        let start = std::time::Instant::now();
+        app.trash_paths(vec![fine.join("b.txt"), stuck.join("a.txt"), fine.join("c.txt")]);
+        assert!(start.elapsed() < std::time::Duration::from_millis(300), "the window waited {:?}", start.elapsed());
+        let job = app.engine.jobs.last().expect("a job").id;
+        assert!(app.engine.jobs.last().unwrap().controllable(), "the job can be stopped");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fine.join("b.txt").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.engine.cancel(job);
+        finish_jobs(&mut app);
+        crate::fs::mount_health::tests::answer_again(&stuck);
+        // What was moved stays moved and can be undone; the rest is where it was
+        assert!(!fine.join("b.txt").exists() && fine.join("c.txt").exists() && stuck.join("a.txt").exists());
+        assert_eq!(app.history.undo_label(), Some("Move of “b.txt” to trash"));
+        let entry = app.history.pop_undo().unwrap();
+        let (_, error) = crate::fs::history::apply(entry);
+        assert_eq!(error, None);
+        assert!(fine.join("b.txt").exists(), "undo brings it back");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn after_moving_to_the_trash_the_item_that_slid_into_the_gap_is_selected() {
+        let base = window_dir("trash_next");
+        for f in ["1.txt", "2.txt", "3.txt"] {
+            std::fs::write(base.join(f), "x").unwrap();
+        }
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.select_path(&base.join("2.txt"));
+        trash_now(&mut app, vec![base.join("2.txt")]);
+        let selected: Vec<String> = app.selected_paths().iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(selected, ["3.txt"]);
+        // The last one: the one before it
+        trash_now(&mut app, vec![base.join("3.txt")]);
+        let selected: Vec<String> = app.selected_paths().iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(selected, ["1.txt"]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn what_is_on_a_drive_that_does_not_answer_is_not_trashed_and_the_window_goes_on() {
         let base = window_dir("trash_silent");
         let (stuck, fine) = (base.join("stuck"), base.join("fine"));
@@ -8062,7 +8132,7 @@ mod tests {
         let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
         crate::fs::mount_health::tests::hang_under(&stuck);
         let start = std::time::Instant::now();
-        app.trash_paths(vec![stuck.join("a.txt"), fine.join("b.txt")]);
+        trash_now(&mut app, vec![stuck.join("a.txt"), fine.join("b.txt")]);
         let took = start.elapsed();
         crate::fs::mount_health::tests::answer_again(&stuck);
         assert!(took < std::time::Duration::from_secs(3), "the window waited {took:?}");
@@ -8278,7 +8348,7 @@ mod tests {
 
         // Trash removes it from the listing, offers Undo, and Undo brings it back
         let b = app.current_path.join("b.txt");
-        app.trash_paths(vec![b.clone()]);
+        trash_now(&mut app, vec![b.clone()]);
         assert_eq!(names(&app), ["sub", "taken.txt"]);
         assert!(!b.exists());
         assert!(matches!(app.status_toast.take(), Some(Toast { action: Some(ToastAction::Undo), .. })), "no undo offered");
@@ -8299,7 +8369,7 @@ mod tests {
         assert_eq!(names(&app), ["sub", "b.txt", "taken.txt"]);
 
         // Delete forever runs as a job; the trash record goes with the file
-        app.trash_paths(vec![b.clone()]);
+        trash_now(&mut app, vec![b.clone()]);
         // Where it went is read from the undo entry: the trash is shared with the other tests of the run, which put
         // other things in it, so nothing here may assume it holds only this
         let entry = app.history.pop_undo().expect("trashing is undoable");
@@ -8323,6 +8393,15 @@ mod tests {
         assert!(app.can_modify_here());
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Moves `paths` to the trash as the window does, and waits until the job has ended and the folder is read again.
+    pub(crate) fn trash_now(app: &mut CompressionApp, paths: Vec<PathBuf>) {
+        app.trash_paths(paths);
+        finish_jobs(app);
+        while app.poll_reload() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// Runs the jobs of `app` to the end.
@@ -8398,18 +8477,18 @@ mod tests {
         let said = |app: &CompressionApp| app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
 
         // One of two goes: what went is counted, what did not is named with its reason
-        app.trash_paths(vec![good.clone(), bad.clone()]);
+        trash_now(&mut app, vec![good.clone(), bad.clone()]);
         assert_eq!(said(&app), "Moved “good.txt” to trash · 1 failed: bad.txt: Permission denied");
         assert!(!good.exists() && bad.exists());
         assert_eq!(app.history.undo_label(), Some("Move of “good.txt” to trash"));
         // None goes: the same names and reasons, nothing recorded
-        app.trash_paths(vec![bad.clone()]);
-        assert_eq!(said(&app), "Could not move to trash: bad.txt: Permission denied");
+        trash_now(&mut app, vec![bad.clone()]);
+        assert_eq!(said(&app), "Failed: bad.txt: Permission denied");
         // Two of three: counted as two
         let (c, d) = (base.join("c.txt"), base.join("d.txt"));
         std::fs::write(&c, "x").unwrap();
         std::fs::write(&d, "x").unwrap();
-        app.trash_paths(vec![c, bad.clone(), d]);
+        trash_now(&mut app, vec![c, bad.clone(), d]);
         assert_eq!(said(&app), "Moved 2 items to trash · 1 failed: bad.txt: Permission denied");
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -8433,7 +8512,7 @@ mod tests {
 
         // Only items on a drive without a trash: nothing is copied into the home trash, one question names them
         let (bare1, bare2) = (file(&shm, "bare1.txt"), file(&shm, "bare2.txt"));
-        app.trash_paths(vec![bare1.clone(), bare2.clone()]);
+        trash_now(&mut app, vec![bare1.clone(), bare2.clone()]);
         let (title, body, paths) = asked(&app).expect("no question");
         assert_eq!((title.as_str(), paths.as_slice()), ("Delete permanently?", [bare1.clone(), bare2.clone()].as_slice()));
         assert_eq!(body, "Files that have no trash on their drive or server can't be moved to the trash. 2 items will be deleted for good.");
@@ -8449,7 +8528,7 @@ mod tests {
         // Mixed with a normal item and an item on a server: the normal one is trashed, the other two are one question
         let (fine, bare3, server) = (file(&root, "fine.txt"), file(&shm, "bare3.txt"), file(&root, "on_server.txt"));
         network::declare_remote_for_tests(&server);
-        app.trash_paths(vec![fine.clone(), bare3.clone(), server.clone()]);
+        trash_now(&mut app, vec![fine.clone(), bare3.clone(), server.clone()]);
         let (_, body, paths) = asked(&app).expect("no question");
         assert_eq!(paths, vec![server.clone(), bare3.clone()], "one question for both");
         assert!(body.starts_with("Files that have no trash on their drive or server"), "{body}");
@@ -8459,14 +8538,14 @@ mod tests {
 
         // Only an item on a server: the question as it was, and nothing else
         app.dialog = None;
-        app.trash_paths(vec![server.clone()]);
+        trash_now(&mut app, vec![server.clone()]);
         let (_, body, paths) = asked(&app).expect("no question");
         assert_eq!((paths, body.as_str()), (vec![server.clone()], "Files on a server can't be moved to the trash. “on_server.txt” will be deleted for good."));
 
         // A normal item alone: no question
         app.dialog = None;
         let plain = file(&root, "plain.txt");
-        app.trash_paths(vec![plain.clone()]);
+        trash_now(&mut app, vec![plain.clone()]);
         assert!(app.dialog.is_none() && !plain.exists());
         crate::fs::ops::tests::unlock_and_remove(&root);
         crate::fs::ops::tests::unlock_and_remove(&shm);
@@ -8835,7 +8914,7 @@ mod tests {
         app.treat_folder_as_server(stick.clone(), true);
 
         // "Move to trash" asks to delete for good, and changes nothing yet
-        app.trash_paths(vec![gone.clone()]);
+        trash_now(&mut app, vec![gone.clone()]);
         let Some(Dialog::Confirm { title, action: ConfirmAction::DeleteForever(paths), .. }) = app.dialog.take() else { panic!("no question") };
         assert_eq!((title.as_str(), paths.as_slice()), ("Delete permanently?", [gone.clone()].as_slice()));
         assert!(gone.exists() && !in_trash("treat_delete_gone.txt"));
@@ -8852,7 +8931,7 @@ mod tests {
 
         // Treated as local again: the trash and the undo are back
         app.treat_folder_as_server(stick.clone(), false);
-        app.trash_paths(vec![kept.clone()]);
+        trash_now(&mut app, vec![kept.clone()]);
         assert!(app.dialog.is_none() && !kept.exists(), "no question, and the file is in the trash");
         assert!(in_trash("treat_delete_kept.txt"));
         assert!(app.history.undo_label().is_some_and(|l| l.starts_with("Move of")));
@@ -9204,7 +9283,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = CompressionApp::new(base.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
         let said = |app: &CompressionApp| app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
-        app.trash_paths(vec![file.clone()]);
+        trash_now(&mut app, vec![file.clone()]);
         // Where it went is read from the undo entry: the trash is shared with the other tests of the run
         let entry = app.history.pop_undo().expect("trashing is undoable");
         let trashed = match entry.edits.as_slice() {
@@ -9329,7 +9408,7 @@ mod tests {
         std::fs::create_dir_all(&pinned).unwrap();
         app.pins = vec![pinned.clone()];
         let events = app.plugins.record_file_ops();
-        app.trash_paths(vec![pinned.clone()]);
+        trash_now(&mut app, vec![pinned.clone()]);
         assert_eq!(app.pins, vec![pinned.clone()]);
         app.undo();
         finish_jobs(&mut app);

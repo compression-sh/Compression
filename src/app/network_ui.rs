@@ -2607,11 +2607,7 @@ mod tests {
         put(&app, &[dir.join("new.txt"), dir.join("other")]);
         app.add_listed(&dir.join("new.txt"));
         assert!(!has(&app, &dir.join("new.txt")) && has(&app, &dir.join("other")));
-        // A removal
-        put(&app, &[dir.join("gone"), dir.join("gone/below"), dir.join("other")]);
-        app.remove_listed(&[dir.join("gone")]);
-        assert!(!has(&app, &dir.join("gone")) && !has(&app, &dir.join("gone/below")) && has(&app, &dir.join("other")));
-        // Any job that ends
+        // Any job that ends (a removal is one: moving to the trash and deleting for good are jobs)
         put(&app, &[dir.join("other")]);
         app.engine.spawn(JobKind::Other, "test".to_owned(), String::new(), |_| Outcome::done("done".to_owned()));
         wait_for(|| {
@@ -3412,7 +3408,7 @@ mod tests {
         assert!(dir.join("a2.txt").exists());
 
         // Deleting asks, as for a server: there is no trash, the file is deleted for good or not at all
-        app.trash_paths(vec![dir.join("b.txt")]);
+        crate::app::tests::trash_now(&mut app, vec![dir.join("b.txt")]);
         assert!(matches!(&app.dialog, Some(Dialog::Confirm { action: ConfirmAction::DeleteForever(paths), .. }) if *paths == [dir.join("b.txt")]));
         assert!(dir.join("b.txt").exists());
 
@@ -3421,7 +3417,7 @@ mod tests {
         app.treat_folder_as_server(dir.clone(), false);
         assert_eq!(app.rename_entry(&dir.join("c.txt"), "c2.txt"), Ok(()));
         assert!(dir.join("c2.txt").exists() && !dir.join("c.txt").exists(), "a local rename happens at once");
-        app.trash_paths(vec![dir.join("b.txt")]);
+        crate::app::tests::trash_now(&mut app, vec![dir.join("b.txt")]);
         assert!(app.dialog.is_none() && !dir.join("b.txt").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
