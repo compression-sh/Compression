@@ -26,12 +26,37 @@ pub fn sources() -> Vec<PathBuf> {
     history_file().into_iter().chain(shared_file()).collect()
 }
 
+/// When Compression itself last wrote the history.
+#[cfg(not(test))]
 static LAST_OWN_WRITE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+// A test has its own moment (as it has its own queue, see `WAITING`): tests that run side by side and set it, or
+// write, cannot change what another one finds
+#[cfg(test)]
+thread_local! {
+    static LAST_OWN_WRITE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+fn last_own_write() -> Option<std::time::Instant> {
+    #[cfg(not(test))]
+    return LAST_OWN_WRITE.lock().ok().and_then(|t| *t);
+    #[cfg(test)]
+    return LAST_OWN_WRITE.with(std::cell::Cell::get);
+}
+
+fn set_last_own_write(when: Option<std::time::Instant>) {
+    #[cfg(not(test))]
+    if let Ok(mut last) = LAST_OWN_WRITE.lock() {
+        *last = when;
+    }
+    #[cfg(test)]
+    LAST_OWN_WRITE.with(|last| last.set(when));
+}
 
 /// Whether Compression itself wrote the history a moment ago, as opposed to another window or app: the Recent
 /// view stays put when its own click is what changed it.
 pub fn written_here_lately() -> bool {
-    LAST_OWN_WRITE.lock().ok().and_then(|t| *t).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3))
+    last_own_write().is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3))
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -145,9 +170,7 @@ fn write_waiting(entries: Vec<Entry>) {
 
 /// Put `entries` (oldest first) in front of the history in `file`: one read, one write.
 fn write_entries(file: &std::path::Path, entries: Vec<Entry>) {
-    if let Ok(mut last) = LAST_OWN_WRITE.lock() {
-        *last = Some(std::time::Instant::now());
-    }
+    set_last_own_write(Some(std::time::Instant::now()));
     let mut history = load_history_from(file);
     for entry in entries {
         history.retain(|e| e.path != entry.path);
@@ -325,11 +348,11 @@ mod tests {
 
     #[test]
     fn a_write_by_compression_counts_as_ours_only_for_a_moment() {
-        *LAST_OWN_WRITE.lock().unwrap() = None;
+        set_last_own_write(None);
         assert!(!written_here_lately());
-        *LAST_OWN_WRITE.lock().unwrap() = Some(std::time::Instant::now());
+        set_last_own_write(Some(std::time::Instant::now()));
         assert!(written_here_lately());
-        *LAST_OWN_WRITE.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        set_last_own_write(Some(std::time::Instant::now() - std::time::Duration::from_secs(10)));
         assert!(!written_here_lately());
         assert!(sources().iter().all(|s| s.is_absolute()));
     }
