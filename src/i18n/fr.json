@@ -941,7 +941,6 @@
   "Created “{}” · {} not included, because they are in other folders": "« {} » créé · {} non inclus, car ils sont dans d’autres dossiers",
   "Cancelled after {}": "Annulé après {}",
   "The clipboard did not answer": "Le presse-papiers n’a pas répondu",
-  "The folder changed while the clipboard was read": "Le dossier a changé pendant la lecture du presse-papiers",
   "Could not find out what opens this file ({})": "Impossible de savoir avec quoi ouvrir ce fichier ({})",
   "Could not find out the type and the default application ({})": "Impossible de déterminer le type et l'application par défaut ({})",
   "The type of this file is not known, so no default can be set for it": "Le type de ce fichier est inconnu, aucun défaut ne peut donc être défini",
@@ -969,5 +968,6 @@
   "“{}” could not be read. It is left as it is, and changes are not saved to it.": "« {} » n’a pas pu être lu. Il reste tel quel et les modifications n’y sont pas enregistrées.",
   "“{}” could not be read and was kept as “{}”. It starts empty.": "« {} » n’a pas pu être lu et a été conservé sous « {} ». Il repart vide.",
   "“{}” could not be read, and could not be kept aside ({}). It is left as it is, and changes are not saved to it.": "« {} » n’a pas pu être lu ni mis de côté ({}). Il reste tel quel et les modifications n’y sont pas enregistrées.",
-  "“{}” could not be saved: {}": "« {} » n’a pas pu être enregistré : {}"
+  "“{}” could not be saved: {}": "« {} » n’a pas pu être enregistré : {}",
+  "“{}” is no longer there. Nothing was pasted.": "« {} » n’existe plus. Rien n’a été collé."
 }

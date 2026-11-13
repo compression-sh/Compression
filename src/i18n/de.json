@@ -941,7 +941,6 @@
   "Created “{}” · {} not included, because they are in other folders": "„{}“ erstellt · {} nicht enthalten, weil sie in anderen Ordnern liegen",
   "Cancelled after {}": "Abgebrochen nach {}",
   "The clipboard did not answer": "Die Zwischenablage hat nicht geantwortet",
-  "The folder changed while the clipboard was read": "Der Ordner hat gewechselt, während die Zwischenablage gelesen wurde",
   "Could not find out what opens this file ({})": "Es ließ sich nicht herausfinden, womit diese Datei geöffnet wird ({})",
   "Could not find out the type and the default application ({})": "Typ und Standardprogramm ließen sich nicht ermitteln ({})",
   "The type of this file is not known, so no default can be set for it": "Der Typ dieser Datei ist nicht bekannt, deshalb lässt sich dafür kein Standard festlegen",
@@ -969,5 +968,6 @@
   "“{}” could not be read. It is left as it is, and changes are not saved to it.": "„{}“ konnte nicht gelesen werden. Die Datei bleibt, wie sie ist, und Änderungen werden nicht darin gespeichert.",
   "“{}” could not be read and was kept as “{}”. It starts empty.": "„{}“ konnte nicht gelesen werden und wurde als „{}“ aufbewahrt. Die Liste beginnt leer.",
   "“{}” could not be read, and could not be kept aside ({}). It is left as it is, and changes are not saved to it.": "„{}“ konnte nicht gelesen und nicht beiseitegelegt werden ({}). Die Datei bleibt, wie sie ist, und Änderungen werden nicht darin gespeichert.",
-  "“{}” could not be saved: {}": "„{}“ konnte nicht gespeichert werden: {}"
+  "“{}” could not be saved: {}": "„{}“ konnte nicht gespeichert werden: {}",
+  "“{}” is no longer there. Nothing was pasted.": "„{}“ ist nicht mehr da. Es wurde nichts eingefügt."
 }

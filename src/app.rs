@@ -1619,8 +1619,8 @@ impl CompressionApp {
 
     /// Saves an image from the clipboard into the current folder as `Pasted image.png`. The file is written on a thread
     /// of its own (the folder may be on a slow disk or a server); `pasted_image` takes the answer in.
-    fn paste_image(&mut self, png: Vec<u8>) {
-        let (dir, tx, ctx) = (self.current_path.clone(), self.open_tx.clone(), self.ctx.clone());
+    fn paste_image(&mut self, dest: &Path, png: Vec<u8>) {
+        let (dir, tx, ctx) = (dest.to_path_buf(), self.open_tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
             let saved = ops::write_new(&dir, std::ffi::OsStr::new("Pasted image.png"), "copy", &png).map_err(|err| crate::fs::describe::io_error(&err));
             let _ = tx.send(OpenReport::PastedImage(dir, saved));
@@ -1720,11 +1720,16 @@ impl CompressionApp {
 
     /// The paste `paste` asked for, with what the clipboard held. It goes into the folder shown now: when that is not
     /// the one it was asked for in, the window says so.
+    /// The paste goes into the folder it was asked in, whatever the window shows by now (another folder, another tab).
+    /// A folder that is gone meanwhile gets nothing, and the window says so; nothing goes anywhere else instead.
     fn paste_snapshot(&mut self, asked_in: &Path, snapshot: crate::clipboard::Snapshot) {
-        self.paste_into(snapshot.files, snapshot.image);
-        if self.current_path != asked_in {
-            self.set_toast(tr("The folder changed while the clipboard was read"));
+        // A server is not asked in the frame (it may hang): the job says it if the folder is gone
+        if !network::is_remote(asked_in) && !asked_in.is_dir() {
+            let name = asked_in.file_name().map_or_else(|| asked_in.display().to_string(), |n| n.to_string_lossy().into_owned());
+            self.set_toast(trf("“{}” is no longer there. Nothing was pasted.", &[&name]));
+            return;
         }
+        self.paste_into_at(asked_in, true, snapshot.files, snapshot.image);
     }
 
     /// `paste` with what the system clipboard holds (files of another application, or of this window, which put
@@ -1738,21 +1743,27 @@ impl CompressionApp {
     /// folder shown. Only what is this window's own clipboard is followed by it: its job decides what stays
     /// (`paste_finished`); files of another application leave it alone.
     fn paste_into(&mut self, external: Option<(Vec<PathBuf>, bool)>, image: Option<Vec<u8>>) {
+        let (dest, modifiable) = (self.current_path.clone(), self.can_modify_here());
+        self.paste_into_at(&dest, modifiable, external, image);
+    }
+
+    /// `paste_into`, into `dest`; `modifiable` says whether it is a folder things can be pasted into.
+    fn paste_into_at(&mut self, dest: &Path, modifiable: bool, external: Option<(Vec<PathBuf>, bool)>, image: Option<Vec<u8>>) {
         let own = self.clipboard.clone();
         let (paths, cut, tracked) = match (external, own) {
             (Some((paths, cut)), Some(own)) if own.paths == paths && own.cut == cut => (paths, cut, true),
             (Some((paths, cut)), _) => (paths, cut, false),
             (None, Some(own)) => (own.paths, own.cut, true),
             (None, None) => {
-                if self.can_modify_here() && let Some(png) = image {
-                    self.paste_image(png);
+                if modifiable && let Some(png) = image {
+                    self.paste_image(dest, png);
                 } else {
                     self.set_toast(tr("Nothing to paste"));
                 }
                 return;
             }
         };
-        if !self.can_modify_here() {
+        if !modifiable {
             self.set_toast(tr("Open a regular folder to paste into"));
             return;
         }
@@ -1761,7 +1772,7 @@ impl CompressionApp {
             self.set_toast(tr("These items are already being moved"));
             return;
         }
-        let dest = self.current_path.clone();
+        let dest = dest.to_path_buf();
         if cut {
             let dest_canon = Self::resolved(&dest);
             let same_folder = paths.iter().any(|p| {
@@ -10751,20 +10762,69 @@ mod tests {
     }
 
     #[test]
-    fn when_the_folder_changed_meanwhile_the_files_go_into_the_folder_shown_now_and_the_window_says_so() {
+    fn a_paste_goes_into_the_folder_it_was_asked_in_whatever_the_window_shows_by_then() {
         let (mut w, root) = window_with_a_cut("paste_moved_on", "unrelated");
         w.app.clipboard = None;
         std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        // Another folder while the clipboard is read
         let (read, _, _) = reader({ let root = root.clone(); move || files_of(&root, &["src/a"], false) }, 150);
         w.app.clipboard_snapshot = read;
         w.app.paste();
-        w.app.current_path = root.join("elsewhere");
-        // The window says so when the answer comes (the end of the copy has a message of its own after that)
-        w.until("the answer", |w| w.app.pending_paste.is_none());
-        assert_eq!(w.app.toast_message(), Some("The folder changed while the clipboard was read"));
-        w.until("pasted", |_| root.join("elsewhere/a").exists());
+        w.app.navigate_to(root.join("elsewhere"));
+        w.until("pasted", |_| root.join("dst/a").exists());
         finish_jobs(&mut w.app);
-        assert!(!root.join("dst/a").exists(), "not into the folder it was asked in");
+        assert!(!root.join("elsewhere/a").exists(), "it went into the folder shown instead of the one it was asked in");
+        // Another tab while the clipboard is read
+        let (read, _, _) = reader({ let root = root.clone(); move || files_of(&root, &["src/b"], false) }, 150);
+        w.app.clipboard_snapshot = read;
+        w.app.navigate_to(root.join("dst"));
+        w.run(Vec::new(), 5);
+        w.app.paste();
+        w.app.new_tab(root.join("elsewhere"));
+        w.until("pasted", |_| root.join("dst/b").exists());
+        finish_jobs(&mut w.app);
+        assert!(!root.join("elsewhere/b").exists());
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn a_paste_into_a_folder_that_went_away_meanwhile_pastes_nothing_anywhere_and_says_so() {
+        let (mut w, root) = window_with_a_cut("paste_folder_gone", "unrelated");
+        std::fs::create_dir_all(root.join("doomed")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        w.app.navigate_to(root.join("doomed"));
+        w.run(Vec::new(), 5);
+        // A cut, read late; the folder it was asked in is gone by then
+        let (read, _, _) = reader({ let root = root.clone(); move || files_of(&root, &["src/a"], true) }, 150);
+        w.app.clipboard_snapshot = read;
+        w.app.paste();
+        w.app.navigate_to(root.join("elsewhere"));
+        std::fs::remove_dir(root.join("doomed")).unwrap();
+        w.until("the answer", |w| w.app.pending_paste.is_none());
+        assert_eq!(w.app.toast_message(), Some("“doomed” is no longer there. Nothing was pasted."));
+        w.run(Vec::new(), 5);
+        assert!(!w.app.engine.running() && root.join("src/a").exists() && !root.join("elsewhere/a").exists(), "something was pasted somewhere");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+    }
+
+    #[test]
+    fn a_late_cut_into_the_folder_it_was_asked_in_keeps_cut_what_it_did_not_move() {
+        let (mut w, root) = window_with_a_cut("paste_cut_late", "b");
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        // This window's own cut of a and b, read late; b is taken in dst, and the question about it is cancelled
+        let (read, _, _) = reader({ let root = root.clone(); move || files_of(&root, &["src/a", "src/b"], true) }, 150);
+        w.app.clipboard_snapshot = read;
+        w.app.paste();
+        w.app.navigate_to(root.join("elsewhere"));
+        w.until("the question", |w| matches!(w.app.dialog, Some(Dialog::Conflict { request: Some(_), .. })));
+        let Some(Dialog::Conflict { request: Some(request), .. }) = w.app.dialog.take() else { panic!("no question") };
+        request.answer(crate::fs::engine::Decision::Cancel, false);
+        w.until("the move to end", |w| !w.app.engine.running());
+        w.run(Vec::new(), 3);
+        assert!(root.join("dst/a").exists() && !root.join("src/a").exists(), "a moved into the folder it was asked in");
+        assert!(root.join("src/b").exists() && !root.join("elsewhere/a").exists() && !root.join("elsewhere/b").exists());
+        // What was not moved stays cut, for another try; what was moved is done with
+        assert_eq!(w.app.clipboard.as_ref().map(|c| c.paths.clone()), Some(vec![root.join("src/b")]));
         crate::fs::ops::tests::unlock_and_remove(&root);
     }
 
@@ -10815,7 +10875,7 @@ mod tests {
         std::fs::create_dir_all(&there).unwrap();
         let mut w = Window::new(here.clone());
         w.run(Vec::new(), 5);
-        w.app.paste_image(b"one".to_vec());
+        w.app.paste_image(&here.clone(), b"one".to_vec());
         w.until("the first picture", |w| {
             w.app.poll_opened();
             w.app.toast_message() == Some("Pasted Pasted image.png")
@@ -10840,7 +10900,8 @@ mod tests {
         w.app.navigate_to(locked.clone());
         w.until("the locked folder", |w| w.app.current_path == locked);
         let before = w.app.history.undo_label().map(str::to_owned);
-        w.app.paste_image(b"three".to_vec());
+        let shown = w.app.current_path.clone();
+        w.app.paste_image(&shown, b"three".to_vec());
         w.until("the refusal", |w| {
             w.app.poll_opened();
             w.app.toast_message().is_some_and(|t| !t.starts_with("Pasted"))

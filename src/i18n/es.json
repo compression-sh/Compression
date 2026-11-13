@@ -941,7 +941,6 @@
   "Created “{}” · {} not included, because they are in other folders": "«{}» creado · {} no incluidos, porque están en otras carpetas",
   "Cancelled after {}": "Cancelado tras {}",
   "The clipboard did not answer": "El portapapeles no respondió",
-  "The folder changed while the clipboard was read": "La carpeta cambió mientras se leía el portapapeles",
   "Could not find out what opens this file ({})": "No se pudo averiguar con qué se abre este archivo ({})",
   "Could not find out the type and the default application ({})": "No se pudo averiguar el tipo ni la aplicación predeterminada ({})",
   "The type of this file is not known, so no default can be set for it": "No se conoce el tipo de este archivo, así que no se puede fijar un valor predeterminado",
@@ -969,5 +968,6 @@
   "“{}” could not be read. It is left as it is, and changes are not saved to it.": "No se pudo leer «{}». Se deja como está y los cambios no se guardan en él.",
   "“{}” could not be read and was kept as “{}”. It starts empty.": "No se pudo leer «{}» y se guardó como «{}». Empieza vacío.",
   "“{}” could not be read, and could not be kept aside ({}). It is left as it is, and changes are not saved to it.": "No se pudo leer «{}» ni apartar ({}). Se deja como está y los cambios no se guardan en él.",
-  "“{}” could not be saved: {}": "No se pudo guardar «{}»: {}"
+  "“{}” could not be saved: {}": "No se pudo guardar «{}»: {}",
+  "“{}” is no longer there. Nothing was pasted.": "«{}» ya no existe. No se ha pegado nada."
 }
