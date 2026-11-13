@@ -121,29 +121,26 @@ pub fn run<S: AsRef<std::ffi::OsStr>>(command: &[S], custom: &str) -> Option<io:
         .or_else(|| RUNS.iter().map(|(name, _)| *name).find(|name| on_path(name)).map(str::to_owned))?;
     let name = Path::new(&chosen).file_name()?.to_string_lossy().into_owned();
     let before = runs_with(&name)?;
+    // Refused before it is started: the terminal would fail by itself, unseen, or be handed another name
+    if TEXT_ONLY.contains(&name.as_str()) && command.iter().any(|word| word.as_ref().to_str().is_none()) {
+        return Some(Err(io::Error::other(crate::i18n::trf("{} can only be handed names that are valid text (UTF-8), and one of these is not. Choose another terminal in Settings → Behavior.", &[&name]))));
+    }
     if name == "tilix" {
-        let line = match tilix_line(command) {
-            Ok(line) => line,
-            Err(err) => return Some(Err(err)),
-        };
-        return Some(start(Command::new(&chosen).args(before).arg(line)).map(|_| ()));
+        return Some(start(Command::new(&chosen).args(before).arg(tilix_line(command))).map(|_| ()));
     }
     Some(start(Command::new(&chosen).args(before).args(command)).map(|_| ()))
 }
 
+/// Terminals that take their arguments only as UTF-8 text. kitty (0.50) stops with a UnicodeDecodeError before it runs
+/// anything, and its window never comes; Tilix's `-e` is a text option (GOptionArg.STRING).
+const TEXT_ONLY: &[&str] = &["kitty", "tilix"];
+
 /// The one line Tilix is given after `-e`: each word in single quotes (a quote in it as `'\''`). Tilix takes a single
 /// argument after `-e` as it is (several it joins, quoting only those with a space) and splits it with GLib's
-/// `g_shell_parse_argv`, which turns this back into exactly these words; nothing in it is run by a shell. Its `-e` is
-/// text (UTF-8), so a word that is not is refused rather than changed.
-fn tilix_line<S: AsRef<std::ffi::OsStr>>(command: &[S]) -> io::Result<String> {
-    let mut words = Vec::with_capacity(command.len());
-    for word in command {
-        let Some(word) = word.as_ref().to_str() else {
-            return Err(io::Error::other(crate::i18n::tr("Tilix can only be handed names that are valid text (UTF-8), and one of these is not. Choose another terminal in Settings → Behavior.")));
-        };
-        words.push(format!("'{}'", word.replace('\'', "'\\''")));
-    }
-    Ok(words.join(" "))
+/// `g_shell_parse_argv`, which turns this back into exactly these words; nothing in it is run by a shell. Words that are
+/// not UTF-8 never come here (see `TEXT_ONLY`).
+fn tilix_line<S: AsRef<std::ffi::OsStr>>(command: &[S]) -> String {
+    command.iter().map(|word| format!("'{}'", word.as_ref().to_string_lossy().replace('\'', "'\\''"))).collect::<Vec<_>>().join(" ")
 }
 
 /// The arguments that tell the terminal `name` to run the command that follows them; `None` for one not known to.
@@ -257,7 +254,7 @@ pub(crate) mod tests {
             assert_eq!(args.len(), 2, "{args:?}");
             assert_eq!(args[0], b"-e");
             let line = std::str::from_utf8(args[1]).unwrap();
-            assert_eq!(line, tilix_line(&command).unwrap());
+            assert_eq!(line, tilix_line(&command));
             match glib_split(line) {
                 Some(words) => assert_eq!(words, command, "GLib splits the line into other words"),
                 None => eprintln!("SKIPPED: no Python GLib binding, the line was not split by GLib here"),
@@ -267,9 +264,42 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(dir.join("tilix.argv"));
         let odd = [std::ffi::OsString::from("vim"), std::os::unix::ffi::OsStringExt::from_vec(b"/x/\xe4.txt".to_vec())];
         let err = run(&odd, &tilix.to_string_lossy()).expect("tilix was not taken").unwrap_err();
-        assert!(err.to_string().starts_with("Tilix can only be handed names that are valid text"), "{err}");
+        assert!(err.to_string().starts_with("tilix can only be handed names that are valid text"), "{err}");
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(!dir.join("tilix.argv").exists(), "Tilix was started with a name it cannot take");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn kitty_gets_text_as_it_is_and_a_name_that_is_not_text_is_refused_before_it_is_started() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let dir = std::env::temp_dir().join(format!("compression_terminal_kitty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let kitty = recording_terminal(&dir, "kitty");
+        // Valid text, however odd: handed over word for word, kitty takes no flags before the command
+        let text = [std::ffi::OsString::from("/usr/bin/vim"), std::ffi::OsString::from("/home/me/-r \"x\" 'y'\n$(id) ü.txt")];
+        run(&text, &kitty.to_string_lossy()).expect("kitty was not taken").unwrap();
+        let mut expected = Vec::new();
+        for word in &text {
+            expected.extend_from_slice(word.as_bytes());
+            expected.push(0);
+        }
+        assert_eq!(wait_for(&dir.join("kitty.argv")), expected);
+        // Bytes that are not UTF-8, alone or in the middle of text: refused, and kitty is not started
+        for bad in [b"/x/caf\xe9.txt".to_vec(), b"\xff".to_vec(), b"/x/\xc3(broken\xc3".to_vec()] {
+            let _ = std::fs::remove_file(dir.join("kitty.argv"));
+            let command = [std::ffi::OsString::from("/usr/bin/vim"), std::ffi::OsString::from_vec(bad)];
+            let err = run(&command, &kitty.to_string_lossy()).expect("kitty was not taken").unwrap_err();
+            assert_eq!(err.to_string(), "kitty can only be handed names that are valid text (UTF-8), and one of these is not. Choose another terminal in Settings → Behavior.");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!dir.join("kitty.argv").exists(), "kitty was started with a name it cannot take");
+        }
+        // Another terminal takes such a name as it is
+        let xterm = recording_terminal(&dir, "xterm");
+        let command = [std::ffi::OsString::from("/usr/bin/vim"), std::ffi::OsString::from_vec(b"/x/caf\xe9.txt".to_vec())];
+        run(&command, &xterm.to_string_lossy()).expect("xterm was not taken").unwrap();
+        assert_eq!(wait_for(&dir.join("xterm.argv")), b"-e\0/usr/bin/vim\0/x/caf\xe9.txt\0");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -285,6 +315,13 @@ pub(crate) mod tests {
         for (name, before) in CONVENTIONS {
             let terminal = recording_terminal(&dir, name);
             let started = run(&command, &terminal.to_string_lossy()).unwrap_or_else(|| panic!("{name} was not taken"));
+            // A terminal that takes only text refuses this name before it is started (see the kitty test)
+            if TEXT_ONLY.contains(name) {
+                assert!(started.is_err(), "{name} was handed a name that is not text");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert!(!dir.join(format!("{name}.argv")).exists(), "{name} was started");
+                continue;
+            }
             started.unwrap();
             let mut expected = Vec::new();
             for word in before.iter().map(std::ffi::OsStr::new).chain(command.iter().map(|w| w.as_os_str())) {

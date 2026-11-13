@@ -771,6 +771,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn opening_a_name_that_is_not_text_with_kitty_is_refused_and_nothing_is_started() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = std::env::temp_dir().join(format!("compression_open_kitty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |name: &str, body: &str| crate::fs::terminal::tests::install_script(&dir.join(name), body);
+        let started = dir.join("started");
+        let kitty = script("kitty", &format!("touch {}\nexec \"$@\"", started.display()));
+        let file = dir.join(std::ffi::OsString::from_vec(b"caf\xe9.txt".to_vec()));
+        std::fs::write(&file, "x").unwrap();
+        let app = AppEntry { id: "vim.desktop".into(), name: "Vim".into(), exec: "vim %f".into(), mimes: Vec::new(), icon: None, terminal: true };
+        let err = launch(&app, &file, &kitty.to_string_lossy()).unwrap_err();
+        assert!(err.to_string().starts_with("kitty can only be handed names that are valid text"), "{err}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!started.exists(), "kitty was started anyway");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_launcher_for_the_terminal_is_listed_and_known_as_one() {
         let dir = std::env::temp_dir().join(format!("compression_terminal_desktop_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
