@@ -2097,6 +2097,80 @@ mod tests {
         std::fs::remove_dir_all(&top).unwrap();
     }
 
+    /// A server that does not answer, for `a_server_that_hangs_holds_up_neither…`: a question about a folder on a server
+    /// waits until `open_server_gate`; one about a folder of this computer is answered as always.
+    static SERVER_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+    static SERVER_ASKED: AtomicUsize = AtomicUsize::new(0);
+    static OPENED_BY_WATCHDOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn hanging_server(next: &Next) -> (Option<PathBuf>, bool) {
+        if next.local().is_some_and(|p| network::is_remote(&p)) {
+            SERVER_ASKED.fetch_add(1, Ordering::SeqCst);
+            let (lock, opened) = &SERVER_GATE;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = opened.wait(open).unwrap();
+            }
+        }
+        ask_server(next)
+    }
+
+    fn open_server_gate() {
+        let (lock, opened) = &SERVER_GATE;
+        *lock.lock().unwrap() = true;
+        opened.notify_all();
+    }
+
+    #[test]
+    fn a_server_that_hangs_holds_up_neither_the_clicks_on_it_nor_anything_else_in_the_window() {
+        // Through the window's own way: `navigate_to` asks, `poll_network` (each frame) takes the answers in. The 30 s
+        // are a watchdog that keeps a broken test from hanging for ever, not a time the window may take: when the
+        // window waits for the server, only the watchdog lets it go on, and the test fails for that
+        let (mut app, top) = app_in_mount(1, "hanging_ui");
+        let local = std::env::temp_dir().join(format!("compression_hanging_ui_local_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&local);
+        std::fs::create_dir_all(&local).unwrap();
+        let local = local.canonicalize().unwrap();
+        app.net.ask = hanging_server;
+        let watchdog = Duration::from_secs(30);
+        let (cancel, cancelled) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if cancelled.recv_timeout(watchdog).is_err() {
+                OPENED_BY_WATCHDOG.store(true, Ordering::SeqCst);
+                open_server_gate();
+            }
+        });
+        let ctx = egui::Context::default();
+        let wait = |app: &mut CompressionApp, what: &str, done: &dyn Fn(&CompressionApp) -> bool| {
+            let limit = Instant::now() + watchdog;
+            while !done(app) {
+                assert!(Instant::now() < limit, "{what}: not reached");
+                app.poll_network(&ctx);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // Twenty clicks on a folder of the server that hangs
+        for _ in 0..20 {
+            app.navigate_to(top.join("t0"));
+            app.poll_network(&ctx);
+        }
+        wait(&mut app, "the question to the server", &|_| SERVER_ASKED.load(Ordering::SeqCst) >= 1);
+        assert!(!OPENED_BY_WATCHDOG.load(Ordering::SeqCst), "the clicks waited for the server");
+        assert_eq!(SERVER_ASKED.load(Ordering::SeqCst), 1, "20 clicks, one question");
+        // Meanwhile something else: going to a folder of this computer is answered and done
+        app.navigate_to(local.clone());
+        wait(&mut app, "arriving in the local folder", &|app| app.current_path == local);
+        assert!(!OPENED_BY_WATCHDOG.load(Ordering::SeqCst), "the window waited for the server");
+        assert_eq!(SERVER_ASKED.load(Ordering::SeqCst), 1);
+        // The server answers at last: its late answer is taken in, and does not take the window back there
+        let _ = cancel.send(());
+        open_server_gate();
+        wait(&mut app, "the late answer", &|app| app.net.checking.is_empty());
+        assert_eq!(app.current_path, local, "a late answer moved the window");
+        let _ = std::fs::remove_dir_all(&local);
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
     fn slow_resolution(next: &Next) -> (Option<PathBuf>, bool) {
         // The step that used to run on the window's thread: following links and asking what the path is
         std::thread::sleep(Duration::from_millis(700));
