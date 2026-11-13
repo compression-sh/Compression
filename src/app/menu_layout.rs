@@ -632,7 +632,7 @@ fn toggle_hidden(layout: &mut MenuLayout, spot: Spot) {
     }
 }
 
-/// A row of an entry: the part with the handle and the name can be dragged, the eye only clicked (a press on the eye never
+/// A row of an entry: the part with the icon and the name can be dragged, the eye only clicked (a press on the eye never
 /// starts a drag). Returns the row and whether the eye was clicked.
 fn entry_row(ui: &mut egui::Ui, theme: &SerpantinumTheme, (icon, label): (&str, &str), hidden: bool, spot: Spot, lifted: bool, indent: f32) -> (egui::Rect, bool) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::hover());
@@ -649,9 +649,8 @@ fn entry_row(ui: &mut egui::Ui, theme: &SerpantinumTheme, (icon, label): (&str, 
     }
     let fade = if hidden || lifted { 0.45 } else { 1.0 };
     let x = rect.left() + indent;
-    material::paint_icon(painter, egui::pos2(x + 14.0, rect.center().y), icons::DRAG, 16.0, theme.subtext0.gamma_multiply(fade));
-    material::paint_icon(painter, egui::pos2(x + 38.0, rect.center().y), icon, 18.0, theme.text.gamma_multiply(fade));
-    painter.text(egui::pos2(x + 56.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(material::FONT_BODY), theme.text.gamma_multiply(fade));
+    material::paint_icon(painter, egui::pos2(x + 14.0, rect.center().y), icon, 18.0, theme.text.gamma_multiply(fade));
+    painter.text(egui::pos2(x + 32.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(material::FONT_BODY), theme.text.gamma_multiply(fade));
     let eye = if hidden { icons::VISIBILITY_OFF } else { icons::VISIBILITY };
     material::paint_icon(painter, eye_rect.center(), eye, 18.0, if eye_resp.hovered() { theme.mauve } else { theme.subtext0 });
     if body_resp.dragged() || lifted {
@@ -660,15 +659,18 @@ fn entry_row(ui: &mut egui::Ui, theme: &SerpantinumTheme, (icon, label): (&str, 
     (rect, eye_resp.clicked())
 }
 
+/// The part of a submenu's row that is dragged: its folder icon; the name field beside it is for typing.
+const SUBMENU_HANDLE_W: f32 = 28.0;
+
 /// The id under which the name field of the submenu at `spot` keeps what is typed into it.
 fn name_field(spot: Spot) -> egui::Id {
     egui::Id::unique("cm_submenu_name").with((spot.group, spot.index))
 }
 
-/// A row of a submenu: its name can be typed over, its handle dragged, its eye clicked.
+/// A row of a submenu: its name can be typed over, its folder icon dragged, its eye clicked.
 fn submenu_row(ui: &mut egui::Ui, theme: &SerpantinumTheme, label: &str, hidden: bool, spot: Spot, lifted: bool) -> (egui::Rect, bool) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::hover());
-    let (handle, rest) = rect.split_left_right_at_x(rect.left() + 48.0);
+    let (handle, rest) = rect.split_left_right_at_x(rect.left() + SUBMENU_HANDLE_W);
     let (field, eye_rect) = rest.split_left_right_at_x(rest.right() - EYE_W);
     let id = ui.make_persistent_id(("cm_row", spot.group, spot.index, spot.leaf));
     let handle_resp = ui.interact(handle, id, egui::Sense::drag());
@@ -678,8 +680,7 @@ fn submenu_row(ui: &mut egui::Ui, theme: &SerpantinumTheme, label: &str, hidden:
     }
     let fade = if hidden || lifted { 0.45 } else { 1.0 };
     ui.painter().rect_filled(rect, egui::CornerRadius::same(material::radius_md()), theme.surface1.gamma_multiply(fade));
-    material::paint_icon(ui.painter(), egui::pos2(rect.left() + 14.0, rect.center().y), icons::DRAG, 16.0, theme.subtext0.gamma_multiply(fade));
-    material::paint_icon(ui.painter(), egui::pos2(rect.left() + 38.0, rect.center().y), icons::FOLDER, 18.0, theme.text.gamma_multiply(fade));
+    material::paint_icon(ui.painter(), egui::pos2(rect.left() + 14.0, rect.center().y), icons::FOLDER, 18.0, theme.text.gamma_multiply(fade));
     let key = name_field(spot);
     let mut text = ui.ctx().data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| label.to_owned());
     let edit = material::put_over(ui, field.shrink2(egui::vec2(8.0, 4.0)), egui::TextEdit::singleline(&mut text).hint_text(tr("Submenu name")).font(egui::FontId::proportional(material::FONT_BODY)));
@@ -1088,6 +1089,72 @@ mod tests {
         assert!((reset.center().y - new_group.center().y).abs() < 2.0 && reset.left() > new_group.right() && reset.left() - new_group.right() < 80.0, "{new_group:?} {reset:?}");
         page.click(reset.center());
         assert!(page.layout(MenuKind::File).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Where a glyph is drawn on the page.
+    fn glyphs(page: &Page, glyph: &str) -> Vec<egui::Rect> {
+        page.shown.iter().filter(|(t, _)| t == glyph).map(|(_, r)| *r).collect()
+    }
+
+    #[test]
+    fn the_rows_carry_no_drag_handle_and_keep_their_action_icons_at_their_left() {
+        let (mut page, dir) = Page::new("handles", true);
+        for tab in ["Files", "Folders", "Empty space"] {
+            page.click(page.find(tab).center());
+            assert!(glyphs(&page, icons::DRAG).is_empty(), "{tab}: a drag handle is drawn");
+            assert!(!glyphs(&page, icons::VISIBILITY).is_empty(), "{tab}: the eyes stay");
+            assert!(!glyphs(&page, icons::FOLDER).is_empty(), "{tab}: submenus keep their folder");
+        }
+        // The action icons stay, each right before its name, at the left of the row where the handle was
+        for (name, glyph) in [("Undo", icons::UNDO), ("Paste", icons::PASTE)] {
+            let (label, icon) = (page.find(name), glyphs(&page, glyph)[0]);
+            assert!((icon.center().y - label.center().y).abs() < 1.0, "{name}");
+            assert_eq!(label.left() - icon.center().x, 18.0, "{name}: icon and name keep their distance");
+            assert!(icon.center().x < 24.0, "{name}: no empty room left of the icon ({icon:?})");
+        }
+        // An entry of a submenu sits one step in, with its own icon (the dashed square of Select all)
+        let leaf = glyphs(&page, icons::SELECT_ALL)[0];
+        assert_eq!(leaf.center().x - glyphs(&page, icons::UNDO)[0].center().x, 28.0);
+        assert_eq!(page.find("Select all").left() - leaf.center().x, 18.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_submenu_is_dragged_by_its_folder_icon_and_a_press_in_its_name_field_starts_no_drag() {
+        let (mut page, dir) = Page::new("submenu_drag", false);
+        let more = page.find("More actions");
+        // Pressed in the name field and moved: that is typing, not a drag
+        page.run(vec![egui::Event::PointerMoved(more.center())], 2);
+        page.press(more.center(), true);
+        page.run(vec![egui::Event::PointerMoved(more.center() + egui::vec2(0.0, 40.0))], 2);
+        assert!(egui::DragAndDrop::payload::<Dragged>(&page.ctx).is_none(), "the name field started a drag");
+        page.press(more.center() + egui::vec2(0.0, 40.0), false);
+        page.run(Vec::new(), 2);
+        assert!(page.layout(MenuKind::File).is_none_or(|l| l == default_layout(MenuKind::File, &[])), "nothing moved");
+        // By its folder icon it goes to the top of the first group
+        let folder = glyphs(&page, icons::FOLDER).into_iter().min_by(|a, b| (a.center().y - more.center().y).abs().total_cmp(&(b.center().y - more.center().y).abs())).expect("a folder");
+        assert!((folder.center().y - more.center().y).abs() < ROW_H / 2.0, "the folder of More actions");
+        let open = page.find("Open");
+        page.drag(folder.center(), egui::pos2(300.0, open.top() + 4.0));
+        let layout = page.layout(MenuKind::File).expect("kept");
+        assert!(matches!(&layout.groups[0][0], MenuNode::Submenu { name, .. } if name == "builtin:more"), "{:?}", ids_of(&layout));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_entry_is_dragged_out_of_a_submenu_by_its_icon() {
+        let (mut page, dir) = Page::new("leaf_drag", false);
+        page.click(page.find("Empty space").center());
+        let leaf = glyphs(&page, icons::SELECT_ALL)[0];
+        let undo = page.find("Undo");
+        page.drag(leaf.center(), egui::pos2(300.0, undo.top() + 4.0));
+        let layout = page.layout(MenuKind::Background).expect("kept");
+        // Out of the submenu "Select", right before Undo
+        let ids = ids_of(&layout);
+        let group = ids.iter().find(|g| g.contains(&"undo".to_owned())).unwrap();
+        assert_eq!(group[..2], ["select_all", "undo"], "{ids:?}");
+        assert!(ids.iter().flatten().any(|n| n == "builtin:select[invert_selection,select_pattern]"), "{ids:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
