@@ -11878,6 +11878,38 @@ mod tests {
     }
 
     #[test]
+    fn eject_is_offered_for_what_lsblk_calls_removable_or_hot_pluggable_and_never_for_a_built_in_disk_that_is_neither() {
+        // As lsblk -J tells it on a computer with a built-in NVMe disk (/boot, /), a built-in SATA disk whose data
+        // partition the person mounted, the same SATA disk where the kernel calls its port hot-pluggable, and a stick
+        let disk = |name: &str, hotplug: bool, rm: bool, parts: &[(&str, Option<&str>)]| {
+            let children: Vec<String> = parts.iter().map(|(part, at)| format!(
+                r#"{{"name":"{part}","path":"/dev/{part}","label":"{part}","size":"1G","mountpoint":{},"rm":{rm},"hotplug":{hotplug},"type":"part","fstype":"ext4"}}"#,
+                at.map_or("null".to_owned(), |a| format!("\"{a}\""))
+            )).collect();
+            format!(r#"{{"name":"{name}","path":"/dev/{name}","label":null,"size":"1T","mountpoint":null,"rm":{rm},"hotplug":{hotplug},"type":"disk","fstype":null,"children":[{}]}}"#, children.join(","))
+        };
+        let json = format!(r#"{{"blockdevices":[{}]}}"#, [
+            disk("nvme0n1", false, false, &[("nvme0n1p1", Some("/boot")), ("nvme0n1p2", Some("/"))]),
+            disk("sdc", false, false, &[("sdc1", Some("/run/media/me/data")), ("sdc2", Some("/boot/efi"))]),
+            disk("sdd", true, false, &[("sdd1", Some("/run/media/me/hot")), ("sdd2", Some("/home"))]),
+            disk("sde", true, true, &[("sde1", Some("/run/media/me/STICK"))]),
+        ].join(","));
+        let ctx = egui::Context::default();
+        let app = CompressionApp::new(std::env::temp_dir(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let offers = |dev: &str| {
+            let place = crate::fs::drives::parse_lsblk(&json, true).into_iter().find(|p| p.drive.as_ref().is_some_and(|d| d.dev == dev)).unwrap_or_else(|| panic!("{dev} is not listed"));
+            let target = MenuTarget::Drive(place.drive.clone().unwrap(), place.name.clone(), place.path.clone());
+            app.menu_entries_all(&target).iter().flatten().any(|(_, _, action)| matches!(action, MenuAction::Eject(..)))
+        };
+        assert!(!offers("/dev/sdc1"), "a built-in disk that is neither removable nor hot-pluggable");
+        assert!(!offers("/dev/nvme0n1p1"), "what the system mounted");
+        assert!(offers("/dev/sde1"), "a stick");
+        // Reached: a built-in disk the kernel calls hot-pluggable is offered Eject. What the eject then does with the
+        // system's partition beside it is refused in `drives::eject`, before anything is unmounted
+        assert!(offers("/dev/sdd1"));
+    }
+
+    #[test]
     fn ejecting_holds_the_whole_drive_also_a_partition_mounted_meanwhile_and_lets_go_when_it_failed() {
         use std::os::unix::fs::MetadataExt;
         let work = window_dir("eject_race");

@@ -5,7 +5,7 @@ use std::process::Command;
 use serde_json::Value;
 
 use super::places::{Place, PlaceGroup};
-use crate::i18n::trf;
+use crate::i18n::{tr, trf};
 use crate::ui::icons;
 
 /// The block device behind a Devices entry of the sidebar.
@@ -320,8 +320,15 @@ pub fn eject(dev: &str) -> Result<(), String> {
 fn eject_with(dev: &str, run: &mut Runner) -> Result<(), String> {
     let disk = run("lsblk", &["-no", "pkname", dev]).ok().and_then(|s| s.lines().next().map(str::trim).filter(|s| !s.is_empty()).map(|s| format!("/dev/{s}")));
     let disk = disk.as_deref().unwrap_or(dev);
-    // When the drive's partitions cannot be listed, only `dev` is known: it alone is unmounted
-    let mut devices = run("lsblk", &["-J", "-o", "PATH,MOUNTPOINTS", disk]).map(|text| mounted_devices_in(&text)).unwrap_or_default();
+    // All that is mounted from the drive is looked at before anything is unmounted: when it cannot be told, or a part
+    // of it is where the system mounted it (`/`, `/boot/efi`, `/home`, swap, as on a built-in disk that says it is
+    // hot-pluggable), nothing is unmounted and the drive stays on
+    let listing = run("lsblk", &["-J", "-o", "PATH,MOUNTPOINTS", disk]).map_err(|_| tr("What else is on this drive could not be told, so nothing was ejected. Unmount it instead.").to_owned())?;
+    let mounted = mounted_devices_in(&listing);
+    if let Some(point) = mounted.iter().flat_map(|(_, points)| points).find(|p| !MOUNT_ROOTS.iter().any(|r| Path::new(p).starts_with(r))) {
+        return Err(trf("This drive also holds “{}”, which the system uses, so nothing was ejected. Unmount it instead.", &[point]));
+    }
+    let mut devices: Vec<String> = mounted.into_iter().map(|(device, _)| device).collect();
     devices.retain(|d| d != dev);
     devices.insert(0, dev.to_owned());
     for device in &devices {
@@ -338,12 +345,13 @@ fn is_mounted_with(dev: &str, run: &mut Runner) -> bool {
     run("lsblk", &["-no", "MOUNTPOINTS", dev]).map_or(true, |s| !s.trim().is_empty())
 }
 
-/// The devices in `lsblk -J -o PATH,MOUNTPOINTS` output that are mounted, of the devices and all their children.
-fn mounted_devices_in(json: &str) -> Vec<String> {
-    fn walk(node: &serde_json::Value, out: &mut Vec<String>) {
-        let mounted = node.get("mountpoints").and_then(|m| m.as_array()).is_some_and(|points| points.iter().any(|p| p.as_str().is_some_and(|p| !p.is_empty())));
-        if mounted && let Some(path) = node.get("path").and_then(|p| p.as_str()) {
-            out.push(path.to_owned());
+/// The devices in `lsblk -J -o PATH,MOUNTPOINTS` output that are mounted (or used as swap, `[SWAP]`), with where, of
+/// the devices and all their children.
+fn mounted_devices_in(json: &str) -> Vec<(String, Vec<String>)> {
+    fn walk(node: &serde_json::Value, out: &mut Vec<(String, Vec<String>)>) {
+        let points: Vec<String> = node.get("mountpoints").and_then(|m| m.as_array()).into_iter().flatten().filter_map(|p| p.as_str()).filter(|p| !p.is_empty()).map(str::to_owned).collect();
+        if !points.is_empty() && let Some(path) = node.get("path").and_then(|p| p.as_str()) {
+            out.push((path.to_owned(), points));
         }
         for child in node.get("children").and_then(|c| c.as_array()).into_iter().flatten() {
             walk(child, out);
@@ -392,12 +400,14 @@ mod tests {
         mounted: Vec<&'static str>,
         busy: Vec<&'static str>,
         lsblk_works: bool,
+        /// Partitions mounted where the system mounts (`/boot/efi`, `[SWAP]`), as on a built-in disk.
+        system: Vec<(&'static str, &'static str)>,
         calls: Vec<String>,
     }
 
     impl FakeDrive {
         fn new(mounted: &[&'static str]) -> Self {
-            FakeDrive { mounted: mounted.to_vec(), busy: Vec::new(), lsblk_works: true, calls: Vec::new() }
+            FakeDrive { mounted: mounted.to_vec(), busy: Vec::new(), lsblk_works: true, system: Vec::new(), calls: Vec::new() }
         }
 
         fn run(&mut self, program: &str, args: &[&str]) -> Result<String, String> {
@@ -406,7 +416,12 @@ mod tests {
                 ("lsblk", _) if !self.lsblk_works => Err("lsblk: not found".into()),
                 ("lsblk", ["-no", "pkname", _]) => Ok("sdb".into()),
                 ("lsblk", ["-J", "-o", "PATH,MOUNTPOINTS", "/dev/sdb"]) => {
-                    let child = |p: &str| format!(r#"{{"path": "{p}", "mountpoints": [{}]}}"#, if self.mounted.contains(&p) { format!("\"/run/media/me/{}\"", &p[5..]) } else { "null".into() });
+                    let point = |p: &str| match self.system.iter().find(|(d, _)| *d == p) {
+                        Some((_, at)) => format!("\"{at}\""),
+                        None if self.mounted.contains(&p) => format!("\"/run/media/me/{}\"", &p[5..]),
+                        None => "null".into(),
+                    };
+                    let child = |p: &str| format!(r#"{{"path": "{p}", "mountpoints": [{}]}}"#, point(p));
                     let children: Vec<String> = ["/dev/sdb1", "/dev/sdb2", "/dev/sdb3"].iter().map(|p| child(p)).collect();
                     Ok(format!(r#"{{"blockdevices": [{{"path": "/dev/sdb", "mountpoints": [null], "children": [{}]}}]}}"#, children.join(",")))
                 }
@@ -469,17 +484,31 @@ mod tests {
         let mut drive = FakeDrive::new(&["/dev/sdb2"]);
         assert_eq!(eject_with("/dev/sdb1", &mut |p, a| drive.run(p, a)), Ok(()));
         assert!(drive.mounted.is_empty() && drive.powered_off());
-        // Without lsblk only the partition asked for is known, and the drive is that device
+        // Without lsblk what else is on the drive cannot be told: nothing is unmounted, and the drive stays on
         let mut drive = FakeDrive::new(&["/dev/sdb1"]);
         drive.lsblk_works = false;
-        assert_eq!(eject_with("/dev/sdb1", &mut |p, a| drive.run(p, a)), Ok(()));
-        assert!(drive.calls.contains(&"udisksctl power-off -b /dev/sdb1".to_owned()), "{:?}", drive.calls);
-        // Without lsblk a failed unmount cannot be told from one that was not needed: it stays a failure
-        let mut drive = FakeDrive::new(&["/dev/sdb1"]);
-        drive.lsblk_works = false;
-        drive.busy.push("/dev/sdb1");
-        assert_eq!(eject_with("/dev/sdb1", &mut |p, a| drive.run(p, a)), Err("Error unmounting /dev/sdb1: target is busy".to_owned()));
-        assert!(!drive.powered_off());
+        assert_eq!(eject_with("/dev/sdb1", &mut |p, a| drive.run(p, a)), Err("What else is on this drive could not be told, so nothing was ejected. Unmount it instead.".to_owned()));
+        assert!(!drive.calls.iter().any(|c| c.starts_with("udisksctl") || c.starts_with("umount")), "{:?}", drive.calls);
+        assert_eq!(drive.mounted, ["/dev/sdb1"]);
+    }
+
+    #[test]
+    fn a_drive_that_also_holds_what_the_system_uses_is_not_ejected_and_nothing_of_it_is_unmounted() {
+        // As on a built-in disk that says it can be hot-plugged: a data partition the person mounted, beside the
+        // system's own partitions
+        for (at, point) in [("/dev/sdb2", "/boot/efi"), ("/dev/sdb2", "/"), ("/dev/sdb3", "[SWAP]"), ("/dev/sdb2", "/home")] {
+            let mut drive = FakeDrive::new(&["/dev/sdb1"]);
+            drive.system.push((at, point));
+            let result = eject_with("/dev/sdb1", &mut |p, a| drive.run(p, a));
+            assert_eq!(result, Err(format!("This drive also holds “{point}”, which the system uses, so nothing was ejected. Unmount it instead.")));
+            // Nothing at all was let go of, the one clicked included, and the drive stays on
+            assert!(!drive.calls.iter().any(|c| c.starts_with("udisksctl") || c.starts_with("umount")), "{point}: {:?}", drive.calls);
+            assert_eq!(drive.mounted, ["/dev/sdb1"]);
+        }
+        // A stick with several partitions the person mounted is ejected whole, as before
+        let mut drive = FakeDrive::new(&["/dev/sdb1", "/dev/sdb2", "/dev/sdb3"]);
+        assert_eq!(eject_with("/dev/sdb2", &mut |p, a| drive.run(p, a)), Ok(()));
+        assert!(drive.mounted.is_empty() && drive.powered_off());
     }
 
     #[test]
@@ -490,7 +519,8 @@ mod tests {
             {"path": "/dev/sdb3", "mountpoints": [""]},
             {"path": "/dev/sdb4", "mountpoints": [null], "children": [{"path": "/dev/mapper/luks-1", "mountpoints": ["/run/media/me/Secret"]}]}
         ]}]}"#;
-        assert_eq!(mounted_devices_in(json), ["/dev/sdb1", "/dev/mapper/luks-1"]);
+        let devices: Vec<String> = mounted_devices_in(json).into_iter().map(|(d, _)| d).collect();
+        assert_eq!(devices, ["/dev/sdb1", "/dev/mapper/luks-1"]);
         assert!(mounted_devices_in("not json").is_empty());
     }
 

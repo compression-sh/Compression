@@ -982,5 +982,7 @@
   "Which drive “{}” is on could not be told, so it was not ejected. Unmount it instead.": "Không xác định được “{}” nằm trên ổ nào nên nó chưa được đẩy ra. Hãy gỡ gắn kết nó thay vào đó.",
   "“{}” runs in a terminal, and no terminal that can run it was found. Choose one in Settings → Behavior.": "“{}” chạy trong terminal, nhưng không tìm thấy terminal nào chạy được nó. Hãy chọn một terminal trong Cài đặt → Hành vi.",
   "The folder “{}” could not be made: {}": "Không thể tạo thư mục “{}”: {}",
-  "Tilix can only be handed names that are valid text (UTF-8), and one of these is not. Choose another terminal in Settings → Behavior.": "Chỉ có thể truyền cho Tilix các tên là văn bản hợp lệ (UTF-8), và một trong số này thì không. Hãy chọn terminal khác trong Cài đặt → Hành vi."
+  "Tilix can only be handed names that are valid text (UTF-8), and one of these is not. Choose another terminal in Settings → Behavior.": "Chỉ có thể truyền cho Tilix các tên là văn bản hợp lệ (UTF-8), và một trong số này thì không. Hãy chọn terminal khác trong Cài đặt → Hành vi.",
+  "What else is on this drive could not be told, so nothing was ejected. Unmount it instead.": "Không xác định được ổ này còn chứa gì khác nên không có gì được đẩy ra. Hãy gỡ gắn kết nó thay vào đó.",
+  "This drive also holds “{}”, which the system uses, so nothing was ejected. Unmount it instead.": "Ổ này còn chứa “{}” mà hệ thống đang dùng nên không có gì được đẩy ra. Hãy gỡ gắn kết nó thay vào đó."
 }
