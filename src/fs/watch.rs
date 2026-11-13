@@ -305,12 +305,25 @@ mod tests {
         // SAFETY: pipe2 fills two descriptors that are owned from here on
         assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }, 0);
         let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let (number, pipe) = (write.as_raw_fd(), std::fs::read_link(format!("/proc/self/fd/{}", write.as_raw_fd())).unwrap());
         let started = Watcher::start(write, &egui::Context::default(), |_work| Err(std::io::Error::other("no thread")));
         assert!(started.is_none());
+        // Closed in this process at once: its number no longer stands for this pipe (another thread may have been
+        // given the number again, for something else)
+        assert_ne!(std::fs::read_link(format!("/proc/self/fd/{number}")).ok(), Some(pipe), "the write end is still open here");
+        // And the pipe ends once nobody else holds it either: a child another test is just starting holds a copy of
+        // every descriptor until it runs its program (a read gives EAGAIN until then). 30 s are a watchdog
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut byte = 0u8;
-        // SAFETY: reads one byte into a variable of ours
-        let n = unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
-        assert_eq!(n, 0, "the write end was still open (a read would give EAGAIN)");
+        loop {
+            // SAFETY: reads one byte into a variable of ours
+            let n = unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+            if n == 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < limit, "the write end was still open somewhere (a read gives EAGAIN)");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     #[test]
