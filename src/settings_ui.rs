@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::i18n::{self, tr, tr_dyn, trf, Language};
 
@@ -24,6 +24,52 @@ pub(crate) const CONTEXT_MENU_TAB: usize = 8;
 const PAGE_WIDTH: f32 = 720.0;
 /// The category that lists the sidebar's places.
 pub(crate) const SIDEBAR_TAB: usize = 3;
+
+/// Whether the folder typed into a setting is there, asked on a thread of its own: the path may lead onto a server or
+/// drive that does not answer, and the field is drawn in every frame. One question at a time; an answer counts only
+/// for the very path the field holds when it comes, so one that is out of date is never shown for a newer path.
+#[derive(Default)]
+pub(crate) struct FolderCheck {
+    known: Option<(PathBuf, bool)>,
+    asking: Option<std::sync::mpsc::Receiver<(PathBuf, bool)>>,
+}
+
+impl FolderCheck {
+    /// Whether `path` is a folder; `None` while that is not known yet.
+    pub(crate) fn is_dir(&mut self, path: &Path, ctx: &egui::Context) -> Option<bool> {
+        self.is_dir_with(path, ctx, |p| p.is_dir())
+    }
+
+    fn is_dir_with(&mut self, path: &Path, ctx: &egui::Context, check: fn(&Path) -> bool) -> Option<bool> {
+        if let Some(asking) = &self.asking {
+            match asking.try_recv() {
+                Ok(answer) => {
+                    self.known = Some(answer);
+                    self.asking = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.asking = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some((asked, is_dir)) = &self.known
+            && asked == path
+        {
+            return Some(*is_dir);
+        }
+        // A newer path is asked once the question in flight is answered: a server that hangs costs one thread
+        if self.asking.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (asked, ctx) = (path.to_path_buf(), ctx.clone());
+            std::thread::spawn(move || {
+                let is_dir = check(&asked);
+                let _ = tx.send((asked, is_dir));
+                ctx.request_repaint();
+            });
+            self.asking = Some(rx);
+        }
+        None
+    }
+}
 
 fn category_focus_id() -> egui::Id {
     egui::Id::unique("set_cat_focus")
@@ -294,7 +340,8 @@ impl CompressionApp {
 
             material::collapsible(ui, "start_custom_path", self.settings.start_location == StartLocation::Custom, |ui| {
                 let mut path_str = self.settings.start_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-                let valid = path_str.is_empty() || PathBuf::from(&path_str).is_dir();
+                // Not known yet counts as fine: nothing is marked wrong before it is
+                let valid = path_str.trim().is_empty() || self.start_folder_check.is_dir(Path::new(path_str.trim()), ui.ctx()) != Some(false);
                 material::input_frame(&theme).show(ui, |ui| {
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut path_str)
@@ -946,7 +993,7 @@ impl CompressionApp {
             let default_dir = crate::fs::templates::user_dir(None);
             let mut path_str = self.settings.templates_dir.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
             let shown = if path_str.trim().is_empty() { default_dir.clone() } else { Some(PathBuf::from(path_str.trim())) };
-            let valid = path_str.trim().is_empty() || PathBuf::from(path_str.trim()).is_dir();
+            let valid = path_str.trim().is_empty() || self.templates_folder_check.is_dir(Path::new(path_str.trim()), ui.ctx()) != Some(false);
             material::input_frame(&theme).show(ui, |ui| {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut path_str)
@@ -1685,6 +1732,75 @@ fn category_row(
 mod tests {
     use super::*;
     use crate::settings::{Settings, SCROLL_SPEED_DEFAULT};
+
+    static CHECK_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+    static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A folder check that waits at a gate, as on a server that does not answer; a path ending in "folder" is one.
+    fn held_check(path: &Path) -> bool {
+        CHECKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (lock, opened) = &CHECK_GATE;
+        let mut open = lock.lock().unwrap();
+        while !*open {
+            open = opened.wait(open).unwrap();
+        }
+        path.ends_with("folder")
+    }
+
+    #[test]
+    fn a_typed_folder_is_checked_off_the_window_one_question_at_a_time_and_an_old_answer_is_never_shown_for_a_new_path() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let ctx = egui::Context::default();
+        let mut check = FolderCheck::default();
+        let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // A draw that waited for the check would hang the test: the gate opens after 30 s, and the answer then comes
+        // where none may be
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            let (lock, opened) = &CHECK_GATE;
+            *lock.lock().unwrap() = true;
+            opened.notify_all();
+        });
+        // A field drawn while the check hangs: not known, and drawing goes on (a waiting draw would hang the test)
+        assert_eq!(check.is_dir_with(Path::new("/srv/old-folder"), &ctx, held_check), None);
+        while CHECKS.load(SeqCst) == 0 {
+            assert!(std::time::Instant::now() < watchdog);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // The person types on: still not known, and no second question while the first hangs
+        for _ in 0..5 {
+            assert_eq!(check.is_dir_with(Path::new("/srv/new-file"), &ctx, held_check), None);
+        }
+        assert_eq!(CHECKS.load(SeqCst), 1, "a second question while the first hangs");
+        {
+            let (lock, opened) = &CHECK_GATE;
+            *lock.lock().unwrap() = true;
+            opened.notify_all();
+        }
+        // The answer about the old path comes: it is not shown for the new one, which is asked then
+        let mut seen = None;
+        while seen.is_none() {
+            assert!(std::time::Instant::now() < watchdog, "the new path was never answered");
+            seen = check.is_dir_with(Path::new("/srv/new-file"), &ctx, held_check);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(seen, Some(false), "the answer about another path was taken");
+        assert_eq!(CHECKS.load(SeqCst), 2);
+        // The real check
+        let dir = std::env::temp_dir().join(format!("compression_folder_check_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (path, expected) in [(dir.clone(), true), (dir.join("not-there"), false)] {
+            let mut check = FolderCheck::default();
+            let mut seen = None;
+            while seen.is_none() {
+                assert!(std::time::Instant::now() < watchdog);
+                seen = check.is_dir(&path, &ctx);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert_eq!(seen, Some(expected), "{}", path.display());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn texts(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
         fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {

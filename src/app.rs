@@ -515,6 +515,9 @@ pub struct CompressionApp {
     reserved: Vec<PathBuf>,
     /// A folder another part of the app wants shown (settings buttons), opened at the next frame.
     pub(crate) pending_open: Option<PathBuf>,
+    /// Whether the folders typed into the settings (start folder, templates) are there, asked off the window's thread.
+    pub(crate) start_folder_check: crate::settings_ui::FolderCheck,
+    pub(crate) templates_folder_check: crate::settings_ui::FolderCheck,
     drive_state: drives_ui::DriveState,
     net: network_ui::NetState,
     /// For work that reports back from other threads.
@@ -883,6 +886,8 @@ impl CompressionApp {
             last_item_rects: Vec::new(),
             reserved: Vec::new(),
             pending_open: None,
+            start_folder_check: Default::default(),
+            templates_folder_check: Default::default(),
             drive_state: drives_ui::DriveState::new(),
             net: network_ui::NetState::new(),
             ctx: ctx.clone(),
