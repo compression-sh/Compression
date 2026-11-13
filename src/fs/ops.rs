@@ -1071,19 +1071,7 @@ fn check_listing(listing: &str) -> io::Result<()> {
 /// over this way; the caller puts the items where they go (and asks about names that are taken), then removes the
 /// folder. A failure or a stop takes the folder away again.
 pub fn extract_staged(archive: &Path, dest: &Path, control: &Control) -> io::Result<PathBuf> {
-    let mut stage = None;
-    for n in 0..1000 {
-        let candidate = dest.join(format!(".compression-extract-{}-{n}", std::process::id()));
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => {
-                stage = Some(candidate);
-                break;
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
-        }
-    }
-    let stage = stage.ok_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists))?;
+    let stage = new_stage(dest)?;
     match extract(archive, &stage, control) {
         Ok(()) => Ok(stage),
         Err(e) => {
@@ -1093,18 +1081,45 @@ pub fn extract_staged(archive: &Path, dest: &Path, control: &Control) -> io::Res
     }
 }
 
-/// Extract into a fresh folder next to the archive (`<archive stem>`), returning that folder.
-pub fn extract_beside(archive: &Path, control: &Control) -> io::Result<PathBuf> {
-    let parent = archive.parent().ok_or_else(|| io::Error::other(tr("It has no folder to go in")))?;
-    let dest = unique_path(parent, std::ffi::OsStr::new(&archive_stem(archive)), "extracted");
-    std::fs::create_dir(&dest)?;
-    match extract(archive, &dest, control) {
-        Ok(()) => Ok(dest),
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&dest);
-            Err(e)
+/// A hidden folder in `dir` for unpacking into, made here (`create_dir` fails for one that is there), so it is known to
+/// be this unpacking's own and nothing else is in it but what is unpacked. A hard stop leaves it as
+/// `.compression-extract-<pid>-<n>`; it is never removed by its name alone.
+fn new_stage(dir: &Path) -> io::Result<PathBuf> {
+    for n in 0..1000 {
+        let candidate = dir.join(format!(".compression-extract-{}-{n}", std::process::id()));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
         }
     }
+    Err(io::Error::from(io::ErrorKind::AlreadyExists))
+}
+
+/// Extract into a fresh folder next to the archive (`<archive stem>`, or the next free name), returning that folder.
+/// It is unpacked into a hidden folder of its own (`new_stage`) and given its name only when it is whole: until then
+/// nobody can put anything into it by that name, a stop or failure takes away that folder alone, and a name taken
+/// meanwhile is never written into or over.
+pub fn extract_beside(archive: &Path, control: &Control) -> io::Result<PathBuf> {
+    let parent = archive.parent().ok_or_else(|| io::Error::other(tr("It has no folder to go in")))?;
+    let stage = new_stage(parent)?;
+    let result = extract(archive, &stage, control).and_then(|()| {
+        for _ in 0..100 {
+            let dest = unique_path(parent, std::ffi::OsStr::new(&archive_stem(archive)), "extracted");
+            match crate::compat::rename_noreplace(&stage, &dest) {
+                Ok(()) => return Ok(dest),
+                // Taken between the look and the rename: the next free name
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::from(io::ErrorKind::AlreadyExists))
+    });
+    if result.is_err() {
+        // The archive is where it was; what was unpacked so far is in this folder of its own alone
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2164,6 +2179,49 @@ pub(crate) mod tests {
             assert_eq!(names(&outside), ["secret"], "{format}");
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn unpacking_beside_the_archive_never_takes_away_what_someone_else_puts_there_meanwhile() {
+        let (root, inside, _) = evil_root("beside_foreign");
+        let tar = raw_tar(&[("a", 'f', ""), ("b", 'f', ""), ("c", 'f', "")]);
+        let archive = archive_as(&inside, "photos.tar", &tar).unwrap();
+        // Stopped while someone saves a file into the folder the archive is going to: their file stays
+        let calls = std::cell::Cell::new(0);
+        let stop = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                std::fs::create_dir_all(inside.join("photos")).unwrap();
+                std::fs::write(inside.join("photos/theirs.txt"), "theirs").unwrap();
+            }
+            calls.get() >= 3
+        };
+        let err = extract_beside(&archive, &Control::new(&stop, &|_| {})).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted, "{err}");
+        assert_eq!(std::fs::read_to_string(inside.join("photos/theirs.txt")).unwrap(), "theirs", "someone else's file was taken away");
+        assert_eq!(names(&inside), ["photos", "photos.tar"], "something of the stopped unpacking is left");
+        assert_eq!(names(&inside.join("photos")), ["theirs.txt"]);
+        // Done while that folder was made meanwhile: the unpacked folder goes beside it, and theirs is untouched
+        std::fs::remove_dir_all(inside.join("photos")).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let stop = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                std::fs::create_dir_all(inside.join("photos")).unwrap();
+                std::fs::write(inside.join("photos/theirs.txt"), "theirs").unwrap();
+            }
+            false
+        };
+        let out = extract_beside(&archive, &Control::new(&stop, &|_| {})).unwrap();
+        assert_ne!(out, inside.join("photos"));
+        assert_eq!(names(&out), ["a", "b", "c"]);
+        assert_eq!(names(&inside.join("photos")), ["theirs.txt"], "a folder made meanwhile was written into or over");
+        // A broken archive: nothing is left, no hidden folder either
+        std::fs::remove_dir_all(&out).unwrap();
+        std::fs::write(inside.join("broken.tar"), b"not a tar at all, not even close").unwrap();
+        assert!(extract_beside(&inside.join("broken.tar"), &Control::unlimited()).is_err());
+        assert_eq!(names(&inside), ["broken.tar", "photos", "photos.tar"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
