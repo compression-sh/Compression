@@ -17,6 +17,8 @@ pub struct AppEntry {
     mimes: Vec<String>,
     /// Raw `Icon=` value: an absolute path or a theme icon name.
     pub icon: Option<String>,
+    /// `Terminal=true`: the program runs in a terminal (an editor or viewer for the console).
+    terminal: bool,
 }
 
 fn application_dirs() -> Vec<PathBuf> {
@@ -91,7 +93,7 @@ fn parse_desktop(id: &str, path: &Path) -> Option<AppEntry> {
             }
     }
     let is_true = |key: &str| fields.get(key) == Some(&"true");
-    if fields.get("Type") != Some(&"Application") || is_true("NoDisplay") || is_true("Hidden") || is_true("Terminal") {
+    if fields.get("Type") != Some(&"Application") || is_true("NoDisplay") || is_true("Hidden") {
         return None;
     }
     let mimes: Vec<String> = fields
@@ -104,6 +106,7 @@ fn parse_desktop(id: &str, path: &Path) -> Option<AppEntry> {
         exec: fields.get("Exec")?.to_string(),
         icon: fields.get("Icon").map(|i| i.to_string()).filter(|i| !i.is_empty()),
         mimes,
+        terminal: is_true("Terminal"),
     })
 }
 
@@ -325,8 +328,10 @@ fn split_exec(exec: &str) -> Vec<String> {
     args
 }
 
-pub fn launch(app: &AppEntry, file: &Path) -> std::io::Result<()> {
-    // The path goes in as it is, byte for byte: a name that is not UTF-8 reaches the program unchanged
+/// The command `app`'s `Exec=` makes for `file`: its words as the desktop entry quotes them, `%f`/`%F`/`%u`/`%U` as the
+/// path byte for byte (as one argument of its own), `%%` as `%`; the other field codes say nothing of a single file
+/// and are left out. Without any of those codes the path goes last.
+fn exec_args(app: &AppEntry, file: &Path) -> Vec<std::ffi::OsString> {
     let mut used_file = false;
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     for arg in split_exec(&app.exec) {
@@ -353,9 +358,23 @@ pub fn launch(app: &AppEntry, file: &Path) -> std::io::Result<()> {
     if !used_file {
         args.push(file.as_os_str().to_owned());
     }
-    let Some((program, rest)) = args.split_first() else {
+    args
+}
+
+/// Opens `file` with `app`. A program that runs in a terminal is started in one (`terminal`, the command of the
+/// settings, else `$TERMINAL` or one installed, see `terminal::run`), and never without one.
+pub fn launch(app: &AppEntry, file: &Path, terminal: &str) -> std::io::Result<()> {
+    // The path goes in as it is, byte for byte: a name that is not UTF-8 reaches the program unchanged
+    let args = exec_args(app, file);
+    if args.first().is_none_or(|program| program.as_os_str() == file.as_os_str()) {
         return Err(std::io::Error::other(crate::i18n::tr("The launcher has no command")));
-    };
+    }
+    if app.terminal {
+        return crate::fs::terminal::run(&args, terminal).unwrap_or_else(|| {
+            Err(std::io::Error::other(crate::i18n::trf("“{}” runs in a terminal, and no terminal that can run it was found. Choose one in Settings → Behavior.", &[&app.name])))
+        });
+    }
+    let (program, rest) = args.split_first().expect("checked above");
     let mut child = Command::new(program)
         .args(rest)
         .stdin(Stdio::null())
@@ -703,6 +722,69 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn the_exec_line_keeps_its_words_and_puts_the_path_in_as_one_argument() {
+        use std::os::unix::ffi::OsStringExt;
+        let file = PathBuf::from(std::ffi::OsString::from_vec(b"/x/a b \xe4.txt".to_vec()));
+        let app = |exec: &str| AppEntry { id: "t.desktop".into(), name: "T".into(), exec: exec.into(), mimes: Vec::new(), icon: None, terminal: true };
+        let os = |words: &[&str]| words.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let with_file = |mut words: Vec<std::ffi::OsString>, at: usize| {
+            words.insert(at, file.clone().into_os_string());
+            words
+        };
+        assert_eq!(exec_args(&app("vim %f"), &file), with_file(os(&["vim"]), 1));
+        assert_eq!(exec_args(&app(r#""/opt/my editor/bin/ed" --title "two words" %F %i %c %k 100%%"#), &file), with_file(os(&["/opt/my editor/bin/ed", "--title", "two words", "100%"]), 3));
+        // Without a field code the path goes last; an escaped quote stays a quote
+        assert_eq!(exec_args(&app(r#"less "-P\"x\"""#), &file), with_file(os(&["less", "-P\"x\""]), 2));
+    }
+
+    #[test]
+    fn a_program_for_the_terminal_is_run_in_one_with_the_path_byte_for_byte_and_never_without_one() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let dir = std::env::temp_dir().join(format!("compression_open_in_terminal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |name: &str, body: &str| crate::fs::terminal::tests::install_script(&dir.join(name), body);
+        // A stand-in for xterm that runs what follows its -e, as xterm does, and a console program that writes down
+        // the file it was given
+        let got = dir.join("got");
+        let xterm = script("xterm", "touch \"$0.ran\"\n[ \"$1\" = -e ] || exit 3\nshift\nexec \"$@\"");
+        let editor = script("editor", &format!("printf %s \"$1\" > {}.part && mv {}.part {}", got.display(), got.display(), got.display()));
+        let file = dir.join(std::ffi::OsString::from_vec(b"-a b\n\xe4.txt".to_vec()));
+        std::fs::write(&file, "x").unwrap();
+        let app = AppEntry { id: "e.desktop".into(), name: "Editor".into(), exec: format!("{} %f", editor.display()), mimes: Vec::new(), icon: None, terminal: true };
+        launch(&app, &file, &xterm.to_string_lossy()).unwrap();
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !got.exists() {
+            assert!(std::time::Instant::now() < limit, "the program was not run in the terminal");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(&got).unwrap(), file.as_os_str().as_bytes());
+        assert!(dir.join("xterm.ran").exists(), "the program was run, but not in the terminal");
+        // A terminal that is not known to run a program: said, and the program is not started without one
+        std::fs::remove_file(&got).unwrap();
+        let other = script("my-own-terminal", "exec \"$@\"");
+        let err = launch(&app, &file, &other.to_string_lossy()).unwrap_err();
+        assert_eq!(err.to_string(), "“Editor” runs in a terminal, and no terminal that can run it was found. Choose one in Settings → Behavior.");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!got.exists(), "the program was started without a terminal");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_launcher_for_the_terminal_is_listed_and_known_as_one() {
+        let dir = std::env::temp_dir().join(format!("compression_terminal_desktop_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("vim.desktop");
+        std::fs::write(&file, "[Desktop Entry]\nType=Application\nName=Vim\nExec=vim %F\nTerminal=true\nMimeType=text/plain;\n").unwrap();
+        let app = parse_desktop("vim.desktop", &file).expect("a launcher for the terminal is listed");
+        assert!(app.terminal);
+        std::fs::write(&file, "[Desktop Entry]\nType=Application\nName=Gedit\nExec=gedit %U\n").unwrap();
+        assert!(!parse_desktop("gedit.desktop", &file).unwrap().terminal);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn open_with_hands_the_program_the_path_byte_for_byte() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
         let dir = std::env::temp_dir().join(format!("compression_open_with_bytes_{}", std::process::id()));
@@ -713,8 +795,8 @@ pub(crate) mod tests {
         let got = dir.join("got");
         // A launcher whose program writes down the argument it was given
         let exec = format!("sh -c \"printf %%s \\\"$1\\\" > {}\" opener %f", got.display());
-        let app = AppEntry { id: "t.desktop".into(), name: "T".into(), exec, mimes: Vec::new(), icon: None };
-        launch(&app, &file).unwrap();
+        let app = AppEntry { id: "t.desktop".into(), name: "T".into(), exec, mimes: Vec::new(), icon: None, terminal: false };
+        launch(&app, &file, "").unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::fs::metadata(&got).map_or(true, |m| m.len() == 0) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -725,7 +807,7 @@ pub(crate) mod tests {
 
     /// An entry for tests of other modules.
     pub(crate) fn entry(id: &str, name: &str) -> AppEntry {
-        AppEntry { id: id.into(), name: name.into(), exec: "true".into(), mimes: Vec::new(), icon: None }
+        AppEntry { id: id.into(), name: name.into(), exec: "true".into(), mimes: Vec::new(), icon: None, terminal: false }
     }
 
     /// A stand-in for `xdg-mime` that keeps its defaults in `dir/state` and logs each call in `dir/calls`. It sleeps `delay`
@@ -744,7 +826,7 @@ pub(crate) mod tests {
     pub(crate) const KEEPS: &str = "echo \"$3=$2\" >> \"$D/state\"";
 
     fn app(id: &str, mimes: &[&str]) -> AppEntry {
-        AppEntry { id: id.into(), name: id.into(), exec: "true".into(), mimes: mimes.iter().map(|m| m.to_string()).collect(), icon: None }
+        AppEntry { id: id.into(), name: id.into(), exec: "true".into(), mimes: mimes.iter().map(|m| m.to_string()).collect(), icon: None, terminal: false }
     }
 
     #[test]

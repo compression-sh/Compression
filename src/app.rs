@@ -1417,7 +1417,7 @@ impl CompressionApp {
             let app = self.installed_apps().iter().find(|a| a.id == id).cloned();
             match app {
                 Some(app) => {
-                    if let Err(err) = apps::launch(&app, path) {
+                    if let Err(err) = apps::launch(&app, path, self.settings.terminal.trim()) {
                         self.set_toast(trf("Failed to start {}: {}", &[&app.name, &crate::fs::describe::io_error(&err)]));
                     }
                     return;
@@ -7480,7 +7480,7 @@ impl CompressionApp {
         }
         if launch
             && let Some(app) = selected.and_then(|i| listed.get(i)) {
-                match apps::launch(app, path) {
+                match apps::launch(app, path, self.settings.terminal.trim()) {
                     Ok(()) => {
                         recent::record(path);
                         if *for_file {

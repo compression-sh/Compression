@@ -979,5 +979,6 @@
   "Folders deeper than {} levels were not searched.": "Les dossiers à plus de {} niveaux de profondeur n’ont pas été parcourus.",
   "The font “{}” could not be read ({}). Adwaita Sans is used instead.": "La police « {} » n’a pas pu être lue ({}). Adwaita Sans est utilisée à la place.",
   "“{}” is not a font Compression can use. Adwaita Sans is used instead.": "« {} » n’est pas une police que Compression peut utiliser. Adwaita Sans est utilisée à la place.",
-  "Which drive “{}” is on could not be told, so it was not ejected. Unmount it instead.": "Impossible de savoir sur quel disque se trouve « {} » : il n’a pas été éjecté. Démontez-le plutôt."
+  "Which drive “{}” is on could not be told, so it was not ejected. Unmount it instead.": "Impossible de savoir sur quel disque se trouve « {} » : il n’a pas été éjecté. Démontez-le plutôt.",
+  "“{}” runs in a terminal, and no terminal that can run it was found. Choose one in Settings → Behavior.": "« {} » s’exécute dans un terminal, et aucun terminal capable de le lancer n’a été trouvé. Choisissez-en un dans Paramètres → Comportement."
 }

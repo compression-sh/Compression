@@ -96,7 +96,7 @@ const RUNS: &[(&str, &[&str])] = &[
     ("alacritty", &["-e"]),
     ("foot", &[]),
     ("wezterm", &["start", "--"]),
-    ("tilix", &["-e"]),
+    // tilix is left out: its `-e` takes the command as one line of text to split, not as the words it is made of
     ("terminator", &["-x"]),
     ("mate-terminal", &["-x"]),
     ("urxvt", &["-e"]),
@@ -106,8 +106,10 @@ const RUNS: &[(&str, &[&str])] = &[
 ];
 
 /// Start a terminal that runs `command`: the one of the settings, of `$TERMINAL`, or the first one
-/// installed. `None` when that terminal is not known to take a command.
-pub fn run(command: &[String], custom: &str) -> Option<io::Result<()>> {
+/// installed. `None` when that terminal is not known to take a command. Each word of `command` reaches the program as
+/// the argument it is, byte for byte: the terminals listed take the words that follow as the command, none of them is
+/// handed a line for a shell.
+pub fn run<S: AsRef<std::ffi::OsStr>>(command: &[S], custom: &str) -> Option<io::Result<()>> {
     let custom = trusted(custom, crate::fs::admin::is_admin());
     let env = std::env::var("TERMINAL").ok().and_then(|t| t.split_whitespace().next().map(str::to_owned)).filter(|t| on_path(t));
     let chosen = custom
@@ -117,8 +119,13 @@ pub fn run(command: &[String], custom: &str) -> Option<io::Result<()>> {
         .or(env)
         .or_else(|| RUNS.iter().map(|(name, _)| *name).find(|name| on_path(name)).map(str::to_owned))?;
     let name = Path::new(&chosen).file_name()?.to_string_lossy().into_owned();
-    let (_, before) = RUNS.iter().find(|(known, _)| *known == name)?;
-    Some(start(Command::new(&chosen).args(*before).args(command)).map(|_| ()))
+    let before = runs_with(&name)?;
+    Some(start(Command::new(&chosen).args(before).args(command)).map(|_| ()))
+}
+
+/// The arguments that tell the terminal `name` to run the command that follows them; `None` for one not known to.
+fn runs_with(name: &str) -> Option<&'static [&'static str]> {
+    RUNS.iter().find(|(known, _)| *known == name).map(|(_, before)| *before)
 }
 
 /// The ssh command that logs in to `host` and opens a shell in `dir` there.
@@ -137,8 +144,93 @@ pub fn ssh_command(user: Option<&str>, host: &str, port: Option<u16>, dir: &str)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Terminals that run a command, and how: each takes the words after these as the command.
+    const CONVENTIONS: &[(&str, &[&str])] = &[
+        ("ptyxis", &["--new-window", "--"]),
+        ("kgx", &["--"]),
+        ("gnome-terminal", &["--"]),
+        ("konsole", &["-e"]),
+        ("xfce4-terminal", &["-x"]),
+        ("kitty", &[]),
+        ("alacritty", &["-e"]),
+        ("foot", &[]),
+        ("wezterm", &["start", "--"]),
+        ("terminator", &["-x"]),
+        ("mate-terminal", &["-x"]),
+        ("urxvt", &["-e"]),
+        ("xterm", &["-e"]),
+        ("st", &["-e"]),
+        ("x-terminal-emulator", &["-e"]),
+    ];
+
+    #[test]
+    fn each_terminal_is_told_to_run_a_command_its_own_way_and_one_that_takes_a_line_of_text_is_not_used() {
+        for (name, before) in CONVENTIONS {
+            assert_eq!(runs_with(name), Some(*before), "{name}");
+        }
+        assert_eq!(RUNS.len(), CONVENTIONS.len(), "a terminal without a tested convention");
+        // tilix and lxterminal take the command as one line to split; an unknown terminal is not guessed at
+        for name in ["tilix", "lxterminal", "my-own-terminal"] {
+            assert_eq!(runs_with(name), None, "{name}");
+        }
+    }
+
+    /// A stand-in for the terminal `name` in `dir`: it writes down the arguments it was started with, each ended by NUL,
+    /// to `<name>.argv`.
+    fn recording_terminal(dir: &Path, name: &str) -> std::path::PathBuf {
+        install_script(&dir.join(name), "printf '%s\\0' \"$@\" > \"$0.argv.part\" && mv \"$0.argv.part\" \"$0.argv\"")
+    }
+
+    /// A shell script at `path`, put there by `cp`: a file this process wrote itself may still be open for writing in
+    /// a child another test is just starting, and then cannot be run (ETXTBSY) until that child has started.
+    pub(crate) fn install_script(path: &Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let draft = path.with_extension("draft");
+        std::fs::write(&draft, format!("#!/bin/sh\n{body}\n")).unwrap();
+        assert!(Command::new("cp").arg(&draft).arg(path).status().unwrap().success());
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_path_buf()
+    }
+
+    fn wait_for(file: &Path) -> Vec<u8> {
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !file.exists() {
+            assert!(std::time::Instant::now() < limit, "{} was not started", file.display());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::read(file).unwrap()
+    }
+
+    #[test]
+    fn every_terminal_is_really_started_with_the_command_word_for_word_and_byte_for_byte() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let dir = std::env::temp_dir().join(format!("compression_terminal_runs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A program and a file whose name is not UTF-8 and has spaces, a line break, quotes and a leading dash
+        let file = std::ffi::OsString::from_vec(b"/home/me/-r \"x\" 'y'\n$(z) \xe4.txt".to_vec());
+        let command = [std::ffi::OsString::from("/usr/bin/vim"), std::ffi::OsString::from("+set nu"), file];
+        for (name, before) in CONVENTIONS {
+            let terminal = recording_terminal(&dir, name);
+            let started = run(&command, &terminal.to_string_lossy()).unwrap_or_else(|| panic!("{name} was not taken"));
+            started.unwrap();
+            let mut expected = Vec::new();
+            for word in before.iter().map(std::ffi::OsStr::new).chain(command.iter().map(|w| w.as_os_str())) {
+                expected.extend_from_slice(word.as_bytes());
+                expected.push(0);
+            }
+            assert_eq!(wait_for(&dir.join(format!("{name}.argv"))), expected, "{name}");
+        }
+        // A terminal not known to run a command is not started at all
+        let unknown = recording_terminal(&dir, "tilix");
+        assert!(run(&command, &unknown.to_string_lossy()).is_none());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!dir.join("tilix.argv").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_terminal_that_was_closed_is_collected_and_starting_it_does_not_wait() {
