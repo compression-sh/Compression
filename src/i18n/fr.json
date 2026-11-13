@@ -824,7 +824,7 @@
   "Nothing to disconnect it with was found": "Aucun outil pour le déconnecter n’a été trouvé",
   "{} on {}": "{} sur {}",
   "Could not reach {}": "Impossible de joindre {}",
-  "The server did not answer within 30 seconds": "Le serveur n’a pas répondu en 30 secondes",
+  "The server did not answer within {} seconds": "Le serveur n’a pas répondu en {} seconde|Le serveur n’a pas répondu en {} secondes",
   "The connection program printed too much": "Le programme de connexion a produit trop de sortie",
   "Edit custom theme": "Modifier le thème personnalisé",
   "Start from": "Partir de",

@@ -15,7 +15,7 @@ use std::sync::{LazyLock, Mutex, OnceLock, RwLock, mpsc};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 
-use crate::i18n::{tr, trf};
+use crate::i18n::{tr, trf, trn};
 
 /// A way of reaching files on another computer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1038,7 +1038,7 @@ impl Session {
                     }
                     if quiet_since.elapsed() >= timeout {
                         kill();
-                        outcome = Some(Err(Failure::Message(tr("The server did not answer within 30 seconds").to_owned())));
+                        outcome = Some(Err(Failure::Message(no_answer(timeout))));
                         break;
                     }
                     continue;
@@ -1481,7 +1481,7 @@ fn run_capturing(command: Command, input: Option<String>, stdout: bool, cancelle
     use super::process::run_capped_with;
     match run_capped_with(command, input.map(String::into_bytes), 1 << 20, timeout, cancelled) {
         Ok(output) => Ok((output.success, String::from_utf8_lossy(if stdout { &output.stdout } else { &output.stderr }).into_owned())),
-        Err(failure) => Err(failure_of(failure)),
+        Err(failure) => Err(failure_of(failure, timeout)),
     }
 }
 
@@ -1490,10 +1490,15 @@ const QUESTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// How long disconnecting a server may take.
 const DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn failure_of(failure: super::process::Failure) -> Failure {
+/// That a program did not answer within `timeout`, the time it was given.
+fn no_answer(timeout: std::time::Duration) -> String {
+    trn(timeout.as_secs() as usize, "The server did not answer within {} second", "The server did not answer within {} seconds")
+}
+
+fn failure_of(failure: super::process::Failure, timeout: std::time::Duration) -> Failure {
     use super::process::Failure as Stopped;
     match failure {
-        Stopped::TimedOut => Failure::Message(tr("The server did not answer within 30 seconds").to_owned()),
+        Stopped::TimedOut => Failure::Message(no_answer(timeout)),
         Stopped::TooMuchOutput => Failure::Message(tr("The connection program printed too much").to_owned()),
         Stopped::Cancelled => Failure::Cancelled,
         Stopped::Io(e) => Failure::Message(super::describe::io_error(&e)),
@@ -1503,7 +1508,7 @@ fn failure_of(failure: super::process::Failure) -> Failure {
 /// Runs a program that has a short answer to give, and stops it, with what it started, when it
 /// takes longer than `timeout`.
 fn output_within(command: Command, timeout: std::time::Duration) -> Result<super::process::Output, Failure> {
-    super::process::run_capped(command, 1 << 20, timeout).map_err(failure_of)
+    super::process::run_capped(command, 1 << 20, timeout).map_err(|failure| failure_of(failure, timeout))
 }
 
 /// Runs an unmount command: `Ok` when it worked, else what it said (or that it took too long).
@@ -1512,7 +1517,7 @@ fn unmount_with(command: Command, timeout: std::time::Duration) -> Result<(), St
         Ok(out) if out.success => Ok(()),
         Ok(out) => Err(last_line(&String::from_utf8_lossy(&out.stderr))),
         Err(Failure::Message(message)) => Err(message),
-        Err(_) => Err(tr("The server did not answer within 30 seconds").to_owned()),
+        Err(_) => Err(no_answer(timeout)),
     }
 }
 
@@ -1593,7 +1598,7 @@ pub fn disconnect(mount: &Mount) -> Result<(), String> {
                 Ok(out) if out.success => Ok(()),
                 Ok(out) => Err(clean_gio_error(&String::from_utf8_lossy(&out.stderr))),
                 Err(Failure::Message(message)) => Err(message),
-                Err(_) => Err(tr("The server did not answer within 30 seconds").to_owned()),
+                Err(_) => Err(no_answer(DISCONNECT_TIMEOUT)),
             }
         }
         MountKind::Helper | MountKind::System => {
@@ -1998,7 +2003,7 @@ mod tests {
     fn a_connection_program_that_hangs_is_stopped_at_the_time_limit() {
         let started = std::time::Instant::now();
         let result = run_capturing(sh("sleep 30"), None, false, &|| false, std::time::Duration::from_millis(200));
-        assert!(matches!(&result, Err(Failure::Message(m)) if *m == tr("The server did not answer within 30 seconds")), "wrong answer");
+        assert!(matches!(&result, Err(Failure::Message(m)) if *m == no_answer(std::time::Duration::from_millis(200))), "wrong answer");
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "it was not stopped");
     }
 
@@ -2025,8 +2030,8 @@ mod tests {
     fn short_questions_and_unmounts_are_stopped_when_they_hang_and_work_when_they_do_not() {
         let ms = std::time::Duration::from_millis;
         let started = std::time::Instant::now();
-        assert!(matches!(output_within(sh("sleep 30"), ms(200)), Err(Failure::Message(m)) if m == tr("The server did not answer within 30 seconds")));
-        assert_eq!(unmount_with(sh("sleep 30"), ms(200)), Err(tr("The server did not answer within 30 seconds").to_owned()));
+        assert!(matches!(output_within(sh("sleep 30"), ms(200)), Err(Failure::Message(m)) if m == no_answer(ms(200))));
+        assert_eq!(unmount_with(sh("sleep 30"), ms(200)), Err(no_answer(ms(200))));
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "they were not stopped");
         // Normal ones: the answer, the result, and what an unmount says when it fails
         let out = output_within(sh("echo 'local path: /run/user/1000/gvfs/x'"), std::time::Duration::from_secs(10)).ok().unwrap();
@@ -2057,7 +2062,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         let started = std::time::Instant::now();
         let result = session_with(rx).drive_gio(fake_gio("sleep 30"), &addr("sftp://h/"), std::time::Duration::from_millis(300));
-        assert!(matches!(&result, Err(Failure::Message(m)) if *m == tr("The server did not answer within 30 seconds")), "wrong answer");
+        assert!(matches!(&result, Err(Failure::Message(m)) if *m == no_answer(std::time::Duration::from_millis(300))), "wrong answer");
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "the mount was not stopped");
 
         // The window drops its sender while gio works
@@ -2272,9 +2277,29 @@ mod tests {
     }
 
     #[test]
+    fn a_program_that_took_too_long_is_told_with_the_time_it_had() {
+        let said = |timeout| match failure_of(super::super::process::Failure::TimedOut, timeout) {
+            Failure::Message(text) => text,
+            _ => panic!("not a message"),
+        };
+        assert_eq!(said(QUESTION_TIMEOUT), "The server did not answer within 10 seconds");
+        assert_eq!(said(DISCONNECT_TIMEOUT), "The server did not answer within 30 seconds");
+        assert_eq!(said(std::time::Duration::from_secs(1)), "The server did not answer within 1 second");
+        // Programs that are stopped for taking too long say the same, with their own time
+        let sh = |script: &str| {
+            let mut c = Command::new("sh");
+            c.args(["-c", script]);
+            c
+        };
+        let wait = std::time::Duration::from_millis(1200);
+        assert!(matches!(output_within(sh("sleep 30"), wait), Err(Failure::Message(m)) if m == "The server did not answer within 1 second"));
+        assert_eq!(unmount_with(sh("sleep 30"), wait), Err("The server did not answer within 1 second".to_owned()));
+    }
+
+    #[test]
     fn a_program_that_could_not_run_is_told_in_words_and_never_as_the_systems_english() {
         use super::super::process::Failure as Stopped;
-        let said = |failure| match failure_of(failure) {
+        let said = |failure| match failure_of(failure, QUESTION_TIMEOUT) {
             Failure::Message(text) => text,
             _ => panic!("not a message"),
         };
