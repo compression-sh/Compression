@@ -11495,7 +11495,6 @@ mod tests {
         let mount = |name: &str, host: &str| Mount { name: name.into(), address: Some(address(host)), local: work.join(name), kind: MountKind::Helper };
         w.app.net.servers.saved = vec![Server { name: "off".into(), address: address("off.example") }];
         w.app.net.mounts = vec![mount("up", "up.example"), mount("down", "down.example")];
-        let ctx = w.ctx.clone();
         // "down" is the one server that does not answer; its answer comes from a thread. The 30 s are a watchdog
         w.until("the answer of down", |w| {
             let c = w.ctx.clone();
