@@ -1284,6 +1284,8 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
     }
     let mut outcome = Outcome::done(message).with(effect);
     outcome.cancelled = was_cancelled;
+    // Called off at a question: not everything was done, so it is no success (what was done can still be undone)
+    outcome.ok = !was_cancelled;
     outcome
 }
 
@@ -1600,6 +1602,24 @@ mod tests {
         assert!(!base.join("dest/data/n3").exists(), "no half copy");
         assert!(base.join("dest/more/d.txt").exists(), "the next folder is merged too");
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_copy_called_off_at_a_question_is_no_success_and_keeps_what_it_did() {
+        let dir = sandbox("called_off");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("dst")).unwrap();
+        for f in ["a", "b"] {
+            std::fs::write(dir.join("src").join(f), f).unwrap();
+        }
+        std::fs::write(dir.join("dst/b"), "old").unwrap();
+        let pairs = vec![(dir.join("src/a"), dir.join("dst/a")), (dir.join("src/b"), dir.join("dst/b"))];
+        let (outcome, asked) = run_answering(Op::Move, pairs, |_| (Decision::Cancel, false));
+        assert_eq!(asked, vec![dir.join("dst/b")]);
+        assert!(outcome.cancelled && !outcome.ok, "a move that was called off counted as a success");
+        assert!(dir.join("dst/a").exists() && dir.join("src/b").exists());
+        assert!(matches!(outcome.effect, Effect::Record(_)), "what was moved can be undone");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
