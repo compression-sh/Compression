@@ -662,6 +662,7 @@ pub fn filled_icon_button(
 
     let color = if close { theme.text } else { lerp_color(theme.subtext1, accent.unwrap_or(theme.text), fx.hover.max(fx.press)) };
     paint_icon(ui.painter(), rect.center(), icon, if close { 9.0 } else { (size * 0.42).round() }, color);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tooltip));
     if tooltip.is_empty() { response } else { response.on_hover_text(tooltip) }
 }
 
@@ -810,6 +811,8 @@ pub fn chip_width(
         x += 22.0;
     }
     ui.painter().text(Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, label, egui::FontId::proportional(FONT_CHIP), color);
+    // A chip is a choice that is on or off: a button that is pressed or not
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, label));
     response
 }
 
@@ -1464,6 +1467,9 @@ pub fn file_row(
         response.scroll_to_me(Some(egui::Align::Center));
     }
     // A name that does not fit is whole in the tooltip
+    // An entry of the list of the folder, named by the file and saying whether it is selected
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ListItem, true, item.display_name()));
+    ui.ctx().accesskit_node_builder(response.id, |node| node.set_selected(selected));
     if shortened { response.on_hover_text(item.display_name()) } else { response }
 }
 
@@ -1525,6 +1531,8 @@ pub fn menu_submenu_item(
 pub fn dropdown(
     ui: &mut egui::Ui,
     id_source: impl std::hash::Hash + std::fmt::Debug,
+    // What is chosen, for a screen reader (the words shown beside it are drawn apart from it)
+    name: &str,
     options: &[String],
     selected: &mut usize,
     theme: &SerpantinumTheme,
@@ -1559,6 +1567,9 @@ pub fn dropdown(
         egui::Stroke::NONE,
     ));
 
+    // A combo box, named, with the option chosen as its value and whether its list is open
+    response.widget_info(|| egui::WidgetInfo { current_text_value: Some(shown.to_owned()), ..egui::WidgetInfo::labeled(egui::Role::ComboBox, true, name) });
+    ui.ctx().accesskit_node_builder(response.id, |node| node.set_expanded(open));
     let mut changed = false;
     egui::Popup::menu(&response)
         .gap(4.0)
@@ -1582,6 +1593,8 @@ pub fn dropdown(
                 paint_fill(ui.painter(), r, pill(r), layer, &fx);
                 let color = if current { theme.mauve } else { lerp_color(theme.subtext0, theme.text, fx.hover.max(fx.press)) };
                 paint_label(ui, rect.left() + 16.0, rect.center().y, label, FONT_BODY, color, rect.width() - 32.0);
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ListBoxOption, true, label));
+                ui.ctx().accesskit_node_builder(resp.id, |node| node.set_selected(current));
                 if resp.clicked() {
                     *selected = i;
                     changed = !current;
@@ -1671,6 +1684,9 @@ pub fn file_tile(
         response.scroll_to_me(Some(egui::Align::Center));
     }
     // A name that does not fit is whole in the tooltip
+    // An entry of the list of the folder, named by the file and saying whether it is selected
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ListItem, true, item.display_name()));
+    ui.ctx().accesskit_node_builder(response.id, |node| node.set_selected(selected));
     if shortened { response.on_hover_text(item.display_name()) } else { response }
 }
 
@@ -1777,6 +1793,52 @@ pub fn check_row(
 
 /// Setting row with a slider: icon and label at the left, a Material track with a round handle and the value at the right.
 /// Returns true when `value` changed.
+/// What a slider (`response`, over `lo..=hi`, now at `value`) is moved to from the keyboard while it has the focus
+/// (arrows a `step` each way, Home and End to the ends) or by a screen reader (increment, decrement), and what it tells
+/// a screen reader: its name `label`, value, ends and step. `None` when it is not moved.
+fn slider_access(ui: &egui::Ui, response: &egui::Response, label: &str, value: f32, (lo, hi): (f32, f32), step: f32) -> Option<f32> {
+    let mut moved = 0.0;
+    let mut to = None;
+    if response.has_focus() {
+        ui.input_mut(|i| {
+            for (key, by) in [(egui::Key::ArrowLeft, -step), (egui::Key::ArrowDown, -step), (egui::Key::ArrowRight, step), (egui::Key::ArrowUp, step)] {
+                if i.consume_key(egui::Modifiers::NONE, key) {
+                    moved += by;
+                }
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
+                to = Some(lo);
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::End) {
+                to = Some(hi);
+            }
+        });
+    }
+    ui.input(|i| {
+        let asked = |action| i.num_accesskit_action_requests(response.id, action) as f32;
+        moved += step * (asked(egui::accesskit::Action::Increment) - asked(egui::accesskit::Action::Decrement));
+    });
+    let new = (moved != 0.0 || to.is_some()).then(|| to.unwrap_or_else(|| ((value + moved) / step).round() * step).clamp(lo, hi));
+    let shown = new.unwrap_or(value);
+    response.widget_info(|| egui::WidgetInfo::slider(true, f64::from(shown), label));
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_min_numeric_value(f64::from(lo));
+        node.set_max_numeric_value(f64::from(hi));
+        node.set_numeric_value_step(f64::from(step));
+        node.add_action(egui::accesskit::Action::Increment);
+        node.add_action(egui::accesskit::Action::Decrement);
+    });
+    new.filter(|v| (v - value).abs() > f32::EPSILON)
+}
+
+/// The ring round a slider's handle at `center` while it has the keyboard focus.
+fn slider_focus(ui: &egui::Ui, response: &egui::Response, center: Pos2, handle_r: f32) {
+    if response.has_focus() && focus_visible(ui.ctx()) {
+        let ring = Rect::from_center_size(center, Vec2::splat(handle_r * 2.0 + 8.0));
+        paint_focus_ring(ui.painter(), ring, full(ring), 1.0);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn slider_row(
     ui: &mut egui::Ui,
@@ -1814,6 +1876,10 @@ pub fn slider_row(
                 changed = true;
             }
     }
+    if let Some(v) = slider_access(ui, &response, label, f32::from(*value), (lo, hi), 1.0) {
+        *value = v.round() as u8;
+        changed = true;
+    }
 
     let active = response.dragged();
     let hover = animate(ui.ctx(), id.with("hover"), response.hovered() || active);
@@ -1828,6 +1894,7 @@ pub fn slider_row(
         painter.circle_filled(Pos2::new(x, y), handle_r + 6.0, theme.with_alpha(theme.mauve, (hover * if active { 52.0 } else { 34.0 }) as u8));
     }
     painter.circle_filled(Pos2::new(x, y), handle_r - if active { 1.0 } else { 0.0 }, theme.mauve);
+    slider_focus(ui, &response, Pos2::new(x, y), handle_r);
 
     let galley = painter.layout_no_wrap(format!("{}{suffix}", *value), egui::FontId::proportional(FONT_BODY), theme.text);
     painter.galley(Pos2::new(rect.right() - 16.0 - galley.size().x, y - galley.size().y / 2.0), galley, theme.text);
@@ -1904,6 +1971,10 @@ pub fn marked_slider_row(
                 changed = true;
             }
     }
+    if let Some(v) = slider_access(ui, &response, label, *value, (lo, hi), 0.05) {
+        *value = v;
+        changed = true;
+    }
 
     let active = response.dragged();
     let hover = animate(ui.ctx(), id.with("hover"), response.hovered() || active);
@@ -1931,6 +2002,7 @@ pub fn marked_slider_row(
         painter.circle_filled(Pos2::new(x, y), handle_r + 6.0, theme.with_alpha(theme.mauve, (hover * if active { 52.0 } else { 34.0 }) as u8));
     }
     painter.circle_filled(Pos2::new(x, y), handle_r - if active { 1.0 } else { 0.0 }, theme.mauve);
+    slider_focus(ui, &response, Pos2::new(x, y), handle_r);
 
     let shown = format!("{:.2}", *value);
     let shown = shown.trim_end_matches('0').trim_end_matches('.');
@@ -2165,7 +2237,7 @@ pub fn choice_row_with(
         let dd_rect = Rect::from_min_size(Pos2::new(rect.right() - dd_w - 8.0, rect.center().y - 16.0), Vec2::new(dd_w, 32.0));
         let owned: Vec<String> = options.iter().map(|o| (*o).to_owned()).collect();
         let mut pick = selected;
-        let changed = ui.scope_builder(egui::UiBuilder::new().max_rect(dd_rect), |ui| dropdown(ui, id, &owned, &mut pick, theme)).inner;
+        let changed = ui.scope_builder(egui::UiBuilder::new().max_rect(dd_rect), |ui| dropdown(ui, id, label, &owned, &mut pick, theme)).inner;
         return changed.then_some(pick);
     }
 
@@ -2387,6 +2459,11 @@ pub fn dialog_header_sized(
     const SIZE: f32 = 30.0;
     let mut close = false;
     let mut hearted = false;
+    // The part of the window the header is the top of is the dialog, named by its title
+    ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+        node.set_role(egui::Role::Dialog);
+        node.set_label(title);
+    });
     ui.horizontal_top(|ui| {
         if let Some(on) = heart {
             let (icon, tip) = if on { (icons::HEART, tr("Remove from bookmarks")) } else { (icons::HEART_OUTLINE, tr("Add to bookmarks")) };
@@ -2810,6 +2887,85 @@ mod accessibility_tests {
             }
         }
         found
+    }
+
+    /// Every node a screen reader is told of after a few frames of `add`, with `events` one per frame from the second
+    /// on, as keys are pressed one after the other.
+    fn tree(events: Vec<egui::Event>, mut add: impl FnMut(&mut egui::Ui)) -> Vec<(egui::accesskit::NodeId, egui::accesskit::Node)> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut found = Vec::new();
+        for n in 0..events.len() + 3 {
+            let now = n.checked_sub(1).and_then(|at| events.get(at)).cloned().into_iter().collect();
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))), time: Some(n as f64 * 0.05), events: now, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| add(ui));
+            out.textures_delta.clear();
+            if let Some(update) = out.platform_output.accesskit_update {
+                found = update.nodes;
+            }
+        }
+        found
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    #[test]
+    fn chips_dropdowns_and_close_buttons_say_what_they_are() {
+        use egui::Role;
+        use egui::accesskit::Toggled;
+        let theme = SerpantinumTheme::default();
+        assert_eq!(accessible(|ui| { chip(ui, "c", None, "Images", &theme, true); }), [(Role::Button, Some("Images".to_owned()), Some(Toggled::True), false, false)]);
+        assert_eq!(accessible(|ui| { chip(ui, "c", None, "Images", &theme, false); }), [(Role::Button, Some("Images".to_owned()), Some(Toggled::False), false, false)]);
+        assert_eq!(accessible(|ui| { filled_icon_button(ui, "x", icons::CLOSE, &theme, CLOSE_BUTTON, "Close", None); }), [(Role::Button, Some("Close".to_owned()), None, false, false)]);
+        let options = vec!["PDF".to_owned(), "Images".to_owned()];
+        let nodes = tree(Vec::new(), |ui| {
+            let mut at = 1;
+            dropdown(ui, "d", "File type", &options, &mut at, &theme);
+        });
+        let combo = nodes.iter().map(|(_, n)| n).find(|n| n.role() == Role::ComboBox).expect("no combo box");
+        assert_eq!((combo.label(), combo.value(), combo.is_expanded()), (Some("File type"), Some("Images"), Some(false)));
+    }
+
+    #[test]
+    fn a_slider_is_named_tells_its_value_and_ends_and_moves_from_the_keyboard_and_for_a_screen_reader() {
+        use egui::Role;
+        let theme = SerpantinumTheme::default();
+        let slider = |nodes: &[(egui::accesskit::NodeId, egui::accesskit::Node)]| nodes.iter().find(|(_, n)| n.role() == Role::Slider).cloned().expect("no slider");
+        // Tab to it, then arrows, Home and End
+        for (keys, start, expected) in [
+            (vec![key(egui::Key::Tab), key(egui::Key::ArrowRight)], 50u8, 51u8),
+            (vec![key(egui::Key::Tab), key(egui::Key::ArrowDown)], 50, 49),
+            (vec![key(egui::Key::Tab), key(egui::Key::End)], 50, 100),
+            (vec![key(egui::Key::Tab), key(egui::Key::Home)], 50, 1),
+            // Without the focus, keys are not its
+            (vec![key(egui::Key::ArrowRight)], 50, 50),
+        ] {
+            let mut value = start;
+            let nodes = tree(keys.clone(), |ui| {
+                slider_row(ui, "o", icons::VISIBILITY, "Opacity", &theme, &mut value, 1..=100, "%");
+            });
+            assert_eq!(value, expected, "{keys:?}");
+            let (_, node) = slider(&nodes);
+            assert_eq!((node.label(), node.numeric_value(), node.min_numeric_value(), node.max_numeric_value()), (Some("Opacity"), Some(f64::from(expected)), Some(1.0), Some(100.0)));
+        }
+        // The marked slider, in steps of 0.05, and what a screen reader asks for
+        let mut value = 1.0;
+        let first = tree(Vec::new(), |ui| {
+            marked_slider_row(ui, "m", icons::MOUSE, "Wheel scroll speed", &theme, &mut value, 0.25..=2.25, &[(1.0, "Default")], "×", None);
+        });
+        let (id, node) = slider(&first);
+        assert_eq!((node.label(), node.numeric_value_step()), (Some("Wheel scroll speed"), Some(0.05000000074505806)));
+        let ask = |action| egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest { action, target_tree: egui::accesskit::TreeId::ROOT, target_node: id, data: None });
+        tree(vec![ask(egui::accesskit::Action::Increment)], |ui| {
+            marked_slider_row(ui, "m", icons::MOUSE, "Wheel scroll speed", &theme, &mut value, 0.25..=2.25, &[(1.0, "Default")], "×", None);
+        });
+        assert!((value - 1.05).abs() < 1e-4, "{value}");
+        tree(vec![key(egui::Key::Tab), key(egui::Key::ArrowLeft), key(egui::Key::ArrowLeft)], |ui| {
+            marked_slider_row(ui, "m", icons::MOUSE, "Wheel scroll speed", &theme, &mut value, 0.25..=2.25, &[(1.0, "Default")], "×", None);
+        });
+        assert!((value - 0.95).abs() < 1e-4, "{value}");
     }
 
     #[test]

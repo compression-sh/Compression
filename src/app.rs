@@ -5020,7 +5020,9 @@ impl CompressionApp {
                             ui.set_min_height(material::BUTTON_HEIGHT);
                             ui.scope(|ui| {
                                 ui.set_max_width(label_width);
-                                ui.add(egui::Label::new(egui::RichText::new(message).size(material::FONT_BODY).color(theme.text)).wrap_mode(egui::TextWrapMode::Wrap));
+                                let said = ui.add(egui::Label::new(egui::RichText::new(message).size(material::FONT_BODY).color(theme.text)).wrap_mode(egui::TextWrapMode::Wrap));
+                                // Said by a screen reader when it comes, without taking the focus from what the person is doing
+                                ctx.accesskit_node_builder(said.id, |node| node.set_live(egui::accesskit::Live::Polite));
                             });
                             if has_action {
                                 ui.add_space(8.0);
@@ -9788,6 +9790,45 @@ mod tests {
     }
 
     #[test]
+    fn a_screen_reader_hears_the_files_with_their_selection_the_dialogs_by_their_title_and_the_messages_as_they_come() {
+        use egui::accesskit::{Live, Node, NodeId, Role};
+        let work = window_dir("screen_reader");
+        for name in ["alpha.txt", "beta.txt"] {
+            std::fs::write(work.join(name), name).unwrap();
+        }
+        let mut w = Window::new(work.clone());
+        w.ctx.enable_accesskit();
+        w.until("the files", |w| w.shows("alpha.txt") && w.shows("beta.txt"));
+        w.click(w.at("alpha.txt"), egui::PointerButton::Primary);
+        w.run(Vec::new(), 3);
+        let nodes = |w: &Window| -> std::collections::HashMap<NodeId, Node> { w.access.as_ref().expect("nothing was told").nodes.iter().cloned().collect() };
+        let tree = nodes(&w);
+        let item = |name: &str| tree.values().find(|n| n.role() == Role::ListItem && n.label() == Some(name)).unwrap_or_else(|| panic!("{name} is not in the list"));
+        assert_eq!(item("alpha.txt").is_selected(), Some(true));
+        assert_eq!(item("beta.txt").is_selected(), Some(false));
+        // A message is said when it comes, without moving the focus
+        w.app.set_toast("Copied 2 items");
+        w.run(Vec::new(), 3);
+        let tree = nodes(&w);
+        assert!(tree.values().any(|n| n.value() == Some("Copied 2 items") && n.live() == Some(Live::Polite)), "the message is not said");
+        // A dialog is one, named by its title, and its close button is inside it
+        w.app.dialog = Some(Dialog::Alert { title: "Can't move a file over itself".into(), body: "It is already here.".into() });
+        w.run(Vec::new(), 5);
+        let tree = nodes(&w);
+        let (dialog, _) = tree.iter().find(|(_, n)| n.role() == Role::Dialog).expect("no dialog");
+        assert_eq!(tree[dialog].label(), Some("Can't move a file over itself"));
+        let mut inside = vec![*dialog];
+        let mut close = false;
+        while let Some(id) = inside.pop() {
+            let Some(node) = tree.get(&id) else { continue };
+            close |= node.role() == Role::Button && node.label() == Some("Close");
+            inside.extend(node.children().iter().copied());
+        }
+        assert!(close, "the close button is not part of the dialog");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
     fn another_window_moving_on_is_taken_up_without_a_message() {
         let ctx = egui::Context::default();
         let mut app = CompressionApp::new(std::env::temp_dir(), SerpantinumTheme::default(), Settings::default(), &ctx);
@@ -10062,6 +10103,8 @@ mod tests {
         shapes: Vec<(String, egui::Rect)>,
         /// Circles drawn last frame: where, how big, filled with what, and the stroke color if outlined.
         circles: Vec<(egui::Pos2, f32, egui::Color32, egui::Color32)>,
+        /// What a screen reader was told last, once `ctx.enable_accesskit()` was called.
+        access: Option<egui::accesskit::TreeUpdate>,
     }
 
     impl Window {
@@ -10072,7 +10115,7 @@ mod tests {
             // The settings file is shared by the whole test run; a window that watched it would take over what another
             // test writes there (its search scope, its sort order) in the middle of its own steps
             app.settings_watch = None;
-            let mut window = Self { app, ctx, frame: eframe::Frame::_new_kittest(), time: 0.0, last: Vec::new(), shapes: Vec::new(), circles: Vec::new() };
+            let mut window = Self { app, ctx, frame: eframe::Frame::_new_kittest(), time: 0.0, last: Vec::new(), shapes: Vec::new(), circles: Vec::new(), access: None };
             window.run(Vec::new(), 12);
             window
         }
@@ -10094,6 +10137,9 @@ mod tests {
                 let (app, frame) = (&mut self.app, &mut self.frame);
                 let mut out = self.ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, frame));
                 out.textures_delta.clear();
+                if let Some(update) = out.platform_output.accesskit_update.take() {
+                    self.access = Some(update);
+                }
                 self.shapes.clear();
                 self.circles.clear();
                 for clipped in &out.shapes {
@@ -10561,7 +10607,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(std::io::Error::from_raw_os_error(libc::EACCES)).unwrap();
         app.admin_launch = Some(rx);
-        let mut w = Window { app, ctx: egui::Context::default(), frame: eframe::Frame::_new_kittest(), time: 0.0, last: Vec::new(), shapes: Vec::new(), circles: Vec::new() };
+        let mut w = Window { app, ctx: egui::Context::default(), frame: eframe::Frame::_new_kittest(), time: 0.0, last: Vec::new(), shapes: Vec::new(), circles: Vec::new(), access: None };
         w.run(Vec::new(), 3);
         assert_eq!(w.app.toast_message(), Some("Permission denied"));
     }

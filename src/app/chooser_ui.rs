@@ -205,7 +205,7 @@ impl CompressionApp {
                         if !ch.spec.filters.is_empty() {
                             let labels: Vec<String> = ch.spec.filters.iter().map(|f| f.label.clone()).collect();
                             // The listing is read again below, once the chooser is back: it filters by it
-                            filter_changed = material::dropdown(ui, "chooser_filter", &labels, &mut ch.filter, &theme);
+                            filter_changed = material::dropdown(ui, "chooser_filter", tr("File type"), &labels, &mut ch.filter, &theme);
                         }
                         let Chooser { spec, choice_values, .. } = &mut ch;
                         for (choice, value) in spec.choices.iter().zip(choice_values.iter_mut()) {
@@ -218,7 +218,7 @@ impl CompressionApp {
                                 ui.label(egui::RichText::new(choice.label.replace('_', "")).size(material::FONT_CAPTION).color(theme.subtext1));
                                 let labels: Vec<String> = choice.options.iter().map(|(_, label)| label.clone()).collect();
                                 let mut at = choice.options.iter().position(|(id, _)| id == value).unwrap_or(0);
-                                if material::dropdown(ui, ("chooser_choice", &choice.id), &labels, &mut at, &theme) {
+                                if material::dropdown(ui, ("chooser_choice", &choice.id), &choice.label.replace('_', ""), &labels, &mut at, &theme) {
                                     *value = choice.options[at].0.clone();
                                 }
                             }
