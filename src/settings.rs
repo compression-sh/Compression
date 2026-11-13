@@ -512,7 +512,21 @@ impl Settings {
             std::fs::create_dir_all(dir)?;
         }
         let kept = set_aside_if_broken(file)?.map(|(kept, _)| kept);
-        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        let mut value = serde_json::to_value(self).map_err(std::io::Error::other)?;
+        // What `managed.json` lays over the settings is not the person's own choice: each of its keys keeps what the
+        // person's file had (or stays out of it), so taking a key out of the managed file gives their choice back
+        let object = |text: String| serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.as_object().cloned());
+        let managed = std::fs::read_to_string(file.with_file_name("managed.json")).ok().and_then(object);
+        if let (Some(managed), Some(out)) = (managed, value.as_object_mut()) {
+            let own = std::fs::read_to_string(file).ok().and_then(object).unwrap_or_default();
+            for key in managed.keys() {
+                match own.get(key) {
+                    Some(mine) => out.insert(key.clone(), mine.clone()),
+                    None => out.remove(key),
+                };
+            }
+        }
+        let json = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
         crate::fs::atomic::write(file, json)?;
         Ok(kept)
     }
@@ -548,6 +562,33 @@ pub(crate) fn set_aside_if_broken(file: &std::path::Path) -> std::io::Result<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_managed_value_is_never_saved_as_the_persons_own_and_their_choice_comes_back_when_it_is_taken_out() {
+        let dir = std::env::temp_dir().join(format!("compression_managed_save_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let own = dir.join("settings.json");
+        let managed = dir.join("managed.json");
+        std::fs::write(&own, r#"{ "show_hidden": false, "theme": "nord" }"#).unwrap();
+        std::fs::write(&managed, r#"{ "show_hidden": true, "folders_first": false }"#).unwrap();
+        let mut settings = Settings::parse_with(&std::fs::read_to_string(&own).unwrap(), Some(&std::fs::read_to_string(&managed).unwrap())).unwrap();
+        assert!(settings.show_hidden && !settings.folders_first, "managed.json is laid over");
+        // A choice the person makes in the window is kept; the managed values stay out of their file
+        settings.theme = "dark".to_owned();
+        settings.save_to(&own).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&own).unwrap()).unwrap();
+        assert_eq!(saved["theme"], "dark");
+        assert_eq!(saved["show_hidden"], false, "the managed value was saved as the person's own");
+        assert!(saved.get("folders_first").is_none(), "a managed key the person never set was written into their file");
+        // Taken out of home-manager: the person's own choice is back, and a key they never set has its default
+        std::fs::remove_file(&managed).unwrap();
+        let back = Settings::parse_with(&std::fs::read_to_string(&own).unwrap(), None).unwrap();
+        assert!(!back.show_hidden);
+        assert_eq!(back.folders_first, Settings::default().folders_first);
+        assert_eq!(back.theme, "dark");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn an_administrator_session_ignores_the_terminal_command_of_the_settings() {
