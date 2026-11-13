@@ -100,7 +100,7 @@ impl Registry {
     }
 
     fn load() -> Self {
-        let mut registry: Registry = Self::file().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let mut registry: Registry = Self::file().map(|f| crate::fs::stored::load_json(&f)).unwrap_or_default();
         registry.validate(|p| read_tags(p).ok());
         registry
     }
@@ -111,11 +111,8 @@ impl Registry {
             return;
         }
         let Some(file) = Self::file() else { return };
-        if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         if let Ok(json) = serde_json::to_string(self) {
-            let _ = crate::fs::atomic::write(&file, json);
+            let _ = crate::fs::stored::save(&file, json);
         }
     }
 
@@ -283,7 +280,7 @@ fn colors_file() -> Option<PathBuf> {
 
 impl Tags {
     pub fn load() -> Self {
-        let colors = colors_file().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let colors = colors_file().map(|f| crate::fs::stored::load_json(&f)).unwrap_or_default();
         Self::with(Registry::load(), colors)
     }
 
@@ -297,11 +294,8 @@ impl Tags {
 
     fn save_colors(&self) {
         let Some(file) = colors_file() else { return };
-        if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         if let Ok(json) = serde_json::to_string_pretty(&self.colors) {
-            let _ = crate::fs::atomic::write(&file, json);
+            let _ = crate::fs::stored::save(&file, json);
         }
     }
 

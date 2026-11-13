@@ -963,5 +963,11 @@
   "“{}” is still needed by “{}”. Wait until it is done, then unmount.": "« {} » est encore utilisé par « {} ». Attendez la fin, puis démontez.",
   "“{}” is still needed by “{}”. Wait until it is done, then eject.": "« {} » est encore utilisé par « {} ». Attendez la fin, puis éjectez.",
   "“{}” is being disconnected or unmounted. Try again once that is done.": "« {} » est en cours de déconnexion ou de démontage. Réessayez une fois terminé.",
-  "The server is being disconnected. Try again once that is done.": "Le serveur est en cours de déconnexion. Réessayez une fois terminé."
+  "The server is being disconnected. Try again once that is done.": "Le serveur est en cours de déconnexion. Réessayez une fois terminé.",
+  "It could not be read, so it is not written over": "Il n’a pas pu être lu, il n’est donc pas écrasé",
+  "“{}” could not be read ({}). It is left as it is, and changes are not saved to it.": "« {} » n’a pas pu être lu ({}). Il reste tel quel et les modifications n’y sont pas enregistrées.",
+  "“{}” could not be read. It is left as it is, and changes are not saved to it.": "« {} » n’a pas pu être lu. Il reste tel quel et les modifications n’y sont pas enregistrées.",
+  "“{}” could not be read and was kept as “{}”. It starts empty.": "« {} » n’a pas pu être lu et a été conservé sous « {} ». Il repart vide.",
+  "“{}” could not be read, and could not be kept aside ({}). It is left as it is, and changes are not saved to it.": "« {} » n’a pas pu être lu ni mis de côté ({}). Il reste tel quel et les modifications n’y sont pas enregistrées.",
+  "“{}” could not be saved: {}": "« {} » n’a pas pu être enregistré : {}"
 }

@@ -963,5 +963,11 @@
   "“{}” is still needed by “{}”. Wait until it is done, then unmount.": "«{}» todavía lo necesita «{}». Espera a que termine y desmonta después.",
   "“{}” is still needed by “{}”. Wait until it is done, then eject.": "«{}» todavía lo necesita «{}». Espera a que termine y expulsa después.",
   "“{}” is being disconnected or unmounted. Try again once that is done.": "«{}» se está desconectando o desmontando. Inténtalo de nuevo cuando termine.",
-  "The server is being disconnected. Try again once that is done.": "El servidor se está desconectando. Inténtalo de nuevo cuando termine."
+  "The server is being disconnected. Try again once that is done.": "El servidor se está desconectando. Inténtalo de nuevo cuando termine.",
+  "It could not be read, so it is not written over": "No se pudo leer, así que no se sobrescribe",
+  "“{}” could not be read ({}). It is left as it is, and changes are not saved to it.": "No se pudo leer «{}» ({}). Se deja como está y los cambios no se guardan en él.",
+  "“{}” could not be read. It is left as it is, and changes are not saved to it.": "No se pudo leer «{}». Se deja como está y los cambios no se guardan en él.",
+  "“{}” could not be read and was kept as “{}”. It starts empty.": "No se pudo leer «{}» y se guardó como «{}». Empieza vacío.",
+  "“{}” could not be read, and could not be kept aside ({}). It is left as it is, and changes are not saved to it.": "No se pudo leer «{}» ni apartar ({}). Se deja como está y los cambios no se guardan en él.",
+  "“{}” could not be saved: {}": "No se pudo guardar «{}»: {}"
 }

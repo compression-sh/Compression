@@ -963,5 +963,11 @@
   "“{}” is still needed by “{}”. Wait until it is done, then unmount.": "“{}” vẫn đang được “{}” sử dụng. Hãy đợi xong rồi gỡ gắn kết.",
   "“{}” is still needed by “{}”. Wait until it is done, then eject.": "“{}” vẫn đang được “{}” sử dụng. Hãy đợi xong rồi đẩy ra.",
   "“{}” is being disconnected or unmounted. Try again once that is done.": "“{}” đang được ngắt kết nối hoặc gỡ gắn kết. Hãy thử lại khi xong.",
-  "The server is being disconnected. Try again once that is done.": "Máy chủ đang được ngắt kết nối. Hãy thử lại khi xong."
+  "The server is being disconnected. Try again once that is done.": "Máy chủ đang được ngắt kết nối. Hãy thử lại khi xong.",
+  "It could not be read, so it is not written over": "Không đọc được nên sẽ không bị ghi đè",
+  "“{}” could not be read ({}). It is left as it is, and changes are not saved to it.": "Không đọc được “{}” ({}). Tệp được giữ nguyên và thay đổi sẽ không được lưu vào đó.",
+  "“{}” could not be read. It is left as it is, and changes are not saved to it.": "Không đọc được “{}”. Tệp được giữ nguyên và thay đổi sẽ không được lưu vào đó.",
+  "“{}” could not be read and was kept as “{}”. It starts empty.": "Không đọc được “{}” nên đã được giữ lại thành “{}”. Danh sách bắt đầu trống.",
+  "“{}” could not be read, and could not be kept aside ({}). It is left as it is, and changes are not saved to it.": "Không đọc được “{}” và cũng không thể để riêng ({}). Tệp được giữ nguyên và thay đổi sẽ không được lưu vào đó.",
+  "“{}” could not be saved: {}": "Không lưu được “{}”: {}"
 }

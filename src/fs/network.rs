@@ -1573,9 +1573,8 @@ fn identity_hash(root: &Address) -> u64 {
 
 fn write_record(id: &str, address: &Address) {
     let Some(dir) = helper_records() else { return };
-    let _ = std::fs::create_dir_all(&dir);
     if let Ok(json) = serde_json::to_string(address) {
-        let _ = crate::fs::atomic::write(&dir.join(format!("{id}.json")), json);
+        let _ = crate::fs::stored::save(&dir.join(format!("{id}.json")), json);
     }
 }
 
@@ -1748,13 +1747,16 @@ impl Servers {
             return;
         }
         let Some(file) = Self::file() else { return };
-        let _ = self.save_to(&file);
+        // Said once (`stored`); the list stays in the window for the next try
+        if let Err(err) = self.save_to(&file) {
+            crate::fs::stored::report(&file, &err);
+        }
     }
 
     fn save_to(&self, file: &Path) -> std::io::Result<()> {
-        // A list that could not be read and could not be put aside stays as it is on disk
+        // A list that could not be read and could not be put aside stays as it is on disk: not written, and said
         if self.locked {
-            return Ok(());
+            return Err(std::io::Error::other(tr("It could not be read, so it is not written over")));
         }
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir)?;
@@ -2219,7 +2221,7 @@ mod tests {
         let (servers, problem) = Servers::load_from(&file);
         assert_eq!(problem, Some(LoadProblem::NotKept));
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        servers.save_to(&file).unwrap();
+        assert!(servers.save_to(&file).is_err(), "a save that does not happen is not a success");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "not json", "the list is not written over the file");
         std::fs::remove_dir_all(&dir).unwrap();
     }

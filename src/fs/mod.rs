@@ -27,3 +27,4 @@ pub mod network;
 pub mod mount_health;
 pub mod secrets;
 pub mod resources;
+pub mod stored;

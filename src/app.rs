@@ -3258,6 +3258,12 @@ impl eframe::App for CompressionApp {
         self.chooser_escape(&ctx, escape_is_taken);
         self.sync_selection(false);
         self.poll_jobs();
+        // What went wrong with the files Compression keeps for the person (pins, bookmarks, …): said once, after what
+        // was said for the action itself, so no success stands for a save that failed
+        let notes = crate::fs::stored::take_notes();
+        if !notes.is_empty() {
+            self.set_toast(notes.join(" · "));
+        }
         self.poll_opened();
         self.poll_clipboard();
         self.poll_defaults();
@@ -11548,6 +11554,25 @@ mod tests {
         assert_eq!(job.kind, JobKind::Permissions);
         assert!(job.controllable());
         std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_of_a_kept_list_is_said_once_in_the_window_and_no_success_stands_for_it() {
+        let work = window_dir("stored_note");
+        let mut w = Window::new(work.clone());
+        std::fs::write(work.join("blocker"), "x").unwrap();
+        // An action says it worked, and its list could not be saved: the window says the failure instead
+        w.app.set_toast("Added to bookmarks");
+        let _ = crate::fs::stored::save(&work.join("blocker/bookmarks.json"), "[]");
+        w.run(Vec::new(), 1);
+        let said = w.app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+        assert!(said.starts_with("“bookmarks.json” could not be saved: "), "{said}");
+        // Not said again in the next frames, nor for the same failure again
+        w.app.status_toast = None;
+        let _ = crate::fs::stored::save(&work.join("blocker/bookmarks.json"), "[]");
+        w.run(Vec::new(), 3);
+        assert!(w.app.status_toast.is_none(), "{:?}", w.app.status_toast.as_ref().map(|t| t.message.clone()));
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]

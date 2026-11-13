@@ -177,13 +177,10 @@ fn load_paths(name: &str) -> Vec<PathBuf> {
 }
 
 fn load_paths_from(file: &std::path::Path) -> Vec<PathBuf> {
-    Some(file)
-        .and_then(|f| std::fs::read_to_string(f).ok())
-        // Every entry is kept, also one whose drive is not plugged in or whose server is not connected now: it is not
-        // there for the moment, which is no reason to drop it from the list when the next change is saved. Opening it
-        // says that it is not there
-        .and_then(|s| serde_json::from_str::<Vec<PathBuf>>(&s).ok())
-        .unwrap_or_default()
+    // Every entry is kept, also one whose drive is not plugged in or whose server is not connected now: it is not there
+    // for the moment, which is no reason to drop it from the list when the next change is saved. Opening it says that
+    // it is not there. A file that cannot be read is kept aside, not written over (`stored`)
+    crate::fs::stored::load_json(file)
 }
 
 /// Where the person's own list is written: nowhere in a test, which must never touch the files of whoever runs it.
@@ -197,30 +194,22 @@ fn save_paths(name: &str, paths: &[PathBuf]) {
     }
 }
 
+/// A failure is said by `stored` (once), and the list stays in the window for the next try.
 fn save_paths_to(file: &std::path::Path, paths: &[PathBuf]) {
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     if let Ok(json) = serde_json::to_string_pretty(paths) {
-        let _ = crate::fs::atomic::write(file, json);
+        let _ = crate::fs::stored::save(file, json);
     }
 }
 
 /// Custom folder icons: folder path -> image path, saved in `~/.config/compression/folder_icons.json`.
 pub fn load_folder_icons() -> HashMap<PathBuf, PathBuf> {
-    config_file("folder_icons.json")
-        .and_then(|f| std::fs::read_to_string(f).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    config_file("folder_icons.json").map(|f| crate::fs::stored::load_json(&f)).unwrap_or_default()
 }
 
 pub fn save_folder_icons(icons: &HashMap<PathBuf, PathBuf>) {
     let Some(file) = user_file_to_write("folder_icons.json") else { return };
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     if let Ok(json) = serde_json::to_string_pretty(icons) {
-        let _ = crate::fs::atomic::write(&file, json);
+        let _ = crate::fs::stored::save(&file, json);
     }
 }
 
@@ -232,10 +221,7 @@ static FOLDER_GLYPHS: std::sync::RwLock<Option<HashMap<PathBuf, char>>> = std::s
 fn with_glyphs<R>(f: impl FnOnce(&mut HashMap<PathBuf, char>) -> R) -> R {
     let mut guard = FOLDER_GLYPHS.write().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(|| {
-        config_file("folder_glyphs.json")
-            .and_then(|f| std::fs::read_to_string(f).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        config_file("folder_glyphs.json").map(|f| crate::fs::stored::load_json(&f)).unwrap_or_default()
     });
     f(map)
 }
@@ -251,13 +237,11 @@ pub fn set_folder_glyph(folder: &std::path::Path, glyph: Option<char>) -> bool {
             Some(c) => m.insert(folder.to_path_buf(), c) != Some(c),
             None => m.remove(folder).is_some(),
         };
-        if changed && let Some(file) = user_file_to_write("folder_glyphs.json") {
-            if let Some(dir) = file.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Ok(json) = serde_json::to_string_pretty(&*m) {
-                let _ = crate::fs::atomic::write(&file, json);
-            }
+        if changed
+            && let Some(file) = user_file_to_write("folder_glyphs.json")
+            && let Ok(json) = serde_json::to_string_pretty(&*m)
+        {
+            let _ = crate::fs::stored::save(&file, json);
         }
         changed
     })
@@ -282,13 +266,10 @@ pub fn move_folder_glyphs(moves: &[(PathBuf, PathBuf)]) {
             return;
         }
         *m = moved;
-        if let Some(file) = user_file_to_write("folder_glyphs.json") {
-            if let Some(dir) = file.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Ok(json) = serde_json::to_string_pretty(&*m) {
-                let _ = crate::fs::atomic::write(&file, json);
-            }
+        if let Some(file) = user_file_to_write("folder_glyphs.json")
+            && let Ok(json) = serde_json::to_string_pretty(&*m)
+        {
+            let _ = crate::fs::stored::save(&file, json);
         }
     });
 }
@@ -311,6 +292,32 @@ fn config_file_to_write(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_broken_list_file_is_kept_aside_and_a_save_that_fails_is_said() {
+        let dir = std::env::temp_dir().join(format!("compression_places_broken_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("bookmarks.json");
+        let broken = "[\"/home/me/Projects\", \"/home/me/Music\",]";
+        std::fs::write(&file, broken).unwrap();
+        let mut loaded = load_paths_from(&file);
+        assert!(loaded.is_empty());
+        loaded.push(dir.join("new"));
+        save_paths_to(&file, &loaded);
+        assert_eq!(std::fs::read_to_string(dir.join("bookmarks.json.broken")).unwrap(), broken, "the hand-edited list is kept");
+        assert_eq!(load_paths_from(&file), vec![dir.join("new")]);
+        let notes = crate::fs::stored::take_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        // A save that cannot happen is said, once
+        std::fs::write(dir.join("blocker"), "x").unwrap();
+        save_paths_to(&dir.join("blocker/pins.json"), &loaded);
+        save_paths_to(&dir.join("blocker/pins.json"), &loaded);
+        let notes = crate::fs::stored::take_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("“pins.json” could not be saved"), "{notes:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_saved_folder_on_a_drive_that_is_not_there_now_is_kept_through_loading_and_saving() {

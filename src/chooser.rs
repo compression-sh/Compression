@@ -254,10 +254,7 @@ pub fn saved_size() -> Option<[f32; 2]> {
 
 fn save_size([w, h]: [f32; 2]) {
     let Some(file) = size_file() else { return };
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = crate::fs::atomic::write(&file, format!("{w}x{h}"));
+    let _ = crate::fs::stored::save(&file, format!("{w}x{h}"));
 }
 
 fn folders_file() -> Option<PathBuf> {
@@ -274,17 +271,11 @@ pub fn remembered_folder(app_id: Option<&str>) -> Option<PathBuf> {
 fn remember_folder(app_id: Option<&str>, folder: &Path) {
     let Some(file) = folders_file() else { return };
     let key = app_id.unwrap_or("");
-    let mut lines: Vec<String> = std::fs::read_to_string(&file)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| l.split_once('\t').is_some_and(|(id, _)| id != key))
-        .map(str::to_owned)
-        .collect();
+    // The folders of the other programs stay: a file that cannot be read is not written over (`stored`)
+    let text = crate::fs::stored::load_with(&file, |bytes| String::from_utf8(bytes.to_vec()).ok()).unwrap_or_default();
+    let mut lines: Vec<String> = text.lines().filter(|l| l.split_once('\t').is_some_and(|(id, _)| id != key)).map(str::to_owned).collect();
     lines.push(format!("{key}\t{}", folder.display()));
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = crate::fs::atomic::write(&file, lines.join("\n") + "\n");
+    let _ = crate::fs::stored::save(&file, lines.join("\n") + "\n");
 }
 
 impl Chooser {

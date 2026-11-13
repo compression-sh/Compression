@@ -77,22 +77,20 @@ fn load_history() -> Vec<Entry> {
 
 /// The history in `file`. Files written before entries carried times get the file's modification time, one second
 /// apart, so they still interleave sensibly with other apps.
+/// A file that can be read in neither form is kept aside, not written over (`stored`).
 fn load_history_from(file: &std::path::Path) -> Vec<Entry> {
-    let Ok(text) = std::fs::read_to_string(file) else { return Vec::new() };
-    if let Ok(entries) = serde_json::from_str::<Vec<Entry>>(&text) {
-        return entries;
-    }
     let base = std::fs::metadata(file)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs());
-    serde_json::from_str::<Vec<PathBuf>>(&text)
-        .unwrap_or_default()
-        .into_iter()
-        .enumerate()
-        .map(|(i, path)| Entry { path, at: base.saturating_sub(i as u64) })
-        .collect()
+    crate::fs::stored::load_with(file, |bytes| {
+        serde_json::from_slice::<Vec<Entry>>(bytes).ok().or_else(|| {
+            let paths = serde_json::from_slice::<Vec<PathBuf>>(bytes).ok()?;
+            Some(paths.into_iter().enumerate().map(|(i, path)| Entry { path, at: base.saturating_sub(i as u64) }).collect())
+        })
+    })
+    .unwrap_or_default()
 }
 
 /// What was used since the history was last written, and when the last of it was: a burst of navigation is
@@ -177,11 +175,8 @@ fn write_entries(file: &std::path::Path, entries: Vec<Entry>) {
         history.insert(0, entry);
     }
     history.truncate(HISTORY_LIMIT);
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     if let Ok(json) = serde_json::to_string(&history) {
-        let _ = crate::fs::atomic::write(file, json);
+        let _ = crate::fs::stored::save(file, json);
     }
 }
 

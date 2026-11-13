@@ -963,5 +963,11 @@
   "“{}” is still needed by “{}”. Wait until it is done, then unmount.": "«{}» ещё нужен задаче «{}». Дождитесь её завершения, затем отмонтируйте.",
   "“{}” is still needed by “{}”. Wait until it is done, then eject.": "«{}» ещё нужен задаче «{}». Дождитесь её завершения, затем извлеките.",
   "“{}” is being disconnected or unmounted. Try again once that is done.": "«{}» сейчас отключается или отмонтируется. Повторите, когда это завершится.",
-  "The server is being disconnected. Try again once that is done.": "Сервер сейчас отключается. Повторите, когда это завершится."
+  "The server is being disconnected. Try again once that is done.": "Сервер сейчас отключается. Повторите, когда это завершится.",
+  "It could not be read, so it is not written over": "Его не удалось прочитать, поэтому он не перезаписывается",
+  "“{}” could not be read ({}). It is left as it is, and changes are not saved to it.": "Не удалось прочитать «{}» ({}). Файл остаётся как есть, изменения в него не сохраняются.",
+  "“{}” could not be read. It is left as it is, and changes are not saved to it.": "Не удалось прочитать «{}». Файл остаётся как есть, изменения в него не сохраняются.",
+  "“{}” could not be read and was kept as “{}”. It starts empty.": "Не удалось прочитать «{}», он сохранён как «{}». Список начинается заново.",
+  "“{}” could not be read, and could not be kept aside ({}). It is left as it is, and changes are not saved to it.": "Не удалось прочитать «{}» и отложить его ({}). Файл остаётся как есть, изменения в него не сохраняются.",
+  "“{}” could not be saved: {}": "Не удалось сохранить «{}»: {}"
 }
