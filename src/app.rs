@@ -9593,6 +9593,13 @@ mod tests {
         app.new_tab(two.clone());
         assert_eq!((app.tabs.len(), app.active_tab), (2, 1));
         assert_eq!(app.current_path, two.canonicalize().unwrap());
+        // The folder is read on a thread; the window waits for it only 80 ms and then shows it as loading. The test
+        // waits until it is read (each frame takes it in with `poll_reload`); the 30 s are a watchdog
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.poll_reload() {
+            assert!(std::time::Instant::now() < limit, "the folder was never read");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(app.items.len(), 1);
         assert!(app.selection.is_empty() && app.back_history.is_empty());
 
