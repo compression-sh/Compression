@@ -916,7 +916,17 @@ fn replace_target(w: &mut Worker, op: Op, src: &Path, target: &Path, known: Opti
         .find(|candidate| candidate.symlink_metadata().is_err())
         .ok_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists))?;
     let built = match op {
-        Op::Copy => copy_new(w, src, &staged, Some(&mut rec.unreadable)).map(|()| Built::Copied)?,
+        // A copy that could not be made whole (a file in it could not be read) does not take the old item's place: it
+        // is taken away again, and the old item and the source stay as they are
+        Op::Copy => {
+            let mut left_out = Vec::new();
+            copy_new(w, src, &staged, Some(&mut left_out))?;
+            if !left_out.is_empty() {
+                ops::remove_tree(&staged).map_err(|err| io::Error::other(trf("Not replaced: the new item could not take the place of the old one ({}); it is kept as “{}”", &[&crate::fs::describe::io_error(&err), &name_of(&staged)])))?;
+                return Err(io::Error::other(trf("Not replaced: {}", &[&unreadable_note(&left_out)])));
+            }
+            Built::Copied
+        }
         Op::Move => match crate::compat::rename_noreplace(src, &staged) {
             Ok(()) => Built::Moved,
             // Another file system: copy, and take the original away once the copy has its place
@@ -2003,7 +2013,7 @@ mod tests {
     }
 
     #[test]
-    fn what_a_copy_over_a_folder_left_out_is_told_by_the_name_it_would_have_and_not_by_the_staging_name() {
+    fn a_copy_that_cannot_be_whole_does_not_replace_and_says_what_it_could_not_read_by_its_own_name() {
         if is_root() {
             return;
         }
@@ -2016,11 +2026,44 @@ mod tests {
         std::fs::set_permissions(dir.join("src/tree/locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
         std::fs::write(dir.join("dst/tree/old.txt"), "old").unwrap();
         let (outcome, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("src/tree"), dir.join("dst/tree"))], Decision::Replace);
-        assert!(outcome.ok, "{}", outcome.message);
+        std::fs::set_permissions(dir.join("src/tree/locked.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Not replaced, and said so, with the file that could not be read under its own name
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert!(outcome.message.contains("Not replaced"), "{}", outcome.message);
         assert!(outcome.message.contains("locked.txt"), "{}", outcome.message);
         assert!(!outcome.message.contains(".compression-new"), "{}", outcome.message);
-        assert_eq!(names(&dir.join("dst/tree")), vec!["ok.txt"]);
+        // The target as it was, the source as it was, and nothing of the copy left over
+        assert_eq!(names(&dir.join("dst/tree")), vec!["old.txt"]);
+        assert_eq!(std::fs::read_to_string(dir.join("dst/tree/old.txt")).unwrap(), "old");
+        assert_eq!(names(&dir.join("dst")), vec!["tree"], "a staging folder was left behind");
+        assert_eq!(names(&dir.join("src/tree")), vec!["locked.txt", "ok.txt"]);
+        assert!(!matches!(outcome.effect, Effect::Record(_)), "nothing happened that an undo would take back");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_plain_copy_and_a_merge_still_leave_out_what_they_cannot_read_and_go_on() {
+        if is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = sandbox("copy_and_merge_skip");
+        std::fs::create_dir_all(dir.join("src/tree")).unwrap();
+        std::fs::write(dir.join("src/tree/ok.txt"), "ok").unwrap();
+        std::fs::write(dir.join("src/tree/locked.txt"), "no").unwrap();
+        std::fs::set_permissions(dir.join("src/tree/locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A copy to a free name
+        std::fs::create_dir_all(dir.join("free")).unwrap();
+        let (copied, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("src/tree"), dir.join("free/tree"))], Decision::Replace);
+        // A merge into a folder that is there
+        std::fs::create_dir_all(dir.join("merge/tree")).unwrap();
+        std::fs::write(dir.join("merge/tree/own.txt"), "own").unwrap();
+        let (merged, _) = run(JobKind::Copy, Op::Copy, vec![(dir.join("src/tree"), dir.join("merge/tree"))], Decision::Merge);
         std::fs::set_permissions(dir.join("src/tree/locked.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(copied.ok && copied.message.contains("locked.txt"), "{}", copied.message);
+        assert_eq!(names(&dir.join("free/tree")), vec!["ok.txt"]);
+        assert!(merged.message.contains("locked.txt"), "{}", merged.message);
+        assert_eq!(names(&dir.join("merge/tree")), vec!["ok.txt", "own.txt"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
