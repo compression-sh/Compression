@@ -976,5 +976,7 @@
   "Forget their tags…": "Забыть их теги…",
   "The tags of {} files that are gone are forgotten. No file is touched.": "Теги {} пропавшего файла будут забыты. Файлы не затрагиваются.|Теги {} пропавших файлов будут забыты. Файлы не затрагиваются.|Теги {} пропавших файлов будут забыты. Файлы не затрагиваются.",
   "Forget": "Забыть",
-  "Folders deeper than {} levels were not searched.": "Папки глубже {} уровней не просматривались."
+  "Folders deeper than {} levels were not searched.": "Папки глубже {} уровней не просматривались.",
+  "The font “{}” could not be read ({}). Adwaita Sans is used instead.": "Не удалось прочитать шрифт «{}» ({}). Вместо него используется Adwaita Sans.",
+  "“{}” is not a font Compression can use. Adwaita Sans is used instead.": "«{}» — не шрифт, который Compression может использовать. Вместо него используется Adwaita Sans."
 }

@@ -653,6 +653,7 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
+ "skrifa 0.44.0",
  "tar",
  "tree_magic_mini",
  "wayland-backend",

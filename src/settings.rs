@@ -726,6 +726,9 @@ mod tests {
             let s = Settings::parse_with(own, Some(broken)).unwrap();
             assert!(!s.show_hidden && s.theme == "dark", "{broken}");
         }
+        // The font, too: its file is checked when it is installed (`ui::fonts`), not here, and the path is kept as written
+        let s = Settings::parse_with(own, Some(r#"{ "font": "/nowhere/broken.ttf" }"#)).unwrap();
+        assert_eq!(s.font.as_deref(), Some(std::path::Path::new("/nowhere/broken.ttf")));
         // A managed value of the wrong type is an error of the settings, as one in settings.json is
         assert!(Settings::parse_with(own, Some(r#"{ "show_hidden": "yes" }"#)).is_err());
     }

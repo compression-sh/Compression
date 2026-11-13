@@ -434,7 +434,7 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
         "compression-file-manager",
         native_options,
         Box::new(move |cc| {
-            ui::fonts::install(&cc.egui_ctx, settings.font.as_deref());
+            let font_problem = ui::fonts::install(&cc.egui_ctx, settings.font.as_deref());
             ui::theme::apply(&cc.egui_ctx, &theme, &theme);
             cc.egui_ctx.set_zoom_factor(settings.scale);
 
@@ -442,6 +442,9 @@ fn open_window(mut request: instance::Request) -> eframe::Result {
             app.tell_about_theme_problems();
             app.tell_about_unsaved_settings();
             app.tell_about_broken_settings(settings::file().as_deref());
+            if let Some(problem) = font_problem {
+                app.set_toast(problem);
+            }
             if fs::admin::is_admin() {
                 app.set_toast(i18n::tr("Running as administrator. Changes to settings are not saved."));
             }

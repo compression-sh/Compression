@@ -2268,7 +2268,10 @@ impl CompressionApp {
             self.repaint_side_windows();
         }
         if self.fonts_dirty {
-            crate::ui::fonts::install(ctx, self.settings.font.as_deref());
+            // Said once per change of the font: the flag is down until the setting changes again
+            if let Some(problem) = crate::ui::fonts::install(ctx, self.settings.font.as_deref()) {
+                self.set_toast(problem);
+            }
             self.fonts_dirty = false;
         }
         if (ctx.zoom_factor() - self.settings.scale).abs() > f32::EPSILON {
@@ -9728,6 +9731,36 @@ mod tests {
         assert_eq!(app.settings.session_tabs, vec![base.clone()]);
         assert!(!app.apply_settings_file(edited));
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_font_that_cannot_be_used_from_the_settings_file_is_said_once_and_kept_and_the_window_goes_on() {
+        let work = window_dir("bad_font");
+        let bad = work.join("broken.ttf");
+        std::fs::write(&bad, b"this is not a font at all").unwrap();
+        let mut w = Window::new(work.clone());
+        w.run(Vec::new(), 2);
+        w.app.status_toast = None;
+        // settings.json (or managed.json laid over it) now names the font: taken up as by the watcher, then drawn
+        let edited = Settings { font: Some(bad.clone()), ..w.app.saved_settings.clone() };
+        assert!(w.app.apply_settings_file(edited));
+        w.app.status_toast = None;
+        w.run(Vec::new(), 5);
+        assert_eq!(said(&mut w), "“broken.ttf” is not a font Compression can use. Adwaita Sans is used instead.");
+        // Said once, not with every frame, and the setting is left as it was written
+        w.run(Vec::new(), 10);
+        assert_eq!(said(&mut w), "");
+        assert_eq!(w.app.settings.font.as_deref(), Some(bad.as_path()));
+        // The file is put right: the next change of the setting takes it, without a word
+        std::fs::write(&bad, include_bytes!("../assets/fonts/AdwaitaSans-Regular.ttf")).unwrap();
+        let fixed = Settings { font: Some(work.join("broken.ttf")), font_name: Some("Fixed".into()), ..w.app.settings.clone() };
+        w.app.settings.font = None;
+        w.app.saved_settings.font = None;
+        assert!(w.app.apply_settings_file(fixed));
+        w.app.status_toast = None;
+        w.run(Vec::new(), 5);
+        assert_eq!(said(&mut w), "");
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]

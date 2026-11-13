@@ -33,6 +33,8 @@ wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 wayland-client = "0.31"
 raw-window-handle = "0.6"
 x11-dl = "2.21"
+# The font reader egui uses (same version as epaint), to check a font file before egui gets it
+skrifa = "0.44"
 ab_glyph = "0.2"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 jpeg-decoder = { version = "0.3", default-features = false }

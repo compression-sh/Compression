@@ -976,5 +976,7 @@
   "Forget their tags…": "Quên thẻ của chúng…",
   "The tags of {} files that are gone are forgotten. No file is touched.": "Thẻ của {} tệp không còn nữa sẽ bị quên. Không tệp nào bị động đến.",
   "Forget": "Quên",
-  "Folders deeper than {} levels were not searched.": "Không tìm trong các thư mục sâu hơn {} cấp."
+  "Folders deeper than {} levels were not searched.": "Không tìm trong các thư mục sâu hơn {} cấp.",
+  "The font “{}” could not be read ({}). Adwaita Sans is used instead.": "Không thể đọc phông chữ “{}” ({}). Adwaita Sans được dùng thay thế.",
+  "“{}” is not a font Compression can use. Adwaita Sans is used instead.": "“{}” không phải là phông chữ Compression có thể dùng. Adwaita Sans được dùng thay thế."
 }

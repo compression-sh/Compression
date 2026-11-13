@@ -976,5 +976,7 @@
   "Forget their tags…": "Olvidar sus etiquetas…",
   "The tags of {} files that are gone are forgotten. No file is touched.": "Se olvidan las etiquetas de {} archivo que ya no existe. No se toca ningún archivo.|Se olvidan las etiquetas de {} archivos que ya no existen. No se toca ningún archivo.",
   "Forget": "Olvidar",
-  "Folders deeper than {} levels were not searched.": "No se buscó en carpetas con más de {} niveles de profundidad."
+  "Folders deeper than {} levels were not searched.": "No se buscó en carpetas con más de {} niveles de profundidad.",
+  "The font “{}” could not be read ({}). Adwaita Sans is used instead.": "No se pudo leer la fuente «{}» ({}). Se usa Adwaita Sans en su lugar.",
+  "“{}” is not a font Compression can use. Adwaita Sans is used instead.": "«{}» no es una fuente que Compression pueda usar. Se usa Adwaita Sans en su lugar."
 }

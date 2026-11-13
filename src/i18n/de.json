@@ -976,5 +976,7 @@
   "Forget their tags…": "Ihre Tags vergessen …",
   "The tags of {} files that are gone are forgotten. No file is touched.": "Die Tags von {} verschwundenen Datei werden vergessen. Keine Datei wird angefasst.|Die Tags von {} verschwundenen Dateien werden vergessen. Keine Datei wird angefasst.",
   "Forget": "Vergessen",
-  "Folders deeper than {} levels were not searched.": "Ordner tiefer als {} Ebenen wurden nicht durchsucht."
+  "Folders deeper than {} levels were not searched.": "Ordner tiefer als {} Ebenen wurden nicht durchsucht.",
+  "The font “{}” could not be read ({}). Adwaita Sans is used instead.": "Die Schrift „{}“ konnte nicht gelesen werden ({}). Stattdessen wird Adwaita Sans verwendet.",
+  "“{}” is not a font Compression can use. Adwaita Sans is used instead.": "„{}“ ist keine Schrift, die Compression verwenden kann. Stattdessen wird Adwaita Sans verwendet."
 }
