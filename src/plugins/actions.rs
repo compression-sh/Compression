@@ -198,10 +198,23 @@ impl Actions {
     fn create_template(&mut self) -> std::io::Result<PathBuf> {
         let dir = self.dir.clone().ok_or_else(|| std::io::Error::other(tr("There is no folder for your actions")))?;
         std::fs::create_dir_all(&dir)?;
-        let path = (1..).map(|n| dir.join(if n == 1 { "new-action.json".to_owned() } else { format!("new-action-{n}.json") })).find(|p| !p.exists()).expect("endless range");
-        std::fs::write(&path, TEMPLATE)?;
-        self.reload();
-        Ok(path)
+        // `create_new`: a name that is taken (also by a link, which is not followed) is passed over, never written over
+        for n in 1..1000u32 {
+            let path = dir.join(if n == 1 { "new-action.json".to_owned() } else { format!("new-action-{n}.json") });
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    if let Err(err) = std::io::Write::write_all(&mut file, TEMPLATE.as_bytes()) {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(err);
+                    }
+                    self.reload();
+                    return Ok(path);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
     }
 }
 
@@ -408,6 +421,24 @@ impl Plugin for Actions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_action_file_never_writes_through_or_over_what_is_there() {
+        let dir = std::env::temp_dir().join(format!("compression_action_template_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A link left by something else under the first name: it points to a file that is not there
+        let outside = std::env::temp_dir().join(format!("compression_action_outside_{}", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        std::os::unix::fs::symlink(&outside, dir.join("new-action.json")).unwrap();
+        let mut actions = Actions::in_dir(Some(dir.clone()));
+        let made = actions.create_template().unwrap();
+        assert!(!outside.exists(), "the template was written through the link");
+        assert_eq!(made, dir.join("new-action-2.json"));
+        assert!(std::fs::read_to_string(&made).unwrap().contains("command"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&outside);
+    }
 
     fn item(name: &str, is_dir: bool) -> FileItem {
         let mut item = FileItem::from_path(Path::new("/")).unwrap();
