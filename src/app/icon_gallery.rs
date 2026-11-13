@@ -58,7 +58,7 @@ impl CompressionApp {
             material::paint_label(ui, row.left() + material::INSET_ICON - 15.0, row.center().y, tr("Icon style"), material::FONT_TITLE, theme.text, row.width());
             ui.add_space(8.0 - ui.spacing().item_spacing.y);
             ui.spacing_mut().item_spacing.y = 2.0;
-            for s in IconStyle::ALL {
+            for s in IconStyle::IN_PICKER {
                 // Each style shows its own folder where a row's icon goes
                 let resp = nav_item(ui, ("ig_style", s as u8), "", s.label(), &theme, s == style);
                 let at = egui::pos2(resp.rect.left() + material::INSET_ICON, resp.rect.center().y);
@@ -206,4 +206,60 @@ fn file_tile(ui: &egui::Ui, theme: &SerpantinumTheme, tile: egui::Rect, style: I
     let galley = material::truncated(ui, caption, material::FONT_CAPTION, theme.subtext0, tile.width() - 12.0);
     let pos = egui::pos2(tile.center().x - galley.size().x / 2.0, tile.bottom() - CAPTION / 2.0 - galley.size().y / 2.0);
     ui.painter().galley(pos, galley, theme.subtext0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn texts(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut found));
+        found
+    }
+
+    #[test]
+    fn the_preview_lists_system_first_then_every_other_style_once_and_opens_on_the_style_in_use() {
+        crate::settings::NO_SAVE.with(|n| n.set(true));
+        let dir = std::env::temp_dir().join(format!("compression_icon_gallery_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = egui::Context::default();
+        let settings = crate::settings::Settings { icon_style: IconStyle::Winter, ..Default::default() };
+        let mut app = CompressionApp::new(dir.clone(), SerpantinumTheme::default(), settings, &ctx);
+        // Opened as the Appearance page opens it
+        app.icon_gallery = Some(app.settings.icon_style);
+        let mut shown = Vec::new();
+        for n in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(920.0, 1200.0))), time: Some(n as f64 * 0.05), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| app.icon_gallery_ui(ui));
+            out.textures_delta.clear();
+            shown = texts(&out);
+        }
+        let labels: Vec<&str> = IconStyle::ALL.iter().map(|s| s.label()).collect();
+        let mut listed: Vec<(String, egui::Rect)> = shown.iter().filter(|(t, _)| labels.contains(&t.as_str())).cloned().collect();
+        listed.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+        let order: Vec<&str> = listed.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(order[0], "System", "{order:?}");
+        assert_eq!(order[1], "Classic", "{order:?}");
+        let mut each = order.clone();
+        each.sort();
+        let mut all = labels.clone();
+        all.sort();
+        assert_eq!(each, all, "every style exactly once: {order:?}");
+        assert_eq!(order, IconStyle::IN_PICKER.map(|s| s.label()), "the same order as the Appearance page");
+        // The style in use stays the one shown, and nothing was changed by looking
+        assert_eq!(app.icon_gallery, Some(IconStyle::Winter));
+        assert!(shown.iter().any(|(t, _)| t == &trf("{} icons", &[&IconStyle::Winter.label()])));
+        assert_eq!(app.settings.icon_style, IconStyle::Winter);
+        assert_eq!(IconStyle::default(), IconStyle::Classic);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

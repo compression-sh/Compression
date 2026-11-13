@@ -48,6 +48,20 @@ impl IconStyle {
         IconStyle::System,
     ];
 
+    /// The styles in the order the Settings offer them: the desktop's own first. `ALL` keeps the order of the
+    /// variants, which `current` reads by number.
+    pub const IN_PICKER: [IconStyle; 9] = [
+        IconStyle::System,
+        IconStyle::Classic,
+        IconStyle::Halloween,
+        IconStyle::Winter,
+        IconStyle::Pixel,
+        IconStyle::Sketch,
+        IconStyle::Glossy,
+        IconStyle::Clay,
+        IconStyle::Origami,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             IconStyle::Classic => tr("Classic"),

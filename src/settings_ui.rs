@@ -385,7 +385,7 @@ impl CompressionApp {
         let card_w = ((ui.available_width() - gap * (per_row - 1) as f32) / per_row as f32).floor().clamp(80.0, 140.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
-            for style in IconStyle::ALL {
+            for style in IconStyle::IN_PICKER {
                 if icon_style_card(ui, ("icon_style_card", style as u8), card_w, style, &theme, self.settings.icon_style == style, &samples).clicked() {
                     self.settings.icon_style = style;
                     self.persist_settings();
@@ -1945,6 +1945,24 @@ mod tests {
         frame(&mut app, &mut state, down());
         frame(&mut app, &mut state, Vec::new());
         assert_eq!(state.tab, 4, "Behavior");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_icon_styles_are_offered_with_system_first() {
+        assert_eq!(IconStyle::IN_PICKER[0], IconStyle::System);
+        let mut offered = IconStyle::IN_PICKER.map(|s| s as u8);
+        offered.sort();
+        assert_eq!(offered, IconStyle::ALL.map(|s| s as u8), "every style once");
+        // The style in use is read by its number from ALL, which keeps the order of the variants
+        for (n, style) in IconStyle::ALL.into_iter().enumerate() {
+            assert_eq!(style as usize, n);
+        }
+        let (mut app, dir) = themes_app("icon_order");
+        let labels: Vec<&str> = IconStyle::ALL.iter().map(|s| s.label()).collect();
+        let drawn: Vec<String> = appearance_texts(&mut app).into_iter().filter(|t| labels.contains(&t.as_str())).collect();
+        let cards = &drawn[drawn.len() - IconStyle::ALL.len()..];
+        assert_eq!(cards, IconStyle::IN_PICKER.map(|s| s.label()), "the cards in the order offered");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
