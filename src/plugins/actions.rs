@@ -7,8 +7,12 @@
 //! ```
 //!
 //! `command` runs in `sh -c` inside the open folder with the selected files as arguments (`"$@"`).
+//! The arguments are the one way that holds every name as it is, byte for byte.
 //! Both kinds also get `COMPRESSION_SELECTED_FILES` (one path per line) and `COMPRESSION_CURRENT_DIR`,
 //! and the same two as `SKI_SELECTED_FILES` and `SKI_CURRENT_DIR`, so scripts written for Ski keep working.
+//! That list cannot be told apart for a name with a line break in it, and a name that is not UTF-8 shows "�" there;
+//! `COMPRESSION_SELECTED_COUNT` (how many files there are) lets a script see when the lines do not add up, and take
+//! the arguments instead.
 //! Optional filters: `extensions`, `dirs_only`, `files_only`, `single` (exactly one item).
 //! Optional limits: `timeout` (seconds, 1 to 3600, default 30) after which the action is stopped, and
 //! `max_output_mb` (MiB, 1 to 64, default 1) it may print on each of its two streams. A value outside
@@ -391,6 +395,7 @@ impl Plugin for Actions {
         };
         let selected = paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join("\n");
         command.current_dir(dir).env("COMPRESSION_SELECTED_FILES", &selected).env("COMPRESSION_CURRENT_DIR", dir).env("SKI_SELECTED_FILES", &selected).env("SKI_CURRENT_DIR", dir).stdin(std::process::Stdio::null());
+        command.env("COMPRESSION_SELECTED_COUNT", paths.len().to_string());
         let (tx, label, running, finished) = (self.done_tx.clone(), entry.label, Arc::clone(&self.running), Arc::clone(&self.finished));
         let limits = entry.def.limits();
         running.fetch_add(1, Ordering::Relaxed);
@@ -620,6 +625,22 @@ mod tests {
         assert!(message.contains("List"), "{message}");
         let out = std::fs::read_to_string(dir.join("out.txt")).unwrap();
         assert_eq!(out, format!("one\ntwo words\n{0} {0}\n", dir.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_name_with_a_line_break_reaches_the_command_whole_and_the_count_shows_the_list_cannot_be_split_by_lines() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let dir = scratch("count");
+        std::fs::write(dir.join("a.json"), r#"{"name":"Count","command":"printf '%s|%s|%s' \"$COMPRESSION_SELECTED_COUNT\" \"$#\" \"$(printf '%s\\n' \"$COMPRESSION_SELECTED_FILES\" | wc -l)\" > out.txt; printf '%s' \"$1\" > arg.bin"}"#).unwrap();
+        let odd = dir.join(std::ffi::OsString::from_vec(b"two\nlines \xe4.txt".to_vec()));
+        let mut actions = Actions::in_dir(Some(dir.clone()));
+        actions.run("a.json", std::slice::from_ref(&odd), &dir);
+        actions.done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // One file: counted as one, though the list of lines has two
+        assert_eq!(std::fs::read_to_string(dir.join("out.txt")).unwrap().replace(' ', ""), "1|1|2");
+        // The argument is the path, byte for byte
+        assert_eq!(std::fs::read(dir.join("arg.bin")).unwrap(), odd.as_os_str().as_bytes());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
