@@ -44,14 +44,23 @@ pub fn set_desktop_icon_theme(name: Option<String>) {
 
 /// The name of the icon theme the desktop uses, as GTK finds it: what the portal says (GNOME's dconf setting), else
 /// GTK's own `settings.ini`, else KDE's, else Adwaita.
+/// It is asked for every icon drawn, so the settings files are read once (as GTK reads them at its start); the portal's
+/// name, which the window keeps up to date, is taken each time.
 pub fn theme_name() -> String {
-    let config = dirs::config_dir();
-    let read = |file: &str| config.as_ref().and_then(|c| std::fs::read_to_string(c.join(file)).ok());
-    theme_name_from(
-        DESKTOP_THEME.read().unwrap_or_else(|e| e.into_inner()).clone(),
-        &[read("gtk-4.0/settings.ini"), read("gtk-3.0/settings.ini")],
-        read("kdeglobals"),
-    )
+    static FROM_FILES: OnceLock<String> = OnceLock::new();
+    let from_files = FROM_FILES.get_or_init(|| {
+        let config = dirs::config_dir();
+        let read = |file: &str| {
+            #[cfg(test)]
+            tests::SETTINGS_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            config.as_ref().and_then(|c| std::fs::read_to_string(c.join(file)).ok())
+        };
+        theme_name_from(None, &[read("gtk-4.0/settings.ini"), read("gtk-3.0/settings.ini")], read("kdeglobals"))
+    });
+    match DESKTOP_THEME.read().unwrap_or_else(|e| e.into_inner()).as_deref() {
+        Some(name) if !name.is_empty() => name.to_owned(),
+        _ => from_files.clone(),
+    }
 }
 
 /// `theme_name` from what each source says: the portal's name, the texts of GTK's settings files and of `kdeglobals`.
@@ -343,6 +352,27 @@ mod tests {
         std::fs::write(base.join("broken.svg"), "not svg").unwrap();
         assert!(rasterize(&base.join("broken.svg"), 48).is_none());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// How often a settings file of GTK or KDE was read for the theme's name.
+    pub(super) static SETTINGS_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[test]
+    fn the_settings_files_are_read_once_and_not_for_every_icon_drawn() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = theme_name();
+        let after_first = SETTINGS_READS.load(Relaxed);
+        // As often as icons are drawn in a few frames
+        for _ in 0..200 {
+            let _ = theme_name();
+        }
+        assert_eq!(SETTINGS_READS.load(Relaxed), after_first, "the files were read again for every name asked for");
+        // The portal's name still counts at once, and goes back to the files' when the portal names none
+        set_desktop_icon_theme(Some("From-The-Portal".into()));
+        assert_eq!(theme_name(), "From-The-Portal");
+        set_desktop_icon_theme(None);
+        assert_ne!(theme_name(), "From-The-Portal");
+        assert_eq!(SETTINGS_READS.load(Relaxed), after_first);
     }
 
     #[test]
