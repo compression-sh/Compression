@@ -125,7 +125,7 @@ pub fn set_files(paths: &[PathBuf], cut: bool) -> bool {
         return false;
     }
     set_own_text(None);
-    if on_wayland() { set_wayland(paths, cut) } else { set_x11(paths) }
+    if on_wayland() { set_wayland(paths, cut) } else { set_x11(paths, cut) }
 }
 
 fn set_wayland(paths: &[PathBuf], cut: bool) -> bool {
@@ -143,14 +143,53 @@ fn set_wayland(paths: &[PathBuf], cut: bool) -> bool {
     Options::new().copy_multi(sources).is_ok()
 }
 
-fn set_x11(paths: &[PathBuf]) -> bool {
+/// Files this process put on the X11 clipboard, and the window that held the clipboard right after. arboard offers
+/// them as `text/uri-list` only, which cannot say they were cut, and gives back only the names it can read as UTF-8,
+/// as their link targets. So while that window still holds the clipboard, a paste takes these, as they were given.
+#[derive(Clone, Debug, PartialEq)]
+struct X11Offer {
+    owner: u64,
+    paths: Vec<PathBuf>,
+    cut: bool,
+}
+
+static X11_OFFER: Mutex<Option<X11Offer>> = Mutex::new(None);
+
+fn set_x11_offer(offer: Option<X11Offer>) {
+    if let Ok(mut held) = X11_OFFER.lock() {
+        *held = offer;
+    }
+}
+
+fn set_x11(paths: &[PathBuf], cut: bool) -> bool {
+    set_x11_offer(None);
     // The selection is served by this owner, so it has to outlive the call
     static OWNER: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
     let Ok(mut owner) = OWNER.lock() else { return false };
     if owner.is_none() {
         *owner = arboard::Clipboard::new().ok();
     }
-    owner.as_mut().is_some_and(|c| c.set().file_list(paths).is_ok())
+    if !owner.as_mut().is_some_and(|c| c.set().file_list(paths).is_ok()) {
+        return false;
+    }
+    set_x11_offer(x11_clipboard_owner().map(|owner| X11Offer { owner, paths: paths.to_vec(), cut }));
+    true
+}
+
+/// The window that holds the X11 clipboard now; `None` when there is none, or it cannot be asked.
+fn x11_clipboard_owner() -> Option<u64> {
+    let xlib = x11_dl::xlib::Xlib::open().ok()?;
+    // SAFETY: a connection of its own, opened, asked and closed here; the atom name is NUL-terminated
+    unsafe {
+        let display = (xlib.XOpenDisplay)(std::ptr::null());
+        if display.is_null() {
+            return None;
+        }
+        let selection = (xlib.XInternAtom)(display, c"CLIPBOARD".as_ptr(), 0);
+        let owner = (xlib.XGetSelectionOwner)(display, selection);
+        (xlib.XCloseDisplay)(display);
+        (owner != 0).then_some(owner as u64)
+    }
 }
 
 /// The files on the system clipboard, and whether they were cut, if any application put them there.
@@ -194,6 +233,8 @@ pub fn set_text(text: String) -> bool {
         use wl_clipboard_rs::copy::{MimeType, Options, Source};
         return Options::new().copy(Source::Bytes(text.into_bytes().into_boxed_slice()), MimeType::Text).is_ok();
     }
+    // Text takes the clipboard from the files this process put there, through the same window
+    set_x11_offer(None);
     // The selection is served by this owner, so it has to outlive the call
     static OWNER: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
     let Ok(mut owner) = OWNER.lock() else { return false };
@@ -321,13 +362,44 @@ fn get_wayland() -> Option<(Vec<PathBuf>, bool)> {
 }
 
 fn get_x11() -> Option<(Vec<PathBuf>, bool)> {
-    let paths = arboard::Clipboard::new().ok()?.get().file_list().ok()?;
+    let ours = X11_OFFER.lock().ok().and_then(|held| held.clone());
+    x11_files(ours, x11_clipboard_owner(), || arboard::Clipboard::new().ok()?.get().file_list().ok())
+}
+
+/// The files on the X11 clipboard: this process's own offer as it was given while the window that took the clipboard
+/// for it (`ours.owner`) still holds it, else what `read` gets. X11 does not say whether another program's files
+/// were cut, so they are copied.
+fn x11_files(ours: Option<X11Offer>, owner: Option<u64>, read: impl FnOnce() -> Option<Vec<PathBuf>>) -> Option<(Vec<PathBuf>, bool)> {
+    if let Some(ours) = ours
+        && owner == Some(ours.owner)
+    {
+        return Some((ours.paths, ours.cut));
+    }
+    let paths = read()?;
     (!paths.is_empty()).then_some((paths, false))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_this_process_put_on_the_x11_clipboard_come_back_as_given_and_cut_while_it_holds_it() {
+        use std::os::unix::ffi::OsStringExt;
+        let odd = PathBuf::from(std::ffi::OsString::from_vec(b"/home/me/caf\xe9.txt".to_vec()));
+        let link = PathBuf::from("/home/me/link to photos");
+        let ours = X11Offer { owner: 0x40_0001, paths: vec![odd.clone(), link.clone()], cut: true };
+        // What arboard reads back: names it can read as UTF-8 only, links as their targets
+        let read = || Some(vec![PathBuf::from("/home/me/Photos")]);
+        // Still held by the window that took it for this process: as given, and cut
+        assert_eq!(x11_files(Some(ours.clone()), Some(0x40_0001), || panic!("asked the clipboard")), Some((vec![odd, link], true)));
+        // Another program took it: what it offers, copied, since X11 does not say whether it was cut
+        assert_eq!(x11_files(Some(ours.clone()), Some(0x60_0003), read), Some((vec![PathBuf::from("/home/me/Photos")], false)));
+        // Nobody holds it, or it cannot be asked: not taken for this process's own
+        assert_eq!(x11_files(Some(ours.clone()), None, read), Some((vec![PathBuf::from("/home/me/Photos")], false)));
+        assert_eq!(x11_files(None, Some(0x40_0001), read), Some((vec![PathBuf::from("/home/me/Photos")], false)));
+        assert_eq!(x11_files(Some(ours), Some(0x60_0003), || Some(Vec::new())), None);
+    }
 
     #[test]
     fn uris_round_trip() {
