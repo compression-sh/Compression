@@ -4936,10 +4936,17 @@ impl CompressionApp {
         if t > 0.001 {
             pill("selection_pill_area", area.left_bottom() + egui::vec2(14.0, -12.0), egui::Align2::LEFT_BOTTOM, t, None, &self.pill_text);
         }
-        // A search that stopped at its limit says so, whether or not the status bar is shown
-        if !self.search_query.trim().is_empty() && self.search.limit_reached() {
-            let text = trf("{} results. Narrow down the search.", &[&crate::fs::search::MAX_RESULTS]);
-            pill("search_limit_area", area.center_bottom() + egui::vec2(0.0, -12.0), egui::Align2::CENTER_BOTTOM, 1.0, Some(icons::INFO), &text);
+        // A search that stopped at its limit, or left out folders for their depth, says so, whether or not the status bar
+        // is shown; each in its own words, both when both are true
+        if !self.search_query.trim().is_empty() && (self.search.limit_reached() || self.search.depth_reached()) {
+            let mut parts = Vec::new();
+            if self.search.limit_reached() {
+                parts.push(trf("{} results. Narrow down the search.", &[&crate::fs::search::MAX_RESULTS]));
+            }
+            if self.search.depth_reached() {
+                parts.push(trf("Folders deeper than {} levels were not searched.", &[&crate::fs::search::MAX_DEPTH]));
+            }
+            pill("search_limit_area", area.center_bottom() + egui::vec2(0.0, -12.0), egui::Align2::CENTER_BOTTOM, 1.0, Some(icons::INFO), &parts.join(" · "));
         }
         // Plugin status (the git branch) sits in the corner; the clipboard pill stacks above it
         let statuses = if self.settings.show_status_bar { self.plugins.statuses() } else { Vec::new() };
@@ -12329,6 +12336,33 @@ mod tests {
         w.until("the undo to end", |w| !w.app.engine.running());
         assert!(dir.join("one.txt").exists() && !dir.join("uno.txt").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_window_says_when_a_search_left_out_folders_for_their_depth() {
+        let dir = window_dir("search_depth");
+        let mut at = dir.clone();
+        for n in 0..=crate::fs::search::MAX_DEPTH {
+            at = at.join(format!("d{n}"));
+        }
+        std::fs::create_dir_all(&at).unwrap();
+        std::fs::write(at.join("needle.txt"), "x").unwrap();
+        std::fs::write(dir.join("needle_top.txt"), "x").unwrap();
+        let hint = format!("Folders deeper than {} levels were not searched.", crate::fs::search::MAX_DEPTH);
+        let mut w = Window::new(dir.clone());
+        search_for(&mut w, "needle");
+        finish_search(&mut w);
+        w.run(Vec::new(), 12);
+        assert!(w.shows(&hint), "no hint: {:?}", w.last);
+        assert!(!w.shows(&format!("{} results. Narrow down the search.", crate::fs::search::MAX_RESULTS)), "the depth was taken for the limit of results");
+        // A search in a folder that is not that deep: no hint
+        search_for(&mut w, "needle_top");
+        w.app.navigate_to(dir.join("d0/d1"));
+        search_for(&mut w, "needle");
+        finish_search(&mut w);
+        w.run(Vec::new(), 12);
+        assert!(!w.shows(&hint));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- The search says when it stopped at its limit

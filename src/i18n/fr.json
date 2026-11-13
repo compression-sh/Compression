@@ -975,5 +975,6 @@
   "{} tagged files are no longer there: their drive is connected, and the files are not.": "{} fichier étiqueté n’existe plus : son lecteur est connecté, mais pas le fichier.|{} fichiers étiquetés n’existent plus : leur lecteur est connecté, mais pas les fichiers.",
   "Forget their tags…": "Oublier leurs étiquettes…",
   "The tags of {} files that are gone are forgotten. No file is touched.": "Les étiquettes de {} fichier disparu sont oubliées. Aucun fichier n’est touché.|Les étiquettes de {} fichiers disparus sont oubliées. Aucun fichier n’est touché.",
-  "Forget": "Oublier"
+  "Forget": "Oublier",
+  "Folders deeper than {} levels were not searched.": "Les dossiers à plus de {} niveaux de profondeur n’ont pas été parcourus."
 }

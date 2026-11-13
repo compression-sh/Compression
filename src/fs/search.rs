@@ -12,7 +12,8 @@ use super::scanner::TypeFilter;
 use super::recent;
 
 pub const MAX_RESULTS: usize = 400;
-const MAX_DEPTH: usize = 8;
+/// How many folders deep a search goes below the folder it starts in.
+pub const MAX_DEPTH: usize = 8;
 const BATCH: usize = 24;
 /// Larger files are not read when searching inside files.
 const CONTENT_LIMIT: u64 = 1024 * 1024;
@@ -61,11 +62,13 @@ pub struct Search {
     finished: bool,
     /// The search stopped because it had `MAX_RESULTS` results; a new one starts with a flag of its own.
     limit_hit: Arc<AtomicBool>,
+    /// The search left out a folder because it was deeper than `MAX_DEPTH`.
+    depth_hit: Arc<AtomicBool>,
 }
 
 impl Search {
     pub fn new() -> Self {
-        Self { generation: Arc::new(AtomicU64::new(0)), rx: None, finished: true, limit_hit: Arc::new(AtomicBool::new(false)) }
+        Self { generation: Arc::new(AtomicU64::new(0)), rx: None, finished: true, limit_hit: Arc::new(AtomicBool::new(false)), depth_hit: Arc::new(AtomicBool::new(false)) }
     }
 
     /// Cancel any running search.
@@ -74,11 +77,18 @@ impl Search {
         self.rx = None;
         self.finished = true;
         self.limit_hit = Arc::new(AtomicBool::new(false));
+        self.depth_hit = Arc::new(AtomicBool::new(false));
     }
 
     /// The results stop at `MAX_RESULTS` because the search did, not because there were no more to find.
     pub fn limit_reached(&self) -> bool {
         self.limit_hit.load(Ordering::Relaxed)
+    }
+
+    /// The search left out folders that were deeper than `MAX_DEPTH` (it did not go into them, so what is in them was
+    /// not looked at). Not set when no folder was that deep.
+    pub fn depth_reached(&self) -> bool {
+        self.depth_hit.load(Ordering::Relaxed)
     }
 
     /// A search is still walking folders.
@@ -94,6 +104,8 @@ impl Search {
         self.finished = false;
         self.limit_hit = Arc::new(AtomicBool::new(false));
         let limit_hit = self.limit_hit.clone();
+        self.depth_hit = Arc::new(AtomicBool::new(false));
+        let depth_hit = self.depth_hit.clone();
         let ctx = ctx.clone();
 
         std::thread::spawn(move || {
@@ -142,6 +154,9 @@ impl Search {
                     // Not even looked at: asking a mount that does not answer would hold this thread
                     if is_real_dir && !enter(&path) {
                         continue;
+                    }
+                    if is_real_dir && depth >= MAX_DEPTH {
+                        depth_hit.store(true, Ordering::Relaxed);
                     }
                     if is_real_dir && depth < MAX_DEPTH {
                         let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
@@ -276,6 +291,45 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         (count, search.limit_reached())
+    }
+
+    #[test]
+    fn a_search_says_when_it_left_folders_out_for_their_depth_and_only_then() {
+        let root = std::env::temp_dir().join(format!("compression_search_depth_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // A folder exactly as deep as the search goes: all of it is searched
+        let mut exact = root.join("exact");
+        for n in 0..MAX_DEPTH {
+            exact = exact.join(format!("d{n}"));
+        }
+        std::fs::create_dir_all(&exact).unwrap();
+        std::fs::write(exact.join("needle.txt"), "x").unwrap();
+        // One more level below: that folder is left out, and the search says so
+        let deeper = root.join("deeper");
+        let mut at = deeper.clone();
+        for n in 0..=MAX_DEPTH {
+            at = at.join(format!("d{n}"));
+        }
+        std::fs::create_dir_all(&at).unwrap();
+        std::fs::write(at.join("needle.txt"), "x").unwrap();
+        let mut search = Search::new();
+        let found = |search: &mut Search, dir: &std::path::Path| {
+            search.start(&egui::Context::default(), dir.to_path_buf(), "needle".into(), true, TypeFilter::All, SearchOptions::default());
+            let mut count = 0;
+            while search.is_running() {
+                count += search.poll().len();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            count + search.poll().len()
+        };
+        assert_eq!(found(&mut search, &root.join("exact")), 1);
+        assert!(!search.depth_reached(), "nothing was left out");
+        assert_eq!(found(&mut search, &deeper), 0);
+        assert!(search.depth_reached(), "a folder was left out, and the search did not say so");
+        assert!(!search.limit_reached(), "the depth is not the limit of results");
+        search.cancel();
+        assert!(!search.depth_reached());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

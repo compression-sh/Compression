@@ -975,5 +975,6 @@
   "{} tagged files are no longer there: their drive is connected, and the files are not.": "{} markierte Datei ist nicht mehr vorhanden: Ihr Laufwerk ist verbunden, die Datei nicht.|{} markierte Dateien sind nicht mehr vorhanden: Ihr Laufwerk ist verbunden, die Dateien nicht.",
   "Forget their tags…": "Ihre Tags vergessen …",
   "The tags of {} files that are gone are forgotten. No file is touched.": "Die Tags von {} verschwundenen Datei werden vergessen. Keine Datei wird angefasst.|Die Tags von {} verschwundenen Dateien werden vergessen. Keine Datei wird angefasst.",
-  "Forget": "Vergessen"
+  "Forget": "Vergessen",
+  "Folders deeper than {} levels were not searched.": "Ordner tiefer als {} Ebenen wurden nicht durchsucht."
 }

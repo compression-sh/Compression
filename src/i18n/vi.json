@@ -975,5 +975,6 @@
   "{} tagged files are no longer there: their drive is connected, and the files are not.": "{} tệp có thẻ không còn nữa: ổ đĩa đã được kết nối nhưng tệp thì không.",
   "Forget their tags…": "Quên thẻ của chúng…",
   "The tags of {} files that are gone are forgotten. No file is touched.": "Thẻ của {} tệp không còn nữa sẽ bị quên. Không tệp nào bị động đến.",
-  "Forget": "Quên"
+  "Forget": "Quên",
+  "Folders deeper than {} levels were not searched.": "Không tìm trong các thư mục sâu hơn {} cấp."
 }
