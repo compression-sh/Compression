@@ -32,14 +32,11 @@ Check a download with `sha256sum -c SHA256SUMS --ignore-missing`. Docker, buildi
 
 The [wiki](https://github.com/compression-sh/Compression/wiki/) documents every feature:
 
-| Topic | Pages |
-| --- | --- |
-| Getting started | [Installation](https://github.com/compression-sh/Compression/wiki/Installation), [Desktop Integration](https://github.com/compression-sh/Compression/wiki/Desktop-Integration) (default file manager, system file dialog) |
-| Everyday use | [Navigation](https://github.com/compression-sh/Compression/wiki/Navigation), [File Operations](https://github.com/compression-sh/Compression/wiki/File-Operations) (undo, safe replace, the jobs list), [Search](https://github.com/compression-sh/Compression/wiki/Search), [Archives](https://github.com/compression-sh/Compression/wiki/Archives) |
-| Servers and drives | [Servers](https://github.com/compression-sh/Compression/wiki/Servers) (status dot, Reconnect), [Drives and Devices](https://github.com/compression-sh/Compression/wiki/Drives-and-Devices) (eject, phones and cameras) |
-| Plugins | [Plugins](https://github.com/compression-sh/Compression/wiki/Plugins): Git, Checksums, Tags, Duplicate Finder, Compare Folders, Quick Look, [Custom Actions](https://github.com/compression-sh/Compression/wiki/Custom-Actions) (your own commands) |
-| Make it yours | [Settings](https://github.com/compression-sh/Compression/wiki/Settings), [Keyboard Shortcuts](https://github.com/compression-sh/Compression/wiki/Keyboard-Shortcuts), [Themes and Appearance](https://github.com/compression-sh/Compression/wiki/Themes-and-Appearance) (themes, icon styles, transparency, languages) |
-| Help | [Troubleshooting](https://github.com/compression-sh/Compression/wiki/Troubleshooting) |
+- [Installation](https://github.com/compression-sh/Compression/wiki/Installation) and [Desktop Integration](https://github.com/compression-sh/Compression/wiki/Desktop-Integration) (default file manager, system file dialog)
+- [Navigation](https://github.com/compression-sh/Compression/wiki/Navigation), [File Operations](https://github.com/compression-sh/Compression/wiki/File-Operations) (undo, free-space check, the jobs list), [Search](https://github.com/compression-sh/Compression/wiki/Search), [Archives](https://github.com/compression-sh/Compression/wiki/Archives), [Servers](https://github.com/compression-sh/Compression/wiki/Servers) (status dot, Reconnect, phones and cameras)
+- [Plugins](https://github.com/compression-sh/Compression/wiki/Plugins): Git, Checksums, Tags, Duplicate Finder, Compare Folders, Quick Look, [Custom Actions](https://github.com/compression-sh/Compression/wiki/Custom-Actions) (your own commands, with a time and output limit)
+- [Settings](https://github.com/compression-sh/Compression/wiki/Settings), [Keyboard Shortcuts](https://github.com/compression-sh/Compression/wiki/Keyboard-Shortcuts), [Themes and Appearance](https://github.com/compression-sh/Compression/wiki/Themes-and-Appearance) (built-in themes, theme editor, transparency, languages)
+- [Troubleshooting](https://github.com/compression-sh/Compression/wiki/Troubleshooting)
 
 [docs/guide.md](docs/guide.md) is a compact summary of recent behaviour that lives in the repository.
 
