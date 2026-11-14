@@ -1970,10 +1970,13 @@ mod tests {
         let (mut app, top) = app_in_mount(2, "folder");
         let link = top.join("link");
         std::os::unix::fs::symlink(top.join("t0"), &link).unwrap();
-        let started = Instant::now();
+        // The server does not answer until the test lets go: the call must come back while it does not
+        app.net.ask = held_answer;
+        let held = HeldAnswers::hold(&top);
         app.navigate_to(link);
-        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(!held.waited(), "the window waited for the server");
         assert_eq!(app.current_path, top.join("t1/sub"), "nothing moves before the server has answered");
+        held.release();
         apply(&mut app);
         assert_eq!(app.current_path, top.join("t0"), "the link was resolved on the thread");
         assert_eq!(app.back_history.last(), Some(&top.join("t1/sub")));
@@ -2185,6 +2188,89 @@ mod tests {
         assert_eq!(app.current_path, local, "a late answer moved the window");
         let _ = std::fs::remove_dir_all(&local);
         let _ = std::fs::remove_dir_all(&top);
+    }
+
+    /// A watchdog for something a test holds back: after 30 s it calls `let_go` and says so (`fired`). The 30 s keep a
+    /// broken test from hanging; they are no time the window may take. When the watchdog had to let go, what the test
+    /// called waited for what was held.
+    struct Watchdog {
+        fired: Arc<std::sync::atomic::AtomicBool>,
+        cancel: mpsc::Sender<()>,
+    }
+
+    impl Watchdog {
+        fn new(let_go: impl FnOnce() + Send + 'static) -> Self {
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (cancel, cancelled) = mpsc::channel::<()>();
+            let flag = fired.clone();
+            std::thread::spawn(move || {
+                if matches!(cancelled.recv_timeout(Duration::from_secs(30)), Err(mpsc::RecvTimeoutError::Timeout)) {
+                    flag.store(true, Ordering::SeqCst);
+                    let_go();
+                }
+            });
+            Watchdog { fired, cancel }
+        }
+
+        fn fired(&self) -> bool {
+            self.fired.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            let _ = self.cancel.send(());
+        }
+    }
+
+    /// Folders whose paths `held_answer` does not answer until they are let go of: a server that does not answer, for one
+    /// test each (a folder of its own), so tests running side by side do not let go of each other's.
+    static HELD_FOLDERS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static HELD_LET_GO: std::sync::Condvar = std::sync::Condvar::new();
+
+    fn let_go_of(folder: &Path) {
+        HELD_FOLDERS.lock().unwrap().retain(|f| f != folder);
+        HELD_LET_GO.notify_all();
+    }
+
+    /// The questions about paths in `folder` are held until `release` (or the watchdog) lets go.
+    struct HeldAnswers {
+        folder: PathBuf,
+        watchdog: Watchdog,
+    }
+
+    impl HeldAnswers {
+        fn hold(folder: &Path) -> Self {
+            HELD_FOLDERS.lock().unwrap().push(folder.to_path_buf());
+            let held = folder.to_path_buf();
+            HeldAnswers { folder: folder.to_path_buf(), watchdog: Watchdog::new(move || let_go_of(&held)) }
+        }
+
+        /// Whether what was called waited for the held answer (only the watchdog let it go on).
+        fn waited(&self) -> bool {
+            self.watchdog.fired()
+        }
+
+        fn release(&self) {
+            let_go_of(&self.folder);
+        }
+    }
+
+    impl Drop for HeldAnswers {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    /// `ask_server`, except that a path in a held folder waits until it is let go of.
+    fn held_answer(next: &Next) -> (Option<PathBuf>, bool) {
+        if let Some(path) = next.local() {
+            let mut held = HELD_FOLDERS.lock().unwrap();
+            while held.iter().any(|f| path.starts_with(f)) {
+                held = HELD_LET_GO.wait(held).unwrap();
+            }
+        }
+        ask_server(next)
     }
 
     /// For `when_following_the_path_itself_is_slow…`: every resolution waits until `let_resolutions_go`.
@@ -2443,10 +2529,12 @@ mod tests {
         let (mut app, base) = local_app("current");
         let shown = app.current_path.clone();
         std::fs::remove_dir_all(&shown).unwrap();
-        let started = Instant::now();
+        app.net.ask = held_answer;
+        let held = HeldAnswers::hold(&base);
         app.apply_disk_changes(Default::default(), false, vec![shown.clone()]);
-        assert!(started.elapsed() < Duration::from_millis(400), "{:?}", started.elapsed());
+        assert!(!held.waited(), "the window waited for the answer");
         assert_eq!(app.current_path, shown, "not decided before the thread has answered");
+        held.release();
         drain(&mut app);
         assert_eq!(app.current_path, base.join("c"));
         // A false alarm moves nothing
@@ -2463,9 +2551,11 @@ mod tests {
         let shown = app.current_path.clone();
         let parked_idx = 1 - app.active_tab;
         std::fs::remove_dir_all(base.join("a/b")).unwrap();
-        let started = Instant::now();
+        app.net.ask = held_answer;
+        let held = HeldAnswers::hold(&base);
         app.apply_disk_changes(Default::default(), false, vec![base.join("a/b")]);
-        assert!(started.elapsed() < Duration::from_millis(400), "{:?}", started.elapsed());
+        assert!(!held.waited(), "the window waited for the answer");
+        held.release();
         drain(&mut app);
         assert_eq!(app.current_path, shown);
         assert_eq!(app.tabs[parked_idx].saved.as_ref().map(|s| s.folder().to_path_buf()), Some(base.join("a")));
@@ -2479,11 +2569,13 @@ mod tests {
         let gone = app.current_path.clone();
         app.close_tab(&ctx, app.active_tab);
         std::fs::remove_dir_all(&gone).unwrap();
-        let started = Instant::now();
+        app.net.ask = held_answer;
+        let held = HeldAnswers::hold(&base);
         app.reopen_tab();
-        assert!(started.elapsed() < Duration::from_millis(400), "{:?}", started.elapsed());
+        assert!(!held.waited(), "the window waited for the answer");
         assert_eq!(app.tabs.len(), 2, "the tab is back at once");
         assert_eq!(app.current_path, gone);
+        held.release();
         drain(&mut app);
         assert_eq!(app.current_path, base.join("c"), "and then moved to what is left");
         std::fs::remove_dir_all(&base).unwrap();
@@ -2567,11 +2659,12 @@ mod tests {
             Kind::Dir
         });
         let (top, ctx) = (fake_server("hang"), egui::Context::default());
-        let started = Instant::now();
+        // Frames that waited for the hanging question would hang the test: the watchdog lets it go after 30 s
+        let watchdog = { let release = release.clone(); Watchdog::new(move || { let _ = release.send(()); }) };
         for i in 0..200 {
             assert_eq!(known.get(&top.join(format!("p{}", i % 3)), 0, &ctx), None);
         }
-        assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+        assert!(!watchdog.fired(), "a frame waited for the server");
         wait_for(|| (calls.load(Ordering::SeqCst) > 0).then_some(()));
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one question per mount, however many frames ask");
@@ -2849,11 +2942,11 @@ mod tests {
         let (app, release, calls) = app_with_hanging_server();
         let (pin, ctx) = (fake_server("pin").join("projects"), egui::Context::default());
         assert!(!pin.is_dir(), "a stat would say it is nothing");
-        let started = Instant::now();
+        let watchdog = { let release = release.clone(); Watchdog::new(move || { let _ = release.send(()); }) };
         for _ in 0..100 {
             assert!(app.pin_is_folder(&pin, &ctx));
         }
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(!watchdog.fired(), "a frame waited for the server");
         assert!(app.is_folder(&pin), "and a drop target on a server is taken for a folder too");
         release.send(()).unwrap();
         wait_for(|| (!app.pin_is_folder(&pin, &ctx)).then_some(()));
@@ -2929,9 +3022,9 @@ mod tests {
             let _ = hold.lock().unwrap().recv();
             crate::compat::rename_noreplace(from, to)
         });
-        let started = Instant::now();
+        let watchdog = { let release = release.clone(); Watchdog::new(move || { let _ = release.send(()); }) };
         assert_eq!(app.rename_entry(&dir.join("a.txt"), "b.txt"), Ok(()));
-        assert!(started.elapsed() < Duration::from_millis(500), "the call waited for the server");
+        assert!(!watchdog.fired(), "the call waited for the server");
         assert!(dir.join("a.txt").exists() && app.history.undo_label().is_none(), "nothing happened yet");
         release.send(()).unwrap();
         wait_for(|| {
