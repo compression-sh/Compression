@@ -11909,7 +11909,9 @@ mod tests {
         std::fs::write(work.join("file.txt"), "x").unwrap();
         let ctx = egui::Context::default();
         let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
-        let admin = crate::fs::admin::available();
+        // Administrator access counts as there, whether or not this computer has pkexec, so a missing entry shows
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(Some(true)));
+        let admin = true;
         let labels = |groups: &[Vec<MenuEntry>]| -> Vec<Vec<String>> { groups.iter().map(|g| g.iter().map(|e| e.1.to_owned()).collect()).collect() };
         let submenu = |groups: &[Vec<MenuEntry>], name: &str| -> Vec<String> {
             groups.iter().flatten().find(|e| e.1 == name).and_then(|e| if let MenuAction::Submenu(inner) = &e.2 { Some(inner.iter().map(|i| i.1.to_owned()).collect()) } else { None }).unwrap_or_else(|| panic!("no submenu {name}"))
@@ -11924,7 +11926,11 @@ mod tests {
         assert!(!labels(&groups).iter().flatten().any(|l| l == "Open in terminal" || l == "Open as administrator"), "{:?}", labels(&groups));
         let inner = groups[0].iter().find_map(|e| if let MenuAction::Submenu(inner) = &e.2 { Some(inner.clone()) } else { None }).unwrap();
         let targets: Vec<PathBuf> = inner.iter().filter_map(|e| match &e.2 { MenuAction::OpenTerminal(p) | MenuAction::OpenAsAdmin(p) => Some(p.clone()), _ => None }).collect();
-        assert!(targets.iter().all(|p| *p == dir.path) && !targets.is_empty(), "{targets:?}");
+        assert!(targets.iter().all(|p| *p == dir.path) && targets.len() == 2, "{targets:?}");
+        // Without administrator access the submenu has no entry for it
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(Some(false)));
+        assert_eq!(submenu(&app.menu_entries(&MenuTarget::Item(dir.clone())), "Open in"), ["New tab", "New window", "Terminal"]);
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(Some(true)));
         // Files and folders: deleting for good is the last of More actions, not beside the trash
         for item in [dir, FileItem::from_path(&work.join("file.txt")).unwrap()] {
             let groups = app.menu_entries(&MenuTarget::Item(item.clone()));
@@ -11945,6 +11951,7 @@ mod tests {
         let groups = app.menu_entries(&MenuTarget::Item(file));
         let with_trash = groups.iter().find(|g| g.iter().any(|e| e.1 == "Move to trash")).unwrap();
         assert_eq!(with_trash.iter().map(|e| e.1).collect::<Vec<_>>(), ["Move to trash", "Delete permanently"]);
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(None));
         let _ = std::fs::remove_dir_all(&work);
     }
 

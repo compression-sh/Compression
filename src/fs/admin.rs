@@ -41,8 +41,18 @@ fn pkexec() -> Option<PathBuf> {
     std::env::split_paths(&paths).chain(extra).map(|dir| dir.join("pkexec")).find(|p| p.is_file())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// On this thread, whether administrator access counts as available, instead of looking for pkexec.
+    pub(crate) static TEST_AVAILABLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether administrator access can be asked for at all.
 pub fn available() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_AVAILABLE.with(std::cell::Cell::get) {
+        return on;
+    }
     !is_admin() && pkexec().is_some()
 }
 
