@@ -12,12 +12,6 @@
 
 <p align="center"><em>A small, fast Rust file manager for Wayland and X11.</em></p>
 
-- **Quick to use**: list and grid views with thumbnails, tabs, search, Quick Look, vim keys if you want them
-- **Safe with your files**: undo, the trash, and Replace only ever with a complete copy
-- **Archives built in**: zip and tar.gz out of the box, 7z and more with your system's tools; every job can be cancelled
-- **Servers as folders**: SMB, SFTP, FTP and WebDAV, with a status dot and Reconnect
-- **Yours to shape**: themes and a theme editor, icon styles, your own context menu, keybindings and plugins
-
 ![Compression showing a Pictures folder as a grid of thumbnails](docs/screenshots/hero.png)
 
 ## Install
