@@ -985,5 +985,6 @@
   "The folder “{}” could not be made: {}": "Không thể tạo thư mục “{}”: {}",
   "{} can only be handed names that are valid text (UTF-8), and one of these is not. Choose another terminal in Settings → Behavior.": "Chỉ có thể truyền cho {} các tên là văn bản hợp lệ (UTF-8), và một trong số này thì không. Hãy chọn terminal khác trong Cài đặt → Hành vi.",
   "What else is on this drive could not be told, so nothing was ejected. Unmount it instead.": "Không xác định được ổ này còn chứa gì khác nên không có gì được đẩy ra. Hãy gỡ gắn kết nó thay vào đó.",
-  "This drive also holds “{}”, which the system uses, so nothing was ejected. Unmount it instead.": "Ổ này còn chứa “{}” mà hệ thống đang dùng nên không có gì được đẩy ra. Hãy gỡ gắn kết nó thay vào đó."
+  "This drive also holds “{}”, which the system uses, so nothing was ejected. Unmount it instead.": "Ổ này còn chứa “{}” mà hệ thống đang dùng nên không có gì được đẩy ra. Hãy gỡ gắn kết nó thay vào đó.",
+  "Media": "Đa phương tiện"
 }

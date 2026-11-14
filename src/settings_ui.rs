@@ -1390,7 +1390,12 @@ impl CompressionApp {
         ui.spacing_mut().item_spacing.y = 2.0;
         let installed = self.installed_apps();
         for (idx, category) in apps::CATEGORIES.iter().enumerate() {
+            // The kinds in two groups: what is watched and listened to, and the files one works on
+            if let Some(heading) = category_heading(category.label) {
+                material::section_label(ui, heading, &theme);
+            }
             let current = defaults.get(idx).and_then(|d| d.as_deref()).and_then(|id| installed.iter().find(|a| a.id == id));
+            let current_icon = current.and_then(|app| self.app_icon(ui.ctx(), app));
             let unavailable;
             let value = match (marks.get(&idx), &known[idx]) {
                 (Some(DefaultMark::Setting), _) => tr("Setting…"),
@@ -1403,7 +1408,7 @@ impl CompressionApp {
                 (None, apps::Known::Is(_)) => current.map_or(tr("Not set"), |a| a.name.as_str()),
             };
             let is_open = *picking == Some(idx);
-            if category_row(ui, ("cat_row", idx), category.icon, tr(category.label), value, &theme, is_open).clicked() {
+            if category_row(ui, ("cat_row", idx), category.icon, tr(category.label), value, current_icon.as_ref(), &theme, is_open).clicked() {
                 *picking = if is_open { None } else { Some(idx) };
             }
             material::collapsible(ui, ("cat_collapse", idx), *picking == Some(idx), |ui| {
@@ -1414,7 +1419,11 @@ impl CompressionApp {
                     let probe = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 44.0));
                     let tex = if ui.is_rect_visible(probe) { self.app_icon(ui.ctx(), app) } else { None };
                     let on = defaults[idx].as_deref() == Some(app.id.as_str());
-                    if app_row(ui, ("cat_app", idx, &app.id), tex.as_ref(), &app.name, &theme, on).clicked() {
+                    let row = app_row(ui, ("cat_app", idx, &app.id), tex.as_ref(), &app.name, &theme, on);
+                    if on {
+                        default_mark(ui, row.rect, &theme);
+                    }
+                    if row.clicked() {
                         chosen = Some(app);
                     }
                 }
@@ -1683,12 +1692,32 @@ fn icon_style_card(
     resp
 }
 
+/// The heading the kinds of files are grouped under, given before the first of each group.
+fn category_heading(label: &str) -> Option<&'static str> {
+    match label {
+        "Images" => Some(tr("Media")),
+        "Documents" => Some(tr("Files")),
+        _ => None,
+    }
+}
+
+/// A tick and "Default" at the right end of the row of the application that is the default.
+fn default_mark(ui: &egui::Ui, row: egui::Rect, theme: &SerpantinumTheme) {
+    let galley = ui.painter().layout_no_wrap(tr("Default").to_owned(), egui::FontId::proportional(material::FONT_CAPTION), theme.mauve);
+    let text_left = row.right() - 16.0 - galley.size().x;
+    ui.painter().galley(egui::pos2(text_left, row.center().y - galley.size().y / 2.0), galley, theme.mauve);
+    material::paint_icon(ui.painter(), egui::pos2(text_left - 12.0, row.center().y), icons::CHECK, material::ICON_SM, theme.mauve);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn category_row(
     ui: &mut egui::Ui,
     id_source: impl std::hash::Hash + std::fmt::Debug,
     icon: &str,
     label: &str,
     value: &str,
+    // The icon of the application that is the default, before its name
+    app_icon: Option<&egui::TextureHandle>,
     theme: &SerpantinumTheme,
     open: bool,
 ) -> egui::Response {
@@ -1724,13 +1753,13 @@ fn category_row(
         material::ICON_SM,
         material::lerp_color(theme.subtext1, theme.text, fx.hover.max(sel)),
     );
-    ui.painter().text(
-        egui::pos2(rect.right() - 42.0, rect.center().y),
-        egui::Align2::RIGHT_CENTER,
-        value,
-        egui::FontId::proportional(material::FONT_CAPTION),
-        theme.subtext1,
-    );
+    let galley = ui.painter().layout_no_wrap(value.to_owned(), egui::FontId::proportional(material::FONT_CAPTION), theme.subtext1);
+    let value_left = rect.right() - 42.0 - galley.size().x;
+    ui.painter().galley(egui::pos2(value_left, rect.center().y - galley.size().y / 2.0), galley, theme.subtext1);
+    if let Some(tex) = app_icon {
+        let at = egui::Rect::from_center_size(egui::pos2(value_left - 14.0, rect.center().y), egui::vec2(18.0, 18.0));
+        egui::Image::from_texture(egui::load::SizedTexture::new(tex.id(), at.size())).paint_at(ui, at);
+    }
     resp
 }
 
@@ -2165,6 +2194,64 @@ mod tests {
 
     fn toast_text(app: &CompressionApp) -> String {
         app.toast_message().unwrap_or_default().to_owned()
+    }
+
+    #[test]
+    fn the_applications_page_groups_the_kinds_and_marks_the_default() {
+        let (mut app, mut state, dir) = defaults_window("page", Vec::new());
+        let mime = apps::CATEGORIES[0].mimes[0];
+        apps::TEST_INSTALLED.with(|t| *t.borrow_mut() = Some(std::sync::Arc::new(vec![apps::tests::entry_for("viewer.desktop", "Viewer", &[mime]), apps::tests::entry_for("other.desktop", "Other", &[mime])])));
+        state.defaults[0] = Some("viewer.desktop".to_owned());
+        state.known[0] = apps::Known::Is(Some("viewer.desktop".to_owned()));
+        let shown = applications_texts(&mut app, &mut state);
+        let at = |text: &str| shown.iter().position(|t| t == text).unwrap_or_else(|| panic!("{text:?} is not shown: {shown:?}"));
+        // Media before Images, Video and Music; Files before Documents, Text and Archives
+        assert!(at("Media") < at("Images") && at("Music") < at("Files") && at("Files") < at("Documents") && at("Documents") < at("Archives"), "{shown:?}");
+        assert_eq!(shown.iter().filter(|t| *t == "Media" || *t == "Files").count(), 2, "each heading once");
+        assert_eq!(shown.iter().filter(|t| t.starts_with("The application that opens each kind of file")).count(), 1, "the hint once, at the top");
+        assert!(at("Viewer") > at("Images"), "the default's name in its row");
+        // Opened: the applications of the kind, the default marked as such, and only it
+        state.picking = Some(0);
+        let shown = applications_texts(&mut app, &mut state);
+        assert_eq!(shown.iter().filter(|t| *t == "Default").count(), 1, "{shown:?}");
+        assert!(shown.iter().any(|t| t == "Other"));
+        apps::TEST_INSTALLED.with(|t| *t.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_kind_shows_the_icon_of_its_default_application_in_its_row() {
+        fn textured(shape: &egui::Shape, id: egui::TextureId) -> bool {
+            match shape {
+                egui::Shape::Mesh(mesh) => mesh.texture_id == id,
+                egui::Shape::Rect(rect) => rect.fill_texture_id() == id,
+                egui::Shape::Vec(shapes) => shapes.iter().any(|s| textured(s, id)),
+                _ => false,
+            }
+        }
+        let (mut app, mut state, dir) = defaults_window("icon", Vec::new());
+        let mime = apps::CATEGORIES[0].mimes[0];
+        apps::TEST_INSTALLED.with(|t| *t.borrow_mut() = Some(std::sync::Arc::new(vec![apps::tests::entry_for("viewer.desktop", "Viewer", &[mime])])));
+        let ctx = app.ctx.clone();
+        let tex = ctx.load_texture("app", egui::ColorImage::new([2, 2], vec![egui::Color32::RED; 4]), egui::TextureOptions::default());
+        app.app_icons.insert("viewer.desktop".to_owned(), Some(tex.clone()));
+        for (default, expected) in [(None, false), (Some("viewer.desktop"), true)] {
+            state.defaults[0] = default.map(str::to_owned);
+            state.known[0] = apps::Known::Is(default.map(str::to_owned));
+            let mut drawn = false;
+            for n in 0..2 {
+                let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 1400.0))), time: Some(n as f64 * 0.05), ..Default::default() };
+                let SettingsState { picking, defaults, known, marks, .. } = &mut state;
+                let mut out = ctx.run_ui(raw, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| app.applications_tab(ui, picking, defaults, known, marks));
+                });
+                out.textures_delta.clear();
+                drawn = out.shapes.iter().any(|c| textured(&c.shape, tex.id()));
+            }
+            assert_eq!(drawn, expected, "default {default:?}");
+        }
+        apps::TEST_INSTALLED.with(|t| *t.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

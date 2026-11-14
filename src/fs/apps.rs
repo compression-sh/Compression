@@ -33,8 +33,18 @@ fn application_dirs() -> Vec<PathBuf> {
 
 static APPS: RwLock<Option<Arc<Vec<AppEntry>>>> = RwLock::new(None);
 
+// Tests only (not in the program): the applications a test on this thread says are installed, in place of a scan
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_INSTALLED: std::cell::RefCell<Option<Arc<Vec<AppEntry>>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// The installed applications as last scanned. Blocks the calling thread when there is no scan yet.
 pub fn installed() -> Arc<Vec<AppEntry>> {
+    #[cfg(test)]
+    if let Some(apps) = TEST_INSTALLED.with(|t| t.borrow().clone()) {
+        return apps;
+    }
     if let Some(apps) = APPS.read().ok().and_then(|a| a.clone()) {
         return apps;
     }
@@ -827,6 +837,11 @@ pub(crate) mod tests {
     /// An entry for tests of other modules.
     pub(crate) fn entry(id: &str, name: &str) -> AppEntry {
         AppEntry { id: id.into(), name: name.into(), exec: "true".into(), mimes: Vec::new(), icon: None, terminal: false }
+    }
+
+    /// An entry that opens `mimes`, for tests of other modules.
+    pub(crate) fn entry_for(id: &str, name: &str, mimes: &[&str]) -> AppEntry {
+        AppEntry { mimes: mimes.iter().map(|m| m.to_string()).collect(), ..entry(id, name) }
     }
 
     /// A stand-in for `xdg-mime` that keeps its defaults in `dir/state` and logs each call in `dir/calls`. It sleeps `delay`

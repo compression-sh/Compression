@@ -985,5 +985,6 @@
   "The folder “{}” could not be made: {}": "No se pudo crear la carpeta «{}»: {}",
   "{} can only be handed names that are valid text (UTF-8), and one of these is not. Choose another terminal in Settings → Behavior.": "A {} solo se le pueden pasar nombres que sean texto válido (UTF-8), y uno de estos no lo es. Elija otra terminal en Ajustes → Comportamiento.",
   "What else is on this drive could not be told, so nothing was ejected. Unmount it instead.": "No se pudo saber qué más hay en esta unidad, así que no se expulsó nada. Desmóntela en su lugar.",
-  "This drive also holds “{}”, which the system uses, so nothing was ejected. Unmount it instead.": "Esta unidad también contiene «{}», que usa el sistema, así que no se expulsó nada. Desmóntela en su lugar."
+  "This drive also holds “{}”, which the system uses, so nothing was ejected. Unmount it instead.": "Esta unidad también contiene «{}», que usa el sistema, así que no se expulsó nada. Desmóntela en su lugar.",
+  "Media": "Multimedia"
 }

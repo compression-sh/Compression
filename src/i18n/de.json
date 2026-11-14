@@ -985,5 +985,6 @@
   "The folder “{}” could not be made: {}": "Der Ordner „{}“ konnte nicht angelegt werden: {}",
   "{} can only be handed names that are valid text (UTF-8), and one of these is not. Choose another terminal in Settings → Behavior.": "{} können nur Namen übergeben werden, die gültiger Text (UTF-8) sind, und einer davon ist es nicht. Wählen Sie unter Einstellungen → Verhalten ein anderes Terminal.",
   "What else is on this drive could not be told, so nothing was ejected. Unmount it instead.": "Was sonst auf diesem Laufwerk liegt, ließ sich nicht feststellen, deshalb wurde nichts ausgeworfen. Hängen Sie es stattdessen aus.",
-  "This drive also holds “{}”, which the system uses, so nothing was ejected. Unmount it instead.": "Dieses Laufwerk enthält auch „{}“, das vom System verwendet wird, deshalb wurde nichts ausgeworfen. Hängen Sie es stattdessen aus."
+  "This drive also holds “{}”, which the system uses, so nothing was ejected. Unmount it instead.": "Dieses Laufwerk enthält auch „{}“, das vom System verwendet wird, deshalb wurde nichts ausgeworfen. Hängen Sie es stattdessen aus.",
+  "Media": "Medien"
 }

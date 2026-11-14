@@ -985,5 +985,6 @@
   "The folder “{}” could not be made: {}": "Le dossier « {} » n’a pas pu être créé : {}",
   "{} can only be handed names that are valid text (UTF-8), and one of these is not. Choose another terminal in Settings → Behavior.": "{} ne peut recevoir que des noms en texte valide (UTF-8), et l’un d’eux ne l’est pas. Choisissez un autre terminal dans Paramètres → Comportement.",
   "What else is on this drive could not be told, so nothing was ejected. Unmount it instead.": "Impossible de savoir ce que contient encore ce disque : rien n’a été éjecté. Démontez-le plutôt.",
-  "This drive also holds “{}”, which the system uses, so nothing was ejected. Unmount it instead.": "Ce disque contient aussi « {} », utilisé par le système : rien n’a été éjecté. Démontez-le plutôt."
+  "This drive also holds “{}”, which the system uses, so nothing was ejected. Unmount it instead.": "Ce disque contient aussi « {} », utilisé par le système : rien n’a été éjecté. Démontez-le plutôt.",
+  "Media": "Médias"
 }
