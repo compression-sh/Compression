@@ -11508,9 +11508,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(work.join("up")).unwrap();
         let mut w = Window::new(work.clone());
-        // As above: the real listing must not replace the made-up mounts
+        // As above: the real listing must not replace the made-up mounts; and the rows of the drives the sidebar shows
+        // must not move once the test has found where a row is (the real listing comes on a thread of its own)
         let ctx = w.ctx.clone();
         w.app.hold_network_listing_once_it_came(&ctx);
+        w.app.hold_drive_listing_once_it_came(&ctx);
         let theme = w.app.theme;
         let address = |host: &str| Address::parse(&format!("sftp://me@{host}/")).unwrap();
         let mount = |name: &str, host: &str| Mount { name: name.into(), address: Some(address(host)), local: work.join(name), kind: MountKind::Helper };

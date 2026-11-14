@@ -30,6 +30,22 @@ impl DriveState {
     }
 }
 
+/// Tests only (not in the program): waits until the listing of the drives the window asked for at start has come, then
+/// holds further listings back (as if one were on its way), so the sidebar's rows stay where a test found them. The
+/// window asks again every few seconds (`REFRESH`) by itself. The 30 s are a watchdog.
+#[cfg(test)]
+impl CompressionApp {
+    pub(crate) fn hold_drive_listing_once_it_came(&mut self, ctx: &egui::Context) {
+        let limit = Instant::now() + Duration::from_secs(30);
+        while self.drive_state.listing {
+            assert!(Instant::now() < limit, "the listing of the drives never came");
+            self.poll_drives(ctx);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.drive_state.listing = true;
+    }
+}
+
 impl CompressionApp {
     /// Apply finished work and ask for a new listing every few seconds.
     pub(super) fn poll_drives(&mut self, ctx: &egui::Context) {
