@@ -16,23 +16,78 @@ pub fn files_dir() -> Option<PathBuf> {
     root().map(|r| r.join("files"))
 }
 
+/// `files_dir` with its links resolved, as the folders shown are, once it was resolved (see `preload`).
+static RESOLVED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Resolve the trash folder on a thread of its own, then call `done`: the context menu asks for it without waiting.
+pub fn preload(done: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(move || {
+        if let Some(files) = files_dir() {
+            RESOLVED.get_or_init(|| resolve(&files));
+        }
+        #[cfg(test)]
+        tests::PRELOADED.store(true, std::sync::atomic::Ordering::SeqCst);
+        done();
+    });
+}
+
+/// `path` with its links resolved: the nearest folder above it that is there, resolved, with the rest put back. So it is
+/// right also before the trash folder is made (its own parts are made as folders, not links).
+fn resolve(path: &Path) -> PathBuf {
+    #[cfg(test)]
+    tests::RESOLVES.with(|n| n.set(n.get() + 1));
+    path.ancestors()
+        .find_map(|above| Some(above.canonicalize().ok()?.join(path.strip_prefix(above).ok()?)))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// `files_dir` resolved; resolved here and now the first time if `preload` has not done it yet.
+fn files_dir_resolved() -> Option<PathBuf> {
+    let files = files_dir()?;
+    Some(RESOLVED.get_or_init(|| resolve(&files)).clone())
+}
+
+/// `files_dir` resolved, without asking the file system: `None` until `preload` has resolved it.
+fn files_dir_known() -> Option<PathBuf> {
+    #[cfg(test)]
+    if tests::COLD.with(std::cell::Cell::get) {
+        return None;
+    }
+    known_in(&RESOLVED)
+}
+
+/// What `cell` holds, without resolving anything when it holds nothing yet.
+fn known_in(cell: &std::sync::OnceLock<PathBuf>) -> Option<PathBuf> {
+    cell.get().cloned()
+}
+
+/// `contains`, without asking the file system: `None` while that is not known yet.
+pub fn contains_known(path: &Path) -> Option<bool> {
+    files_dir_known().map(|files| path.starts_with(files))
+}
+
+/// `is_trash_folder`, without asking the file system: `None` while that is not known yet.
+pub fn is_trash_folder_known(path: &Path) -> Option<bool> {
+    files_dir_known().map(|files| files == path)
+}
+
+/// Whether `path` sits directly in a trash folder, where its record is, by the names alone, without asking the file
+/// system (a trash on a drive is not checked for its `info` folder; restoring says so if a record is missing): `None`
+/// while the home trash is not known yet.
+pub fn is_top_level_known(path: &Path) -> Option<bool> {
+    let files = files_dir_known()?;
+    let parent = path.parent();
+    Some(parent == Some(files.as_path()) || parent.is_some_and(|p| p.file_name().is_some_and(|n| n == "files") && p.parent().is_some_and(|r| topdir_of(r).is_some())))
+}
+
 /// Whether `path` is the trash folder itself or something inside it.
 pub fn contains(path: &Path) -> bool {
-    files_dir().is_some_and(|files| {
-        let files = files.canonicalize().unwrap_or(files);
-        path.starts_with(files)
-    })
+    files_dir_resolved().is_some_and(|files| path.starts_with(files))
 }
 
 /// Whether the trash folder is the folder being looked at.
 pub fn is_trash_folder(path: &Path) -> bool {
-    files_dir().is_some_and(|files| files.canonicalize().unwrap_or(files) == path)
-}
-
-/// Whether `path` sits directly in the trash folder, where its record is.
-pub fn is_top_level(path: &Path) -> bool {
-    let home = files_dir().is_some_and(|files| path.parent().is_some_and(|parent| parent == files || files.canonicalize().is_ok_and(|f| f == parent)));
-    home || path.parent().is_some_and(|p| p.file_name().is_some_and(|n| n == "files") && p.parent().is_some_and(|r| topdir_of(r).is_some() && r.join("info").is_dir()))
+    files_dir_resolved().is_some_and(|files| files == path)
 }
 
 /// The trash folders on mounted drives that exist, where items deleted there wait: `<drive>/.Trash-$uid`
@@ -440,8 +495,59 @@ fn decode(s: &str) -> std::ffi::OsString {
 
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        /// How often a trash folder was resolved on this thread.
+        pub(crate) static RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// On this thread, the trash folder counts as not resolved yet (as right after the start).
+        pub(crate) static COLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Whether `preload` has resolved the trash folder in this process.
+    pub(crate) static PRELOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[test]
+    fn what_is_not_resolved_yet_is_not_resolved_by_asking_whether_it_is_known() {
+        let before = RESOLVES.with(std::cell::Cell::get);
+        assert_eq!(known_in(&std::sync::OnceLock::new()), None);
+        assert_eq!(RESOLVES.with(std::cell::Cell::get), before);
+    }
+
+    #[test]
+    fn a_trash_folder_that_is_not_made_yet_is_resolved_through_the_folder_above_it() {
+        let dir = std::env::temp_dir().join(format!("compression_trash_resolve_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        let real = dir.join("real").canonicalize().unwrap();
+        assert_eq!(resolve(&dir.join("link/Trash/files")), real.join("Trash/files"));
+        assert_eq!(resolve(&dir.join("link")), real);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_known_answers_ask_nothing_and_say_unknown_until_resolved() {
+        COLD.with(|c| c.set(true));
+        let before = RESOLVES.with(std::cell::Cell::get);
+        assert_eq!(contains_known(Path::new("/x")), None);
+        assert_eq!(is_trash_folder_known(Path::new("/x")), None);
+        assert_eq!(is_top_level_known(Path::new("/x/y")), None);
+        assert_eq!(RESOLVES.with(std::cell::Cell::get), before, "nothing was resolved for them");
+        COLD.with(|c| c.set(false));
+        // Once resolved, they answer, still without resolving
+        let files = files_dir_resolved().unwrap();
+        let before = RESOLVES.with(std::cell::Cell::get);
+        assert_eq!(contains_known(&files.join("a")), Some(true));
+        assert_eq!(is_trash_folder_known(&files), Some(true));
+        assert_eq!(is_top_level_known(&files.join("a")), Some(true));
+        assert_eq!(is_top_level_known(&files.join("a/b")), Some(false));
+        assert_eq!(is_top_level_known(Path::new("/media/stick/.Trash-1000/files/a")), Some(true));
+        assert_eq!(is_top_level_known(Path::new("/media/stick/files/a")), Some(false));
+        assert_eq!(contains_known(Path::new("/elsewhere")), Some(false));
+        assert_eq!(RESOLVES.with(std::cell::Cell::get), before);
+    }
 
     /// `trash_in` with the plain move, as the trash uses it outside a job.
     fn trash_in(root: &Path, topdir: Option<&Path>, original: &Path) -> io::Result<PathBuf> {

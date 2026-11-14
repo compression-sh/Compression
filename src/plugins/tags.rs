@@ -84,6 +84,8 @@ fn file_name(path: &Path) -> String {
 }
 
 pub fn read_tags(path: &Path) -> std::io::Result<Vec<String>> {
+    #[cfg(test)]
+    tests::TAG_READS.with(|n| n.set(n.get() + 1));
     Ok(xattr::get(path, ATTR)?.map(|v| parse(&v)).unwrap_or_default())
 }
 
@@ -256,6 +258,11 @@ pub struct Tags {
     dir: Option<PathBuf>,
     generation: u64,
     folder_rx: Option<mpsc::Receiver<FolderRead>>,
+    /// The tags of the files a menu was opened for that were not known yet, read on one thread at a time: the paths it
+    /// reads, and those that wait for it (a server may hang; opening the menu again must not start another thread).
+    menu_rx: Option<mpsc::Receiver<Vec<(PathBuf, Entry)>>>,
+    menu_reading: Vec<PathBuf>,
+    menu_waiting: Vec<PathBuf>,
     prompt: Option<Prompt>,
     messages: Vec<String>,
     /// Beside each remembered file: its file system, and whether its tags wait to be written to it.
@@ -325,6 +332,9 @@ impl Tags {
             dir: None,
             generation: 0,
             folder_rx: None,
+            menu_rx: None,
+            menu_reading: Vec::new(),
+            menu_waiting: Vec::new(),
             prompt: None,
             messages: Vec::new(),
             metas: Metas::default(),
@@ -334,6 +344,26 @@ impl Tags {
             confirm_cleanup: false,
             last_check: None,
         }
+    }
+
+    /// Reads the tags of the waiting paths on a thread, unless one is reading already.
+    fn read_for_menu(&mut self) {
+        let missing: Vec<PathBuf> = std::mem::take(&mut self.menu_waiting).into_iter().filter(|p| !self.cache.contains_key(p)).collect();
+        if missing.is_empty() {
+            return;
+        }
+        self.menu_reading = missing.clone();
+        #[cfg(test)]
+        tests::MENU_READS_STARTED.with(|n| n.set(n.get() + 1));
+        let (tx, rx) = mpsc::channel();
+        self.menu_rx = Some(rx);
+        std::thread::spawn(move || {
+            let read = missing.into_iter().filter_map(|path| {
+                let (_, key) = key_of(&path)?;
+                Some((path.clone(), Entry { key, tags: read_tags(&path).unwrap_or_default() }))
+            });
+            let _ = tx.send(read.collect());
+        });
     }
 
     /// Finds out on a thread where the remembered files are (`paths`, or all of them). With `forget`, the files found
@@ -672,6 +702,26 @@ impl Plugin for Tags {
 
     fn poll(&mut self) -> bool {
         let mut changed = self.take_check();
+        if let Some(rx) = &self.menu_rx {
+            match rx.try_recv() {
+                Ok(read) => {
+                    self.menu_rx = None;
+                    self.menu_reading.clear();
+                    for (path, entry) in read {
+                        // What was learnt meanwhile (a folder read, a tag set here) is not replaced
+                        self.cache.entry(path).or_insert(entry);
+                    }
+                    self.read_for_menu();
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.menu_rx = None;
+                    self.menu_reading.clear();
+                    self.read_for_menu();
+                }
+            }
+        }
         if let Some(rx) = &self.folder_rx {
             match rx.try_recv() {
                 Ok((generation, dir, read)) if generation == self.generation => {
@@ -708,7 +758,7 @@ impl Plugin for Tags {
     }
 
     fn busy(&self) -> bool {
-        self.folder_rx.is_some() || self.check_rx.is_some()
+        self.folder_rx.is_some() || self.check_rx.is_some() || self.menu_rx.is_some()
     }
 
     fn marks(&self, item: &FileItem) -> Vec<Mark> {
@@ -732,7 +782,8 @@ impl Plugin for Tags {
         if selection.is_empty() || selection.iter().any(|i| i.is_symlink) {
             return Vec::new();
         }
-        let per_file: Vec<Vec<String>> = selection.iter().map(|i| self.tags_of(&i.path)).collect();
+        // Only what is known already: a file whose tags are still being read (`menu_opened`) counts as not having them
+        let per_file: Vec<Vec<String>> = selection.iter().map(|i| self.cache.get(&i.path).map(|e| e.tags.clone()).unwrap_or_default()).collect();
         let group = ("tags", tr("Tags"));
         let mut items = Vec::new();
         for name in self.known() {
@@ -745,6 +796,19 @@ impl Plugin for Tags {
         }
         items
     }
+
+    fn menu_opened(&mut self, selection: &[FileItem]) {
+        for item in selection {
+            let asked = self.menu_reading.contains(&item.path) || self.menu_waiting.contains(&item.path);
+            if !item.is_symlink && !asked && !self.cache.contains_key(&item.path) {
+                self.menu_waiting.push(item.path.clone());
+            }
+        }
+        if self.menu_rx.is_none() {
+            self.read_for_menu();
+        }
+    }
+
 
     fn run(&mut self, id: &str, paths: &[PathBuf], _dir: &Path) -> Reaction {
         if let Some(name) = id.strip_prefix("toggle:") {
@@ -971,8 +1035,74 @@ impl Plugin for Tags {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        /// How often tags were read from a file on this thread.
+        pub(crate) static TAG_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// How many threads were started to read tags for menus, from this thread.
+        pub(super) static MENU_READS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn settle_menu_reads(tags: &mut Tags) {
+        for _ in 0..500 {
+            if !tags.busy() {
+                return;
+            }
+            tags.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the menu's read did not end");
+    }
+
+    #[test]
+    fn tags_read_for_a_menu_never_replace_what_was_learnt_meanwhile() {
+        let Some((dir, a)) = scratch_file("menu_late") else { return };
+        write_tags(&a, &["work".to_owned()]).unwrap();
+        let mut tags = Tags::with(Registry::default(), BTreeMap::new());
+        let item = FileItem::from_path(&a).unwrap();
+        tags.menu_opened(std::slice::from_ref(&item));
+        // Changed here before the read came back (as setting a tag in the menu does)
+        tags.remember(&a, vec!["new".to_owned()]);
+        settle_menu_reads(&mut tags);
+        assert_eq!(tags.cache.get(&a).map(|e| e.tags.clone()), Some(vec!["new".to_owned()]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opening_menus_again_and_again_reads_one_at_a_time_never_twice_and_each_file_gets_its_own_tags() {
+        let Some((dir, a)) = scratch_file("menu_again") else { return };
+        let b = dir.join("b");
+        std::fs::write(&b, "b").unwrap();
+        write_tags(&a, &["work".to_owned()]).unwrap();
+        write_tags(&b, &["other".to_owned()]).unwrap();
+        let (ia, ib) = (FileItem::from_path(&a).unwrap(), FileItem::from_path(&b).unwrap());
+        let mut tags = Tags::with(Registry::default(), BTreeMap::new());
+        let started = || MENU_READS_STARTED.with(std::cell::Cell::get);
+        let before = started();
+        tags.menu_opened(std::slice::from_ref(&ia));
+        assert_eq!((started() - before, tags.menu_reading.clone()), (1, vec![a.clone()]));
+        // While that read runs (it is not taken in until `poll`): the same file again and again, and another selection
+        for _ in 0..50 {
+            tags.menu_opened(std::slice::from_ref(&ia));
+        }
+        for _ in 0..3 {
+            tags.menu_opened(&[ia.clone(), ib.clone()]);
+        }
+        assert_eq!(started() - before, 1, "no second thread while one reads");
+        assert_eq!(tags.menu_reading, vec![a.clone()]);
+        assert_eq!(tags.menu_waiting, vec![b.clone()], "the other file waits, once");
+        // Then the waiting one is read, and each file has its own tags
+        settle_menu_reads(&mut tags);
+        assert_eq!(started() - before, 2);
+        assert_eq!(tags.cache.get(&a).map(|e| e.tags.clone()), Some(vec!["work".to_owned()]));
+        assert_eq!(tags.cache.get(&b).map(|e| e.tags.clone()), Some(vec!["other".to_owned()]));
+        // Known now: opening again starts nothing
+        tags.menu_opened(&[ia, ib]);
+        assert_eq!(started() - before, 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     use crate::fs::xattr::{self, tests::scratch_file};
 
@@ -1356,11 +1486,53 @@ mod tests {
     }
 
     #[test]
+    fn a_menu_for_several_files_marks_a_tag_only_once_all_of_them_were_read_and_have_it() {
+        let Some((dir, a)) = scratch_file("menu_several") else { return };
+        let b = dir.join("b");
+        std::fs::write(&b, "b").unwrap();
+        write_tags(&a, &["work".to_owned()]).unwrap();
+        let read = |paths: &[&Path]| {
+            let mut tags = Tags::with(Registry(BTreeMap::from([(a.clone(), vec!["work".to_owned()])])), BTreeMap::new());
+            let items: Vec<FileItem> = paths.iter().map(|p| FileItem::from_path(p).unwrap()).collect();
+            tags.menu_opened(&items);
+            for _ in 0..500 {
+                if !tags.busy() {
+                    break;
+                }
+                tags.poll();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            tags.menu_items(&items)
+        };
+        let icon = |entries: &[MenuItem]| entries.iter().find(|e| e.id == "toggle:work").unwrap().icon;
+        // One of the two has it: not marked, but there is something to remove
+        let entries = read(&[&a, &b]);
+        assert_eq!(icon(&entries), icons::TAG);
+        assert!(entries.iter().any(|e| e.id == "clear"));
+        write_tags(&b, &["work".to_owned()]).unwrap();
+        assert_eq!(icon(&read(&[&a, &b])), icons::CHECK);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn menu_hides_for_links_and_marks_the_tags_all_files_share() {
         let Some((dir, file)) = scratch_file("menu") else { return };
         write_tags(&file, &["work".to_owned()]).unwrap();
-        let tags = Tags::with(Registry(BTreeMap::from([(file.clone(), vec!["work".to_owned()])])), BTreeMap::new());
+        let mut tags = Tags::with(Registry(BTreeMap::from([(file.clone(), vec!["work".to_owned()])])), BTreeMap::new());
         let item = FileItem::from_path(&file).unwrap();
+        // Not known yet: the menu does not read the file itself (it is drawn in every frame), so nothing is marked yet
+        let entries = tags.menu_items(std::slice::from_ref(&item));
+        assert_eq!(entries.iter().find(|e| e.id == "toggle:work").unwrap().icon, icons::TAG);
+        assert!(!entries.iter().any(|e| e.id == "clear"));
+        // Opening the menu has the tags read on a thread; then they are marked
+        tags.menu_opened(std::slice::from_ref(&item));
+        for _ in 0..500 {
+            if !tags.busy() {
+                break;
+            }
+            tags.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let entries = tags.menu_items(std::slice::from_ref(&item));
         let toggle = entries.iter().find(|e| e.id == "toggle:work").unwrap();
         assert_eq!(toggle.icon, icons::CHECK);

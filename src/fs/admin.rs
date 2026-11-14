@@ -35,6 +35,8 @@ pub fn config_override() -> Option<PathBuf> {
 }
 
 fn pkexec() -> Option<PathBuf> {
+    #[cfg(test)]
+    tests::PKEXEC_LOOKS.with(|n| n.set(n.get() + 1));
     let paths = std::env::var_os("PATH").unwrap_or_default();
     // NixOS and a few other systems keep the setuid wrapper outside the usual PATH of a desktop session
     let extra = ["/run/wrappers/bin", "/usr/bin", "/usr/local/bin"].map(PathBuf::from);
@@ -47,13 +49,21 @@ thread_local! {
     pub(crate) static TEST_AVAILABLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// Whether administrator access can be asked for at all.
+/// Where pkexec is, once it was looked for (`preload`).
+static PKEXEC: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Look for pkexec on a thread of its own, so that menus that offer administrator access never look in the frame.
+pub fn preload() {
+    std::thread::spawn(|| PKEXEC.get_or_init(pkexec));
+}
+
+/// Whether administrator access can be asked for at all. Until `preload` has looked, it cannot.
 pub fn available() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_AVAILABLE.with(std::cell::Cell::get) {
         return on;
     }
-    !is_admin() && pkexec().is_some()
+    !is_admin() && PKEXEC.get().is_some_and(Option::is_some)
 }
 
 /// Whether the program that is about to be run as root can only be changed by root and by the
@@ -171,8 +181,27 @@ pub fn open_folder(dir: &Path) -> io::Result<mpsc::Receiver<io::Error>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Whether `preload` has looked for pkexec in this process.
+    pub(crate) fn pkexec_looked() -> bool {
+        PKEXEC.get().is_some()
+    }
+
+    thread_local! {
+        /// How often pkexec was looked for on this thread.
+        pub(crate) static PKEXEC_LOOKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn asking_whether_administrator_access_exists_never_looks_for_pkexec_itself() {
+        let before = PKEXEC_LOOKS.with(std::cell::Cell::get);
+        for _ in 0..10 {
+            let _ = available();
+        }
+        assert_eq!(PKEXEC_LOOKS.with(std::cell::Cell::get), before, "menus ask in every frame; only preload looks, on its own thread");
+    }
     use std::ffi::OsString;
 
     fn words(list: &[&str]) -> Vec<String> {

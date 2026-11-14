@@ -173,9 +173,13 @@ pub trait Plugin {
     fn status(&self) -> Option<Status> {
         None
     }
+    /// What the menu of `selection` shows. Called in every frame the menu is open: it must not ask the file system,
+    /// which may be a server that hangs (`menu_opened` is the moment to start finding out, off the window's thread).
     fn menu_items(&self, _selection: &[FileItem]) -> Vec<MenuItem> {
         Vec::new()
     }
+    /// The menu of `selection` was just opened.
+    fn menu_opened(&mut self, _selection: &[FileItem]) {}
     /// Entries for the menu of the open folder and the main menu. `others` holds the folder of the
     /// other tab when exactly two tabs are open. `run` receives `[here, others...]` as its paths.
     fn folder_menu_items(&self, _here: &Path, _others: &[PathBuf]) -> Vec<MenuItem> {
@@ -385,6 +389,12 @@ impl Plugins {
     /// Menu entries for the selection, with the id of the plugin each one belongs to.
     pub fn menu_items(&self, selection: &[FileItem]) -> Vec<(&'static str, MenuItem)> {
         self.active().flat_map(|p| p.menu_items(selection).into_iter().map(|item| (p.id(), item))).collect()
+    }
+
+    pub fn menu_opened(&mut self, selection: &[FileItem]) {
+        for plugin in self.active_mut() {
+            plugin.menu_opened(selection);
+        }
     }
 
     pub fn folder_menu_items(&self, here: &Path, others: &[PathBuf]) -> Vec<(&'static str, MenuItem)> {

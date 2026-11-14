@@ -91,9 +91,10 @@ enum MenuTarget {
 
 type MenuEntry = (&'static str, &'static str, MenuAction);
 
-/// "Open as administrator" for a real folder, unless Compression already is one or cannot elevate.
+/// "Open as administrator" for the folder `path` (callers give folders only, as the listing knows them: nothing is asked
+/// of the file system, which may be a server that hangs), unless Compression already is one or cannot elevate.
 fn admin_entry(path: &Path) -> Option<MenuEntry> {
-    (path.is_dir() && !trash::is_trash_folder(path) && crate::fs::admin::available())
+    (trash::is_trash_folder_known(path) == Some(false) && crate::fs::admin::available())
         .then(|| (icons::SHIELD, tr("Open as administrator"), MenuAction::OpenAsAdmin(path.to_path_buf())))
 }
 
@@ -827,6 +828,11 @@ impl CompressionApp {
         network::set_user_remote_folders(&settings.remote_folders);
         apps::preload();
         crate::ui::fonts::preload();
+        crate::fs::admin::preload();
+        trash::preload({
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        });
         // Ctrl+= / Ctrl+- resize icons (see `zoom_icons`), not the whole interface
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let places = Place::default_places();
@@ -1129,6 +1135,12 @@ impl CompressionApp {
 
     fn in_trash(&self) -> bool {
         trash::contains(&self.current_path)
+    }
+
+    /// `in_trash`, without asking the file system: `None` until the trash folder is resolved (`trash::preload`). For the
+    /// context menu, which is built in every frame it is open.
+    fn trash_known(&self) -> Option<bool> {
+        trash::contains_known(&self.current_path)
     }
 
     /// The listing mixes items from many folders (search results, Recent).
@@ -1967,6 +1979,11 @@ impl CompressionApp {
         self.clipboard_offer = None;
         if matches!(target, MenuTarget::Folder) {
             self.probe_clipboard(ctx);
+        }
+        // What the plugins need to know for this menu is found out now, off the window's thread, not in its frames
+        if let MenuTarget::Item(item) = &target {
+            let selection = self.menu_group(item);
+            self.plugins.menu_opened(&selection);
         }
         self.menu = Some(ContextMenu { pos, target, open_label: None, label_rx });
     }
@@ -5711,9 +5728,14 @@ impl CompressionApp {
     }
 
     fn menu_entries(&self, target: &MenuTarget) -> Vec<Vec<MenuEntry>> {
+        // Whether this is the trash decides which entries there are (Restore, or Move to trash and Rename); until that is
+        // known without asking the file system (see `trash::preload`), none is offered rather than a wrong one
+        if matches!(target, MenuTarget::Item(_) | MenuTarget::Folder) && self.trash_known().is_none() {
+            return vec![vec![(icons::INFO, tr("Loading…"), MenuAction::Unavailable(tr("Loading…")))]];
+        }
         let mut groups = self.menu_entries_all(target);
         if let MenuTarget::Item(item) = target
-            && !self.in_trash()
+            && self.trash_known() != Some(true)
             && let Some(group) = self.plugin_menu_group(item)
         {
             // Above the closing group of path and properties
@@ -5734,7 +5756,7 @@ impl CompressionApp {
     fn menu_kind(&self, target: &MenuTarget) -> Option<menu_layout::MenuKind> {
         use menu_layout::MenuKind;
         match target {
-            _ if self.in_trash() => None,
+            _ if self.trash_known() == Some(true) => None,
             MenuTarget::Item(item) if self.menu_group(item).len() == 1 => Some(if item.is_dir { MenuKind::Folder } else { MenuKind::File }),
             MenuTarget::Folder => Some(MenuKind::Background),
             _ => None,
@@ -5819,7 +5841,7 @@ impl CompressionApp {
                 _ => vec![(icon, label, MenuAction::Submenu(entries))],
             }
         };
-        let (in_trash, mixed) = (self.in_trash(), self.is_mixed_listing());
+        let (in_trash, mixed) = (self.trash_known() == Some(true), self.is_mixed_listing());
         let calc_size = self.settings.folder_sizes == crate::settings::FolderSizeMode::OnDemand;
         // Clipboard / transfer / archive entries shared by every selection; `keep` leaves out
         // everything that would move or remove the items themselves
@@ -5900,7 +5922,7 @@ impl CompressionApp {
             MenuTarget::Item(item) if in_trash => {
                 let paths: Vec<PathBuf> = self.menu_group(item).into_iter().map(|i| i.path).collect();
                 // The trash keeps a record only for what was deleted directly; search results can be inside those
-                let restore = if paths.iter().all(|p| trash::is_top_level(p)) {
+                let restore = if paths.iter().all(|p| trash::is_top_level_known(p) == Some(true)) {
                     MenuAction::Restore(paths.clone())
                 } else {
                     MenuAction::Unavailable(tr("Only items deleted directly can be restored. Restore the folder this is in instead."))
@@ -5980,7 +6002,7 @@ impl CompressionApp {
                 vec![(icons::NEW_WINDOW, tr("New window"), MenuAction::NewWindow), (icons::NEW_TAB, tr("New tab"), MenuAction::NewTab)],
                 vec![(icons::LAN_CONNECT, tr("Connect to server…"), MenuAction::ConnectToServer)],
                 self.history_entries(),
-                self.plugin_folder_group().filter(|_| !self.in_recent() && !self.in_trash() && !self.in_bookmarks()).unwrap_or_default(),
+                self.plugin_folder_group().filter(|_| !self.in_recent() && self.trash_known() == Some(false) && !self.in_bookmarks()).unwrap_or_default(),
                 vec![
                     (icons::REFRESH, tr("Refresh"), MenuAction::Refresh),
                     (icons::COG, tr("Settings"), MenuAction::OpenSettings),
@@ -10273,7 +10295,13 @@ mod tests {
         w.run(Vec::new(), 20);
         assert!(w.app.error_denied, "a refusal for lack of rights is not recognized");
         assert!(w.shows("This folder can't be opened") && w.shows("Permission denied"), "{:?}", w.last);
-        assert_eq!(w.shows("Open as administrator"), crate::fs::admin::available(), "{:?}", w.last);
+        // Offered exactly where administrator access exists, whether or not this computer has pkexec
+        for available in [true, false] {
+            crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(Some(available)));
+            w.run(Vec::new(), 3);
+            assert_eq!(w.shows("Open as administrator"), available, "{:?}", w.last);
+        }
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(None));
 
         // Any other reason: no offer
         w.app.error_denied = false;
@@ -11902,6 +11930,136 @@ mod tests {
         assert_eq!(w.app.job_needing(&crate::fs::resources::of_all([&b])), None);
         assert_eq!(std::fs::read_to_string(a.join("same.txt")).unwrap(), "old");
         let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_context_menu_asks_the_file_system_nothing_in_its_frames_and_has_tags_read_off_the_window_thread() {
+        let Some((dir, file)) = crate::fs::xattr::tests::scratch_file("menu_tags") else { return };
+        crate::plugins::tags::write_tags(&file, &["work".to_owned()]).unwrap();
+        let work = window_dir("menu_fs");
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(Some(true)));
+        fn labels(entries: &[MenuEntry], out: &mut Vec<String>) {
+            for e in entries {
+                out.push(e.1.to_owned());
+                if let MenuAction::Submenu(inner) = &e.2 {
+                    labels(inner, out);
+                }
+            }
+        }
+        let all = |app: &CompressionApp, target: &MenuTarget| -> Vec<String> {
+            let mut out = Vec::new();
+            for group in app.menu_entries(target) {
+                labels(&group, &mut out);
+            }
+            out
+        };
+        // A folder as the listing knows it gets administrator access without the file system being asked: this one
+        // is not even there, and is offered it all the same
+        let mut gone = FileItem::sample("gone", crate::fs::file_item::FileType::Directory);
+        gone.path = work.join("gone");
+        assert!(all(&app, &MenuTarget::Item(gone)).contains(&"Open as administrator".to_owned()));
+        // A tagged file whose tags are not known yet: the menu's frames do not read them
+        let target = MenuTarget::Item(FileItem::from_path(&file).unwrap());
+        assert!(!all(&app, &target).contains(&"Remove all tags".to_owned()));
+        // Opening the menu has them read on a thread, and they show once they are there
+        app.open_menu(&ctx, egui::Pos2::ZERO, target.clone());
+        for _ in 0..500 {
+            app.plugins.poll();
+            if all(&app, &target).contains(&"Remove all tags".to_owned()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(all(&app, &target).contains(&"Remove all tags".to_owned()), "{:?}", all(&app, &target));
+        // Closed and opened again: known at once, and the entries act on the same file
+        app.menu = None;
+        app.open_menu(&ctx, egui::Pos2::ZERO, target.clone());
+        assert!(all(&app, &target).contains(&"Remove all tags".to_owned()));
+        let acts_on: Vec<Vec<PathBuf>> = app.menu_entries(&target).into_iter().flatten().filter_map(|e| match e.2 {
+            MenuAction::Trash(paths) | MenuAction::Copy(paths) => Some(paths),
+            _ => None,
+        }).collect();
+        assert!(!acts_on.is_empty() && acts_on.iter().all(|paths| paths == &vec![file.clone()]), "{acts_on:?}");
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(None));
+        let _ = std::fs::remove_dir_all(&work);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opening_a_context_menu_from_cold_and_drawing_it_again_asks_the_file_system_nothing() {
+        let Some((dir, file)) = crate::fs::xattr::tests::scratch_file("menu_cold") else { return };
+        crate::plugins::tags::write_tags(&file, &["work".to_owned()]).unwrap();
+        let work = window_dir("menu_cold");
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        // As right after the start: the trash folder not resolved, no tags known for the file (it is not in the folder
+        // shown), and whatever pkexec's search has found
+        crate::fs::trash::tests::COLD.with(|c| c.set(true));
+        let asked = || {
+            (
+                crate::fs::trash::tests::RESOLVES.with(std::cell::Cell::get),
+                crate::fs::admin::tests::PKEXEC_LOOKS.with(std::cell::Cell::get),
+                crate::plugins::tags::tests::TAG_READS.with(std::cell::Cell::get),
+            )
+        };
+        let before = asked();
+        let item = MenuTarget::Item(FileItem::from_path(&file).unwrap());
+        let mut folder = FileItem::sample("sub", crate::fs::file_item::FileType::Directory);
+        folder.path = work.join("sub");
+        let labels = |app: &CompressionApp, target: &MenuTarget| -> Vec<String> { app.menu_entries(target).into_iter().flatten().map(|e| e.1.to_owned()).collect() };
+        // Opened and drawn many times while the trash is not known: only an entry that does nothing, no wrong action
+        for target in [item.clone(), MenuTarget::Item(folder.clone()), MenuTarget::Folder] {
+            app.open_menu(&ctx, egui::Pos2::ZERO, target.clone());
+            for _ in 0..20 {
+                assert_eq!(labels(&app, &target), ["Loading…"]);
+            }
+            app.menu = None;
+        }
+        assert_eq!(asked(), before, "(trash resolved, pkexec looked for, tags read) on the window's thread");
+        // Not known whether a folder is the trash: no administrator access is offered for it (also in the empty view)
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(Some(true)));
+        assert!(admin_entry(&work).is_none());
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(None));
+        // Once the trash is known (a thread resolved it), the menu is whole, still without asking anything here
+        crate::fs::trash::tests::COLD.with(|c| c.set(false));
+        for _ in 0..500 {
+            if crate::fs::trash::contains_known(&work).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.open_menu(&ctx, egui::Pos2::ZERO, item.clone());
+        for _ in 0..20 {
+            assert!(labels(&app, &item).contains(&"Move to trash".to_owned()));
+        }
+        assert_eq!(asked(), before);
+        let _ = std::fs::remove_dir_all(&work);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_window_looks_for_pkexec_and_the_trash_on_threads_of_their_own() {
+        let work = window_dir("pkexec_preload");
+        let ctx = egui::Context::default();
+        let _app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        for _ in 0..500 {
+            if crate::fs::admin::tests::pkexec_looked() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(crate::fs::admin::tests::pkexec_looked());
+        // The trash folder is resolved on a thread too, so that a context menu never waits for it
+        for _ in 0..500 {
+            if crate::fs::trash::tests::PRELOADED.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(crate::fs::trash::tests::PRELOADED.load(std::sync::atomic::Ordering::SeqCst));
         let _ = std::fs::remove_dir_all(&work);
     }
 
