@@ -98,6 +98,26 @@ fn admin_entry(path: &Path) -> Option<MenuEntry> {
         .then(|| (icons::SHIELD, tr("Open as administrator"), MenuAction::OpenAsAdmin(path.to_path_buf())))
 }
 
+/// Makes the new folder, empty file or file from `template` called `name` in `dir`, on the thread of `create_entry`.
+/// The new item as read there, and what a template left beside it; or why it was not made.
+fn make_new(dir: &Path, is_dir: bool, name: &str, template: Option<&Template>) -> Result<(Option<FileItem>, Option<String>), String> {
+    #[cfg(test)]
+    tests::wait_while_held(dir);
+    let path = dir.join(name);
+    let made = if is_dir {
+        std::fs::create_dir(&path).map(|()| None)
+    } else if let Some(template) = template {
+        templates::create(template, &path)
+    } else {
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map(|_| None)
+    };
+    match made {
+        Ok(note) => Ok((FileItem::from_path(&path), note)),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(trf("“{}” already exists", &[&name])),
+        Err(err) => Err(crate::fs::describe::io_error(&err)),
+    }
+}
+
 /// How long a paste waits for the program that holds the clipboard before it gives up.
 const CLIPBOARD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// The most threads reading the clipboard at once: one that hangs stays until its owner answers.
@@ -264,7 +284,8 @@ struct MenuGhost {
 }
 
 pub(crate) enum Dialog {
-    Create { is_dir: bool, name: String, error: Option<String>, first_frame: bool, templates: Vec<Template>, template: usize, edited: bool },
+    /// `id` tells this dialog from one opened before it; `waiting`: the file or folder is being made on a thread.
+    Create { id: u64, waiting: bool, is_dir: bool, name: String, error: Option<String>, first_frame: bool, templates: Vec<Template>, template: usize, edited: bool },
     /// `waiting`: the item is on a server and the rename has been asked for; the dialog stays for the answer.
     Rename { path: PathBuf, is_dir: Option<bool>, name: String, error: Option<String>, first_frame: bool, waiting: bool },
     Confirm { title: String, body: String, confirm: String, action: ConfirmAction },
@@ -454,6 +475,11 @@ enum OpenReport {
     PastedImage(PathBuf, Result<PathBuf, String>),
     /// What the thread that read the properties of a file found: `None` when it could not be read.
     Properties(PathBuf, Option<Box<Properties>>),
+    /// The thread that made a new file or folder for the dialog `dialog`, in `dir`: the new item as read there and what
+    /// was left beside it (`templates::create`), or why it was not made.
+    Created { dialog: u64, dir: PathBuf, name: String, result: Result<(Option<FileItem>, Option<String>), String> },
+    /// The templates of the templates folder, read on a thread for the dialog `dialog`.
+    Templates { dialog: u64, found: Vec<Template> },
 }
 
 pub struct CompressionApp {
@@ -480,6 +506,8 @@ pub struct CompressionApp {
     open_rx: mpsc::Receiver<OpenReport>,
     /// The properties of a file are being read on a worker; asking again meanwhile starts nothing.
     properties_pending: bool,
+    /// The last dialog for a new file or folder that was opened, to tell its answers from those of one before it.
+    create_seq: u64,
     /// Reads the properties of a file on the worker; other only in tests (one that fails on purpose).
     properties_loader: fn(&Path, &[String], std::time::Duration) -> Option<Properties>,
     /// What setting a default application came to, from the worker that asked `xdg-mime`.
@@ -872,6 +900,7 @@ impl CompressionApp {
             open_tx,
             open_rx,
             properties_pending: false,
+            create_seq: 0,
             properties_loader: Properties::load,
             defaults_tx,
             defaults_rx,
@@ -1543,6 +1572,14 @@ impl CompressionApp {
                     }
                 }
                 OpenReport::PastedImage(dir, Ok(path)) => self.pasted_image(&dir, path),
+                OpenReport::Created { dialog, dir, name, result } => self.created(dialog, &dir, &name, result),
+                OpenReport::Templates { dialog, found } => {
+                    if let Some(Dialog::Create { id, templates, .. }) = &mut self.dialog
+                        && *id == dialog
+                    {
+                        templates.extend(found);
+                    }
+                }
                 OpenReport::PastedImage(_, Err(why)) => self.set_toast(why),
                 OpenReport::Unknown(why) => self.set_toast(trf("Could not find out what opens this file ({})", &[&why.text()])),
             }
@@ -5319,13 +5356,25 @@ impl CompressionApp {
             self.set_toast(tr("Open a regular folder to create files in it"));
             return;
         }
-        let templates = if is_dir { Vec::new() } else { templates::load(self.settings.templates_dir.as_deref()) };
+        // The built-in templates at once; those of the templates folder come from a thread (it may be anywhere)
+        let templates = if is_dir { Vec::new() } else { templates::builtin() };
         let base = if is_dir { tr("New Folder") } else { templates.first().map_or(tr("Untitled"), |t| t.file_name.as_str()) };
         let name = self.free_name(base);
-        self.dialog = Some(Dialog::Create { is_dir, name, error: None, first_frame: true, templates, template: 0, edited: false });
+        self.create_seq += 1;
+        let id = self.create_seq;
+        if !is_dir {
+            let (tx, ctx, custom) = (self.open_tx.clone(), self.ctx.clone(), self.settings.templates_dir.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(OpenReport::Templates { dialog: id, found: templates::user(custom.as_deref()) });
+                ctx.request_repaint();
+            });
+        }
+        self.dialog = Some(Dialog::Create { id, waiting: false, is_dir, name, error: None, first_frame: true, templates, template: 0, edited: false });
     }
 
-    /// `name` if nothing in the folder has it, otherwise `name 2`, `name 3`… (before the extension).
+    /// `name` if nothing in the listing has it, otherwise `name 2`, `name 3`… (before the extension). The listing is asked,
+    /// not the file system (the folder may be on a server that hangs): a name taken by something it does not show is said
+    /// when the item is made.
     fn free_name(&self, name: &str) -> String {
         let (stem, ext) = match name.rfind('.') {
             Some(i) if i > 0 => (&name[..i], &name[i..]),
@@ -5333,42 +5382,68 @@ impl CompressionApp {
         };
         let mut candidate = name.to_owned();
         let mut n = 2;
-        while self.current_path.join(&candidate).symlink_metadata().is_ok() {
+        while self.items.iter().any(|item| item.name == candidate) {
             candidate = format!("{stem} {n}{ext}");
             n += 1;
         }
         candidate
     }
 
-    fn create_entry(&mut self, is_dir: bool, name: &str, template: Option<&Template>) -> Result<(), String> {
+    /// Starts making `name` in the folder shown, on a thread (the folder may be on a server that hangs); the answer comes
+    /// as `OpenReport::Created` for the dialog `dialog`, see `created`. A name that cannot be is said at once.
+    fn create_entry(&mut self, dialog: u64, is_dir: bool, name: &str, template: Option<&Template>) -> Result<(), String> {
         let name = name.trim();
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
             return Err(tr("Enter a valid name").to_owned());
         }
-        let path = self.current_path.join(name);
-        // What a template left beside the new file (a second, hidden name for it), said with the result
-        let mut note = None;
-        let result = if is_dir {
-            std::fs::create_dir(&path)
-        } else if let Some(template) = template {
-            templates::create(template, &path).map(|left| note = left)
-        } else {
-            std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map(|_| ())
-        };
-        result.map_err(|err| match err.kind() {
-            std::io::ErrorKind::AlreadyExists => trf("“{}” already exists", &[&name]),
-            _ => crate::fs::describe::io_error(&err),
-        })?;
-
-        self.add_listed(&path);
-        if let Some(idx) = self.items.iter().position(|i| i.name == name) {
-            self.selected_index = Some(idx);
-            self.scroll_to_selected = true;
-        }
-        self.history.record(UndoEntry::new(trf("Creation of {}", &[&name]), vec![Edit::Trash(path)]));
-        let created = trf("Created {}", &[&name]);
-        self.set_toast_action(note.map_or(created.clone(), |note| format!("{created} · {note}")), ToastAction::Undo);
+        #[cfg(test)]
+        tests::CREATES_STARTED.with(|n| n.set(n.get() + 1));
+        let (dir, name, template, tx, ctx) = (self.current_path.clone(), name.to_owned(), template.cloned(), self.open_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let result = make_new(&dir, is_dir, &name, template.as_ref());
+            let _ = tx.send(OpenReport::Created { dialog, dir, name, result });
+            ctx.request_repaint();
+        });
         Ok(())
+    }
+
+    /// The answer for a new item from `create_entry`. It was made in `dir`, the folder shown when it was asked for, also
+    /// if the window shows another one by now. A failure goes back to the dialog that asked, if it still waits, or else
+    /// is said.
+    fn created(&mut self, dialog: u64, dir: &Path, name: &str, result: Result<(Option<FileItem>, Option<String>), String>) {
+        let (item, note) = match result {
+            Ok(made) => made,
+            Err(why) => {
+                match &mut self.dialog {
+                    Some(Dialog::Create { id, waiting, error, .. }) if *id == dialog && *waiting => {
+                        *waiting = false;
+                        *error = Some(why);
+                    }
+                    _ => self.set_toast(why),
+                }
+                return;
+            }
+        };
+        if matches!(&self.dialog, Some(Dialog::Create { id, waiting: true, .. }) if *id == dialog) {
+            self.dialog = None;
+        }
+        let path = dir.join(name);
+        self.history.record(UndoEntry::new(trf("Creation of {}", &[&name]), vec![Edit::Trash(path.clone())]));
+        let mut message = if dir == self.current_path {
+            self.add_listed_item(&path, item);
+            if let Some(idx) = self.items.iter().position(|i| i.name == name) {
+                self.selected_index = Some(idx);
+                self.scroll_to_selected = true;
+            }
+            trf("Created {}", &[&name])
+        } else {
+            let folder = dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned());
+            trf("Created {} in {}", &[&name, &folder])
+        };
+        if let Some(note) = note {
+            message = format!("{message} · {note}");
+        }
+        self.set_toast_action(message, ToastAction::Undo);
     }
 
     /// Whether `path` is a folder, as the listing says: no file system (maybe a server) is asked. `None` when it is
@@ -6559,11 +6634,13 @@ impl CompressionApp {
     }
 
     fn create_dialog_contents(&mut self, ui: &mut egui::Ui, dialog: &mut Dialog) -> bool {
-        let Dialog::Create { is_dir, name, error, first_frame, templates, template, edited } = dialog else { return false };
+        let Dialog::Create { id, waiting, is_dir, name, error, first_frame, templates, template, edited } = dialog else { return false };
         let theme = self.theme;
         let mut close = material::dialog_header(ui, if *is_dir { tr("New folder") } else { tr("New file") }, None, &theme, "create_close");
 
-        let (changed, mut submit) = name_field(ui, &theme, name, first_frame, !*is_dir);
+        // While it is being made, the name and the template cannot be changed, nor the item asked for again
+        let busy = *waiting;
+        let (changed, mut submit) = ui.add_enabled_ui(!busy, |ui| name_field(ui, &theme, name, first_frame, !*is_dir)).inner;
         if changed {
             *error = None;
             *edited = true;
@@ -6577,14 +6654,14 @@ impl CompressionApp {
             material::section_label(ui, tr("Template"), &theme);
             let mut picked = None;
             material::group_card(ui, &theme, |ui| {
-                egui::ScrollArea::vertical().max_height(material::ENTRY_HEIGHT * 5.0 + 8.0).auto_shrink([false, true]).id_salt("create_templates").show(ui, |ui| {
+                ui.add_enabled_ui(!busy, |ui| egui::ScrollArea::vertical().max_height(material::ENTRY_HEIGHT * 5.0 + 8.0).auto_shrink([false, true]).id_salt("create_templates").show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for (i, t) in templates.iter().enumerate() {
                         if nav_item(ui, ("create_tpl", i), t.icon, &t.name, &theme, *template == i).clicked() {
                             picked = Some(i);
                         }
                     }
-                });
+                }));
             });
             if let Some(i) = picked {
                 // What the template picked before put at the end of the name, which the new one replaces
@@ -6610,12 +6687,15 @@ impl CompressionApp {
             }
         }
 
-        let footer = material::dialog_footer(ui, &theme, FooterSpec::new("create", icons::CHECK, tr("Create")));
+        let label = if busy { tr("Creating…") } else { tr("Create") };
+        let footer = material::dialog_footer(ui, &theme, FooterSpec { enabled: !busy, ..FooterSpec::new("create", icons::CHECK, label) });
         submit |= footer.primary;
+        // Cancel and Escape always work: what is being made goes on, and its answer comes as a message
         close |= footer.cancel;
-        if submit {
-            match self.create_entry(*is_dir, name, templates.get(*template)) {
-                Ok(()) => close = true,
+        if submit && !busy {
+            match self.create_entry(*id, *is_dir, name, templates.get(*template)) {
+                // The dialog stays until the answer (`created`)
+                Ok(()) => *waiting = true,
                 Err(err) => *error = Some(err),
             }
         }
@@ -10261,6 +10341,37 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// How many threads that make a new item were started from this thread.
+        pub(super) static CREATES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Folders in which making a new item waits until the test lets it go (at most 10 s, so that a mutation that makes
+    /// it on the window's thread fails the test instead of holding it for ever).
+    static HELD_FOR_CREATING: (Mutex<Vec<PathBuf>>, std::sync::Condvar) = (Mutex::new(Vec::new()), std::sync::Condvar::new());
+
+    pub(super) fn wait_while_held(dir: &Path) {
+        let (held, changed) = &HELD_FOR_CREATING;
+        let mut list = held.lock().unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while list.iter().any(|d| d == dir) {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            list = changed.wait_timeout(list, left).unwrap().0;
+        }
+    }
+
+    fn hold_creating_in(dir: &Path) {
+        HELD_FOR_CREATING.0.lock().unwrap().push(dir.to_path_buf());
+    }
+
+    fn let_creating_go(dir: &Path) {
+        HELD_FOR_CREATING.0.lock().unwrap().retain(|d| d != dir);
+        HELD_FOR_CREATING.1.notify_all();
+    }
+
     fn window_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("compression_window_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -12064,18 +12175,131 @@ mod tests {
     }
 
     #[test]
+    fn a_new_item_is_made_off_the_window_thread_once_and_in_the_folder_it_was_asked_in() {
+        let here = window_dir("create_here");
+        let elsewhere = here.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let mut w = Window::new(here.clone());
+        w.app.open_create_dialog(false);
+        w.run(Vec::new(), 3);
+        let started = || CREATES_STARTED.with(std::cell::Cell::get);
+        let before = started();
+        // The folder hangs, as a server's may: the window goes on, the dialog waits, and nothing is asked again
+        hold_creating_in(&here);
+        w.click(w.at("Create"), egui::PointerButton::Primary);
+        w.run(Vec::new(), 3);
+        assert!(w.shows("Creating…"), "{:?}", w.last);
+        assert!(matches!(w.app.dialog, Some(Dialog::Create { waiting: true, .. })));
+        w.click(w.at("Creating…"), egui::PointerButton::Primary);
+        w.key(egui::Key::Enter);
+        w.run(Vec::new(), 3);
+        assert_eq!(started() - before, 1, "asked for once");
+        assert!(!here.join("Untitled").exists(), "not made on the window's thread");
+        // Another folder is shown by the time it is made: it is made where it was asked for, and said so
+        w.go(elsewhere.clone());
+        let_creating_go(&here);
+        w.until("the answer", |w| w.app.status_toast.as_ref().is_some_and(|t| t.message.starts_with("Created")));
+        assert!(here.join("Untitled").is_file());
+        let folder = here.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(w.app.status_toast.as_ref().map(|t| t.message.clone()), Some(format!("Created Untitled in {folder}")));
+        assert!(w.app.dialog.is_none(), "the dialog that waited is closed");
+        assert!(!w.app.items.iter().any(|i| i.name == "Untitled"), "not listed in the folder shown");
+        assert_eq!(w.app.history.undo_label(), Some("Creation of Untitled"));
+        let _ = std::fs::remove_dir_all(&here);
+    }
+
+    #[test]
+    fn a_new_item_that_cannot_be_made_is_said_in_the_dialog_that_waits_or_else_as_a_message() {
+        let work = window_dir("create_fails");
+        std::fs::write(work.join("taken.txt"), "mine").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let wait_for = |app: &mut CompressionApp, done: &dyn Fn(&CompressionApp) -> bool| {
+            for _ in 0..1000 {
+                app.poll_opened();
+                if done(app) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("no answer");
+        };
+        // The dialog still waits: the reason is shown there, and it can be tried again
+        app.open_create_dialog(true);
+        let Some(Dialog::Create { id, .. }) = app.dialog else { panic!() };
+        app.create_entry(id, true, "taken.txt", None).unwrap();
+        if let Some(Dialog::Create { waiting, .. }) = &mut app.dialog {
+            *waiting = true;
+        }
+        wait_for(&mut app, &|app| matches!(&app.dialog, Some(Dialog::Create { error: Some(_), .. })));
+        assert!(matches!(&app.dialog, Some(Dialog::Create { waiting: false, error: Some(e), .. }) if e == "“taken.txt” already exists"));
+        assert_eq!(std::fs::read_to_string(work.join("taken.txt")).unwrap(), "mine");
+        // The dialog was closed meanwhile: the reason comes as a message
+        app.dialog = None;
+        app.create_entry(id, true, "taken.txt", None).unwrap();
+        wait_for(&mut app, &|app| app.status_toast.as_ref().is_some_and(|t| t.message.contains("already exists")));
+        // And one made after its dialog was closed is still said, with its undo
+        app.create_entry(id, true, "fresh", None).unwrap();
+        wait_for(&mut app, &|app| app.status_toast.as_ref().is_some_and(|t| t.message == "Created fresh"));
+        assert!(work.join("fresh").is_dir() && app.items.iter().any(|i| i.name == "fresh"));
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_new_name_is_proposed_from_the_listing_and_the_templates_folder_is_read_off_the_window_thread() {
+        let work = window_dir("create_prepare");
+        std::fs::write(work.join("Untitled"), "").unwrap();
+        let templates_dir = work.join("tpl");
+        std::fs::create_dir(&templates_dir).unwrap();
+        std::fs::write(templates_dir.join("Invoice.odt"), "odt").unwrap();
+        let mut w = Window::new(work.clone());
+        w.until("the listing", |w| w.app.items.iter().any(|i| i.name == "Untitled"));
+        // Made after the folder was read, so only the file system knows it: the proposal does not ask it
+        std::fs::create_dir(work.join("New Folder")).unwrap();
+        w.app.open_create_dialog(true);
+        assert!(matches!(&w.app.dialog, Some(Dialog::Create { name, .. }) if name == "New Folder"));
+        w.app.settings.templates_dir = Some(templates_dir.clone());
+        w.app.open_create_dialog(false);
+        let Some(Dialog::Create { name, templates, id, .. }) = &w.app.dialog else { panic!() };
+        assert_eq!(name, "Untitled 2", "the listing has Untitled");
+        let (builtin, id) = (crate::fs::templates::builtin().len(), *id);
+        assert_eq!(templates.len(), builtin, "the templates folder is not read on the window's thread");
+        // A dialog opened again meanwhile: only the answer for it counts
+        w.app.open_create_dialog(false);
+        let Some(Dialog::Create { id: again, .. }) = &w.app.dialog else { panic!() };
+        assert_ne!(*again, id);
+        w.until("the templates folder", |w| matches!(&w.app.dialog, Some(Dialog::Create { templates, .. }) if templates.len() > builtin));
+        w.run(Vec::new(), 20);
+        let Some(Dialog::Create { templates, .. }) = &w.app.dialog else { panic!() };
+        assert_eq!(templates.iter().filter(|t| t.name == "Invoice").count(), 1, "the earlier dialog's answer is not taken in");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
     fn a_file_from_a_template_made_by_a_hard_link_says_its_hidden_second_name_and_a_folder_is_made_as_before() {
         let work = window_dir("template_link");
         crate::compat::tests::without_support_under(&work);
         let ctx = egui::Context::default();
         let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
-        let markdown = crate::fs::templates::load(None).into_iter().find(|t| t.file_name.ends_with(".md")).unwrap();
-        app.create_entry(false, "notes.md", Some(&markdown)).unwrap();
+        let markdown = crate::fs::templates::builtin().into_iter().find(|t| t.file_name.ends_with(".md")).unwrap();
+        let answered = |app: &mut CompressionApp, what: &str| {
+            for _ in 0..1000 {
+                app.poll_opened();
+                if app.status_toast.as_ref().is_some_and(|t| t.message.starts_with(what)) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("no answer for {what}");
+        };
+        app.create_entry(0, false, "notes.md", Some(&markdown)).unwrap();
+        answered(&mut app, "Created notes.md");
         let toast = app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
         assert!(toast.starts_with("Created notes.md") && toast.contains("second, hidden name") && toast.contains(".compression-new-"), "{toast}");
         assert_eq!(std::fs::read_to_string(work.join("notes.md")).unwrap(), "# \n");
         // A new folder takes its own way, which needs neither
-        app.create_entry(true, "folder", None).unwrap();
+        app.create_entry(0, true, "folder", None).unwrap();
+        answered(&mut app, "Created folder");
         assert!(work.join("folder").is_dir());
         assert_eq!(app.status_toast.as_ref().map(|t| t.message.as_str()), Some("Created folder"));
         let _ = std::fs::remove_dir_all(&work);

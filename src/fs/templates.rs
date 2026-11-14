@@ -40,7 +40,8 @@ pub fn user_dir(custom: Option<&Path>) -> Option<PathBuf> {
     custom.map(Path::to_path_buf).or_else(dirs::template_dir).or_else(|| dirs::home_dir().map(|h| h.join("Templates")))
 }
 
-fn builtin() -> Vec<Template> {
+/// The built-in templates; nothing is read.
+pub fn builtin() -> Vec<Template> {
     let make = |name: &str, file: &str, icon, content, executable| Template {
         name: name.to_owned(),
         file_name: file.to_owned(),
@@ -59,16 +60,13 @@ fn builtin() -> Vec<Template> {
     ]
 }
 
-/// Built-in templates first, then the files of the templates folder (one level of subfolders
-/// is looked into), alphabetically.
-pub fn load(custom: Option<&Path>) -> Vec<Template> {
-    let mut all = builtin();
-    let Some(dir) = user_dir(custom) else { return all };
+/// The files of the templates folder (one level of subfolders is looked into), alphabetically. Reads that folder.
+pub fn user(custom: Option<&Path>) -> Vec<Template> {
+    let Some(dir) = user_dir(custom) else { return Vec::new() };
     let mut found = Vec::new();
     collect(&dir, 0, &mut found);
     found.sort_by(|a, b| super::scanner::natural_cmp(&a.name, &b.name));
-    all.extend(found);
-    all
+    found
 }
 
 fn collect(dir: &Path, depth: usize, out: &mut Vec<Template>) {
@@ -433,7 +431,7 @@ pub(crate) mod tests {
         std::fs::write(dir.join("tpl/sub/Letter.txt"), "dear").unwrap();
         std::fs::write(dir.join("tpl/.hidden"), "x").unwrap();
 
-        let all = load(Some(&dir.join("tpl")));
+        let all: Vec<Template> = builtin().into_iter().chain(user(Some(&dir.join("tpl")))).collect();
         let names: Vec<&str> = all.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"Invoice") && names.contains(&"Letter") && !names.iter().any(|n| n.contains("hidden")));
         assert_eq!(all[0].file_name, "Untitled");
