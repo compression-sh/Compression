@@ -14,6 +14,7 @@ use crate::settings::{Density, Settings, StartLocation};
 use crate::ui::fonts::SystemFont;
 use crate::ui::icon_style::{self, IconStyle};
 use crate::ui::icons;
+use crate::ui::system_icons;
 use crate::ui::material::{self, button, chip, choice_row, filled_icon_button, group_card, nav_item_roving, switch_row_with, ButtonKind, Column};
 use crate::ui::theme::{self, SerpantinumTheme, ACCENTS};
 
@@ -1679,9 +1680,16 @@ fn icon_style_card(
     let painter = ui.painter().with_clip_rect(stage);
     painter.rect_filled(stage, CornerRadius::same(material::radius_md()), theme.base);
     let at = |x: f32| egui::pos2(stage.left() + stage.width() * x, stage.center().y);
-    icon_style::paint_folder(style, &painter, at(0.27), 30.0, theme.blue);
+    // "System" shows the desktop's icon theme as it looks itself, in its own colors; what it lacks, in the classic drawing
+    let in_own_colors = |names: &[String], center: egui::Pos2, size: f32| style == IconStyle::System && system_icons::paint_original(&painter, names, center, size);
+    if !in_own_colors(&system_icons::names_for(true, "folder"), at(0.27), 36.0) {
+        icon_style::paint_folder(style, &painter, at(0.27), 30.0, theme.blue);
+    }
     // Two kinds drawn by chance when Settings opens, the same on every card so the styles compare
     for (item, x) in samples.iter().zip([0.6, 0.84]) {
+        if in_own_colors(&system_icons::names_for(item.is_dir, &item.name), at(x), 24.0) {
+            continue;
+        }
         let icon = material::item_icon_animated(item, theme, 0.0);
         material::paint_item_icon_in(style, &painter, item, at(x), 20.0, icon, 1.0);
     }
@@ -2194,6 +2202,69 @@ mod tests {
 
     fn toast_text(app: &CompressionApp) -> String {
         app.toast_message().unwrap_or_default().to_owned()
+    }
+
+    /// The card of `style` drawn twice: its shapes, and the pictures given to egui for it.
+    fn icon_card(style: IconStyle, samples: &[FileItem; 2]) -> (Vec<egui::Shape>, Vec<std::sync::Arc<egui::ColorImage>>) {
+        let ctx = egui::Context::default();
+        let theme = SerpantinumTheme::default();
+        let (mut shapes, mut images) = (Vec::new(), Vec::new());
+        for n in 0..2 {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0))), time: Some(n as f64 * 0.05), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                icon_style_card(ui, "card", 140.0, style, &theme, false, samples);
+            });
+            // Not the font atlas
+            images.extend(out.textures_delta.set.iter().filter(|(id, _)| *id != &egui::TextureId::default()).flat_map(|(_, deltas)| deltas.iter()).map(|delta| match &delta.image {
+                egui::ImageData::Color(image) => image.clone(),
+            }));
+            out.textures_delta.clear();
+            shapes = out.shapes.into_iter().map(|c| c.shape).collect();
+        }
+        (shapes, images)
+    }
+
+    #[test]
+    fn the_system_card_shows_the_icon_theme_in_its_own_colors_and_the_classic_drawing_where_it_has_none() {
+        let base = std::env::temp_dir().join(format!("compression_icon_card_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let samples = [FileItem::sample("notes.txt", crate::fs::file_item::FileType::Document), FileItem::sample("notes.txt", crate::fs::file_item::FileType::Document)];
+        let put = |rel: &str, text: &str| {
+            let file = base.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        };
+        put("Card/index.theme", "[Icon Theme]\nName=Card\nDirectories=scalable/all\n\n[scalable/all]\nSize=64\nMinSize=8\nMaxSize=512\nType=Scalable\n");
+        crate::ui::system_icons::tests::use_icon_theme(Some(("Card", &base)));
+        // A theme without any of them: the card draws what Classic draws, the name apart
+        let (classic, _) = icon_card(IconStyle::Classic, &samples);
+        let (bare, pictures) = icon_card(IconStyle::System, &samples);
+        assert_eq!(bare.len(), classic.len());
+        let blue = SerpantinumTheme::default().blue;
+        assert!(bare.iter().any(|s| matches!(s, egui::Shape::Rect(r) if r.fill == blue)), "the classic folder");
+        assert!(pictures.is_empty());
+        // With the folder and the file's icon, both are drawn from the theme in the colors the icon carries: Breeze's
+        // dark gray and blue, not the palette's text and accent
+        put("Card/scalable/all/folder.svg", crate::ui::system_icons::tests::SCHEME_SVG);
+        put(&format!("Card/scalable/all/{}.svg", crate::ui::system_icons::names_for(false, "notes.txt")[0]), crate::ui::system_icons::tests::SCHEME_SVG);
+        let (shapes, pictures) = icon_card(IconStyle::System, &samples);
+        let textured = shapes
+            .iter()
+            .filter(|s| match s {
+                egui::Shape::Rect(r) => r.fill_texture_id() != egui::TextureId::default(),
+                egui::Shape::Mesh(m) => m.texture_id != egui::TextureId::default(),
+                _ => false,
+            })
+            .count();
+        assert_eq!(textured, 3, "the folder and the two files");
+        assert!(!pictures.is_empty());
+        for image in &pictures {
+            let [w, h] = image.size;
+            let at = |x: usize| image.pixels[(h / 2) * w + x];
+            assert_eq!((at(w / 4).to_srgba_unmultiplied(), at(w * 3 / 4).to_srgba_unmultiplied()), ([0x23, 0x26, 0x29, 255], [0x3d, 0xae, 0xe9, 255]));
+        }
+        crate::ui::system_icons::tests::use_icon_theme(None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

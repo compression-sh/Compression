@@ -196,6 +196,10 @@ fn installed() -> (String, std::sync::Arc<Vec<Theme>>) {
 fn find(names: &[String], size: u32) -> Option<PathBuf> {
     type Found = HashMap<(String, Vec<String>, u32), Option<PathBuf>>;
     static FOUND: OnceLock<Mutex<Found>> = OnceLock::new();
+    #[cfg(test)]
+    if let Some(themes) = tests::THEMES.with(|t| t.borrow().clone()) {
+        return find_in(&themes, names, size);
+    }
     let found = FOUND.get_or_init(Mutex::default);
     let (theme, themes) = installed();
     let key = (theme, names.to_vec(), size);
@@ -267,6 +271,12 @@ impl IconColors {
     fn sheet(&self, own_color: bool) -> String {
         if own_color { self.classes.clone() } else { format!("svg {{ color: {}; }}\n{}", self.text, self.classes) }
     }
+
+    /// The same colors without the classes of KDE's color scheme: an icon made for them keeps the defaults it carries,
+    /// as the theme's own preview shows it; `currentColor` with no color of its own is still the text color.
+    fn original(&self) -> IconColors {
+        IconColors { text: self.text.clone(), classes: String::new() }
+    }
 }
 
 /// Whether the root of the SVG `bytes` gives `currentColor` a color of its own.
@@ -327,10 +337,12 @@ struct Textures {
     made: HashMap<(PathBuf, u32), Option<egui::TextureHandle>>,
 }
 
-/// The icon of `path` as a texture of `px` pixels in the palette in use, made once.
-fn texture(ctx: &egui::Context, path: &Path, px: u32) -> Option<egui::TextureHandle> {
-    let colors = colors(ctx);
-    let cache = ctx.data_mut(|d| d.get_temp_mut_or_default::<std::sync::Arc<Mutex<Textures>>>(egui::Id::NULL.with("system_icon_textures")).clone());
+/// The icon of `path` as a texture of `px` pixels in the palette in use (or, `original`, in its own colors), made once.
+/// Each way keeps textures of its own, so that drawing both in one frame does not draw either again.
+fn texture(ctx: &egui::Context, path: &Path, px: u32, original: bool) -> Option<egui::TextureHandle> {
+    let colors = if original { std::sync::Arc::new(colors(ctx).original()) } else { colors(ctx) };
+    let cache_id = egui::Id::NULL.with(if original { "system_icon_textures_original" } else { "system_icon_textures" });
+    let cache = ctx.data_mut(|d| d.get_temp_mut_or_default::<std::sync::Arc<Mutex<Textures>>>(cache_id).clone());
     let key = (path.to_path_buf(), px);
     {
         let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -341,7 +353,8 @@ fn texture(ctx: &egui::Context, path: &Path, px: u32) -> Option<egui::TextureHan
             return tex.clone();
         }
     }
-    let tex = rasterize(path, px, &colors).map(|image| ctx.load_texture(format!("system-icon-{}-{px}", path.display()), image, egui::TextureOptions::LINEAR));
+    let name = format!("system-icon-{}-{px}{}", path.display(), if original { "-original" } else { "" });
+    let tex = rasterize(path, px, &colors).map(|image| ctx.load_texture(name, image, egui::TextureOptions::LINEAR));
     // A file that cannot be drawn is not tried again in every frame
     let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     if cache.colors == colors {
@@ -370,9 +383,18 @@ fn rasterize(path: &Path, px: u32, colors: &IconColors) -> Option<egui::ColorIma
 
 /// Draws the first of `names` the desktop's themes have, `size` points wide at `center`; false when none has any.
 pub fn paint(painter: &egui::Painter, names: &[String], center: egui::Pos2, size: f32, fade: f32) -> bool {
+    paint_in(painter, names, center, size, fade, false)
+}
+
+/// As `paint`, in the icon's own colors rather than the palette's: how the theme itself looks, for the preview of the style.
+pub fn paint_original(painter: &egui::Painter, names: &[String], center: egui::Pos2, size: f32) -> bool {
+    paint_in(painter, names, center, size, 1.0, true)
+}
+
+fn paint_in(painter: &egui::Painter, names: &[String], center: egui::Pos2, size: f32, fade: f32, original: bool) -> bool {
     let px = size * painter.ctx().pixels_per_point();
     let tier = TIERS.into_iter().find(|t| *t as f32 >= px).unwrap_or(TIERS[TIERS.len() - 1]);
-    let Some(tex) = find(names, tier).and_then(|file| texture(painter.ctx(), &file, tier)) else { return false };
+    let Some(tex) = find(names, tier).and_then(|file| texture(painter.ctx(), &file, tier, original)) else { return false };
     let [w, h] = tex.size();
     let scale = size / w.max(h) as f32;
     let shown = egui::Rect::from_center_size(center, egui::vec2(w as f32 * scale, h as f32 * scale));
@@ -381,8 +403,18 @@ pub fn paint(painter: &egui::Painter, names: &[String], center: egui::Pos2, size
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        /// The themes `find` looks in on this thread instead of the desktop's.
+        pub(super) static THEMES: std::cell::RefCell<Option<std::sync::Arc<Vec<Theme>>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// From now on, on this thread, the icons are the theme `name` in `base`; `None` gives the desktop's back.
+    pub(crate) fn use_icon_theme(theme: Option<(&str, &Path)>) {
+        THEMES.with(|t| *t.borrow_mut() = theme.map(|(name, base)| std::sync::Arc::new(chain(name, &[base.to_path_buf()]))));
+    }
 
     const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="#3070ff"/></svg>"##;
 
@@ -447,7 +479,7 @@ mod tests {
 
     /// An icon made like Breeze's: the left half in the text color, the right half in the accent, both with the
     /// light-theme defaults the icon itself carries.
-    const SCHEME_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><defs><style type="text/css" id="current-color-scheme">.ColorScheme-Text { color:#232629; } .ColorScheme-Accent { color:#3daee9; }</style></defs><rect width="8" height="16" style="fill:currentColor" class="ColorScheme-Text"/><rect x="8" width="8" height="16" style="fill:currentColor" class="ColorScheme-Accent"/></svg>"##;
+    pub(crate) const SCHEME_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><defs><style type="text/css" id="current-color-scheme">.ColorScheme-Text { color:#232629; } .ColorScheme-Accent { color:#3daee9; }</style></defs><rect width="8" height="16" style="fill:currentColor" class="ColorScheme-Text"/><rect x="8" width="8" height="16" style="fill:currentColor" class="ColorScheme-Accent"/></svg>"##;
 
     fn palette(light: bool, accent: egui::Color32) -> crate::ui::theme::SerpantinumTheme {
         crate::ui::theme::SerpantinumTheme {
@@ -506,13 +538,42 @@ mod tests {
         let ctx = egui::Context::default();
         let dark = palette(false, egui::Color32::from_rgb(204, 190, 255));
         set_colors(&ctx, &dark);
-        let first = texture(&ctx, &file, 24).unwrap();
-        assert_eq!(texture(&ctx, &file, 24).unwrap().id(), first.id(), "one texture per palette");
+        let first = texture(&ctx, &file, 24, false).unwrap();
+        assert_eq!(texture(&ctx, &file, 24, false).unwrap().id(), first.id(), "one texture per palette");
         set_colors(&ctx, &palette(true, egui::Color32::from_rgb(200, 40, 60)));
-        let light = texture(&ctx, &file, 24).unwrap();
+        let light = texture(&ctx, &file, 24, false).unwrap();
         assert_ne!(light.id(), first.id(), "the light palette draws the icon again");
         set_colors(&ctx, &dark);
-        assert_ne!(texture(&ctx, &file, 24).unwrap().id(), light.id());
+        assert_ne!(texture(&ctx, &file, 24, false).unwrap().id(), light.id());
+    }
+
+    #[test]
+    fn in_their_own_colors_icons_made_for_the_color_scheme_keep_the_colors_they_carry() {
+        let scheme = icon_file("original-scheme.svg", SCHEME_SVG);
+        let bare = icon_file("original-bare.svg", r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" fill="currentColor"/></svg>"##);
+        for light in [false, true] {
+            let theme = palette(light, egui::Color32::from_rgb(200, 40, 60));
+            let own = icon_colors(&theme).original();
+            let image = rasterize(&scheme, 32, &own).unwrap();
+            assert_eq!((rgb(&image, 4, 16), rgb(&image, 28, 16)), ([0x23, 0x26, 0x29], [0x3d, 0xae, 0xe9]), "light {light}");
+            // currentColor with no color of its own is still drawn in the text color, not in black
+            assert_eq!(rgb(&rasterize(&bare, 16, &own).unwrap(), 8, 8), [theme.text.r(), theme.text.g(), theme.text.b()], "light {light}");
+        }
+    }
+
+    #[test]
+    fn the_icons_in_their_own_colors_and_in_the_palette_are_kept_apart_and_each_made_once() {
+        let file = icon_file("both.svg", SCHEME_SVG);
+        let ctx = egui::Context::default();
+        set_colors(&ctx, &palette(false, egui::Color32::from_rgb(204, 190, 255)));
+        let tinted = texture(&ctx, &file, 24, false).unwrap();
+        let own = texture(&ctx, &file, 24, true).unwrap();
+        assert_ne!(own.id(), tinted.id());
+        // Drawn by turns, as the list and the preview of the style are in one frame, neither is made again
+        for _ in 0..3 {
+            assert_eq!(texture(&ctx, &file, 24, false).unwrap().id(), tinted.id());
+            assert_eq!(texture(&ctx, &file, 24, true).unwrap().id(), own.id());
+        }
     }
 
     #[test]

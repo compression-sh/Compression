@@ -22,6 +22,7 @@ programs.compression = {
 
 - Settings → Appearance → Icon style offers **System** first: folders and file types come from the icon theme of your desktop (the theme it inherits and hicolor included). What the theme lacks is drawn in the classic style. "Show all icons" lists the styles in the same order.
 - Icons of themes made like Breeze, which mark their shapes for the desktop's colors, are drawn in the colors of the palette in use: text, accent, background and the status colors, light or dark. Icons drawn in colors of their own keep them.
+- The card of the System style under Icon style shows the theme as it looks itself, in its own colors, so that themes can be told apart; the file list draws it in the palette's colors as above.
 
 ## Settings → Context menu
 
