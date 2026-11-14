@@ -8314,6 +8314,9 @@ mod tests {
         let settings = Settings { folder_sizes: crate::settings::FolderSizeMode::Always, ..Settings::default() };
         let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), settings, &ctx);
         let big = work.join("big");
+        // From measuring to reading the status line the sizes are this test's: other tests running side by side
+        // clear the one book of totals (see `dirsize::test_hold`)
+        let held = crate::fs::dirsize::test_hold::hold();
         for _ in 0..300 {
             app.tick_folder_sizes(&ctx);
             if crate::fs::dirsize::totals(&big).is_some() && crate::fs::dirsize::totals(&work.join("empty")).is_some() {
@@ -8328,6 +8331,7 @@ mod tests {
         app.selection = app.items.iter().enumerate().filter(|(_, i)| i.name == "big" || i.name == "note.txt").map(|(n, _)| n).collect();
         let summary = app.selection_summary().unwrap();
         assert!(summary.ends_with(&crate::fs::file_item::format_bytes(5005)), "{summary}");
+        drop(held);
 
         // Something changed inside: the folder and its parent must be measured again
         app.rename_entry(&big.join("data.bin"), "renamed.bin").unwrap();

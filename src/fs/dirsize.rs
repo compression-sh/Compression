@@ -41,12 +41,56 @@ fn book() -> MutexGuard<'static, Option<Book>> {
     guard
 }
 
+/// Tests only (not in the program): the totals are one book for the whole process, and tests running side by side
+/// clear it or switch how it counts while another one is between measuring and reading. A test holds the book with
+/// `test_hold::hold()` for such a stretch; meanwhile `clear`, `invalidate` and `set_size_on_disk` of other threads wait.
+/// The holding thread's own calls go on, so it cannot block itself.
+#[cfg(test)]
+pub(crate) mod test_hold {
+    use std::sync::{Condvar, Mutex};
+    use std::thread::ThreadId;
+
+    static HOLDER: Mutex<Option<ThreadId>> = Mutex::new(None);
+    static FREED: Condvar = Condvar::new();
+
+    pub(crate) struct Held;
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            *HOLDER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            FREED.notify_all();
+        }
+    }
+
+    /// Hold the book until the returned value is dropped.
+    pub(crate) fn hold() -> Held {
+        let me = std::thread::current().id();
+        let mut holder = HOLDER.lock().unwrap_or_else(|e| e.into_inner());
+        while holder.is_some_and(|h| h != me) {
+            holder = FREED.wait(holder).unwrap_or_else(|e| e.into_inner());
+        }
+        *holder = Some(me);
+        Held
+    }
+
+    /// Wait while another thread holds the book.
+    pub(super) fn wait_unless_mine() {
+        let me = std::thread::current().id();
+        let mut holder = HOLDER.lock().unwrap_or_else(|e| e.into_inner());
+        while holder.is_some_and(|h| h != me) {
+            holder = FREED.wait(holder).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 fn with<R>(f: impl FnOnce(&mut Book) -> R) -> R {
     f(book().as_mut().expect("book exists"))
 }
 
 /// Show space used on disk instead of the sum of file lengths.
 pub fn set_size_on_disk(on: bool) {
+    #[cfg(test)]
+    test_hold::wait_unless_mine();
     ON_DISK.store(on, Ordering::Relaxed);
 }
 
@@ -110,6 +154,8 @@ pub fn drop_pending() {
 
 /// Forget `path`, everything below it and every folder above it: their totals include it.
 pub fn invalidate(path: &Path) {
+    #[cfg(test)]
+    test_hold::wait_unless_mine();
     with(|b| {
         b.sizes.retain(|p, _| !(p.starts_with(path) || path.starts_with(p)));
         b.counts.retain(|p, _| !(p.starts_with(path) || path.starts_with(p)));
@@ -127,6 +173,8 @@ pub fn forget(path: &Path) {
 
 /// Forget everything (refresh).
 pub fn clear() {
+    #[cfg(test)]
+    test_hold::wait_unless_mine();
     with(|b| {
         b.sizes.clear();
         b.counts.clear();
