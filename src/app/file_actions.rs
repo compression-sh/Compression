@@ -99,6 +99,11 @@ impl CompressionApp {
             self.set_toast(tr("Compression already runs as administrator"));
             return;
         }
+        // Only an absolute path that is no view (Recent, Bookmarks) is admissible; whether it is a folder is not checked here
+        if !dir.is_absolute() || crate::fs::places::is_virtual(dir) {
+            self.set_toast(tr("Open a folder first to open it as administrator"));
+            return;
+        }
         let dir = if dir.is_dir() { dir.to_path_buf() } else { dir.parent().map(Path::to_path_buf).unwrap_or_else(|| self.current_path.clone()) };
         match crate::fs::admin::open_folder(&dir) {
             Ok(rx) => self.admin_launch = Some(rx),

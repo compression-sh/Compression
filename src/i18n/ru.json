@@ -991,5 +991,6 @@
   "a second, hidden name for it is left as “{}”; it can be deleted": "для него осталось второе скрытое имя «{}»; его можно удалить",
   "This file system cannot make a file from a template without the risk of leaving an incomplete one, so nothing was made under that name": "Эта файловая система не может создать файл из шаблона без риска оставить незавершённый файл, поэтому под этим именем ничего не создано",
   "Creating…": "Создание…",
-  "Created {} in {}": "{} создан в {}"
+  "Created {} in {}": "{} создан в {}",
+  "Open a folder first to open it as administrator": "Сначала откройте папку, чтобы открыть её от имени администратора"
 }

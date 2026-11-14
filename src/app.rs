@@ -94,7 +94,10 @@ type MenuEntry = (&'static str, &'static str, MenuAction);
 /// "Open as administrator" for the folder `path` (callers give folders only, as the listing knows them: nothing is asked
 /// of the file system, which may be a server that hangs), unless Compression already is one or cannot elevate.
 fn admin_entry(path: &Path) -> Option<MenuEntry> {
-    (trash::is_trash_folder_known(path) == Some(false) && crate::fs::admin::available())
+    // An admissible target: absolute and no view (Recent, Bookmarks). Told by the path alone, so this does not prove
+    // that it is a folder.
+    let admissible = path.is_absolute() && !crate::fs::places::is_virtual(path);
+    (admissible && trash::is_trash_folder_known(path) == Some(false) && crate::fs::admin::available())
         .then(|| (icons::SHIELD, tr("Open as administrator"), MenuAction::OpenAsAdmin(path.to_path_buf())))
 }
 
@@ -12149,6 +12152,37 @@ mod tests {
         assert_eq!(asked(), before);
         let _ = std::fs::remove_dir_all(&work);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn administrator_access_is_neither_offered_nor_started_for_virtual_or_non_absolute_targets() {
+        let work = window_dir("admin_views");
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(Some(true)));
+        for _ in 0..500 {
+            if crate::fs::trash::contains_known(&work).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let offered = |app: &CompressionApp, target: &MenuTarget| app.menu_entries(target).into_iter().flatten().any(|e| e.1 == "Open as administrator");
+        // For an absolute path that is no view it is offered (so its absence below means something)
+        assert!(offered(&app, &MenuTarget::Main) && offered(&app, &MenuTarget::Folder));
+        for view in [crate::fs::places::RECENT_PATH, crate::fs::places::BOOKMARKS_PATH] {
+            app.current_path = PathBuf::from(view);
+            assert!(!offered(&app, &MenuTarget::Main), "{view}: main menu");
+            assert!(!offered(&app, &MenuTarget::Folder), "{view}: the empty space");
+        }
+        // Asked for anyway (the keyboard shortcut does this with the view shown): refused before anything is started
+        for target in [Path::new(crate::fs::places::RECENT_PATH), Path::new(crate::fs::places::BOOKMARKS_PATH), Path::new(""), Path::new("relative")] {
+            app.status_toast = None;
+            app.open_as_admin(target);
+            assert!(app.admin_launch.is_none(), "{}", target.display());
+            assert_eq!(app.status_toast.as_ref().map(|t| t.message.as_str()), Some("Open a folder first to open it as administrator"), "{}", target.display());
+        }
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(None));
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]

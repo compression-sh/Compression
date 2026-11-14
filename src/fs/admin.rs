@@ -49,6 +49,16 @@ thread_local! {
     pub(crate) static TEST_AVAILABLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether `dir` is an admissible target for root: absolute and no view (Recent, Bookmarks); empty and relative paths
+/// are refused. Told by the path alone, before pkexec is even looked for: this does not prove that `dir` is a folder.
+fn admissible_target(dir: &Path) -> io::Result<()> {
+    if dir.is_absolute() && !crate::fs::places::is_virtual(dir) {
+        Ok(())
+    } else {
+        Err(io::Error::other(crate::i18n::tr("Open a folder first to open it as administrator")))
+    }
+}
+
 /// Where pkexec is, once it was looked for (`preload`).
 static PKEXEC: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
@@ -159,6 +169,7 @@ pub fn take_environment(args: Vec<String>) -> Vec<String> {
 /// Start Compression as root on `dir`. The result arrives once polkit is done: `Err` carries what went
 /// wrong, and nothing is sent when the person simply dismissed the password prompt.
 pub fn open_folder(dir: &Path) -> io::Result<mpsc::Receiver<io::Error>> {
+    admissible_target(dir)?;
     let pkexec = pkexec().ok_or_else(|| io::Error::other(crate::i18n::tr("pkexec was not found. Install polkit to use administrator mode")))?;
     let exe = crate::portal::own_exe()?;
     check_binary(&exe)?;
@@ -192,6 +203,15 @@ pub(crate) mod tests {
     thread_local! {
         /// How often pkexec was looked for on this thread.
         pub(crate) static PKEXEC_LOOKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn only_an_absolute_path_that_is_no_view_is_an_admissible_root_target() {
+        // Checked before pkexec is looked for; nothing is started here
+        for refused in ["", "relative/folder", crate::fs::places::RECENT_PATH, crate::fs::places::BOOKMARKS_PATH] {
+            assert_eq!(admissible_target(Path::new(refused)).unwrap_err().to_string(), "Open a folder first to open it as administrator", "{refused:?}");
+        }
+        assert!(admissible_target(Path::new("/etc")).is_ok());
     }
 
     #[test]

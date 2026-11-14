@@ -991,5 +991,6 @@
   "a second, hidden name for it is left as “{}”; it can be deleted": "một tên ẩn thứ hai của tệp vẫn còn là “{}”; có thể xóa",
   "This file system cannot make a file from a template without the risk of leaving an incomplete one, so nothing was made under that name": "Hệ thống tệp này không thể tạo tệp từ mẫu mà không có nguy cơ để lại tệp chưa hoàn chỉnh, nên không có gì được tạo với tên đó",
   "Creating…": "Đang tạo…",
-  "Created {} in {}": "Đã tạo {} trong {}"
+  "Created {} in {}": "Đã tạo {} trong {}",
+  "Open a folder first to open it as administrator": "Hãy mở một thư mục trước để mở nó với quyền quản trị"
 }
