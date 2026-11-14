@@ -1,72 +1,40 @@
-
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <title>Compression</title>
   <rect width="512" height="512" fill="#0B1626"/>
 
-  <!-- Data blocks moving inward -->
-  <g fill="#E6F2FB">
-    <!-- Left -->
-    <rect x="64" y="174" width="42" height="28" rx="6"/>
-    <rect x="116" y="178" width="34" height="20" rx="5"/>
-    <rect x="156" y="181" width="24" height="14" rx="4"/>
-
-    <rect x="64" y="242" width="42" height="28" rx="6"/>
-    <rect x="116" y="246" width="34" height="20" rx="5"/>
-    <rect x="156" y="249" width="24" height="14" rx="4"/>
-
-    <rect x="64" y="310" width="42" height="28" rx="6"/>
-    <rect x="116" y="314" width="34" height="20" rx="5"/>
-    <rect x="156" y="317" width="24" height="14" rx="4"/>
-
-    <!-- Right -->
-    <rect x="406" y="174" width="42" height="28" rx="6"/>
-    <rect x="362" y="178" width="34" height="20" rx="5"/>
-    <rect x="332" y="181" width="24" height="14" rx="4"/>
-
-    <rect x="406" y="242" width="42" height="28" rx="6"/>
-    <rect x="362" y="246" width="34" height="20" rx="5"/>
-    <rect x="332" y="249" width="24" height="14" rx="4"/>
-
-    <rect x="406" y="310" width="42" height="28" rx="6"/>
-    <rect x="362" y="314" width="34" height="20" rx="5"/>
-    <rect x="332" y="317" width="24" height="14" rx="4"/>
+  <!-- Datei -->
+  <g fill="#E6F2FB" stroke="#E6F2FB" stroke-width="8" stroke-linejoin="round">
+    <path d="M186 166H278L326 214V346H186Z"/>
+    <path d="M294 166L326 198H294Z"/>
   </g>
 
-  <!-- Compression arrows -->
-  <g fill="#E6F2FB">
-    <path d="M182 236L202 256L182 276Z"/>
-    <path d="M330 236L310 256L330 276Z"/>
+  <!-- Reißverschluss (Zip) -->
+  <g fill="#0B1626">
+    <rect x="240" y="184" width="16" height="8" rx="2"/>
+    <rect x="256" y="196" width="16" height="8" rx="2"/>
+    <rect x="240" y="208" width="16" height="8" rx="2"/>
+    <rect x="256" y="220" width="16" height="8" rx="2"/>
+    <rect x="240" y="232" width="16" height="8" rx="2"/>
+    <rect x="256" y="244" width="16" height="8" rx="2"/>
+    <rect x="240" y="256" width="16" height="8" rx="2"/>
+    <rect x="256" y="268" width="16" height="8" rx="2"/>
+    <rect x="240" y="282" width="32" height="42" rx="6"/>
+  </g>
+  <rect x="250" y="302" width="12" height="12" rx="3" fill="#E6F2FB"/>
+
+  <!-- Kompressions-Pfeile -->
+  <g fill="none" stroke="#E6F2FB" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M216 92L256 124L296 92"/>
+    <path d="M216 420L256 388L296 420"/>
   </g>
 
-  <!-- Archive core -->
-  <rect x="204" y="142" width="104" height="228"
-        rx="18" fill="#E6F2FB"/>
-
-  <!-- Zipper -->
-  <g fill="none" stroke="#0B1626"
-     stroke-width="8" stroke-linecap="round"
-     stroke-linejoin="round">
-    <path d="M256 160V352"/>
-    <path d="M240 180H256M256 204H272
-             M240 228H256M256 252H272
-             M240 276H256M256 300H272
-             M240 324H256"/>
-  </g>
-
-  <!-- Zipper pull -->
-  <rect x="248" y="236" width="16" height="32"
-        rx="6" fill="#0B1626"/>
-  <rect x="253" y="243" width="6" height="14"
-        rx="3" fill="#E6F2FB"/>
-
-  <!-- Motion accents -->
-  <g stroke="#E6F2FB" stroke-width="8"
-     stroke-linecap="round" opacity=".34">
-    <path d="M42 190H52"/>
-    <path d="M34 256H52"/>
-    <path d="M42 322H52"/>
-    <path d="M460 190H470"/>
-    <path d="M460 256H478"/>
-    <path d="M460 322H470"/>
+  <!-- Bewegungslinien -->
+  <g stroke="#E6F2FB" stroke-width="8" stroke-linecap="round" opacity=".4">
+    <path d="M96 230H144"/>
+    <path d="M116 256H156"/>
+    <path d="M96 282H144"/>
+    <path d="M368 230H416"/>
+    <path d="M356 256H396"/>
+    <path d="M368 282H416"/>
   </g>
 </svg>
