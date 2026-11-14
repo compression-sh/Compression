@@ -5832,7 +5832,6 @@ impl CompressionApp {
                     many => manage.push((icons::RENAME, tr("Rename…"), MenuAction::RenameMany(many.to_vec()))),
                 }
                 manage.push((icons::TRASH, tr("Move to trash"), MenuAction::Trash(paths.clone())));
-                manage.push((icons::DELETE_FOREVER, tr("Delete permanently"), MenuAction::DeleteForever(paths.clone())));
             }
             let mut more = vec![
                 (icons::DUPLICATE, tr("Duplicate"), MenuAction::Duplicate(paths.clone())),
@@ -5841,7 +5840,11 @@ impl CompressionApp {
             ];
             if archives {
                 more.push((icons::EXTRACT, tr("Extract here"), MenuAction::ExtractHere(paths.clone())));
-                more.push((icons::EXTRACT, tr("Extract to…"), MenuAction::ExtractTo(paths)));
+                more.push((icons::EXTRACT, tr("Extract to…"), MenuAction::ExtractTo(paths.clone())));
+            }
+            // Deleting for good is not right beside the trash, where a slip of the pointer would take it
+            if !keep {
+                more.push((icons::DELETE_FOREVER, tr("Delete permanently"), MenuAction::DeleteForever(paths)));
             }
             manage.extend(transfer);
             manage.extend(fold(icons::MORE, tr("More actions"), more));
@@ -5854,8 +5857,7 @@ impl CompressionApp {
                 group.extend(fold(icons::NEW_TAB, tr("Open in"), vec![
                     (icons::NEW_TAB, tr("New tab"), MenuAction::OpenInNewTab(item.path.clone())),
                     (icons::NEW_WINDOW, tr("New window"), MenuAction::OpenInNewWindow(item.path.clone())),
-                    (icons::TERMINAL, tr("Terminal"), MenuAction::OpenTerminal(item.path.clone())),
-                ].into_iter().chain(admin_entry(&item.path)).collect()));
+                ]));
             }
             if with {
                 group.push((icons::APPS, tr("Open with…"), MenuAction::OpenWith(item.path.clone())));
@@ -5868,6 +5870,12 @@ impl CompressionApp {
         // The menu of one file or folder. `keep` is for sidebar places, which must not be moved or removed from here.
         let single_groups = |item: &FileItem, show_parent: bool, keep: bool| {
             let mut groups = vec![open_group(item, !item.is_dir, show_parent)];
+            // A folder's terminal and administrator, in sight rather than in a submenu
+            if item.is_dir {
+                let mut tools = vec![(icons::TERMINAL, tr("Open in terminal"), MenuAction::OpenTerminal(item.path.clone()))];
+                tools.extend(admin_entry(&item.path));
+                groups.push(tools);
+            }
             let mut mark = vec![bookmark_entry(&item.path)];
             if item.is_dir {
                 // A submenu cannot hold another, so these sit in the group itself
@@ -5953,11 +5961,15 @@ impl CompressionApp {
                 },
                 {
                     let here = &self.current_path;
+                    let mut tools = vec![(icons::TERMINAL, tr("Open in terminal"), MenuAction::OpenTerminal(here.clone()))];
+                    tools.extend(admin_entry(here));
+                    tools
+                },
+                {
+                    let here = &self.current_path;
                     let mut mark = vec![bookmark_entry(here)];
                     mark.extend(pin_entry(here));
                     mark.push(icon_entry(here));
-                    mark.push((icons::TERMINAL, tr("Open in terminal"), MenuAction::OpenTerminal(here.clone())));
-                    mark.extend(admin_entry(here));
                     mark
                 },
                 vec![(icons::REFRESH, tr("Refresh"), MenuAction::Refresh)],
@@ -11892,6 +11904,49 @@ mod tests {
         assert_eq!(w.app.job_needing(&crate::fs::resources::of_all([&b])), None);
         assert_eq!(std::fs::read_to_string(a.join("same.txt")).unwrap(), "old");
         let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_folder_shows_its_terminal_and_administrator_in_sight_and_deleting_for_good_sits_under_more_actions() {
+        let work = window_dir("menu_order");
+        std::fs::create_dir_all(work.join("dir")).unwrap();
+        std::fs::write(work.join("file.txt"), "x").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let admin = crate::fs::admin::available();
+        let labels = |groups: &[Vec<MenuEntry>]| -> Vec<Vec<String>> { groups.iter().map(|g| g.iter().map(|e| e.1.to_owned()).collect()).collect() };
+        let submenu = |groups: &[Vec<MenuEntry>], name: &str| -> Vec<String> {
+            groups.iter().flatten().find(|e| e.1 == name).and_then(|e| if let MenuAction::Submenu(inner) = &e.2 { Some(inner.iter().map(|i| i.1.to_owned()).collect()) } else { None }).unwrap_or_else(|| panic!("no submenu {name}"))
+        };
+        let tools: Vec<String> = std::iter::once("Open in terminal").chain(admin.then_some("Open as administrator")).map(str::to_owned).collect();
+        // A folder: Open in ▸ new tab and window only, then terminal and administrator on their own, right below
+        let dir = FileItem::from_path(&work.join("dir")).unwrap();
+        let groups = app.menu_entries(&MenuTarget::Item(dir.clone()));
+        assert_eq!(submenu(&groups, "Open in"), ["New tab", "New window"]);
+        assert_eq!(labels(&groups)[1], tools, "{:?}", labels(&groups));
+        let targets: Vec<PathBuf> = groups[1].iter().filter_map(|e| match &e.2 { MenuAction::OpenTerminal(p) | MenuAction::OpenAsAdmin(p) => Some(p.clone()), _ => None }).collect();
+        assert!(targets.iter().all(|p| *p == dir.path) && !targets.is_empty(), "{targets:?}");
+        // Files and folders: deleting for good is the last of More actions, not beside the trash
+        for item in [dir, FileItem::from_path(&work.join("file.txt")).unwrap()] {
+            let groups = app.menu_entries(&MenuTarget::Item(item.clone()));
+            let with_trash = groups.iter().find(|g| g.iter().any(|e| e.1 == "Move to trash")).unwrap();
+            assert!(!with_trash.iter().any(|e| e.1 == "Delete permanently"), "{:?}", labels(&groups));
+            assert_eq!(submenu(&groups, "More actions").last().map(String::as_str), Some("Delete permanently"), "{}", item.name);
+        }
+        // The empty space of a folder: terminal and administrator right after Paste and Select
+        let groups = app.menu_entries(&MenuTarget::Folder);
+        let at = labels(&groups).iter().position(|g| g.contains(&"Paste".to_owned())).expect("no Paste");
+        assert_eq!(labels(&groups)[at + 1], tools, "{:?}", labels(&groups));
+        let targets: Vec<PathBuf> = groups[at + 1].iter().filter_map(|e| match &e.2 { MenuAction::OpenTerminal(p) | MenuAction::OpenAsAdmin(p) => Some(p.clone()), _ => None }).collect();
+        assert!(targets.iter().all(|p| *p == app.current_path));
+        // A menu the person arranged keeps their order: deleting for good beside the trash stays there
+        let file = FileItem::from_path(&work.join("file.txt")).unwrap();
+        let entry = |id: &str| crate::settings::MenuNode::Entry { id: id.to_owned(), hidden: false };
+        app.settings.menu_layouts.file = Some(crate::settings::MenuLayout { groups: vec![vec![entry("open")], vec![entry("trash"), entry("delete")]] });
+        let groups = app.menu_entries(&MenuTarget::Item(file));
+        let with_trash = groups.iter().find(|g| g.iter().any(|e| e.1 == "Move to trash")).unwrap();
+        assert_eq!(with_trash.iter().map(|e| e.1).collect::<Vec<_>>(), ["Move to trash", "Delete permanently"]);
         let _ = std::fs::remove_dir_all(&work);
     }
 

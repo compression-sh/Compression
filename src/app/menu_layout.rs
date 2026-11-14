@@ -189,7 +189,8 @@ pub(crate) fn default_layout(kind: MenuKind, catalog: &[(&'static str, crate::pl
         if extract {
             more.extend(["extract_here", "extract_to"]);
         }
-        vec![entry("rename"), entry("trash"), entry("delete"), entry("copy_to"), entry("move_to"), submenu("builtin:more", &more)]
+        more.push("delete");
+        vec![entry("rename"), entry("trash"), entry("copy_to"), entry("move_to"), submenu("builtin:more", &more)]
     };
     let plugins = plugin_nodes(catalog);
     let groups = match kind {
@@ -202,7 +203,8 @@ pub(crate) fn default_layout(kind: MenuKind, catalog: &[(&'static str, crate::pl
             vec![entry("copy_path"), entry("properties")],
         ],
         MenuKind::Folder => vec![
-            vec![entry("open"), submenu("builtin:open_in", &["new_tab", "new_window", "terminal", "admin"]), entry("show_in_folder")],
+            vec![entry("open"), submenu("builtin:open_in", &["new_tab", "new_window"]), entry("show_in_folder")],
+            vec![entry("terminal"), entry("admin")],
             vec![entry("bookmark"), entry("pin"), submenu("builtin:custom_icon", &["icon_image", "icon_glyph"])],
             vec![entry("copy"), entry("cut")],
             manage(false),
@@ -214,7 +216,8 @@ pub(crate) fn default_layout(kind: MenuKind, catalog: &[(&'static str, crate::pl
             plugins,
             vec![entry("undo"), entry("redo")],
             vec![entry("paste"), submenu("builtin:select", &["select_all", "invert_selection", "select_pattern"])],
-            vec![entry("bookmark"), entry("pin"), submenu("builtin:custom_icon", &["icon_image", "icon_glyph"]), entry("terminal"), entry("admin")],
+            vec![entry("terminal"), entry("admin")],
+            vec![entry("bookmark"), entry("pin"), submenu("builtin:custom_icon", &["icon_image", "icon_glyph"])],
             vec![entry("refresh")],
             vec![entry("copy_path"), entry("properties")],
         ],
@@ -718,6 +721,28 @@ fn take_renames(ctx: &egui::Context, layout: &mut MenuLayout) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_built_in_arrangement_puts_terminal_and_administrator_in_sight_and_deleting_for_good_under_more_actions() {
+        let ids = |nodes: &[MenuNode]| -> Vec<String> {
+            nodes.iter().map(|n| match n {
+                MenuNode::Entry { id, .. } => id.clone(),
+                MenuNode::Submenu { name, entries, .. } => format!("{name}[{}]", entries.iter().map(|l| l.id.as_str()).collect::<Vec<_>>().join(",")),
+            }).collect()
+        };
+        let folder = default_layout(MenuKind::Folder, &[]);
+        assert_eq!(ids(&folder.groups[0]), ["open", "builtin:open_in[new_tab,new_window]", "show_in_folder"]);
+        assert_eq!(ids(&folder.groups[1]), ["terminal", "admin"]);
+        for kind in [MenuKind::File, MenuKind::Folder] {
+            let layout = default_layout(kind, &[]);
+            let manage = layout.groups.iter().find(|g| ids(g).contains(&"trash".to_owned())).unwrap();
+            assert!(!ids(manage).contains(&"delete".to_owned()), "{:?}", ids(manage));
+            assert!(ids(manage).iter().any(|n| n.starts_with("builtin:more[") && n.ends_with(",delete]")), "{:?}", ids(manage));
+        }
+        let background = default_layout(MenuKind::Background, &[]);
+        let at = background.groups.iter().position(|g| ids(g).contains(&"paste".to_owned())).unwrap();
+        assert_eq!(ids(&background.groups[at + 1]), ["terminal", "admin"]);
+    }
 
     fn labels(groups: &[Vec<MenuEntry>]) -> Vec<Vec<String>> {
         groups
