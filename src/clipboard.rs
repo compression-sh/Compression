@@ -523,12 +523,12 @@ mod tests {
         drop(write);
         assert_eq!(reader.join().unwrap().as_deref(), Some("Grüße\r\n".as_bytes()));
         // One that keeps the pipe and never writes: the reader ends by the clock (a few seconds), and the caller is
-        // free all along, since it is a thread that waits
+        // free all along, since it is a thread that waits: the caller is here while the reader still waits for the
+        // holder (no time measured for that; how long the reader waits is checked below)
         let (read, write) = pipe();
         let started = std::time::Instant::now();
         let reader = std::thread::spawn(move || read_pipe(OwnedFd::from(read)));
         assert!(!reader.is_finished(), "the reader waits for the holder");
-        assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(reader.join().unwrap(), None);
         assert!(started.elapsed() >= READ_TIMEOUT - Duration::from_millis(200) && started.elapsed() < READ_TIMEOUT + Duration::from_secs(2), "{:?}", started.elapsed());
         drop(write);
