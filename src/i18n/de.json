@@ -986,5 +986,8 @@
   "{} can only be handed names that are valid text (UTF-8), and one of these is not. Choose another terminal in Settings → Behavior.": "{} können nur Namen übergeben werden, die gültiger Text (UTF-8) sind, und einer davon ist es nicht. Wählen Sie unter Einstellungen → Verhalten ein anderes Terminal.",
   "What else is on this drive could not be told, so nothing was ejected. Unmount it instead.": "Was sonst auf diesem Laufwerk liegt, ließ sich nicht feststellen, deshalb wurde nichts ausgeworfen. Hängen Sie es stattdessen aus.",
   "This drive also holds “{}”, which the system uses, so nothing was ejected. Unmount it instead.": "Dieses Laufwerk enthält auch „{}“, das vom System verwendet wird, deshalb wurde nichts ausgeworfen. Hängen Sie es stattdessen aus.",
-  "Media": "Medien"
+  "Media": "Medien",
+  "what was written is kept as “{}”; it can be deleted": "das bisher Geschriebene bleibt als „{}“ erhalten; es kann gelöscht werden",
+  "a second, hidden name for it is left as “{}”; it can be deleted": "ein zweiter, versteckter Name dafür bleibt als „{}“ bestehen; er kann gelöscht werden",
+  "This file system cannot make a file from a template without the risk of leaving an incomplete one, so nothing was made under that name": "Dieses Dateisystem kann keine Datei aus einer Vorlage anlegen, ohne dass eine unvollständige zurückbleiben könnte, deshalb wurde unter diesem Namen nichts angelegt"
 }

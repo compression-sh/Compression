@@ -5329,10 +5329,12 @@ impl CompressionApp {
             return Err(tr("Enter a valid name").to_owned());
         }
         let path = self.current_path.join(name);
+        // What a template left beside the new file (a second, hidden name for it), said with the result
+        let mut note = None;
         let result = if is_dir {
             std::fs::create_dir(&path)
         } else if let Some(template) = template {
-            templates::create(template, &path)
+            templates::create(template, &path).map(|left| note = left)
         } else {
             std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map(|_| ())
         };
@@ -5347,7 +5349,8 @@ impl CompressionApp {
             self.scroll_to_selected = true;
         }
         self.history.record(UndoEntry::new(trf("Creation of {}", &[&name]), vec![Edit::Trash(path)]));
-        self.set_toast_action(trf("Created {}", &[&name]), ToastAction::Undo);
+        let created = trf("Created {}", &[&name]);
+        self.set_toast_action(note.map_or(created.clone(), |note| format!("{created} · {note}")), ToastAction::Undo);
         Ok(())
     }
 
@@ -11899,6 +11902,24 @@ mod tests {
         assert_eq!(w.app.job_needing(&crate::fs::resources::of_all([&b])), None);
         assert_eq!(std::fs::read_to_string(a.join("same.txt")).unwrap(), "old");
         let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_file_from_a_template_made_by_a_hard_link_says_its_hidden_second_name_and_a_folder_is_made_as_before() {
+        let work = window_dir("template_link");
+        crate::compat::tests::without_support_under(&work);
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let markdown = crate::fs::templates::load(None).into_iter().find(|t| t.file_name.ends_with(".md")).unwrap();
+        app.create_entry(false, "notes.md", Some(&markdown)).unwrap();
+        let toast = app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+        assert!(toast.starts_with("Created notes.md") && toast.contains("second, hidden name") && toast.contains(".compression-new-"), "{toast}");
+        assert_eq!(std::fs::read_to_string(work.join("notes.md")).unwrap(), "# \n");
+        // A new folder takes its own way, which needs neither
+        app.create_entry(true, "folder", None).unwrap();
+        assert!(work.join("folder").is_dir());
+        assert_eq!(app.status_toast.as_ref().map(|t| t.message.as_str()), Some("Created folder"));
         let _ = std::fs::remove_dir_all(&work);
     }
 
