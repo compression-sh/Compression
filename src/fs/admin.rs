@@ -47,21 +47,37 @@ pub fn available() -> bool {
 }
 
 /// Whether the program that is about to be run as root can only be changed by root and by the
-/// person asking: both it and the folder it is in must belong to one of the two and not be
+/// person asking: it and every folder above it, up to `/`, must belong to one of the two and not be
 /// writable by anyone else (a folder others may write to is fine when it is sticky, like `/tmp`:
-/// there nobody can replace another's file). Otherwise anyone who can write there could have root
-/// run what they like by waiting for the password prompt to be answered.
+/// there nobody can replace another's file). Otherwise anyone who can write to one of them could
+/// put another program in its place (the owner of a folder can rename what is in it, a folder above
+/// included) and have root run what they like by waiting for the password prompt to be answered.
+/// The error names the first file or folder that fails and why.
 fn check_binary(exe: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid has no preconditions.
     let me = unsafe { libc::geteuid() };
-    let refuse = || io::Error::other(crate::i18n::tr("Administrator mode only starts a program that nobody else can change"));
-    let folder = exe.parent().ok_or_else(refuse)?;
-    for (path, is_folder) in [(exe, false), (folder, true)] {
-        let meta = std::fs::metadata(path)?;
-        if !is_trusted(meta.uid(), meta.mode(), me, is_folder) {
-            return Err(refuse());
+    check_chain(exe, me, &|path| std::fs::metadata(path).map(|m| (m.uid(), m.mode())))
+}
+
+/// `check_binary` with the owner and mode of each path from `meta`.
+fn check_chain(exe: &Path, me: u32, meta: &dyn Fn(&Path) -> io::Result<(u32, u32)>) -> io::Result<()> {
+    // The program itself, then each folder it is in, up to `/`
+    for (n, path) in exe.ancestors().enumerate() {
+        if path.as_os_str().is_empty() {
+            break;
         }
+        let is_folder = n > 0;
+        let (owner, mode) = meta(path)?;
+        if is_trusted(owner, mode, me, is_folder) {
+            continue;
+        }
+        let shown = path.display().to_string();
+        return Err(io::Error::other(if owner != 0 && owner != me {
+            crate::i18n::trf("Administrator mode was not started: “{}” belongs to another user (UID {}), who could change the program.", &[&shown, &owner])
+        } else {
+            crate::i18n::trf("Administrator mode was not started: “{}” can be changed by other users (permissions {}).", &[&shown, &format!("{:o}", mode & 0o7777)])
+        }));
     }
     Ok(())
 }
@@ -217,6 +233,34 @@ mod tests {
         // A folder anyone may write to is fine only when it is sticky
         assert!(is_trusted(root, 0o41777, me, true));
         assert!(!is_trusted(root, 0o100777 | 0o1000, me, false), "sticky does not help a file");
+    }
+
+    #[test]
+    fn every_folder_above_the_program_up_to_the_root_is_checked_and_the_first_that_fails_is_named() {
+        let me = 1000;
+        // As on a system where /usr and /usr/bin belong to a user without a name (UID 1001)
+        let system = |owners: &'static [(&'static str, u32, u32)]| {
+            move |path: &Path| -> io::Result<(u32, u32)> {
+                owners.iter().find(|(p, _, _)| Path::new(p) == path).map(|(_, owner, mode)| (*owner, *mode)).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+            }
+        };
+        let fine = system(&[("/usr/bin/compression", 0, 0o100755), ("/usr/bin", 0, 0o40755), ("/usr", 0, 0o40755), ("/", 0, 0o40755)]);
+        assert!(check_chain(Path::new("/usr/bin/compression"), me, &fine).is_ok());
+        let usr_bin = system(&[("/usr/bin/compression", 0, 0o100755), ("/usr/bin", 1001, 0o40755), ("/usr", 0, 0o40755), ("/", 0, 0o40755)]);
+        assert_eq!(check_chain(Path::new("/usr/bin/compression"), me, &usr_bin).unwrap_err().to_string(), "Administrator mode was not started: “/usr/bin” belongs to another user (UID 1001), who could change the program.");
+        // A folder further up counts as much: its owner can put another /usr/bin in place
+        let usr = system(&[("/usr/bin/compression", 0, 0o100755), ("/usr/bin", 0, 0o40755), ("/usr", 1001, 0o40755), ("/", 0, 0o40755)]);
+        assert_eq!(check_chain(Path::new("/usr/bin/compression"), me, &usr).unwrap_err().to_string(), "Administrator mode was not started: “/usr” belongs to another user (UID 1001), who could change the program.");
+        // Open to group or world, at the root too; sticky folders are fine
+        let root_open = system(&[("/usr/bin/compression", 0, 0o100755), ("/usr/bin", 0, 0o40755), ("/usr", 0, 0o40755), ("/", 0, 0o40777)]);
+        assert_eq!(check_chain(Path::new("/usr/bin/compression"), me, &root_open).unwrap_err().to_string(), "Administrator mode was not started: “/” can be changed by other users (permissions 777).");
+        let own_build = system(&[("/tmp/b/compression", 1000, 0o100755), ("/tmp/b", 1000, 0o40700), ("/tmp", 0, 0o41777), ("/", 0, 0o40755)]);
+        assert!(check_chain(Path::new("/tmp/b/compression"), me, &own_build).is_ok());
+        let file_open = system(&[("/tmp/b/compression", 1000, 0o100775), ("/tmp/b", 1000, 0o40700), ("/tmp", 0, 0o41777), ("/", 0, 0o40755)]);
+        assert_eq!(check_chain(Path::new("/tmp/b/compression"), me, &file_open).unwrap_err().to_string(), "Administrator mode was not started: “/tmp/b/compression” can be changed by other users (permissions 775).");
+        // What cannot be looked at is an error too
+        let missing = system(&[("/usr/bin/compression", 0, 0o100755)]);
+        assert!(check_chain(Path::new("/usr/bin/compression"), me, &missing).is_err());
     }
 
     #[test]
