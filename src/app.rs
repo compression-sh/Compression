@@ -5857,7 +5857,8 @@ impl CompressionApp {
                 group.extend(fold(icons::NEW_TAB, tr("Open in"), vec![
                     (icons::NEW_TAB, tr("New tab"), MenuAction::OpenInNewTab(item.path.clone())),
                     (icons::NEW_WINDOW, tr("New window"), MenuAction::OpenInNewWindow(item.path.clone())),
-                ]));
+                    (icons::TERMINAL, tr("Terminal"), MenuAction::OpenTerminal(item.path.clone())),
+                ].into_iter().chain(admin_entry(&item.path)).collect()));
             }
             if with {
                 group.push((icons::APPS, tr("Open with…"), MenuAction::OpenWith(item.path.clone())));
@@ -5870,12 +5871,6 @@ impl CompressionApp {
         // The menu of one file or folder. `keep` is for sidebar places, which must not be moved or removed from here.
         let single_groups = |item: &FileItem, show_parent: bool, keep: bool| {
             let mut groups = vec![open_group(item, !item.is_dir, show_parent)];
-            // A folder's terminal and administrator, in sight rather than in a submenu
-            if item.is_dir {
-                let mut tools = vec![(icons::TERMINAL, tr("Open in terminal"), MenuAction::OpenTerminal(item.path.clone()))];
-                tools.extend(admin_entry(&item.path));
-                groups.push(tools);
-            }
             let mut mark = vec![bookmark_entry(&item.path)];
             if item.is_dir {
                 // A submenu cannot hold another, so these sit in the group itself
@@ -11908,7 +11903,7 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_shows_its_terminal_and_administrator_in_sight_and_deleting_for_good_sits_under_more_actions() {
+    fn a_folder_keeps_terminal_and_administrator_under_open_in_and_deleting_for_good_sits_under_more_actions() {
         let work = window_dir("menu_order");
         std::fs::create_dir_all(work.join("dir")).unwrap();
         std::fs::write(work.join("file.txt"), "x").unwrap();
@@ -11920,12 +11915,15 @@ mod tests {
             groups.iter().flatten().find(|e| e.1 == name).and_then(|e| if let MenuAction::Submenu(inner) = &e.2 { Some(inner.iter().map(|i| i.1.to_owned()).collect()) } else { None }).unwrap_or_else(|| panic!("no submenu {name}"))
         };
         let tools: Vec<String> = std::iter::once("Open in terminal").chain(admin.then_some("Open as administrator")).map(str::to_owned).collect();
-        // A folder: Open in ▸ new tab and window only, then terminal and administrator on their own, right below
+        // A folder: at the top only Open and Open in ▸, which holds new tab, new window, terminal and administrator
         let dir = FileItem::from_path(&work.join("dir")).unwrap();
         let groups = app.menu_entries(&MenuTarget::Item(dir.clone()));
-        assert_eq!(submenu(&groups, "Open in"), ["New tab", "New window"]);
-        assert_eq!(labels(&groups)[1], tools, "{:?}", labels(&groups));
-        let targets: Vec<PathBuf> = groups[1].iter().filter_map(|e| match &e.2 { MenuAction::OpenTerminal(p) | MenuAction::OpenAsAdmin(p) => Some(p.clone()), _ => None }).collect();
+        assert_eq!(labels(&groups)[0], ["Open", "Open in"], "{:?}", labels(&groups));
+        let open_in: Vec<String> = ["New tab", "New window", "Terminal"].into_iter().chain(admin.then_some("Open as administrator")).map(str::to_owned).collect();
+        assert_eq!(submenu(&groups, "Open in"), open_in);
+        assert!(!labels(&groups).iter().flatten().any(|l| l == "Open in terminal" || l == "Open as administrator"), "{:?}", labels(&groups));
+        let inner = groups[0].iter().find_map(|e| if let MenuAction::Submenu(inner) = &e.2 { Some(inner.clone()) } else { None }).unwrap();
+        let targets: Vec<PathBuf> = inner.iter().filter_map(|e| match &e.2 { MenuAction::OpenTerminal(p) | MenuAction::OpenAsAdmin(p) => Some(p.clone()), _ => None }).collect();
         assert!(targets.iter().all(|p| *p == dir.path) && !targets.is_empty(), "{targets:?}");
         // Files and folders: deleting for good is the last of More actions, not beside the trash
         for item in [dir, FileItem::from_path(&work.join("file.txt")).unwrap()] {

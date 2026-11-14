@@ -203,8 +203,7 @@ pub(crate) fn default_layout(kind: MenuKind, catalog: &[(&'static str, crate::pl
             vec![entry("copy_path"), entry("properties")],
         ],
         MenuKind::Folder => vec![
-            vec![entry("open"), submenu("builtin:open_in", &["new_tab", "new_window"]), entry("show_in_folder")],
-            vec![entry("terminal"), entry("admin")],
+            vec![entry("open"), submenu("builtin:open_in", &["new_tab", "new_window", "terminal", "admin"]), entry("show_in_folder")],
             vec![entry("bookmark"), entry("pin"), submenu("builtin:custom_icon", &["icon_image", "icon_glyph"])],
             vec![entry("copy"), entry("cut")],
             manage(false),
@@ -723,7 +722,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_built_in_arrangement_puts_terminal_and_administrator_in_sight_and_deleting_for_good_under_more_actions() {
+    fn the_built_in_arrangement_keeps_a_folders_terminal_and_administrator_under_open_in_and_deleting_for_good_under_more_actions() {
         let ids = |nodes: &[MenuNode]| -> Vec<String> {
             nodes.iter().map(|n| match n {
                 MenuNode::Entry { id, .. } => id.clone(),
@@ -731,8 +730,8 @@ mod tests {
             }).collect()
         };
         let folder = default_layout(MenuKind::Folder, &[]);
-        assert_eq!(ids(&folder.groups[0]), ["open", "builtin:open_in[new_tab,new_window]", "show_in_folder"]);
-        assert_eq!(ids(&folder.groups[1]), ["terminal", "admin"]);
+        assert_eq!(ids(&folder.groups[0]), ["open", "builtin:open_in[new_tab,new_window,terminal,admin]", "show_in_folder"]);
+        assert!(!ids(&folder.groups[1]).iter().any(|id| id == "terminal" || id == "admin"), "{:?}", ids(&folder.groups[1]));
         for kind in [MenuKind::File, MenuKind::Folder] {
             let layout = default_layout(kind, &[]);
             let manage = layout.groups.iter().find(|g| ids(g).contains(&"trash".to_owned())).unwrap();
