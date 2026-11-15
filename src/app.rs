@@ -140,8 +140,37 @@ struct PendingText {
     rx: mpsc::Receiver<Option<String>>,
 }
 
-/// Counts a clipboard reader as long as it lives, however its thread ends.
+/// Counts a worker (a clipboard reader, a templates listing, a new item being made) as long as it lives, however its
+/// thread ends.
 struct Reading(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+/// The most templates listings of one window at once: one that hangs (the folder on a server that is gone) stays.
+const MAX_TEMPLATE_LISTINGS: usize = 1;
+/// The most new items of one window being made at once: one that hangs stays until its folder answers.
+const MAX_CREATING: usize = 3;
+
+/// Starts `work` on a thread of its own if `count` is below `most`, and counts it until the thread ends, however it ends
+/// (also when its answer can no longer be delivered). `Ok(false)` when there is no room: nothing is started, queued or
+/// tried again later. If the thread cannot be started, its place is given back at once. The count belongs to one window;
+/// other windows have their own, so this is no limit for the whole process.
+fn start_counted(count: &std::sync::Arc<std::sync::atomic::AtomicUsize>, most: usize, work: impl FnOnce() + Send + 'static) -> std::io::Result<bool> {
+    use std::sync::atomic::Ordering::SeqCst;
+    if count.try_update(SeqCst, SeqCst, |n| (n < most).then_some(n + 1)).is_err() {
+        return Ok(false);
+    }
+    let held = Reading(count.clone());
+    let run = move || {
+        let _held = held;
+        work();
+    };
+    #[cfg(test)]
+    if tests::FAIL_SPAWN.with(std::cell::Cell::get) {
+        drop(run);
+        return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
+    }
+    // A thread that cannot be started drops `run`, and with it `held`
+    std::thread::Builder::new().spawn(run).map(|_| true)
+}
 
 impl Drop for Reading {
     fn drop(&mut self) {
@@ -655,6 +684,9 @@ pub struct CompressionApp {
     pending_text: Option<PendingText>,
     /// How many threads are reading the clipboard now (a thread that hangs counts until it ends).
     clipboard_readers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// How many threads of this window list the templates folder now, and how many make new items (see `start_counted`).
+    template_listings: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    creating: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// How long a paste waits for the clipboard; tests shorten it.
     clipboard_wait: std::time::Duration,
     /// What reads the clipboard for a paste (`clipboard::snapshot`); tests put others here.
@@ -988,6 +1020,8 @@ impl CompressionApp {
             pending_paste: None,
             pending_text: None,
             clipboard_readers: std::sync::Arc::default(),
+            template_listings: std::sync::Arc::default(),
+            creating: std::sync::Arc::default(),
             clipboard_wait: CLIPBOARD_WAIT,
             clipboard_snapshot: std::sync::Arc::new(crate::clipboard::snapshot),
             clipboard_text: std::sync::Arc::new(crate::clipboard::get_text),
@@ -5365,14 +5399,23 @@ impl CompressionApp {
         let name = self.free_name(base);
         self.create_seq += 1;
         let id = self.create_seq;
+        let mut error = None;
         if !is_dir {
             let (tx, ctx, custom) = (self.open_tx.clone(), self.ctx.clone(), self.settings.templates_dir.clone());
-            std::thread::spawn(move || {
+            // An earlier listing that still hangs is not joined by another: only the built-in templates are offered
+            let started = start_counted(&self.template_listings, MAX_TEMPLATE_LISTINGS, move || {
+                #[cfg(test)]
+                if let Some(dir) = &custom {
+                    tests::wait_while_held(dir);
+                }
                 let _ = tx.send(OpenReport::Templates { dialog: id, found: templates::user(custom.as_deref()) });
                 ctx.request_repaint();
             });
+            if !matches!(started, Ok(true)) {
+                error = Some(tr("The templates folder has not answered yet, so only the built-in templates are offered").to_owned());
+            }
         }
-        self.dialog = Some(Dialog::Create { id, waiting: false, is_dir, name, error: None, first_frame: true, templates, template: 0, edited: false });
+        self.dialog = Some(Dialog::Create { id, waiting: false, is_dir, name, error, first_frame: true, templates, template: 0, edited: false });
     }
 
     /// `name` if nothing in the listing has it, otherwise `name 2`, `name 3`… (before the extension). The listing is asked,
@@ -5393,21 +5436,28 @@ impl CompressionApp {
     }
 
     /// Starts making `name` in the folder shown, on a thread (the folder may be on a server that hangs); the answer comes
-    /// as `OpenReport::Created` for the dialog `dialog`, see `created`. A name that cannot be is said at once.
+    /// as `OpenReport::Created` for the dialog `dialog`, see `created`. A name that cannot be is said at once, and so is a
+    /// window that has `MAX_CREATING` items still being made: then nothing is started, nor tried again later.
     fn create_entry(&mut self, dialog: u64, is_dir: bool, name: &str, template: Option<&Template>) -> Result<(), String> {
         let name = name.trim();
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
             return Err(tr("Enter a valid name").to_owned());
         }
-        #[cfg(test)]
-        tests::CREATES_STARTED.with(|n| n.set(n.get() + 1));
         let (dir, name, template, tx, ctx) = (self.current_path.clone(), name.to_owned(), template.cloned(), self.open_tx.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
+        let started = start_counted(&self.creating, MAX_CREATING, move || {
             let result = make_new(&dir, is_dir, &name, template.as_ref());
             let _ = tx.send(OpenReport::Created { dialog, dir, name, result });
             ctx.request_repaint();
         });
-        Ok(())
+        match started {
+            Ok(true) => {
+                #[cfg(test)]
+                tests::CREATES_STARTED.with(|n| n.set(n.get() + 1));
+                Ok(())
+            }
+            Ok(false) => Err(trf("{} new items of this window are still being made, so nothing was made; try again when one has finished", &[&MAX_CREATING])),
+            Err(err) => Err(trf("It could not be started ({}), so nothing was made", &[&crate::fs::describe::io_error(&err)])),
+        }
     }
 
     /// The answer for a new item from `create_entry`. It was made in `dir`, the folder shown when it was asked for, also
@@ -10347,6 +10397,8 @@ mod tests {
     thread_local! {
         /// How many threads that make a new item were started from this thread.
         pub(super) static CREATES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// `start_counted` fails as if no thread could be started (EAGAIN).
+        pub(super) static FAIL_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Folders in which making a new item waits until the test lets it go (at most 10 s, so that a mutation that makes
@@ -12242,6 +12294,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&here);
     }
 
+    /// Lets `app` take in answers until `done`, for at most 5 s.
+    fn poll_until(app: &mut CompressionApp, what: &str, done: impl Fn(&CompressionApp) -> bool) {
+        for _ in 0..1000 {
+            app.poll_opened();
+            if done(app) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("no answer: {what}");
+    }
+
+    fn count(n: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        n.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_window_makes_at_most_three_new_items_at_once_says_so_and_takes_a_place_again_once_one_ends() {
+        let here = window_dir("create_capped");
+        let mut w = Window::new(here.clone());
+        let started = || CREATES_STARTED.with(std::cell::Cell::get);
+        let before = started();
+        hold_creating_in(&here);
+        for name in ["a", "b", "c"] {
+            w.app.create_entry(0, true, name, None).unwrap();
+        }
+        assert_eq!((started() - before, count(&w.app.creating)), (3, 3));
+        // A fourth, from the dialog: nothing starts, the dialog says why and does not wait
+        w.app.open_create_dialog(true);
+        w.run(Vec::new(), 3);
+        w.click(w.at("Create"), egui::PointerButton::Primary);
+        w.run(Vec::new(), 3);
+        assert!(w.shows("3 new items of this window are still being made, so nothing was made; try again when one has finished"), "{:?}", w.last);
+        assert!(matches!(w.app.dialog, Some(Dialog::Create { waiting: false, .. })));
+        assert_eq!((started() - before, count(&w.app.creating)), (3, 3));
+        // Closing the dialog and opening it again gives no new places
+        w.app.dialog = None;
+        w.app.open_create_dialog(true);
+        let err = w.app.create_entry(0, true, "d", None).unwrap_err();
+        assert!(err.starts_with("3 new items of this window"), "{err}");
+        assert_eq!((started() - before, count(&w.app.creating)), (3, 3));
+        // Once they end, the places are free again; what was refused is not made later on its own
+        let_creating_go(&here);
+        w.until("the three answers", |w| count(&w.app.creating) == 0 && ["a", "b", "c"].iter().all(|n| here.join(n).is_dir()));
+        w.run(Vec::new(), 10);
+        assert!(!here.join("d").exists() && !here.join("New Folder").exists(), "nothing refused was made");
+        w.app.dialog = None;
+        w.app.create_entry(0, true, "e", None).unwrap();
+        w.until("e", |w| here.join("e").is_dir() && count(&w.app.creating) == 0);
+        assert_eq!(started() - before, 4);
+        let _ = std::fs::remove_dir_all(&here);
+    }
+
+    #[test]
+    fn a_place_is_given_back_when_the_thread_cannot_start_when_making_fails_and_when_the_answer_cannot_be_delivered() {
+        let work = window_dir("create_places");
+        std::fs::write(work.join("taken"), "mine").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let started = || CREATES_STARTED.with(std::cell::Cell::get);
+        let before = started();
+        // No thread: said, nothing counted, nothing started
+        FAIL_SPAWN.with(|f| f.set(true));
+        let err = app.create_entry(0, true, "x", None).unwrap_err();
+        FAIL_SPAWN.with(|f| f.set(false));
+        assert!(err.starts_with("It could not be started ("), "{err}");
+        assert_eq!((started() - before, count(&app.creating)), (0, 0));
+        // Making fails, with no dialog that waits: said as a message, and the place is free
+        app.create_entry(0, true, "taken", None).unwrap();
+        poll_until(&mut app, "the failure", |app| app.status_toast.as_ref().is_some_and(|t| t.message.contains("already exists")));
+        poll_until(&mut app, "the place", |app| count(&app.creating) == 0);
+        // The window is gone before the answer: the place is still given back when the thread ends
+        hold_creating_in(&work);
+        app.create_entry(0, true, "late", None).unwrap();
+        let creating = app.creating.clone();
+        assert_eq!(count(&creating), 1);
+        drop(app);
+        let_creating_go(&work);
+        for _ in 0..1000 {
+            if count(&creating) == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(count(&creating), 0);
+        assert!(!work.join("x").exists());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_window_lists_the_templates_folder_once_at_a_time_and_offers_the_built_in_ones_meanwhile() {
+        let work = window_dir("templates_capped");
+        let tpl = work.join("tpl");
+        std::fs::create_dir(&tpl).unwrap();
+        std::fs::write(tpl.join("Invoice.odt"), "odt").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        app.settings.templates_dir = Some(tpl.clone());
+        let builtin = crate::fs::templates::builtin().len();
+        let hint = "The templates folder has not answered yet, so only the built-in templates are offered";
+        hold_creating_in(&tpl);
+        app.open_create_dialog(false);
+        assert!(matches!(&app.dialog, Some(Dialog::Create { error: None, .. })));
+        assert_eq!(count(&app.template_listings), 1);
+        // Closed and opened again while the folder hangs: no second listing, the built-in templates and the hint
+        app.dialog = None;
+        app.open_create_dialog(false);
+        assert_eq!(count(&app.template_listings), 1);
+        assert!(matches!(&app.dialog, Some(Dialog::Create { error: Some(e), templates, .. }) if e == hint && templates.len() == builtin));
+        let_creating_go(&tpl);
+        poll_until(&mut app, "the listing to end", |app| count(&app.template_listings) == 0);
+        // Its late answer was for the dialog before: this one is not filled from it
+        assert!(matches!(&app.dialog, Some(Dialog::Create { templates, .. }) if templates.len() == builtin));
+        app.open_create_dialog(false);
+        poll_until(&mut app, "the templates", |app| matches!(&app.dialog, Some(Dialog::Create { templates, error: None, .. }) if templates.iter().any(|t| t.name == "Invoice")));
+        poll_until(&mut app, "the place", |app| count(&app.template_listings) == 0);
+        // No thread: the hint, and the place is free
+        FAIL_SPAWN.with(|f| f.set(true));
+        app.open_create_dialog(false);
+        FAIL_SPAWN.with(|f| f.set(false));
+        assert!(matches!(&app.dialog, Some(Dialog::Create { error: Some(e), .. }) if e == hint));
+        assert_eq!(count(&app.template_listings), 0);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
     #[test]
     fn a_new_item_that_cannot_be_made_is_said_in_the_dialog_that_waits_or_else_as_a_message() {
         let work = window_dir("create_fails");
@@ -12298,14 +12475,25 @@ mod tests {
         assert_eq!(name, "Untitled 2", "the listing has Untitled");
         let (builtin, id) = (crate::fs::templates::builtin().len(), *id);
         assert_eq!(templates.len(), builtin, "the templates folder is not read on the window's thread");
-        // A dialog opened again meanwhile: only the answer for it counts
-        w.app.open_create_dialog(false);
-        let Some(Dialog::Create { id: again, .. }) = &w.app.dialog else { panic!() };
-        assert_ne!(*again, id);
+        // The listing for this dialog comes in, off the window's thread
         w.until("the templates folder", |w| matches!(&w.app.dialog, Some(Dialog::Create { templates, .. }) if templates.len() > builtin));
+        let Some(Dialog::Create { templates, id: same, .. }) = &w.app.dialog else { panic!() };
+        assert_eq!((templates.iter().filter(|t| t.name == "Invoice").count(), *same), (1, id));
+        // A dialog opened again while a listing still runs gets no second one (one at a time per window), and the
+        // answer of the earlier one is not taken in
+        hold_creating_in(&templates_dir);
+        w.app.open_create_dialog(false);
+        let Some(Dialog::Create { id: first, .. }) = &w.app.dialog else { panic!() };
+        let first = *first;
+        w.app.open_create_dialog(false);
+        let Some(Dialog::Create { id: again, error, .. }) = &w.app.dialog else { panic!() };
+        assert_ne!(*again, first);
+        assert!(error.as_deref().is_some_and(|e| e.starts_with("The templates folder has not answered yet")), "{error:?}");
+        let_creating_go(&templates_dir);
+        w.until("the earlier listing to end", |w| w.app.template_listings.load(std::sync::atomic::Ordering::SeqCst) == 0);
         w.run(Vec::new(), 20);
         let Some(Dialog::Create { templates, .. }) = &w.app.dialog else { panic!() };
-        assert_eq!(templates.iter().filter(|t| t.name == "Invoice").count(), 1, "the earlier dialog's answer is not taken in");
+        assert_eq!(templates.len(), builtin, "the earlier dialog's answer is not taken in");
         let _ = std::fs::remove_dir_all(&work);
     }
 
