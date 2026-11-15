@@ -77,10 +77,15 @@ fn collect(dir: &Path, depth: usize, out: &mut Vec<Template>) {
         if file_name.starts_with('.') || out.len() >= 200 {
             continue;
         }
-        if path.is_dir() {
+        // Follows links; looks, opens nothing
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        if meta.is_dir() {
             if depth < 1 {
                 collect(&path, depth + 1, out);
             }
+            continue;
+        }
+        if !meta.is_file() {
             continue;
         }
         let icon = crate::fs::file_item::specific_icon(&file_name).map_or(icons::FILE, |(icon, _)| icon);
@@ -114,15 +119,16 @@ pub fn create(template: &Template, target: &Path) -> io::Result<Option<String>> 
     if target.symlink_metadata().is_ok() {
         return Err(io::ErrorKind::AlreadyExists.into());
     }
-    let (mut read, mode): (Box<dyn io::Read>, Option<std::fs::Permissions>) = match &template.source {
+    let (mut read, mode, len): (Box<dyn io::Read>, Option<std::fs::Permissions>, u64) = match &template.source {
         Source::Builtin { content, executable } => {
             use std::os::unix::fs::PermissionsExt;
-            (Box::new(content.as_bytes()), executable.then(|| std::fs::Permissions::from_mode(0o755)))
+            (Box::new(content.as_bytes()), executable.then(|| std::fs::Permissions::from_mode(0o755)), content.len() as u64)
         }
         Source::File(from) => {
-            let file = std::fs::File::open(from)?;
-            let mode = file.metadata()?.permissions();
-            (Box::new(file), Some(mode))
+            use std::io::Read;
+            let (file, meta) = open_template(from)?;
+            // What is appended while it is read is left out
+            (Box::new(file.take(meta.len())), Some(meta.permissions()), meta.len())
         }
     };
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -131,7 +137,8 @@ pub fn create(template: &Template, target: &Path) -> io::Result<Option<String>> 
     let target_name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let left = |why: String| io::Error::other(format!("{why} · {}", trf("what was written is kept as “{}”; it can be deleted", &[&kept])));
     // Whole and synced before it gets the name; a failed sync is not retried (what reached the disk is unknown)
-    if let Err(err) = fill(&mut read, mode, &mut file).and_then(|()| sync(&file)) {
+    let whole = |written: u64| if written < len { Err(io::Error::other(tr("the template became shorter while it was read"))) } else { Ok(()) };
+    if let Err(err) = fill(&mut read, mode, &mut file).and_then(whole).and_then(|()| sync(&file)) {
         return Err(left(crate::fs::describe::io_error(&err)));
     }
     drop(file);
@@ -213,15 +220,62 @@ fn hard_link(staged: &Path, target: &Path) -> io::Result<()> {
 }
 
 /// Everything `read` gives into `file`, then the permissions `mode`.
-fn fill(read: &mut dyn io::Read, mode: Option<std::fs::Permissions>, file: &mut std::fs::File) -> io::Result<()> {
+fn fill(read: &mut dyn io::Read, mode: Option<std::fs::Permissions>, file: &mut std::fs::File) -> io::Result<u64> {
     #[cfg(test)]
-    tests::copy_maybe_failing(read, file)?;
+    let written = tests::copy_maybe_failing(read, file)?;
     #[cfg(not(test))]
-    io::copy(read, file)?;
+    let written = io::copy(read, file)?;
     if let Some(mode) = mode {
         super::ops::keep_mode(file.set_permissions(mode))?;
     }
-    Ok(())
+    Ok(written)
+}
+
+/// Opens the template file `from` for reading only if it is a regular file (a link to one is followed), with what
+/// `fstat` said of it then.
+///
+/// It is looked at through `O_PATH` first, which runs no driver's `open` and does not open a pipe for reading, so a
+/// pipe, socket or device is never opened. Only a regular file is then opened for reading, through `/proc/self/fd`, so
+/// it is the same file even when the name was swapped meanwhile, and the opened descriptor is checked to be that file.
+/// Without a usable `/proc` the template is refused: opening it by its name instead would open whatever the name points
+/// to by then. Built-in templates read no file and do not need `/proc`.
+///
+/// Not covered: looking it up or opening it may block on a hanging network or FUSE file system; and a change of the
+/// content that keeps its length while it is read goes unnoticed (only a file that gets shorter is caught).
+fn open_template(from: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let looked = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_PATH).open(from)?;
+    let seen = looked.metadata()?;
+    if !seen.is_file() {
+        let name = from.file_name().map_or_else(|| from.display().to_string(), |n| n.to_string_lossy().into_owned());
+        return Err(io::Error::other(trf("“{}” is not a regular file, so it cannot be a template", &[&name])));
+    }
+    let fds = proc_fds();
+    #[cfg(test)]
+    tests::at(tests::Stage::BetweenOpens(looked.as_raw_fd()), from);
+    #[cfg(test)]
+    tests::step("open");
+    // The file looked at, whatever its name points to now; a regular file, so no flags for pipes or terminals are needed
+    let file = std::fs::File::open(fds.join(looked.as_raw_fd().to_string()))
+        .map_err(|err| if fds.is_dir() { err } else { io::Error::other(tr("This template cannot be opened safely here, because /proc is not available")) })?;
+    let meta = file.metadata()?;
+    // The same file as looked at, so a regular one
+    if (meta.dev(), meta.ino()) != (seen.dev(), seen.ino()) {
+        return Err(io::Error::other(tr("The template was replaced while it was opened")));
+    }
+    #[cfg(test)]
+    tests::at(tests::Stage::Opened, from);
+    Ok((file, meta))
+}
+
+/// Where this process's descriptors can be opened again.
+fn proc_fds() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = tests::PROC_FDS.with(|d| d.borrow().clone()) {
+        return dir;
+    }
+    PathBuf::from("/proc/self/fd")
 }
 
 #[cfg(test)]
@@ -255,6 +309,60 @@ pub(crate) mod tests {
     pub(super) fn sync_step() -> Option<io::Error> {
         step("sync");
         FAIL_SYNC.with(Cell::get).then(|| io::Error::from_raw_os_error(libc::EIO))
+    }
+
+    /// Where `open_template` lets a test step in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Stage {
+        /// Looked at as a regular file through this `O_PATH` descriptor, not opened for reading yet.
+        BetweenOpens(i32),
+        /// Opened for reading, its length taken.
+        Opened,
+    }
+
+    type Hook = Box<dyn FnMut(Stage, &Path)>;
+
+    thread_local! {
+        static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+        /// Stands in for `/proc/self/fd`.
+        pub(super) static PROC_FDS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn at(stage: Stage, from: &Path) {
+        HOOK.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook(stage, from);
+            }
+        });
+    }
+
+    /// Runs `f` with `hook` in `open_template`, and the descriptors at `proc_fds` if given.
+    fn with_hook<T>(hook: impl FnMut(Stage, &Path) + 'static, proc_fds: Option<PathBuf>, f: impl FnOnce() -> T) -> T {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        PROC_FDS.with(|d| *d.borrow_mut() = proc_fds);
+        let out = f();
+        HOOK.with(|h| *h.borrow_mut() = None);
+        PROC_FDS.with(|d| *d.borrow_mut() = None);
+        out
+    }
+
+    fn mkfifo(path: &Path) {
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid C string; mkfifo only makes a file system entry.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    }
+
+    /// `f` on a thread of its own, given up on after 5 s: a template that blocks fails the test, not the run.
+    fn within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("creating from the template blocked")
+    }
+
+    fn create_within(template: Template, target: PathBuf) -> (io::Result<Option<String>>, Vec<String>) {
+        within(move || (create(&template, &target), take_steps()))
     }
 
     fn take_steps() -> Vec<String> {
@@ -370,7 +478,7 @@ pub(crate) mod tests {
             }
             take_steps();
             let made = create(&from_file(&tpl), &dir.join("new.bin")).unwrap();
-            assert_eq!(take_steps(), ["sync", "published"], "linked: {linked}");
+            assert_eq!(take_steps(), ["open", "sync", "published"], "linked: {linked}");
             assert_eq!(std::fs::read(dir.join("new.bin")).unwrap(), content);
             assert_eq!(made.is_some(), linked, "only the hard link says something: its hidden second name");
             std::fs::remove_dir_all(&dir).unwrap();
@@ -386,7 +494,7 @@ pub(crate) mod tests {
         take_steps();
         let err = create(&from_file(&tpl), &dir.join("new.bin")).unwrap_err().to_string();
         FAIL_SYNC.with(|f| f.set(false));
-        assert_eq!(take_steps(), ["sync"], "not published, no second try");
+        assert_eq!(take_steps(), ["open", "sync"], "not published, no second try");
         assert!(!dir.join("new.bin").exists(), "nothing under the name");
         let kept = hidden(&dir);
         assert_eq!(kept.len(), 1, "the hidden file is left, not removed");
@@ -489,6 +597,148 @@ pub(crate) mod tests {
             assert!(!links_unsupported(&io::Error::from_raw_os_error(errno)), "{errno}");
         }
         assert!(!links_unsupported(&io::Error::other("not an errno")));
+    }
+
+    #[test]
+    fn pipes_sockets_and_devices_are_never_opened_nor_listed_also_through_links() {
+        let dir = work_dir("special");
+        let tpl = dir.join("tpl");
+        std::fs::create_dir(&tpl).unwrap();
+        mkfifo(&tpl.join("pipe"));
+        std::os::unix::fs::symlink(tpl.join("pipe"), tpl.join("to-pipe")).unwrap();
+        // Looked at only (O_PATH): no driver's open runs
+        std::os::unix::fs::symlink("/dev/null", tpl.join("to-null")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(tpl.join("socket")).unwrap();
+        std::fs::write(tpl.join("Real.txt"), "real").unwrap();
+        for name in ["pipe", "to-pipe", "to-null", "socket"] {
+            take_steps();
+            let (made, steps) = create_within(from_file(&tpl.join(name)), dir.join("new"));
+            let err = made.unwrap_err().to_string();
+            assert!(err.contains("is not a regular file"), "{name}: {err}");
+            assert!(!steps.contains(&"open".to_owned()), "{name}: never opened for reading: {steps:?}");
+            assert_eq!(names(&dir), ["tpl"], "{name}: nothing made, no hidden file");
+        }
+        let listed: Vec<String> = user(Some(&tpl)).into_iter().map(|t| t.file_name).collect();
+        assert_eq!(listed, ["Real.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_link_to_a_regular_file_is_listed_and_makes_the_whole_file() {
+        let dir = work_dir("link");
+        let tpl = dir.join("list");
+        std::fs::create_dir(&tpl).unwrap();
+        let (real, content) = big_template(&dir);
+        std::os::unix::fs::symlink(&real, tpl.join("Linked.bin")).unwrap();
+        let listed = user(Some(&tpl));
+        assert_eq!(listed.iter().map(|t| t.file_name.as_str()).collect::<Vec<_>>(), ["Linked.bin"]);
+        assert_eq!(create(&listed[0], &dir.join("new.bin")).unwrap(), None);
+        assert_eq!(std::fs::read(dir.join("new.bin")).unwrap(), content);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_name_swapped_for_a_pipe_between_looking_and_opening_still_gives_the_file_that_was_looked_at() {
+        let dir = work_dir("swap");
+        let (tpl, content) = big_template(&dir);
+        let (from, aside, template, target) = (tpl.clone(), dir.join("aside"), from_file(&tpl), dir.join("new.bin"));
+        let made = within(move || {
+            with_hook(
+                move |stage, _| {
+                    if matches!(stage, Stage::BetweenOpens(_)) {
+                        std::fs::rename(&from, &aside).unwrap();
+                        mkfifo(&from);
+                    }
+                },
+                None,
+                || create(&template, &target),
+            )
+        });
+        assert_eq!(made.unwrap(), None);
+        assert_eq!(std::fs::read(dir.join("new.bin")).unwrap(), content);
+        use std::os::unix::fs::FileTypeExt;
+        assert!(std::fs::symlink_metadata(&tpl).unwrap().file_type().is_fifo(), "the pipe was there, and not opened");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_proc_a_file_template_is_refused_before_anything_is_made_and_built_in_ones_still_work() {
+        let dir = work_dir("no_proc");
+        let (tpl, _) = big_template(&dir);
+        let gone = dir.join("no-proc");
+        let markdown = builtin().into_iter().find(|t| t.file_name.ends_with(".md")).unwrap();
+        let (refused, built) = with_hook(|_, _| {}, Some(gone), || {
+            (create(&from_file(&tpl), &dir.join("new.bin")), create(&markdown, &dir.join("new.md")))
+        });
+        let err = refused.unwrap_err().to_string();
+        assert!(err.contains("/proc is not available"), "{err}");
+        assert_eq!(built.unwrap(), None);
+        assert_eq!(std::fs::read_to_string(dir.join("new.md")).unwrap(), "# \n");
+        // Nothing for the file template: no name, no hidden file
+        assert_eq!(names(&dir), ["new.md", "tpl"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_descriptor_that_is_not_the_file_looked_at_is_refused() {
+        let dir = work_dir("identity");
+        let (tpl, _) = big_template(&dir);
+        std::fs::write(dir.join("other"), "other").unwrap();
+        let fds = dir.join("fds");
+        std::fs::create_dir(&fds).unwrap();
+        let (links, other) = (fds.clone(), dir.join("other"));
+        let made = with_hook(
+            move |stage, _| {
+                if let Stage::BetweenOpens(fd) = stage {
+                    std::os::unix::fs::symlink(&other, links.join(fd.to_string())).unwrap();
+                }
+            },
+            Some(fds),
+            || create(&from_file(&tpl), &dir.join("new.bin")),
+        );
+        let err = made.unwrap_err().to_string();
+        assert!(err.contains("was replaced while it was opened"), "{err}");
+        assert_eq!(names(&dir), ["fds", "other", "tpl"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_template_that_shrinks_while_it_is_read_publishes_nothing_and_one_that_grows_is_cut_at_its_first_length() {
+        let dir = work_dir("shrinks");
+        let (tpl, _) = big_template(&dir);
+        let from = tpl.clone();
+        let made = with_hook(
+            move |stage, _| {
+                if stage == Stage::Opened {
+                    std::fs::OpenOptions::new().write(true).open(&from).unwrap().set_len(100).unwrap();
+                }
+            },
+            None,
+            || create(&from_file(&tpl), &dir.join("new.bin")),
+        );
+        let err = made.unwrap_err().to_string();
+        assert!(err.contains("became shorter while it was read"), "{err}");
+        assert!(!dir.join("new.bin").exists());
+        let kept = hidden(&dir);
+        assert_eq!(kept.len(), 1);
+        assert!(err.contains(&*kept[0].file_name().unwrap().to_string_lossy()), "the hidden file is said: {err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let dir = work_dir("grows");
+        let (tpl, content) = big_template(&dir);
+        let from = tpl.clone();
+        let made = with_hook(
+            move |stage, _| {
+                if stage == Stage::Opened {
+                    std::fs::OpenOptions::new().append(true).open(&from).unwrap().write_all(&[7; 1000]).unwrap();
+                }
+            },
+            None,
+            || create(&from_file(&tpl), &dir.join("new.bin")),
+        );
+        assert_eq!(made.unwrap(), None);
+        assert_eq!(std::fs::read(dir.join("new.bin")).unwrap(), content, "only the length it had when opened");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
