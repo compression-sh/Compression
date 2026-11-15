@@ -91,12 +91,19 @@ fn collect(dir: &Path, depth: usize, out: &mut Vec<Template>) {
 
 /// Write the template's content to the new file `target`, which must not exist yet, and say what was left beside it.
 ///
-/// The content goes into a hidden file of its own beside it (`.compression-new-…`) first, and only the whole file gets
-/// the name, by a rename that never replaces anything (`RENAME_NOREPLACE`) or, where the file system cannot do that, by
-/// a hard link, which never replaces anything either. So there is never an incomplete file under that name, also after
-/// a hard stop. Where neither is possible, nothing is made under the name. Nothing is ever deleted here: a name cannot
-/// be removed without a moment in which it could be someone else's file, so a hidden file that is left (after a
-/// failure, or as the second name of a file made by a hard link) is said instead. `Ok(Some(note))` is such a note.
+/// The content goes into a hidden file of its own beside it (`.compression-new-…`) first. That file, with its
+/// permissions, is synced (`fsync`), and only then does the whole file get the name, by a rename that never replaces
+/// anything (`RENAME_NOREPLACE`) or, where the file system cannot do that, by a hard link, which never replaces anything
+/// either. So a crash or kill never leaves an incomplete file under that name. Where neither way to give the name
+/// exists, or the sync fails, nothing is made under the name and the sync is not retried.
+///
+/// Power loss: nothing here is promised. The sync asks for the content before the name exists, which helps only where
+/// the file system and the device keep what `fsync` confirmed (not checked); the folder is not synced, so the new name
+/// itself may be gone after a power loss.
+///
+/// Nothing is ever deleted here: a name cannot be removed without a moment in which it could be someone else's file,
+/// so a hidden file that is left (after a failure, or as the second name of a file made by a hard link) is said
+/// instead. `Ok(Some(note))` is such a note.
 pub fn create(template: &Template, target: &Path) -> io::Result<Option<String>> {
     // Nothing to write: made directly, like a new empty file, which cannot be incomplete and works on every file system
     if let Source::Builtin { content: "", executable: false } = &template.source {
@@ -123,16 +130,31 @@ pub fn create(template: &Template, target: &Path) -> io::Result<Option<String>> 
     let kept = staged.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let target_name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let left = |why: String| io::Error::other(format!("{why} · {}", trf("what was written is kept as “{}”; it can be deleted", &[&kept])));
-    if let Err(err) = fill(&mut read, mode, &mut file) {
+    // Whole and synced before it gets the name; a failed sync is not retried (what reached the disk is unknown)
+    if let Err(err) = fill(&mut read, mode, &mut file).and_then(|()| sync(&file)) {
         return Err(left(crate::fs::describe::io_error(&err)));
     }
     drop(file);
-    match publish(&staged, target) {
+    let published = publish(&staged, target);
+    #[cfg(test)]
+    if published.is_ok() {
+        tests::step("published");
+    }
+    match published {
         Ok(Published::Renamed) => Ok(None),
         Ok(Published::Linked) => Ok(Some(trf("a second, hidden name for it is left as “{}”; it can be deleted", &[&kept]))),
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(left(trf("“{}” already exists", &[&target_name]))),
         Err(err) => Err(left(crate::fs::describe::io_error(&err))),
     }
+}
+
+/// `fsync` of the hidden file, with its content and permissions, before it gets the name.
+fn sync(file: &std::fs::File) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(err) = tests::sync_step() {
+        return Err(err);
+    }
+    file.sync_all()
 }
 
 /// How the whole file got its name.
@@ -219,6 +241,24 @@ pub(crate) mod tests {
 
     thread_local! {
         static FAIL: Cell<Option<Fail>> = const { Cell::new(None) };
+        /// The sync of the hidden file fails (EIO).
+        static FAIL_SYNC: Cell<bool> = const { Cell::new(false) };
+        /// What happened, in order: the sync and the publication.
+        static STEPS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn step(what: &str) {
+        STEPS.with(|s| s.borrow_mut().push(what.to_owned()));
+    }
+
+    /// Notes the sync, and gives the failure to bring about, if any.
+    pub(super) fn sync_step() -> Option<io::Error> {
+        step("sync");
+        FAIL_SYNC.with(Cell::get).then(|| io::Error::from_raw_os_error(libc::EIO))
+    }
+
+    fn take_steps() -> Vec<String> {
+        STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()))
     }
 
     /// Folders in which the tests pretend the file system cannot make hard links.
@@ -318,6 +358,43 @@ pub(crate) mod tests {
             assert!(err.contains(&name), "{label}: the message names what is kept: {err}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    #[test]
+    fn the_file_is_synced_before_it_gets_its_name_on_either_way() {
+        for linked in [false, true] {
+            let dir = work_dir(&format!("sync_order_{linked}"));
+            let (tpl, content) = big_template(&dir);
+            if linked {
+                crate::compat::tests::without_support_under(&dir);
+            }
+            take_steps();
+            let made = create(&from_file(&tpl), &dir.join("new.bin")).unwrap();
+            assert_eq!(take_steps(), ["sync", "published"], "linked: {linked}");
+            assert_eq!(std::fs::read(dir.join("new.bin")).unwrap(), content);
+            assert_eq!(made.is_some(), linked, "only the hard link says something: its hidden second name");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_synced_never_gets_its_name_and_the_hidden_file_is_said() {
+        let dir = work_dir("sync_file_fails");
+        let (tpl, content) = big_template(&dir);
+        std::fs::write(dir.join("other.bin"), b"someone else's").unwrap();
+        FAIL_SYNC.with(|f| f.set(true));
+        take_steps();
+        let err = create(&from_file(&tpl), &dir.join("new.bin")).unwrap_err().to_string();
+        FAIL_SYNC.with(|f| f.set(false));
+        assert_eq!(take_steps(), ["sync"], "not published, no second try");
+        assert!(!dir.join("new.bin").exists(), "nothing under the name");
+        let kept = hidden(&dir);
+        assert_eq!(kept.len(), 1, "the hidden file is left, not removed");
+        assert_eq!(std::fs::read(&kept[0]).unwrap(), content, "it holds what was written");
+        let name = kept[0].file_name().unwrap().to_string_lossy().into_owned();
+        assert!(err.contains(&name), "the message names it: {err}");
+        assert_eq!(std::fs::read(dir.join("other.bin")).unwrap(), b"someone else's");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
