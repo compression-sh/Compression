@@ -680,6 +680,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_ordinary_failure_to_open_again_is_said_as_itself_and_not_as_a_missing_proc() {
+        // The descriptors are there, but opening this one fails (a link to itself: ELOOP, also for root)
+        let dir = work_dir("reopen_fails");
+        let (tpl, _) = big_template(&dir);
+        let fds = dir.join("fds");
+        std::fs::create_dir(&fds).unwrap();
+        let links = fds.clone();
+        let made = with_hook(
+            move |stage, _| {
+                if let Stage::BetweenOpens(fd) = stage {
+                    let own = links.join(fd.to_string());
+                    std::os::unix::fs::symlink(&own, &own).unwrap();
+                }
+            },
+            Some(fds),
+            || create(&from_file(&tpl), &dir.join("new.bin")),
+        );
+        let err = made.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "the error itself: {err}");
+        assert!(!err.to_string().contains("/proc"), "{err}");
+        assert_eq!(names(&dir), ["fds", "tpl"], "no hidden file, nothing under the name");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_descriptor_that_is_not_the_file_looked_at_is_refused() {
         let dir = work_dir("identity");
         let (tpl, _) = big_template(&dir);
