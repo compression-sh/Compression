@@ -358,11 +358,16 @@ impl Tags {
         let (tx, rx) = mpsc::channel();
         self.menu_rx = Some(rx);
         std::thread::spawn(move || {
-            let read = missing.into_iter().filter_map(|path| {
-                let (_, key) = key_of(&path)?;
-                Some((path.clone(), Entry { key, tags: read_tags(&path).unwrap_or_default() }))
-            });
-            let _ = tx.send(read.collect());
+            let read: Vec<(PathBuf, Entry)> = missing
+                .into_iter()
+                .filter_map(|path| {
+                    let (_, key) = key_of(&path)?;
+                    Some((path.clone(), Entry { key, tags: read_tags(&path).unwrap_or_default() }))
+                })
+                .collect();
+            #[cfg(test)]
+            tests::MENU_READ_DONE.lock().unwrap().extend(read.iter().map(|(p, _)| p.clone()));
+            let _ = tx.send(read);
         });
     }
 
@@ -706,8 +711,10 @@ impl Plugin for Tags {
             match rx.try_recv() {
                 Ok(read) => {
                     self.menu_rx = None;
-                    self.menu_reading.clear();
-                    for (path, entry) in read {
+                    // Only for paths still asked about: one removed or moved meanwhile (`file_op_done`) gets nothing
+                    // from before, and neither does a new file made at its place since
+                    let asked = std::mem::take(&mut self.menu_reading);
+                    for (path, entry) in read.into_iter().filter(|(path, _)| asked.contains(path)) {
                         // What was learnt meanwhile (a folder read, a tag set here) is not replaced
                         self.cache.entry(path).or_insert(entry);
                     }
@@ -956,6 +963,7 @@ impl Plugin for Tags {
                             self.reach.insert(to.join(old.strip_prefix(from).unwrap_or(Path::new(""))), reach);
                         }
                     }
+                    self.menu_reading.retain(|p| !p.starts_with(from));
                     // A moved folder takes everything cached below it along
                     let moved: Vec<PathBuf> = self.cache.keys().filter(|p| p.starts_with(from)).cloned().collect();
                     for old in moved {
@@ -975,6 +983,7 @@ impl Plugin for Tags {
                     }
                     self.reach.retain(|p, _| !p.starts_with(path));
                     self.cache.retain(|p, _| !p.starts_with(path));
+                    self.menu_reading.retain(|p| !p.starts_with(path));
                 }
             }
             FileOpEvent::Created(paths) => {
@@ -1045,6 +1054,21 @@ pub(crate) mod tests {
         pub(super) static MENU_READS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
+    /// The paths whose tags a menu's thread has read; its answer is taken in only at `poll`.
+    pub(super) static MENU_READ_DONE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    /// Waits until a menu's thread has read `path`: its answer, from before what the test does next, then waits in
+    /// the channel until `poll`.
+    fn read_by_menu_thread(path: &Path) {
+        for _ in 0..1000 {
+            if MENU_READ_DONE.lock().unwrap().iter().any(|p| p == path) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the menu's thread did not read {}", path.display());
+    }
+
     fn settle_menu_reads(tags: &mut Tags) {
         for _ in 0..500 {
             if !tags.busy() {
@@ -1063,10 +1087,65 @@ pub(crate) mod tests {
         let mut tags = Tags::with(Registry::default(), BTreeMap::new());
         let item = FileItem::from_path(&a).unwrap();
         tags.menu_opened(std::slice::from_ref(&item));
-        // Changed here before the read came back (as setting a tag in the menu does)
+        read_by_menu_thread(&a);
+        // Changed here after the thread read "work", before its answer is taken in (as setting a tag in the menu does)
         tags.remember(&a, vec!["new".to_owned()]);
         settle_menu_reads(&mut tags);
         assert_eq!(tags.cache.get(&a).map(|e| e.tags.clone()), Some(vec!["new".to_owned()]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_menu_read_answered_after_its_file_was_removed_or_moved_puts_nothing_back() {
+        for moved in [false, true] {
+            let Some((dir, a)) = scratch_file(&format!("menu_gone_{moved}")) else { return };
+            write_tags(&a, &["work".to_owned()]).unwrap();
+            let mut tags = Tags::with(Registry::default(), BTreeMap::new());
+            tags.menu_opened(&[FileItem::from_path(&a).unwrap()]);
+            read_by_menu_thread(&a);
+            // The thread read "work"; then Compression removes or moves the file, before the answer is taken in
+            if moved {
+                let b = dir.join("b");
+                std::fs::rename(&a, &b).unwrap();
+                tags.file_op_done(&FileOpEvent::Moved(vec![(a.clone(), b.clone())]));
+                settle_menu_reads(&mut tags);
+                assert!(!tags.cache.contains_key(&b), "nothing was known of it to take along");
+            } else {
+                std::fs::remove_file(&a).unwrap();
+                tags.file_op_done(&FileOpEvent::Removed(vec![a.clone()]));
+                settle_menu_reads(&mut tags);
+            }
+            assert!(!tags.cache.contains_key(&a), "moved: {moved}: no tags put back for the old path");
+            // A new file at the old place has only its own tags (none)
+            std::fs::write(&a, "new").unwrap();
+            tags.menu_opened(&[FileItem::from_path(&a).unwrap()]);
+            settle_menu_reads(&mut tags);
+            assert_eq!(tags.cache.get(&a).map(|e| e.tags.clone()), Some(Vec::new()), "moved: {moved}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_new_file_at_the_place_of_one_removed_while_its_tags_were_read_gets_its_own_tags_from_the_next_read() {
+        let Some((dir, a)) = scratch_file("menu_same_path") else { return };
+        write_tags(&a, &["old".to_owned()]).unwrap();
+        let mut tags = Tags::with(Registry::default(), BTreeMap::new());
+        let started = || MENU_READS_STARTED.with(std::cell::Cell::get);
+        let before = started();
+        tags.menu_opened(&[FileItem::from_path(&a).unwrap()]);
+        read_by_menu_thread(&a);
+        std::fs::remove_file(&a).unwrap();
+        tags.file_op_done(&FileOpEvent::Removed(vec![a.clone()]));
+        // Made again, with other tags, and its menu opened while the old answer still waits
+        std::fs::write(&a, "new").unwrap();
+        write_tags(&a, &["fresh".to_owned()]).unwrap();
+        tags.menu_opened(&[FileItem::from_path(&a).unwrap()]);
+        assert_eq!(started() - before, 1, "still one thread at a time");
+        assert_eq!(tags.menu_waiting, vec![a.clone()], "the new file waits for its own read");
+        // The old answer is dropped and does not hold up the next read
+        settle_menu_reads(&mut tags);
+        assert_eq!(started() - before, 2);
+        assert_eq!(tags.cache.get(&a).map(|e| e.tags.clone()), Some(vec!["fresh".to_owned()]));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
