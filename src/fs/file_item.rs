@@ -561,7 +561,7 @@ fn writable(path: &Path) -> bool {
     }
 }
 
-fn detect_file_type(filename: &str) -> FileType {
+pub(crate) fn detect_file_type(filename: &str) -> FileType {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".fb2.zip") {
         return FileType::Document;

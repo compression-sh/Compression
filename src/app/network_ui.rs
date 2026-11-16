@@ -273,7 +273,7 @@ impl Default for Known {
 
 #[cfg(test)]
 impl Known {
-    fn with_ask(ask: impl Fn(&Path) -> Kind + Send + Sync + 'static) -> Self {
+    pub(super) fn with_ask(ask: impl Fn(&Path) -> Kind + Send + Sync + 'static) -> Self {
         Self { state: Arc::default(), ask: Arc::new(ask) }
     }
 }
@@ -306,8 +306,10 @@ impl KnownState {
     }
 }
 
+/// The thread a path is asked on: one per server mount, and a single one for every path not on a server, so that a
+/// local disk that hangs holds up one thread, not one per path. The answers stay per path.
 fn mount_of_path(path: &Path) -> PathBuf {
-    network::mount_root(path).unwrap_or_else(|| path.to_path_buf())
+    network::mount_root(path).unwrap_or_default()
 }
 
 impl Known {
@@ -2720,9 +2722,9 @@ mod tests {
             state.kinds.insert(missing.clone(), answer(Kind::Missing, 0, generation));
             state.kinds.insert(other.clone(), answer(Kind::Other, 0, generation));
         }
-        assert!(app.pin_is_folder(&unsure, &ctx) && app.is_folder(&unsure));
-        assert!(!app.pin_is_folder(&missing, &ctx) && !app.is_folder(&missing));
-        assert!(!app.pin_is_folder(&other, &ctx) && !app.is_folder(&other));
+        assert!(app.pin_kind(&unsure, &ctx) == Some(true) && app.is_folder(&unsure));
+        assert!(app.pin_kind(&missing, &ctx) == Some(false) && !app.is_folder(&missing));
+        assert!(app.pin_kind(&other, &ctx) == Some(false) && !app.is_folder(&other));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2911,11 +2913,11 @@ mod tests {
             state.kinds.insert(dir.join("folder"), answer(Kind::Missing, 0, 0));
             state.kinds.insert(dir.join("file.txt"), answer(Kind::Dir, 0, 0));
         }
-        assert!(app.pin_is_folder(&dir.join("folder"), &ctx), "the listing says folder");
-        assert!(!app.pin_is_folder(&dir.join("file.txt"), &ctx), "the listing says file");
+        assert_eq!(app.pin_kind(&dir.join("folder"), &ctx), Some(true), "the listing says folder");
+        assert_eq!(app.pin_kind(&dir.join("file.txt"), &ctx), Some(false), "the listing says file");
         // Not in the listing: the cache decides
         app.net.known.state.lock().unwrap().kinds.insert(dir.join("elsewhere"), answer(Kind::Other, 0, app.net.generation_of(&network::mount_root(&dir))));
-        assert!(!app.pin_is_folder(&dir.join("elsewhere"), &ctx));
+        assert_eq!(app.pin_kind(&dir.join("elsewhere"), &ctx), Some(false));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2944,17 +2946,22 @@ mod tests {
         assert!(!pin.is_dir(), "a stat would say it is nothing");
         let watchdog = { let release = release.clone(); Watchdog::new(move || { let _ = release.send(()); }) };
         for _ in 0..100 {
-            assert!(app.pin_is_folder(&pin, &ctx));
+            assert_eq!(app.pin_kind(&pin, &ctx), Some(true));
         }
         assert!(!watchdog.fired(), "a frame waited for the server");
         assert!(app.is_folder(&pin), "and a drop target on a server is taken for a folder too");
         release.send(()).unwrap();
-        wait_for(|| (!app.pin_is_folder(&pin, &ctx)).then_some(()));
+        wait_for(|| (app.pin_kind(&pin, &ctx) == Some(false)).then_some(()));
         assert!(!app.is_folder(&pin), "once the server has said it is not");
         assert!(calls.load(Ordering::SeqCst) >= 1);
-        // A local pin is still looked at
-        assert!(app.pin_is_folder(&std::env::temp_dir(), &ctx));
-        assert!(!app.pin_is_folder(&std::env::temp_dir().join("compression_no_such_pin"), &ctx));
+        // A local pin is not looked at in the frame either: a thread finds out what it is
+        let shown = std::env::temp_dir().join(format!("compression_local_pins_{}", std::process::id()));
+        std::fs::create_dir_all(&shown).unwrap();
+        let local = CompressionApp::new(shown.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let (folder, missing) = (std::env::temp_dir(), std::env::temp_dir().join("compression_no_such_pin"));
+        assert!(wait_for(|| local.pin_kind(&folder, &ctx)));
+        assert!(!wait_for(|| local.pin_kind(&missing, &ctx)));
+        let _ = std::fs::remove_dir_all(&shown);
     }
 
     #[test]

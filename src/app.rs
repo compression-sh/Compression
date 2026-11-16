@@ -1507,6 +1507,10 @@ impl CompressionApp {
 
 
     fn open_file(&mut self, path: &Path) {
+        #[cfg(test)]
+        if tests::OPENED.with(|opened| opened.borrow_mut().as_mut().map(|list| list.push(path.to_path_buf())).is_some()) {
+            return;
+        }
         recent::record(path);
         // A program the person opens is run, after asking once, the way Nautilus asks: "Run" or not. Not on a server
         if is_app_image(path) && !network::is_remote(path) && path.symlink_metadata().is_ok_and(|m| m.is_file()) {
@@ -4255,17 +4259,25 @@ impl CompressionApp {
         }
     }
 
-    /// Whether a pinned path is a folder. A pin on a server is not looked at in the frame (the server may hang): it
-    /// counts as a folder until a thread has said otherwise, and one that is not connected is still a folder.
-    fn pin_is_folder(&self, pin: &Path, ctx: &egui::Context) -> bool {
-        if !network::is_remote(pin) {
-            return pin.is_dir();
-        }
-        // The listing of the folder that is shown says it for free, and is the freshest answer there is
+    /// Whether a pinned path is a folder, without looking at it in the frame (a disk or server may hang). The listing
+    /// of the folder shown says it for free and is the freshest answer there is. A pin on a server counts as a folder
+    /// until a thread has said otherwise, and one that is not connected is still a folder. A local pin is a folder when
+    /// it is the folder shown, or else what a thread found (`Known`, one thread for all local paths); `None` until then.
+    fn pin_kind(&self, pin: &Path, ctx: &egui::Context) -> Option<bool> {
         if let Some(item) = self.items.iter().find(|i| i.path == pin) {
-            return item.is_dir;
+            return Some(item.is_dir);
         }
-        network::is_disconnected(pin) || !matches!(self.net.kind_of(pin, ctx), Some(network_ui::Kind::Other | network_ui::Kind::Missing))
+        if network::is_remote(pin) {
+            return Some(network::is_disconnected(pin) || !matches!(self.net.kind_of(pin, ctx), Some(network_ui::Kind::Other | network_ui::Kind::Missing)));
+        }
+        if self.current_path == pin {
+            return Some(true);
+        }
+        match self.net.kind_of(pin, ctx) {
+            Some(network_ui::Kind::Dir) => Some(true),
+            Some(network_ui::Kind::Other | network_ui::Kind::Missing) => Some(false),
+            _ => None,
+        }
     }
 
     /// The folders leading to the current one, starting at Home, the trash or the root.
@@ -4340,14 +4352,18 @@ impl CompressionApp {
                     let mut rects = Vec::with_capacity(self.pins.len());
                     for (idx, pin) in self.pins.iter().enumerate() {
                         // A pinned folder on a server that is not connected is still a folder: opening it connects
-                        let is_dir = self.pin_is_folder(pin, ui.ctx());
+                        let kind = self.pin_kind(pin, ui.ctx());
+                        let is_dir = kind == Some(true);
                         let selected = browsing && is_dir && self.current_path == *pin;
                         let name = pin.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| pin.display().to_string());
                         let own = crate::fs::places::folder_glyph(pin).map(String::from);
-                        let icon = match &own {
-                            Some(glyph) if is_dir => glyph.as_str(),
-                            _ if is_dir => icons::FOLDER,
-                            _ => FileItem::from_path(pin).map_or(icons::FILE, |i| i.file_type.icon()),
+                        let icon = match (kind, &own) {
+                            (Some(true), Some(glyph)) => glyph.as_str(),
+                            (Some(true), None) => icons::FOLDER,
+                            // From the name alone: an executable of no known type or a broken link gets no icon of its own
+                            (Some(false), _) => crate::fs::file_item::detect_file_type(&name).icon(),
+                            // Not known yet whether it is a file or a folder
+                            (None, _) => icons::PIN,
                         };
                         let resp = nav_item(ui, ("pin", pin), icon, &name, &self.theme, selected);
                         let resp = material::full_text_if_shortened(ui.ctx(), resp, &name);
@@ -4356,7 +4372,8 @@ impl CompressionApp {
                             zones.push(dnd::DropZone { rect: resp.rect, dest: pin.clone() });
                         }
                         if resp.clicked() {
-                            if is_dir { destination = Some(pin.clone()) } else { open_pinned = Some(pin.clone()) }
+                            // Not known yet: going there finds out on a thread, enters a folder and opens anything else
+                            if kind == Some(false) { open_pinned = Some(pin.clone()) } else { destination = Some(pin.clone()) }
                         }
                         if resp.middle_clicked() && is_dir {
                             new_tab_at = Some(pin.clone());
@@ -10464,6 +10481,8 @@ mod tests {
     }
 
     thread_local! {
+        /// While `Some`: what `open_file` was asked to open on this thread, and nothing is opened or started.
+        pub(super) static OPENED: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
         /// How many threads that make a new item were started from this thread.
         pub(super) static CREATES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// `start_counted` fails as if no thread could be started (EAGAIN).
@@ -12461,6 +12480,169 @@ mod tests {
 
     fn open_menu_labels(app: &CompressionApp) -> Vec<String> {
         open_menu_entries(app).into_iter().map(|(label, _)| label).collect()
+    }
+
+    /// What the sidebar's questions about pins did: per path how often, how many at once at most, and whether any ran
+    /// on the window's thread. Each question looks at the disk first, then waits while `held`.
+    #[derive(Default)]
+    struct PinQuestions {
+        asked: Mutex<HashMap<PathBuf, usize>>,
+        running: std::sync::atomic::AtomicUsize,
+        most_at_once: std::sync::atomic::AtomicUsize,
+        on_window_thread: std::sync::atomic::AtomicBool,
+        held: std::sync::atomic::AtomicBool,
+    }
+
+    fn pin_questions(w: &mut Window) -> std::sync::Arc<PinQuestions> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let seen = std::sync::Arc::new(PinQuestions::default());
+        seen.held.store(true, SeqCst);
+        let (log, window) = (seen.clone(), std::thread::current().id());
+        w.app.net.known = network_ui::Known::with_ask(move |path| {
+            if std::thread::current().id() == window {
+                log.on_window_thread.store(true, SeqCst);
+            }
+            *log.asked.lock().unwrap().entry(path.to_path_buf()).or_default() += 1;
+            let now = log.running.fetch_add(1, SeqCst) + 1;
+            log.most_at_once.fetch_max(now, SeqCst);
+            let kind = match std::fs::metadata(path) {
+                Ok(meta) if meta.is_dir() => network_ui::Kind::Dir,
+                Ok(_) => network_ui::Kind::Other,
+                Err(_) => network_ui::Kind::Missing,
+            };
+            for _ in 0..2000 {
+                if !log.held.load(SeqCst) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            log.running.fetch_sub(1, SeqCst);
+            kind
+        });
+        seen
+    }
+
+    /// The icon drawn left of the sidebar row named `name`, in the last frame.
+    fn row_icon(w: &Window, name: &str) -> Option<String> {
+        let (_, row) = w.shapes.iter().find(|(text, _)| text == name)?;
+        w.shapes
+            .iter()
+            .filter(|(text, rect)| text != name && rect.right() <= row.left() && (rect.center().y - row.center().y).abs() < 4.0)
+            .max_by(|a, b| a.1.right().total_cmp(&b.1.right()))
+            .map(|(text, _)| text.clone())
+    }
+
+    fn zone_for(w: &Window, path: &Path) -> bool {
+        w.app.drop_zones.iter().any(|z| z.dest == path)
+    }
+
+    #[test]
+    fn sidebar_pins_are_found_out_on_one_thread_shown_neutral_until_then_and_never_looked_at_in_the_frame() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let work = window_dir("sidebar_pins");
+        let (shown, folder, file, gone) = (work.join("shown"), work.join("pinned-folder"), work.join("pinned-notes.md"), work.join("pinned-gone"));
+        std::fs::create_dir_all(&shown).unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&file, "notes").unwrap();
+        let mut w = Window::new(shown.clone());
+        let seen = pin_questions(&mut w);
+        let before = asked_here();
+        w.app.pins = vec![folder.clone(), file.clone(), gone.clone(), shown.clone()];
+        // Cold, the first question held: drawn many times, all three neutral, no drop target, one question at a time
+        w.run(Vec::new(), 30);
+        for (pin, name) in [(&folder, "pinned-folder"), (&file, "pinned-notes.md"), (&gone, "pinned-gone")] {
+            assert_eq!(row_icon(&w, name).as_deref(), Some(icons::PIN), "{name}: {:?}", w.last);
+            assert!(!zone_for(&w, pin), "{name}");
+        }
+        assert_eq!(seen.running.load(SeqCst), 1);
+        // The folder shown is a folder: known at once, without a question
+        assert!(zone_for(&w, &shown) && w.app.pin_kind(&shown, &w.ctx.clone()) == Some(true));
+        // Taken in: a folder with its drop target, a file with the icon of its name, the missing one as no folder
+        seen.held.store(false, SeqCst);
+        let by_name = crate::fs::file_item::detect_file_type("pinned-notes.md").icon();
+        assert_ne!(by_name, icons::PIN);
+        w.until("the answers", |w| zone_for(w, &folder) && row_icon(w, "pinned-notes.md").as_deref() == Some(by_name));
+        let settled = seen.asked.lock().unwrap().clone();
+        w.run(Vec::new(), 30);
+        assert_eq!(row_icon(&w, "pinned-folder").as_deref(), Some(icons::FOLDER));
+        assert_ne!(row_icon(&w, "pinned-gone").as_deref(), Some(icons::PIN), "known now: not neutral");
+        assert!(!zone_for(&w, &file) && !zone_for(&w, &gone));
+        assert_eq!(w.app.pin_kind(&gone, &w.ctx.clone()), Some(false));
+        assert_eq!(asked_here(), before, "no FileItem::from_path on the window's thread while drawing");
+        assert!(!seen.on_window_thread.load(SeqCst), "no question on the window's thread");
+        assert_eq!(seen.most_at_once.load(SeqCst), 1, "one local question at a time");
+        // Not asked again per frame: nothing more over 30 frames once answered (an answer that was on its way while the
+        // window forgot something is asked once more, by design, hence at most twice)
+        let asked = seen.asked.lock().unwrap().clone();
+        assert_eq!(asked, settled, "no question per frame");
+        assert_eq!(asked.len(), 3, "the folder shown was not asked about: {asked:?}");
+        assert!(asked.values().all(|n| *n <= 2), "{asked:?}");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn an_answer_taken_in_late_puts_back_no_unpinned_pin_and_one_from_before_a_change_is_dropped() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let work = window_dir("sidebar_pins_change");
+        let (shown, first, second) = (work.join("shown"), work.join("first"), work.join("second"));
+        for dir in [&shown, &first, &second] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut w = Window::new(shown);
+        let seen = pin_questions(&mut w);
+        w.app.pins = vec![first.clone(), second.clone()];
+        w.run(Vec::new(), 5);
+        // Unpinned while its question (or the other's) is held: the answers change nothing about which are pinned
+        w.app.pins = vec![second.clone()];
+        w.run(Vec::new(), 5);
+        // The other one becomes a file meanwhile, and the window says it changed it: what was asked before is dropped
+        std::fs::remove_dir(&second).unwrap();
+        std::fs::write(&second, "now a file").unwrap();
+        w.app.net.known.forget(&second);
+        seen.held.store(false, SeqCst);
+        w.until("the second pin", |w| w.app.pin_kind(&second, &w.ctx.clone()) == Some(false));
+        w.run(Vec::new(), 20);
+        assert_eq!(w.app.pins, vec![second.clone()], "no pin put back");
+        assert!(!zone_for(&w, &first) && !zone_for(&w, &second), "the file has no drop target, the unpinned one is not drawn");
+        // Pinned again: its own answer, a folder
+        w.app.pins = vec![second.clone(), first.clone()];
+        w.until("the first pin", |w| zone_for(w, &first));
+        assert_eq!(seen.most_at_once.load(SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_click_on_a_pin_not_known_yet_goes_there_and_a_thread_finds_out_what_it_is() {
+        let work = window_dir("sidebar_pin_click");
+        let (shown, folder, file) = (work.join("shown"), work.join("click-folder"), work.join("click-notes.txt"));
+        std::fs::create_dir_all(&shown).unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&file, "notes").unwrap();
+        let mut w = Window::new(shown);
+        // Nothing is opened or started for real: what would be opened is written down, until the test ends however it ends
+        struct Stop;
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                OPENED.with(|opened| *opened.borrow_mut() = None);
+            }
+        }
+        let _stop = Stop;
+        OPENED.with(|opened| *opened.borrow_mut() = Some(Vec::new()));
+        let opened = || OPENED.with(|opened| opened.borrow().clone().unwrap_or_default());
+        let _seen = pin_questions(&mut w);
+        w.app.pins = vec![folder.clone(), file.clone()];
+        w.run(Vec::new(), 5);
+        assert_eq!(row_icon(&w, "click-folder").as_deref(), Some(icons::PIN), "not known yet");
+        // A folder: entered, not handed to an app
+        w.click(w.at("click-folder"), egui::PointerButton::Primary);
+        w.until("the folder", |w| w.app.current_path == folder);
+        assert!(opened().is_empty(), "{:?}", opened());
+        // A file: the same way finds out it is one and opens it
+        assert_eq!(row_icon(&w, "click-notes.txt").as_deref(), Some(icons::PIN), "not known yet");
+        w.click(w.at("click-notes.txt"), egui::PointerButton::Primary);
+        w.until("the file opened", |_| opened() == vec![file.clone()]);
+        assert_eq!(w.app.current_path, folder);
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]
