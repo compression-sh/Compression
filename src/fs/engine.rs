@@ -1179,6 +1179,17 @@ pub fn transfer(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>) -> Outco
 
 /// `transfer` with the source of the free room given, so a test can say how much there is.
 fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: impl Fn(&Path) -> Option<u64>) -> Outcome {
+    // The target folders as they are before anything is begun, to compare with before each item (`folder_identity`)
+    let mut folders: Vec<(&Path, (u64, u64))> = Vec::new();
+    for parent in pairs.iter().filter_map(|(_, target)| target.parent()) {
+        if folders.iter().any(|(known, _)| *known == parent) {
+            continue;
+        }
+        match folder_identity(parent) {
+            Ok(id) => folders.push((parent, id)),
+            Err(err) => return Outcome::failed(trf("“{}” could not be checked ({}), so nothing was begun", &[&name_of(parent), &crate::fs::describe::io_error(&err)])),
+        }
+    }
     let sizes: Vec<(u64, u64)> = pairs
         .iter()
         .map(|(src, _)| {
@@ -1206,7 +1217,18 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
     let mut rec = Record::default();
     let mut failures = Vec::new();
     let mut was_cancelled = false;
-    for ((src, target), known) in pairs.iter().zip(&sizes) {
+    // A target folder that is no longer the one the job started with, and the items not begun because of it
+    let mut changed: Option<(&Path, &[(PathBuf, PathBuf)])> = None;
+    for (index, ((src, target), known)) in pairs.iter().zip(&sizes).enumerate() {
+        #[cfg(test)]
+        tests::before_item(target);
+        if let Some(parent) = target.parent()
+            && let Some((_, id)) = folders.iter().find(|(known, _)| *known == parent)
+            && folder_identity(parent).ok() != Some(*id)
+        {
+            changed = Some((parent, &pairs[index..]));
+            break;
+        }
         match transfer_one(w, op, src, target, Some(*known), &mut rec) {
             Ok(()) => {}
             Err(e) if is_cancel(&e) => {
@@ -1236,6 +1258,19 @@ fn transfer_with(w: &mut Worker, op: Op, pairs: Vec<(PathBuf, PathBuf)>, free: i
     };
     edits.extend(rec.replaced.iter().cloned().map(Edit::Restore));
     let effect = if edits.is_empty() { Effect::None } else { Effect::Record(UndoEntry::new(undo_label, edits)) };
+
+    // Stopped because the target folder changed: what was done (and can be undone) and what was not begun, apart
+    if let Some((folder, rest)) = changed {
+        let done = pairs.len() - rest.len() - failures.len();
+        let mut text = trf("“{}” is no longer the folder the job started in (its drive may have been removed), so the rest was not begun", &[&name_of(folder)]);
+        text.push_str(&format!(" · {}", trn(done, "{} item was done", "{} items were done")));
+        let not_begun: Vec<String> = rest.iter().map(|(src, _)| name_of(src)).collect();
+        text.push_str(&format!(" · {}: {}", trn(rest.len(), "{} item was not begun", "{} items were not begun"), names_with_more(&not_begun)));
+        for failure in &failures {
+            text.push_str(&format!(" · {failure}"));
+        }
+        return Outcome::failed(text).with(effect);
+    }
 
     let mut message = if was_cancelled {
         tr("Cancelled").to_owned()
@@ -1323,6 +1358,30 @@ pub(crate) fn left_out_note(list: &[(PathBuf, String)], head: String) -> String 
     let mut text = format!("{head}: {}", named.join(", "));
     if list.len() > SHOWN {
         text.push_str(&format!(", {}", trf("and {} more", &[&(list.len() - SHOWN)])));
+    }
+    text
+}
+
+/// What a folder is, its device and inode: whether a path still leads to the folder a job started with. A drive that
+/// was unmounted meanwhile leaves its mount folder gone, or behind on the file system below, which is another folder.
+/// Limits: it is looked at before each item, not while one is made; and a different drive that happens to get the same
+/// device number and the same inode for its top folder would pass as the same.
+fn folder_identity(dir: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(test)]
+    if tests::identity_fails(dir) {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    let meta = std::fs::metadata(dir)?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// The first few of `names`, and how many more there are.
+fn names_with_more(names: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let mut text = names.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    if names.len() > SHOWN {
+        text.push_str(&format!(", {}", trf("and {} more", &[&(names.len() - SHOWN)])));
     }
     text
 }
@@ -1494,6 +1553,29 @@ mod tests {
     pub(super) fn cancel_before_swap(w: &Worker, target: &Path) {
         if CANCELS.lock().unwrap().iter().any(|p| p == target) {
             w.shared.cancel.store(true, Relaxed);
+        }
+    }
+
+    /// Folders whose identity cannot be found out (as on a drive that reports an error).
+    static NO_IDENTITY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) fn identity_fails(dir: &Path) -> bool {
+        NO_IDENTITY.lock().unwrap().iter().any(|p| p == dir)
+    }
+
+    type Action = (PathBuf, Box<dyn FnOnce() + Send>);
+    /// What happens to the target before the item made at a path is begun (as an unmount in another window).
+    static BEFORE_ITEM: Mutex<Vec<Action>> = Mutex::new(Vec::new());
+
+    pub(super) fn before_item(target: &Path) {
+        let due: Vec<Box<dyn FnOnce() + Send>> = {
+            let mut list = BEFORE_ITEM.lock().unwrap();
+            let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut *list).into_iter().partition(|(p, _)| p == target);
+            *list = later;
+            now.into_iter().map(|(_, f)| f).collect()
+        };
+        for f in due {
+            f();
         }
     }
 
@@ -1747,6 +1829,88 @@ mod tests {
         assert!(outcome.ok, "{}", outcome.message);
         assert_eq!(std::fs::read_to_string(dir.join("dst/mix")).unwrap(), "file");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Moves `a` (a file) and `b` (a folder with two files) from one file system into `dst` on another; before `b` is
+    /// begun, `meanwhile` happens to `dst` (as an unmount in another window). The outcome and the test folders.
+    fn move_two_while(name: &str, meanwhile: fn(&Path)) -> Option<(Outcome, PathBuf, PathBuf)> {
+        let (root, shm) = crate::fs::ops::tests::two_file_systems(name)?;
+        let dst = shm.join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(root.join("a"), "first").unwrap();
+        std::fs::create_dir(root.join("b")).unwrap();
+        std::fs::write(root.join("b/one"), "1").unwrap();
+        std::fs::write(root.join("b/two"), "2").unwrap();
+        let at = dst.clone();
+        BEFORE_ITEM.lock().unwrap().push((dst.join("b"), Box::new(move || meanwhile(&at))));
+        let (outcome, _) = run(JobKind::Move, Op::Move, vec![(root.join("a"), dst.join("a")), (root.join("b"), dst.join("b"))], Decision::Skip);
+        Some((outcome, root, shm))
+    }
+
+    /// The paths an undo of `outcome` would move back.
+    fn undo_moves(outcome: &Outcome) -> Vec<PathBuf> {
+        match &outcome.effect {
+            Effect::Record(entry) => entry.edits.iter().filter_map(|e| if let Edit::Move { to, .. } = e { Some(to.clone()) } else { None }).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_move_begins_no_item_once_the_target_folder_is_another_one_as_after_an_unmount_that_leaves_it_behind() {
+        // The drive is unmounted between the items and its mount folder stays (a fixed folder such as /mnt/stick):
+        // the path now leads to another, empty folder. Before, the rest was moved there and the job said "Moved 2 items"
+        let Some((outcome, root, shm)) = move_two_while("folder_left_behind", |dst| {
+            std::fs::remove_dir_all(dst).unwrap();
+            std::fs::create_dir(dst).unwrap();
+        }) else {
+            return;
+        };
+        assert!(!outcome.ok, "{}", outcome.message);
+        assert!(outcome.message.starts_with("“dst” is no longer the folder the job started in"), "{}", outcome.message);
+        assert!(outcome.message.contains("1 item was done") && outcome.message.contains("1 item was not begun: b"), "{}", outcome.message);
+        assert!(!outcome.message.contains("Moved"), "no success said: {}", outcome.message);
+        assert_eq!(std::fs::read_to_string(root.join("b/one")).unwrap(), "1", "the item not begun keeps its original");
+        assert_eq!(std::fs::read_to_string(root.join("b/two")).unwrap(), "2");
+        assert!(names(&shm.join("dst")).is_empty(), "nothing written into the other folder");
+        assert_eq!(undo_moves(&outcome), vec![root.join("a")], "an undo for the item that was done only");
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
+    }
+
+    #[test]
+    fn a_move_begins_no_item_once_the_target_folder_is_gone() {
+        let Some((outcome, root, shm)) = move_two_while("folder_gone", |dst| std::fs::remove_dir_all(dst).unwrap()) else { return };
+        assert!(!outcome.ok);
+        assert!(outcome.message.contains("1 item was not begun: b"), "{}", outcome.message);
+        assert!(root.join("b/one").exists() && root.join("b/two").exists());
+        assert_eq!(undo_moves(&outcome), vec![root.join("a")]);
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
+    }
+
+    #[test]
+    fn a_move_whose_target_folder_cannot_be_identified_begins_nothing_or_nothing_more() {
+        // Not at the start: nothing is begun, nothing taken from the sources
+        let Some((root, shm)) = crate::fs::ops::tests::two_file_systems("identity_start") else { return };
+        let dst = shm.join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(root.join("a"), "first").unwrap();
+        NO_IDENTITY.lock().unwrap().push(dst.clone());
+        let (outcome, _) = run(JobKind::Move, Op::Move, vec![(root.join("a"), dst.join("a"))], Decision::Skip);
+        NO_IDENTITY.lock().unwrap().retain(|p| *p != dst);
+        assert!(!outcome.ok && outcome.message.starts_with("“dst” could not be checked"), "{}", outcome.message);
+        assert!(root.join("a").exists() && names(&dst).is_empty());
+        assert!(matches!(outcome.effect, Effect::None));
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
+        // Between items: the rest is not begun
+        let Some((outcome, root, shm)) = move_two_while("identity_between", |dst| NO_IDENTITY.lock().unwrap().push(dst.to_path_buf())) else { return };
+        NO_IDENTITY.lock().unwrap().retain(|p| !p.starts_with(&shm));
+        assert!(!outcome.ok && outcome.message.contains("1 item was not begun: b"), "{}", outcome.message);
+        assert!(root.join("b/one").exists() && root.join("b/two").exists());
+        assert_eq!(names(&shm.join("dst")), vec!["a"]);
+        crate::fs::ops::tests::unlock_and_remove(&root);
+        crate::fs::ops::tests::unlock_and_remove(&shm);
     }
 
     #[test]
