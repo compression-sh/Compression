@@ -1,6 +1,6 @@
 [package]
 name = "compression"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2024"
 # The locked egui and eframe 0.37 need Rust 1.95
 rust-version = "1.95"
