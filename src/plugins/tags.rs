@@ -973,7 +973,8 @@ impl Plugin for Tags {
                             self.reach.insert(to.join(old.strip_prefix(from).unwrap_or(Path::new(""))), reach);
                         }
                     }
-                    self.menu_reading.retain(|p| !p.starts_with(from));
+                    // An answer for either end is from before: the old item, or what was at the place it went to
+                    self.menu_reading.retain(|p| !p.starts_with(from) && !p.starts_with(to));
                     // A moved folder takes everything cached below it along
                     let moved: Vec<PathBuf> = self.cache.keys().filter(|p| p.starts_with(from)).cloned().collect();
                     for old in moved {
@@ -998,6 +999,8 @@ impl Plugin for Tags {
             }
             FileOpEvent::Created(paths) => {
                 for path in paths {
+                    // Made (or replaced) there now: an answer read before is not about it
+                    self.menu_reading.retain(|p| !p.starts_with(path));
                     for (file, tags) in tagged_in(path) {
                         dirty |= self.registry.record(&file, &tags);
                     }
@@ -1131,6 +1134,33 @@ pub(crate) mod tests {
             tags.menu_opened(&[FileItem::from_path(&a).unwrap()]);
             settle_menu_reads(&mut tags);
             assert_eq!(tags.cache.get(&a).map(|e| e.tags.clone()), Some(Vec::new()), "moved: {moved}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_menu_read_answered_after_another_file_was_moved_or_copied_onto_its_file_puts_nothing_old_back() {
+        // R2: the thread read "old" from `b`; then Compression puts another file there (moved onto it, or a copy that
+        // replaced it) before the answer is taken in
+        for moved in [true, false] {
+            let Some((dir, b)) = scratch_file(&format!("menu_onto_{moved}")) else { return };
+            write_tags(&b, &["old".to_owned()]).unwrap();
+            let mut tags = Tags::with(Registry::default(), BTreeMap::new());
+            tags.menu_opened(&[FileItem::from_path(&b).unwrap()]);
+            read_by_menu_thread(&b);
+            let a = dir.join("a");
+            std::fs::write(&a, "other").unwrap();
+            write_tags(&a, &["new".to_owned()]).unwrap();
+            if moved {
+                std::fs::rename(&a, &b).unwrap();
+                tags.file_op_done(&FileOpEvent::Moved(vec![(a.clone(), b.clone())]));
+            } else {
+                std::fs::copy(&a, &b).unwrap();
+                write_tags(&b, &["new".to_owned()]).unwrap();
+                tags.file_op_done(&FileOpEvent::Created(vec![b.clone()]));
+            }
+            settle_menu_reads(&mut tags);
+            assert_ne!(tags.cache.get(&b).map(|e| e.tags.clone()), Some(vec!["old".to_owned()]), "moved: {moved}: the old tags are not put back");
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
