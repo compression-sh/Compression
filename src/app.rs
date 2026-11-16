@@ -6026,7 +6026,12 @@ impl CompressionApp {
                     [one] => manage.push((icons::RENAME, tr("Rename"), MenuAction::Rename(one.clone()))),
                     many => manage.push((icons::RENAME, tr("Rename…"), MenuAction::RenameMany(many.to_vec()))),
                 }
-                manage.push((icons::TRASH, tr("Move to trash"), MenuAction::Trash(paths.clone())));
+                // Without a trash folder (no data folder) nothing can go there; everything else stays
+                manage.push(if trash::available_known() == Some(false) {
+                    (icons::TRASH, tr("Move to trash"), MenuAction::Unavailable(tr("There is no trash folder")))
+                } else {
+                    (icons::TRASH, tr("Move to trash"), MenuAction::Trash(paths.clone()))
+                });
             }
             let mut more = vec![
                 (icons::DUPLICATE, tr("Duplicate"), MenuAction::Duplicate(paths.clone())),
@@ -12268,6 +12273,68 @@ mod tests {
         assert_eq!(asked(), before);
         let _ = std::fs::remove_dir_all(&work);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_a_trash_folder_menus_stop_loading_and_only_moving_to_the_trash_is_refused() {
+        let work = window_dir("no_trash_menus");
+        std::fs::write(work.join("a.txt"), "a").unwrap();
+        std::fs::create_dir(work.join("sub")).unwrap();
+        let ctx = egui::Context::default();
+        let app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let (file, folder) = (FileItem::from_path(&work.join("a.txt")).unwrap(), FileItem::from_path(&work.join("sub")).unwrap());
+        let targets = [MenuTarget::Item(file), MenuTarget::Item(folder), MenuTarget::Folder];
+        // Every entry, those of submenus included
+        let entries = |target: &MenuTarget| -> Vec<(String, MenuAction)> {
+            let mut out = Vec::new();
+            for (_, label, action) in app.menu_entries(target).into_iter().flatten() {
+                if let MenuAction::Submenu(inner) = &action {
+                    out.extend(inner.iter().map(|(_, l, a)| ((*l).to_owned(), a.clone())));
+                }
+                out.push((label.to_owned(), action));
+            }
+            out
+        };
+        let has = |list: &[(String, MenuAction)], label: &str| list.iter().any(|(l, _)| l == label);
+        let trash_action = |list: &[(String, MenuAction)]| list.iter().find(|(l, _)| l == "Move to trash").map(|(_, a)| a.clone());
+        // Not found out yet: "Loading…" only, in all three
+        crate::fs::trash::tests::COLD.with(|c| c.set(true));
+        for target in &targets {
+            assert_eq!(entries(target).into_iter().map(|(l, _)| l).collect::<Vec<_>>(), ["Loading…"]);
+        }
+        crate::fs::trash::tests::COLD.with(|c| c.set(false));
+        // Found out that there is none: no "Loading…", moving to the trash refused with the reason, the rest offered,
+        // and nothing as if this were the trash
+        crate::fs::trash::tests::NO_TRASH.with(|n| n.set(true));
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(Some(true)));
+        for target in &targets[..2] {
+            let list = entries(target);
+            assert!(!has(&list, "Loading…"), "{:?}", list.iter().map(|(l, _)| l).collect::<Vec<_>>());
+            assert!(matches!(trash_action(&list), Some(MenuAction::Unavailable(why)) if why == "There is no trash folder"));
+            for usable in ["Copy", "Cut", "Rename", "Delete permanently", "Properties"] {
+                assert!(has(&list, usable), "{usable}");
+            }
+            assert!(!list.iter().any(|(_, a)| matches!(a, MenuAction::Trash(_) | MenuAction::Restore(_))));
+        }
+        let background = entries(&targets[2]);
+        for usable in ["New file", "New folder", "Paste", "Refresh", "Open as administrator", "Properties"] {
+            assert!(has(&background, usable), "{usable}");
+        }
+        assert!(!has(&background, "Loading…") && !has(&background, "Empty trash"));
+        crate::fs::trash::tests::NO_TRASH.with(|n| n.set(false));
+        crate::fs::admin::TEST_AVAILABLE.with(|a| a.set(None));
+        // Found out that there is one: moving to the trash is offered
+        for _ in 0..500 {
+            if crate::fs::trash::contains_known(&work).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for target in &targets[..2] {
+            assert!(matches!(trash_action(&entries(target)), Some(MenuAction::Trash(_))));
+        }
+        assert!(has(&entries(&targets[2]), "New file"));
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]

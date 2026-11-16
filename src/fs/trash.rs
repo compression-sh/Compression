@@ -16,15 +16,14 @@ pub fn files_dir() -> Option<PathBuf> {
     root().map(|r| r.join("files"))
 }
 
-/// `files_dir` with its links resolved, as the folders shown are, once it was resolved (see `preload`).
-static RESOLVED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// `files_dir` with its links resolved, as the folders shown are, once it was found out (see `preload`); `None` inside
+/// when there is no trash folder (no data folder), which is known then too.
+static RESOLVED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
 /// Resolve the trash folder on a thread of its own, then call `done`: the context menu asks for it without waiting.
 pub fn preload(done: impl FnOnce() + Send + 'static) {
     std::thread::spawn(move || {
-        if let Some(files) = files_dir() {
-            RESOLVED.get_or_init(|| resolve(&files));
-        }
+        fill(&RESOLVED, files_dir());
         #[cfg(test)]
         tests::PRELOADED.store(true, std::sync::atomic::Ordering::SeqCst);
         done();
@@ -41,34 +40,50 @@ fn resolve(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-/// `files_dir` resolved; resolved here and now the first time if `preload` has not done it yet.
-fn files_dir_resolved() -> Option<PathBuf> {
-    let files = files_dir()?;
-    Some(RESOLVED.get_or_init(|| resolve(&files)).clone())
+/// Puts `files` resolved into `cell`, or that there is no trash folder when `files` is `None`: known either way.
+fn fill(cell: &std::sync::OnceLock<Option<PathBuf>>, files: Option<PathBuf>) -> Option<PathBuf> {
+    cell.get_or_init(|| files.map(|files| resolve(&files))).clone()
 }
 
-/// `files_dir` resolved, without asking the file system: `None` until `preload` has resolved it.
-fn files_dir_known() -> Option<PathBuf> {
+/// `files_dir` resolved; resolved here and now the first time if `preload` has not done it yet.
+fn files_dir_resolved() -> Option<PathBuf> {
+    fill(&RESOLVED, files_dir())
+}
+
+/// `files_dir` resolved, without asking the file system: `None` until `preload` has found out, `Some(None)` when there
+/// is no trash folder.
+fn files_dir_known() -> Option<Option<PathBuf>> {
     #[cfg(test)]
     if tests::COLD.with(std::cell::Cell::get) {
         return None;
+    }
+    #[cfg(test)]
+    if tests::NO_TRASH.with(std::cell::Cell::get) {
+        return Some(None);
     }
     known_in(&RESOLVED)
 }
 
 /// What `cell` holds, without resolving anything when it holds nothing yet.
-fn known_in(cell: &std::sync::OnceLock<PathBuf>) -> Option<PathBuf> {
+fn known_in(cell: &std::sync::OnceLock<Option<PathBuf>>) -> Option<Option<PathBuf>> {
     cell.get().cloned()
 }
 
-/// `contains`, without asking the file system: `None` while that is not known yet.
+/// Whether there is a trash folder to move things to, without asking the file system: `None` while that is not known
+/// yet, `Some(false)` when there is none (no data folder), which stays so.
+pub fn available_known() -> Option<bool> {
+    files_dir_known().map(|files| files.is_some())
+}
+
+/// `contains`, without asking the file system: `None` while that is not known yet. Without a trash folder nothing is in
+/// it.
 pub fn contains_known(path: &Path) -> Option<bool> {
-    files_dir_known().map(|files| path.starts_with(files))
+    files_dir_known().map(|files| files.is_some_and(|files| path.starts_with(files)))
 }
 
 /// `is_trash_folder`, without asking the file system: `None` while that is not known yet.
 pub fn is_trash_folder_known(path: &Path) -> Option<bool> {
-    files_dir_known().map(|files| files == path)
+    files_dir_known().map(|files| files.as_deref() == Some(path))
 }
 
 /// Whether `path` sits directly in a trash folder, where its record is, by the names alone, without asking the file
@@ -77,7 +92,7 @@ pub fn is_trash_folder_known(path: &Path) -> Option<bool> {
 pub fn is_top_level_known(path: &Path) -> Option<bool> {
     let files = files_dir_known()?;
     let parent = path.parent();
-    Some(parent == Some(files.as_path()) || parent.is_some_and(|p| p.file_name().is_some_and(|n| n == "files") && p.parent().is_some_and(|r| topdir_of(r).is_some())))
+    Some(parent.is_some_and(|parent| files.as_deref() == Some(parent)) || parent.is_some_and(|p| p.file_name().is_some_and(|n| n == "files") && p.parent().is_some_and(|r| topdir_of(r).is_some())))
 }
 
 /// Whether `path` is the trash folder itself or something inside it.
@@ -503,6 +518,8 @@ pub(crate) mod tests {
         pub(crate) static RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// On this thread, the trash folder counts as not resolved yet (as right after the start).
         pub(crate) static COLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// On this thread, there counts to be no trash folder (no data folder), as found out.
+        pub(crate) static NO_TRASH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Whether `preload` has resolved the trash folder in this process.
@@ -511,7 +528,7 @@ pub(crate) mod tests {
     #[test]
     fn what_is_not_resolved_yet_is_not_resolved_by_asking_whether_it_is_known() {
         let before = RESOLVES.with(std::cell::Cell::get);
-        assert_eq!(known_in(&std::sync::OnceLock::new()), None);
+        assert_eq!(known_in(&std::sync::OnceLock::<Option<PathBuf>>::new()), None);
         assert_eq!(RESOLVES.with(std::cell::Cell::get), before);
     }
 
@@ -525,6 +542,28 @@ pub(crate) mod tests {
         assert_eq!(resolve(&dir.join("link/Trash/files")), real.join("Trash/files"));
         assert_eq!(resolve(&dir.join("link")), real);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_trash_folder_is_known_as_such_and_not_as_not_found_out_yet() {
+        // As `preload` does without a data folder: the answer is there, and it is "none"
+        let cell = std::sync::OnceLock::new();
+        assert_eq!(known_in(&cell), None, "not found out yet");
+        assert_eq!(fill(&cell, None), None);
+        assert_eq!(known_in(&cell), Some(None), "found out: there is none");
+        // What the menus ask then: nothing is in the trash or is it, and there is none to move things to
+        NO_TRASH.with(|n| n.set(true));
+        assert_eq!(available_known(), Some(false));
+        assert_eq!(contains_known(Path::new("/x")), Some(false));
+        assert_eq!(is_trash_folder_known(Path::new("/x")), Some(false));
+        assert_eq!(is_top_level_known(Path::new("/x/y")), Some(false));
+        assert_eq!(is_top_level_known(Path::new("/")), Some(false), "no parent is not the missing trash folder");
+        // A drive's trash is told by its names, as before
+        assert_eq!(is_top_level_known(Path::new("/media/stick/.Trash-1000/files/a")), Some(true));
+        NO_TRASH.with(|n| n.set(false));
+        COLD.with(|c| c.set(true));
+        assert_eq!(available_known(), None, "not found out yet");
+        COLD.with(|c| c.set(false));
     }
 
     #[test]
