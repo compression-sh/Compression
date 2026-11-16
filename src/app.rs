@@ -4784,7 +4784,7 @@ impl CompressionApp {
                     let idx = row_idx * cols + col_idx;
                     let selected = self.selection.contains(&idx);
                     // Tiles out of view only keep their place; building every tile of a big folder each frame is what made it lag
-                    if !slot.intersects(clip) && !(selected && should_scroll) {
+                    if !(slot.intersects(clip) || selected && should_scroll) {
                         item_rects.push((idx, slot));
                         continue;
                     }

@@ -2093,7 +2093,7 @@ pub(crate) mod tests {
             assert!(child.wait().unwrap().success());
         } else {
             // `.tar`, and a tar under another name for 7z (it tells the format by the content)
-            if !name.ends_with(".tar") && !(have("7z") || have("7za")) {
+            if !(name.ends_with(".tar") || have("7z") || have("7za")) {
                 return None;
             }
             std::fs::write(&path, tar).unwrap();

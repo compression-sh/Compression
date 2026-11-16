@@ -169,7 +169,7 @@ fn set_x11(paths: &[PathBuf], cut: bool) -> bool {
     if owner.is_none() {
         *owner = arboard::Clipboard::new().ok();
     }
-    if !owner.as_mut().is_some_and(|c| c.set().file_list(paths).is_ok()) {
+    if owner.as_mut().is_none_or(|c| c.set().file_list(paths).is_err()) {
         return false;
     }
     set_x11_offer(x11_clipboard_owner().map(|owner| X11Offer { owner, paths: paths.to_vec(), cut }));

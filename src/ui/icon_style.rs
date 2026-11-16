@@ -1110,7 +1110,7 @@ fn thin(mut on: Vec<bool>, keep: &[bool], side: usize) -> Vec<bool> {
                     let count = p.iter().filter(|&&b| b).count();
                     let turns = (0..8).filter(|&i| !p[i] && p[(i + 1) % 8]).count();
                     let (n, e, s, w) = (p[0], p[2], p[4], p[6]);
-                    let clear = if pass == 0 { !(n && e && s) && !(e && s && w) } else { !(n && e && w) && !(n && s && w) };
+                    let clear = if pass == 0 { !e || !s || !n && !w } else { !n || !w || !e && !s };
                     (2..=6).contains(&count) && turns == 1 && clear
                 })
                 .collect();

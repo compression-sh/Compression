@@ -179,7 +179,7 @@ fn replace_text(text: &str, find: &str, with: &str, match_case: bool) -> String 
     while let Some(i) = lower_text[at..].find(&lower_find) {
         // Equal total lengths do not make equal positions (one letter grows, another shrinks):
         // a match that does not sit on letter boundaries of the real text cannot be cut out of it
-        if !text.get(at + i..at + i + find.len()).is_some_and(|real| real.to_lowercase() == lower_find) {
+        if text.get(at + i..at + i + find.len()).is_none_or(|real| real.to_lowercase() != lower_find) {
             return text.replace(find, with);
         }
         out.push_str(&text[at..at + i]);
