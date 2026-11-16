@@ -165,13 +165,8 @@ fn start_counted(count: &std::sync::Arc<std::sync::atomic::AtomicUsize>, most: u
         let _held = held;
         work();
     };
-    #[cfg(test)]
-    if tests::FAIL_SPAWN.with(std::cell::Cell::get) {
-        drop(run);
-        return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
-    }
     // A thread that cannot be started drops `run`, and with it `held`
-    std::thread::Builder::new().spawn(run).map(|_| true)
+    crate::fs::spawn(run).map(|()| true)
 }
 
 impl Drop for Reading {
@@ -908,11 +903,11 @@ impl CompressionApp {
         network::set_user_remote_folders(&settings.remote_folders);
         apps::preload();
         crate::ui::fonts::preload();
-        crate::fs::admin::preload();
-        trash::preload({
+        // A worker that cannot be started is said once the window is there
+        let not_started = crate::fs::admin::preload().err().or(trash::preload({
             let ctx = ctx.clone();
             move || ctx.request_repaint()
-        });
+        }).err());
         // Ctrl+= / Ctrl+- resize icons (see `zoom_icons`), not the whole interface
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let places = Place::default_places();
@@ -1102,6 +1097,9 @@ impl CompressionApp {
             type_ahead: (String::new(), std::time::Instant::now()),
         };
 
+        if let Some(err) = not_started {
+            app.set_toast(trf("A background task could not be started ({})", &[&crate::fs::describe::io_error(&err)]));
+        }
         app.reload_items();
         app.announce_servers_problem();
         app.request_drive_listing(ctx, true);
@@ -10485,8 +10483,6 @@ mod tests {
         pub(super) static OPENED: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
         /// How many threads that make a new item were started from this thread.
         pub(super) static CREATES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-        /// `start_counted` fails as if no thread could be started (EAGAIN).
-        pub(super) static FAIL_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Folders in which making a new item waits until the test lets it go (at most 10 s, so that a mutation that makes
@@ -10505,6 +10501,8 @@ mod tests {
             list = changed.wait_timeout(list, left).unwrap().0;
         }
     }
+
+    use crate::fs::FAIL_SPAWN;
 
     fn hold_creating_in(dir: &Path) {
         HELD_FOR_CREATING.0.lock().unwrap().push(dir.to_path_buf());

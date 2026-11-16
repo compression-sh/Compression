@@ -63,8 +63,10 @@ fn admissible_target(dir: &Path) -> io::Result<()> {
 static PKEXEC: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
 /// Look for pkexec on a thread of its own, so that menus that offer administrator access never look in the frame.
-pub fn preload() {
-    std::thread::spawn(|| PKEXEC.get_or_init(pkexec));
+pub fn preload() -> std::io::Result<()> {
+    crate::fs::spawn(|| {
+        PKEXEC.get_or_init(pkexec);
+    })
 }
 
 /// Whether administrator access can be asked for at all. Until `preload` has looked, it cannot.
@@ -212,6 +214,15 @@ pub(crate) mod tests {
             assert_eq!(admissible_target(Path::new(refused)).unwrap_err().to_string(), "Open a folder first to open it as administrator", "{refused:?}");
         }
         assert!(admissible_target(Path::new("/etc")).is_ok());
+    }
+
+    #[test]
+    fn a_preload_that_cannot_start_its_thread_is_an_error() {
+        // R4: said by the window; until pkexec is found, administrator access is not offered
+        crate::fs::FAIL_SPAWN.with(|f| f.set(true));
+        let started = preload();
+        crate::fs::FAIL_SPAWN.with(|f| f.set(false));
+        assert_eq!(started.map_err(|e| e.raw_os_error()), Err(Some(libc::EAGAIN)));
     }
 
     #[test]

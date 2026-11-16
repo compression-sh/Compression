@@ -353,11 +353,9 @@ impl Tags {
             return;
         }
         self.menu_reading = missing.clone();
-        #[cfg(test)]
-        tests::MENU_READS_STARTED.with(|n| n.set(n.get() + 1));
         let (tx, rx) = mpsc::channel();
         self.menu_rx = Some(rx);
-        std::thread::spawn(move || {
+        let started = crate::fs::spawn(move || {
             let read: Vec<(PathBuf, Entry)> = missing
                 .into_iter()
                 .filter_map(|path| {
@@ -369,6 +367,18 @@ impl Tags {
             tests::MENU_READ_DONE.lock().unwrap().extend(read.iter().map(|(p, _)| p.clone()));
             let _ = tx.send(read);
         });
+        match started {
+            Ok(()) => {
+                #[cfg(test)]
+                tests::MENU_READS_STARTED.with(|n| n.set(n.get() + 1));
+            }
+            // Said, and nothing is left reading: the paths wait for the next menu to try again
+            Err(err) => {
+                self.menu_rx = None;
+                self.menu_waiting.extend(std::mem::take(&mut self.menu_reading));
+                self.messages.push(trf("A background task could not be started ({})", &[&crate::fs::describe::io_error(&err)]));
+            }
+        }
     }
 
     /// Finds out on a thread where the remembered files are (`paths`, or all of them). With `forget`, the files found
@@ -1123,6 +1133,25 @@ pub(crate) mod tests {
             assert_eq!(tags.cache.get(&a).map(|e| e.tags.clone()), Some(Vec::new()), "moved: {moved}");
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn a_menu_read_that_cannot_be_started_is_said_and_tried_again_by_the_next_menu() {
+        // R4
+        let Some((dir, a)) = scratch_file("menu_no_thread") else { return };
+        write_tags(&a, &["work".to_owned()]).unwrap();
+        let item = FileItem::from_path(&a).unwrap();
+        let mut tags = Tags::with(Registry::default(), BTreeMap::new());
+        crate::fs::FAIL_SPAWN.with(|f| f.set(true));
+        tags.menu_opened(std::slice::from_ref(&item));
+        crate::fs::FAIL_SPAWN.with(|f| f.set(false));
+        assert!(tags.menu_rx.is_none() && tags.menu_reading.is_empty(), "nothing left reading");
+        assert_eq!(tags.menu_waiting, vec![a.clone()]);
+        assert!(tags.messages.iter().any(|m| m.starts_with("A background task could not be started")), "{:?}", tags.messages);
+        tags.menu_opened(std::slice::from_ref(&item));
+        settle_menu_reads(&mut tags);
+        assert_eq!(tags.cache.get(&a).map(|e| e.tags.clone()), Some(vec!["work".to_owned()]));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

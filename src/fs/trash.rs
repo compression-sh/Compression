@@ -21,13 +21,23 @@ pub fn files_dir() -> Option<PathBuf> {
 static RESOLVED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
 /// Resolve the trash folder on a thread of its own, then call `done`: the context menu asks for it without waiting.
-pub fn preload(done: impl FnOnce() + Send + 'static) {
-    std::thread::spawn(move || {
-        fill(&RESOLVED, files_dir());
+/// If no thread can be started, it is resolved here and now, once (as anything that needs the trash folder before
+/// `preload` has resolved it does), so that the menus do not wait for ever; the error is returned to be said.
+pub fn preload(done: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    preload_into(&RESOLVED, done)
+}
+
+/// `preload` into `cell`.
+fn preload_into(cell: &'static std::sync::OnceLock<Option<PathBuf>>, done: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    crate::fs::spawn(move || {
+        fill(cell, files_dir());
         #[cfg(test)]
         tests::PRELOADED.store(true, std::sync::atomic::Ordering::SeqCst);
         done();
-    });
+    })
+    .inspect_err(|_| {
+        fill(cell, files_dir());
+    })
 }
 
 /// `path` with its links resolved: the nearest folder above it that is there, resolved, with the rest put back. So it is
@@ -542,6 +552,21 @@ pub(crate) mod tests {
         assert_eq!(resolve(&dir.join("link/Trash/files")), real.join("Trash/files"));
         assert_eq!(resolve(&dir.join("link")), real);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_preload_that_cannot_start_its_thread_is_an_error_and_the_trash_folder_is_known_anyway() {
+        // R4: the menus must not wait for ever for a thread that never started
+        // A cell of its own: the one of the process is filled by other tests already
+        static CELL: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        crate::fs::FAIL_SPAWN.with(|f| f.set(true));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        let started = preload_into(&CELL, move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
+        crate::fs::FAIL_SPAWN.with(|f| f.set(false));
+        assert!(started.is_err());
+        assert!(known_in(&CELL).is_some(), "found out here instead");
+        assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "no thread, so no call from one");
     }
 
     #[test]

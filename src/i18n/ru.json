@@ -995,6 +995,7 @@
   "the template became shorter while it was read": "шаблон стал короче во время чтения",
   "This file system cannot make a file from a template without the risk of leaving an incomplete one, so nothing was made under that name": "Эта файловая система не может создать файл из шаблона без риска оставить незавершённый файл, поэтому под этим именем ничего не создано",
   "Creating…": "Создание…",
+  "A background task could not be started ({})": "Не удалось запустить фоновую задачу ({})",
   "Earlier lookups have not answered yet, so this one was not looked up": "Предыдущие запросы ещё не ответили, поэтому этот не был запущен",
   "The templates folder has not answered yet, so only the built-in templates are offered": "Папка шаблонов ещё не ответила, поэтому доступны только встроенные шаблоны",
   "{} new items of this window are still being made, so nothing was made; try again when one has finished": "В этом окне ещё создаются новые элементы ({}), поэтому ничего не создано; попробуйте снова, когда один из них завершится",

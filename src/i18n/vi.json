@@ -995,6 +995,7 @@
   "the template became shorter while it was read": "mẫu đã ngắn đi trong lúc đang đọc",
   "This file system cannot make a file from a template without the risk of leaving an incomplete one, so nothing was made under that name": "Hệ thống tệp này không thể tạo tệp từ mẫu mà không có nguy cơ để lại tệp chưa hoàn chỉnh, nên không có gì được tạo với tên đó",
   "Creating…": "Đang tạo…",
+  "A background task could not be started ({})": "Không thể khởi động một tác vụ nền ({})",
   "Earlier lookups have not answered yet, so this one was not looked up": "Các lần tra cứu trước chưa phản hồi nên lần này chưa được thực hiện",
   "The templates folder has not answered yet, so only the built-in templates are offered": "Thư mục mẫu chưa phản hồi nên chỉ có các mẫu tích hợp sẵn",
   "{} new items of this window are still being made, so nothing was made; try again when one has finished": "Cửa sổ này vẫn đang tạo {} mục mới nên chưa tạo gì; hãy thử lại khi một mục đã xong",

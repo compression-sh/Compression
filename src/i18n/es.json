@@ -995,6 +995,7 @@
   "the template became shorter while it was read": "la plantilla se acortó mientras se leía",
   "This file system cannot make a file from a template without the risk of leaving an incomplete one, so nothing was made under that name": "Este sistema de archivos no puede crear un archivo a partir de una plantilla sin el riesgo de dejar uno incompleto, así que no se creó nada con ese nombre",
   "Creating…": "Creando…",
+  "A background task could not be started ({})": "No se pudo iniciar una tarea en segundo plano ({})",
   "Earlier lookups have not answered yet, so this one was not looked up": "Las consultas anteriores aún no han respondido, así que esta no se inició",
   "The templates folder has not answered yet, so only the built-in templates are offered": "La carpeta de plantillas aún no ha respondido, así que solo se ofrecen las plantillas integradas",
   "{} new items of this window are still being made, so nothing was made; try again when one has finished": "Esta ventana todavía está creando {} elementos nuevos, así que no se creó nada; inténtalo de nuevo cuando termine alguno",
