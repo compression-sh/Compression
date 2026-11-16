@@ -2,6 +2,8 @@
 name = "compression"
 version = "0.6.4"
 edition = "2024"
+# The locked egui and eframe 0.37 need Rust 1.95
+rust-version = "1.95"
 description = "A small, fast, keyboard-friendly file manager"
 license = "MIT"
 repository = "https://github.com/compression-sh/Compression"
