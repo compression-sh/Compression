@@ -5546,6 +5546,8 @@ impl CompressionApp {
             self.dialog = None;
         }
         let path = dir.join(name);
+        // Also when another folder is shown by now: what was said about this path (a pin on it) is no longer so
+        self.net.known.forget(&path);
         self.history.record(UndoEntry::new(trf("Creation of {}", &[&name]), vec![Edit::Trash(path.clone())]));
         let mut message = if dir == self.current_path {
             self.add_listed_item(&path, item);
@@ -12464,6 +12466,32 @@ mod tests {
 
     fn count(n: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> usize {
         n.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_pin_on_a_folder_made_after_another_folder_is_shown_is_found_out_again() {
+        // R1: the folder a pin points to was missing; it is made while the window shows another folder
+        let work = window_dir("create_pin_kind");
+        let (here, elsewhere) = (work.join("here"), work.join("elsewhere"));
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let pinned = here.join("Project");
+        let mut w = Window::new(here.clone());
+        w.app.net.known = network_ui::Known::with_ask(move |path| {
+            if path.is_dir() { network_ui::Kind::Dir } else { network_ui::Kind::Missing }
+        });
+        let ctx = w.ctx.clone();
+        w.until("missing", |w| w.app.pin_kind(&pinned, &ctx) == Some(false));
+        w.app.dialog = None;
+        hold_creating_in(&here);
+        w.app.create_entry(0, true, "Project", None).unwrap();
+        w.go(elsewhere.clone());
+        let_creating_go(&here);
+        w.until("made", |w| w.app.status_toast.as_ref().is_some_and(|t| t.message.starts_with("Created Project")));
+        assert!(pinned.is_dir());
+        // Not the 30 s old "missing": asked again at once
+        w.until("a folder", |w| w.app.pin_kind(&pinned, &ctx) == Some(true));
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]
