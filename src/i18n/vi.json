@@ -999,6 +999,7 @@
   "“{}” is no longer the folder the job started in (its drive may have been removed), so the rest was not begun": "“{}” không còn là thư mục mà tác vụ đã bắt đầu (có thể ổ đĩa của nó đã bị tháo), nên phần còn lại chưa được bắt đầu",
   "{} items were done": "Đã xong {} mục",
   "{} items were not begun": "Chưa bắt đầu {} mục",
+  "It stopped unexpectedly, so it may not have been made": "Đã dừng bất ngờ nên có thể mục chưa được tạo",
   "A background task could not be started ({})": "Không thể khởi động một tác vụ nền ({})",
   "Earlier lookups have not answered yet, so this one was not looked up": "Các lần tra cứu trước chưa phản hồi nên lần này chưa được thực hiện",
   "The templates folder has not answered yet, so only the built-in templates are offered": "Thư mục mẫu chưa phản hồi nên chỉ có các mẫu tích hợp sẵn",

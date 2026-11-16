@@ -999,6 +999,7 @@
   "“{}” is no longer the folder the job started in (its drive may have been removed), so the rest was not begun": "«{}» больше не та папка, в которой началась задача (возможно, её диск был извлечён), поэтому остальное не начато",
   "{} items were done": "Выполнен {} элемент|Выполнено {} элемента|Выполнено {} элементов",
   "{} items were not begun": "Не начат {} элемент|Не начато {} элемента|Не начато {} элементов",
+  "It stopped unexpectedly, so it may not have been made": "Операция неожиданно прервалась, поэтому элемент мог не быть создан",
   "A background task could not be started ({})": "Не удалось запустить фоновую задачу ({})",
   "Earlier lookups have not answered yet, so this one was not looked up": "Предыдущие запросы ещё не ответили, поэтому этот не был запущен",
   "The templates folder has not answered yet, so only the built-in templates are offered": "Папка шаблонов ещё не ответила, поэтому доступны только встроенные шаблоны",

@@ -999,6 +999,7 @@
   "“{}” is no longer the folder the job started in (its drive may have been removed), so the rest was not begun": "« {} » n’est plus le dossier dans lequel la tâche a commencé (son lecteur a peut-être été retiré), le reste n’a donc pas été commencé",
   "{} items were done": "{} élément a été traité|{} éléments ont été traités",
   "{} items were not begun": "{} élément n’a pas été commencé|{} éléments n’ont pas été commencés",
+  "It stopped unexpectedly, so it may not have been made": "Cela s’est arrêté de manière inattendue ; l’élément n’a peut-être pas été créé",
   "A background task could not be started ({})": "Une tâche d’arrière-plan n’a pas pu être lancée ({})",
   "Earlier lookups have not answered yet, so this one was not looked up": "Les requêtes précédentes n’ont pas encore répondu, celle-ci n’a donc pas été lancée",
   "The templates folder has not answered yet, so only the built-in templates are offered": "Le dossier des modèles n’a pas encore répondu, seuls les modèles intégrés sont donc proposés",

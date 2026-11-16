@@ -106,6 +106,8 @@ fn admin_entry(path: &Path) -> Option<MenuEntry> {
 fn make_new(dir: &Path, is_dir: bool, name: &str, template: Option<&Template>) -> Result<(Option<FileItem>, Option<String>), String> {
     #[cfg(test)]
     tests::wait_while_held(dir);
+    #[cfg(test)]
+    tests::panic_if_asked(dir);
     let path = dir.join(name);
     let made = if is_dir {
         std::fs::create_dir(&path).map(|()| None)
@@ -5507,7 +5509,9 @@ impl CompressionApp {
         }
         let (dir, name, template, tx, ctx) = (self.current_path.clone(), name.to_owned(), template.cloned(), self.open_tx.clone(), self.ctx.clone());
         let started = start_counted(&self.creating, MAX_CREATING, move || {
-            let result = make_new(&dir, is_dir, &name, template.as_ref());
+            // A worker that fails must still answer, or its dialog would wait for ever
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| make_new(&dir, is_dir, &name, template.as_ref())))
+                .unwrap_or_else(|_| Err(tr("It stopped unexpectedly, so it may not have been made").to_owned()));
             let _ = tx.send(OpenReport::Created { dialog, dir, name, result });
             ctx.request_repaint();
         });
@@ -10514,6 +10518,15 @@ mod tests {
 
     use crate::fs::FAIL_SPAWN;
 
+    /// Folders in which making a new item panics.
+    static PANIC_IN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) fn panic_if_asked(dir: &Path) {
+        if PANIC_IN.lock().unwrap().iter().any(|d| d == dir) {
+            panic!("making a new item panicked (test)");
+        }
+    }
+
     fn hold_creating_in(dir: &Path) {
         HELD_FOR_CREATING.0.lock().unwrap().push(dir.to_path_buf());
     }
@@ -12491,6 +12504,26 @@ mod tests {
         assert!(pinned.is_dir());
         // Not the 30 s old "missing": asked again at once
         w.until("a folder", |w| w.app.pin_kind(&pinned, &ctx) == Some(true));
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_making_that_panics_ends_the_waiting_dialog_with_a_message_and_frees_its_place() {
+        // R3
+        let work = window_dir("create_panics");
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        PANIC_IN.lock().unwrap().push(work.clone());
+        app.open_create_dialog(true);
+        let Some(Dialog::Create { id, .. }) = app.dialog else { panic!() };
+        app.create_entry(id, true, "x", None).unwrap();
+        if let Some(Dialog::Create { waiting, .. }) = &mut app.dialog {
+            *waiting = true;
+        }
+        poll_until(&mut app, "the answer", |app| matches!(&app.dialog, Some(Dialog::Create { waiting: false, error: Some(_), .. })));
+        PANIC_IN.lock().unwrap().retain(|d| *d != work);
+        assert!(matches!(&app.dialog, Some(Dialog::Create { error: Some(e), .. }) if e == "It stopped unexpectedly, so it may not have been made"));
+        poll_until(&mut app, "the place", |app| count(&app.creating) == 0);
         let _ = std::fs::remove_dir_all(&work);
     }
 
