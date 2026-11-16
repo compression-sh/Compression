@@ -157,8 +157,16 @@ const MAX_MENU_LOOKUPS: usize = 3;
 /// other windows have their own, so this is no limit for the whole process.
 fn start_counted(count: &std::sync::Arc<std::sync::atomic::AtomicUsize>, most: usize, work: impl FnOnce() + Send + 'static) -> std::io::Result<bool> {
     use std::sync::atomic::Ordering::SeqCst;
-    if count.try_update(SeqCst, SeqCst, |n| (n < most).then_some(n + 1)).is_err() {
-        return Ok(false);
+    // Taken only while below `most`, also when several take at once (`try_update` would need Rust 1.95)
+    let mut now = count.load(SeqCst);
+    loop {
+        if now >= most {
+            return Ok(false);
+        }
+        match count.compare_exchange_weak(now, now + 1, SeqCst, SeqCst) {
+            Ok(_) => break,
+            Err(seen) => now = seen,
+        }
     }
     let held = Reading(count.clone());
     let run = move || {
@@ -12456,6 +12464,77 @@ mod tests {
 
     fn count(n: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> usize {
         n.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_place_is_taken_only_while_there_is_room_and_given_back_whatever_happens() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        use std::sync::Arc;
+        let wait_zero = |count: &Arc<AtomicUsize>| {
+            for _ in 0..1000 {
+                if count.load(SeqCst) == 0 {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            panic!("the place was not given back");
+        };
+        // Room: started, counted while it runs, given back when it ends
+        let count = Arc::new(AtomicUsize::new(0));
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        assert!(start_counted(&count, 2, move || {
+            let _ = wait.recv();
+        })
+        .unwrap());
+        assert_eq!(count.load(SeqCst), 1);
+        go.send(()).unwrap();
+        wait_zero(&count);
+        // Full: nothing started, nothing counted
+        count.store(2, SeqCst);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        assert!(!start_counted(&count, 2, move || flag.store(true, SeqCst)).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!ran.load(SeqCst) && count.load(SeqCst) == 2);
+        count.store(0, SeqCst);
+        // Many at once: exactly as many as there is room for, never more counted
+        let gate = Arc::new(std::sync::Barrier::new(16));
+        let hold = Arc::new(AtomicBool::new(true));
+        let most_seen = Arc::new(AtomicUsize::new(0));
+        let takers: Vec<_> = (0..16)
+            .map(|_| {
+                let (count, gate, hold, most_seen) = (count.clone(), gate.clone(), hold.clone(), most_seen.clone());
+                std::thread::spawn(move || {
+                    gate.wait();
+                    let watch = count.clone();
+                    let started = start_counted(&count, 3, move || {
+                        while hold.load(SeqCst) {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                    })
+                    .unwrap();
+                    most_seen.fetch_max(watch.load(SeqCst), SeqCst);
+                    started
+                })
+            })
+            .collect();
+        let started = takers.into_iter().map(|t| t.join().unwrap()).filter(|s| *s).count();
+        assert_eq!(started, 3);
+        assert!(most_seen.load(SeqCst) <= 3 && count.load(SeqCst) == 3);
+        hold.store(false, SeqCst);
+        wait_zero(&count);
+        // No thread: an error, and the place is given back at once; the work is never run
+        FAIL_SPAWN.with(|f| f.set(true));
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let failed = start_counted(&count, 3, move || flag.store(true, SeqCst));
+        FAIL_SPAWN.with(|f| f.set(false));
+        assert!(failed.is_err());
+        assert_eq!(count.load(SeqCst), 0);
+        assert!(!ran.load(SeqCst));
+        // Work that panics gives its place back too
+        assert!(start_counted(&count, 3, || panic!("worker fails (test)")).unwrap());
+        wait_zero(&count);
     }
 
     /// How often `FileItem::from_path` ran on this thread, the window's in these tests.
