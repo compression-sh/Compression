@@ -1000,5 +1000,6 @@
   "{} new items of this window are still being made, so nothing was made; try again when one has finished": "В этом окне ещё создаются новые элементы ({}), поэтому ничего не создано; попробуйте снова, когда один из них завершится",
   "It could not be started ({}), so nothing was made": "Не удалось запустить ({}), поэтому ничего не создано",
   "Created {} in {}": "{} создан в {}",
+  "Could not create “{}” in {}: {}": "Не удалось создать «{}» в {}: {}",
   "Open a folder first to open it as administrator": "Сначала откройте папку, чтобы открыть её от имени администратора"
 }

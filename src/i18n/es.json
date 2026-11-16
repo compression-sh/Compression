@@ -1000,5 +1000,6 @@
   "{} new items of this window are still being made, so nothing was made; try again when one has finished": "Esta ventana todavía está creando {} elementos nuevos, así que no se creó nada; inténtalo de nuevo cuando termine alguno",
   "It could not be started ({}), so nothing was made": "No se pudo iniciar ({}), así que no se creó nada",
   "Created {} in {}": "{} creado en {}",
+  "Could not create “{}” in {}: {}": "No se pudo crear «{}» en {}: {}",
   "Open a folder first to open it as administrator": "Abre primero una carpeta para abrirla como administrador"
 }

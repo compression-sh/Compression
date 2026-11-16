@@ -376,6 +376,11 @@ pub(crate) mod tests {
         NO_LINKS.lock().unwrap().iter().any(|dir| path.starts_with(dir))
     }
 
+    /// Hard links count as missing under `dir` from now on.
+    pub(crate) fn without_links_under(dir: &Path) {
+        NO_LINKS.lock().unwrap().push(dir.to_path_buf());
+    }
+
     struct FailingRead<'a> {
         inner: &'a mut dyn Read,
         left: u64,

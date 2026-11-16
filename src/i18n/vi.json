@@ -1000,5 +1000,6 @@
   "{} new items of this window are still being made, so nothing was made; try again when one has finished": "Cửa sổ này vẫn đang tạo {} mục mới nên chưa tạo gì; hãy thử lại khi một mục đã xong",
   "It could not be started ({}), so nothing was made": "Không thể bắt đầu ({}) nên chưa tạo gì",
   "Created {} in {}": "Đã tạo {} trong {}",
+  "Could not create “{}” in {}: {}": "Không thể tạo “{}” trong {}: {}",
   "Open a folder first to open it as administrator": "Hãy mở một thư mục trước để mở nó với quyền quản trị"
 }

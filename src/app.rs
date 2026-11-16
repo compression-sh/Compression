@@ -5501,13 +5501,16 @@ impl CompressionApp {
 
     /// The answer for a new item from `create_entry`. It was made in `dir`, the folder shown when it was asked for, also
     /// if the window shows another one by now. A failure goes back to the dialog that asked, if it still waits, or else
-    /// is said.
+    /// is said. Where that dialog is gone or another folder is shown, the failure names `dir` in full, so that what was
+    /// left there (a hidden file the reason names) can be found; the path is the one asked with, nothing is looked up.
     fn created(&mut self, dialog: u64, dir: &Path, name: &str, result: Result<(Option<FileItem>, Option<String>), String>) {
         let (item, note) = match result {
             Ok(made) => made,
             Err(why) => {
+                let waits = matches!(&self.dialog, Some(Dialog::Create { id, waiting: true, .. }) if *id == dialog);
+                let why = if waits && dir == self.current_path { why } else { trf("Could not create “{}” in {}: {}", &[&name, &dir.display(), &why]) };
                 match &mut self.dialog {
-                    Some(Dialog::Create { id, waiting, error, .. }) if *id == dialog && *waiting => {
+                    Some(Dialog::Create { waiting, error, .. }) if waits => {
                         *waiting = false;
                         *error = Some(why);
                     }
@@ -12657,6 +12660,63 @@ mod tests {
         wait_for(&mut app, &|app| app.status_toast.as_ref().is_some_and(|t| t.message == "Created fresh"));
         assert!(work.join("fresh").is_dir() && app.items.iter().any(|i| i.name == "fresh"));
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_failure_said_after_the_dialog_was_closed_names_the_folder_and_the_hidden_file_left_there() {
+        // Neither a safe rename nor a hard link: the file from the template stays hidden, and the reason names it
+        let work = window_dir("create_failure_named");
+        crate::compat::tests::without_support_under(&work);
+        crate::fs::templates::tests::without_links_under(&work);
+        let ctx = egui::Context::default();
+        let mut app = CompressionApp::new(work.clone(), SerpantinumTheme::default(), Settings::default(), &ctx);
+        let markdown = crate::fs::templates::builtin().into_iter().find(|t| t.file_name.ends_with(".md")).unwrap();
+        app.open_create_dialog(false);
+        let Some(Dialog::Create { id, .. }) = app.dialog else { panic!() };
+        app.dialog = None;
+        app.create_entry(id, false, "notes.md", Some(&markdown)).unwrap();
+        poll_until(&mut app, "the failure", |app| app.status_toast.as_ref().is_some_and(|t| t.message.starts_with("Could not create")));
+        let said = app.status_toast.as_ref().map(|t| t.message.clone()).unwrap_or_default();
+        let head = format!("Could not create “notes.md” in {}: ", work.display());
+        assert!(said.starts_with(&head), "{said}");
+        // The reason stays whole, the hint to the hidden file included, and that file is in the folder named
+        assert!(said.contains("cannot make a file from a template"), "{said}");
+        let hidden: Vec<String> = std::fs::read_dir(&work).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with(".compression-new-")).collect();
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert!(said.contains(&format!("kept as “{}”", hidden[0])), "{said}");
+        assert_eq!(std::fs::read_to_string(work.join(&hidden[0])).unwrap(), "# \n");
+        assert!(!work.join("notes.md").exists());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_failure_for_a_dialog_that_still_waits_names_the_folder_once_another_folder_or_tab_is_shown() {
+        for by_tab in [false, true] {
+            let here = window_dir(&format!("create_failure_moved_{by_tab}"));
+            let elsewhere = here.join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            let mut w = Window::new(here.clone());
+            w.app.open_create_dialog(true);
+            w.run(Vec::new(), 3);
+            hold_creating_in(&here);
+            w.click(w.at("Create"), egui::PointerButton::Primary);
+            w.run(Vec::new(), 3);
+            assert!(matches!(w.app.dialog, Some(Dialog::Create { waiting: true, .. })));
+            // Taken meanwhile, so the waiting item fails
+            std::fs::create_dir(here.join("New Folder")).unwrap();
+            if by_tab {
+                w.app.new_tab(elsewhere.clone());
+                w.until("the other tab", |w| w.app.current_path == elsewhere);
+            } else {
+                w.go(elsewhere.clone());
+            }
+            let_creating_go(&here);
+            w.until("the failure", |w| matches!(&w.app.dialog, Some(Dialog::Create { error: Some(_), .. })));
+            let Some(Dialog::Create { error: Some(error), waiting, .. }) = &w.app.dialog else { panic!() };
+            assert!(!waiting);
+            assert_eq!(*error, format!("Could not create “New Folder” in {}: “New Folder” already exists", here.display()), "by tab: {by_tab}");
+            let _ = std::fs::remove_dir_all(&here);
+        }
     }
 
     #[test]
