@@ -148,6 +148,8 @@ struct Reading(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 const MAX_TEMPLATE_LISTINGS: usize = 1;
 /// The most new items of one window being made at once: one that hangs stays until its folder answers.
 const MAX_CREATING: usize = 3;
+/// The most lookups of one window for menus on pins and sidebar places at once: one that hangs stays until it answers.
+const MAX_MENU_LOOKUPS: usize = 3;
 
 /// Starts `work` on a thread of its own if `count` is below `most`, and counts it until the thread ends, however it ends
 /// (also when its answer can no longer be delivered). `Ok(false)` when there is no room: nothing is started, queued or
@@ -184,6 +186,19 @@ struct ContextMenu {
     /// "Open with <default app>" for files that have one; resolved off the UI thread.
     open_label: Option<String>,
     label_rx: Option<mpsc::Receiver<Result<Option<String>, apps::Why>>>,
+    /// For a menu on a pin or a sidebar place: what its target is, looked up when this menu opened.
+    looked: Option<Looked>,
+}
+
+/// What a menu on a pin or a sidebar place knows of its target. It belongs to that menu: a menu opened later has its
+/// own, and an answer for one closed meanwhile goes nowhere.
+enum Looked {
+    /// Looked up on a thread that has not answered yet.
+    Waiting(mpsc::Receiver<Option<FileItem>>),
+    /// What was found; `None` when it could not be read.
+    Found(Option<FileItem>),
+    /// Not looked up: earlier lookups of this window still hang, or no thread could be started.
+    NotAsked,
 }
 
 #[derive(Clone)]
@@ -687,6 +702,8 @@ pub struct CompressionApp {
     /// How many threads of this window list the templates folder now, and how many make new items (see `start_counted`).
     template_listings: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     creating: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// How many threads of this window look up the target of a menu on a pin or a sidebar place now.
+    menu_lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// How long a paste waits for the clipboard; tests shorten it.
     clipboard_wait: std::time::Duration,
     /// What reads the clipboard for a paste (`clipboard::snapshot`); tests put others here.
@@ -1022,6 +1039,7 @@ impl CompressionApp {
             clipboard_readers: std::sync::Arc::default(),
             template_listings: std::sync::Arc::default(),
             creating: std::sync::Arc::default(),
+            menu_lookups: std::sync::Arc::default(),
             clipboard_wait: CLIPBOARD_WAIT,
             clipboard_snapshot: std::sync::Arc::new(crate::clipboard::snapshot),
             clipboard_text: std::sync::Arc::new(crate::clipboard::get_text),
@@ -2047,6 +2065,10 @@ impl CompressionApp {
             }
             _ => None,
         };
+        let looked = match &target {
+            MenuTarget::Pin(path) | MenuTarget::Place(path, _) => Some(self.look_up(ctx, path)),
+            _ => None,
+        };
         material::reset_anim(ctx, egui::Id::unique("context_menu_anim"), 0.0);
         self.menu_serial += 1;
         // What was said for an earlier menu says nothing about the clipboard now
@@ -2059,7 +2081,24 @@ impl CompressionApp {
             let selection = self.menu_group(item);
             self.plugins.menu_opened(&selection);
         }
-        self.menu = Some(ContextMenu { pos, target, open_label: None, label_rx });
+        self.menu = Some(ContextMenu { pos, target, open_label: None, label_rx, looked });
+    }
+
+    /// What `path` is, for a menu on a pin or a sidebar place: from the listing shown if it has it, or else from a
+    /// thread (the path may be on a server that hangs), never from the file system on the window's thread.
+    fn look_up(&self, ctx: &egui::Context, path: &Path) -> Looked {
+        if let Some(item) = self.items.iter().find(|i| i.path == path) {
+            return Looked::Found(Some(item.clone()));
+        }
+        let (tx, rx) = mpsc::channel();
+        let (path, ctx) = (path.to_path_buf(), ctx.clone());
+        let started = start_counted(&self.menu_lookups, MAX_MENU_LOOKUPS, move || {
+            #[cfg(test)]
+            tests::wait_while_held(&path);
+            let _ = tx.send(FileItem::from_path(&path));
+            ctx.request_repaint();
+        });
+        if matches!(started, Ok(true)) { Looked::Waiting(rx) } else { Looked::NotAsked }
     }
 
     /// Asks what the system clipboard offers, on a thread of its own: its owner may take its time, or never
@@ -6021,6 +6060,15 @@ impl CompressionApp {
             }
             group
         };
+        // A pin or a sidebar place: what the menu that is open looked up of it (see `look_up`)
+        let looked = self.menu.as_ref().and_then(|m| m.looked.as_ref());
+        let unknown: MenuEntry = match looked {
+            Some(Looked::NotAsked) => {
+                let why = tr("Earlier lookups have not answered yet, so this one was not looked up");
+                (icons::INFO, why, MenuAction::Unavailable(why))
+            }
+            _ => (icons::INFO, tr("Loading…"), MenuAction::Unavailable(tr("Loading…"))),
+        };
         // The menu of one file or folder. `keep` is for sidebar places, which must not be moved or removed from here.
         let single_groups = |item: &FileItem, show_parent: bool, keep: bool| {
             let mut groups = vec![open_group(item, !item.is_dir, show_parent)];
@@ -6153,9 +6201,11 @@ impl CompressionApp {
             MenuTarget::Sidebar => vec![self.sidebar_entries(None)],
             MenuTarget::Tab(id) => self.tab_entries(*id),
             MenuTarget::Place(path, place) => {
-                let mut groups = match FileItem::from_path(path) {
-                    Some(item) => single_groups(&item, false, true),
-                    None => vec![vec![(icons::OPEN, tr("Open"), MenuAction::OpenPath(path.clone()))]],
+                let mut groups = match looked {
+                    Some(Looked::Found(Some(item))) => single_groups(item, false, true),
+                    Some(Looked::Found(None)) => vec![vec![(icons::OPEN, tr("Open"), MenuAction::OpenPath(path.clone()))]],
+                    // Not known yet: nothing that depends on what it is
+                    _ => vec![vec![unknown]],
                 };
                 if place.is_some() {
                     groups.push(self.sidebar_entries(*place));
@@ -6201,9 +6251,11 @@ impl CompressionApp {
                 vec![(icons::LAN_CONNECT, tr("Connect to server…"), MenuAction::ConnectToServer)],
                 self.sidebar_entries(Some(SidebarPlace::ConnectToServer)),
             ],
-            MenuTarget::Pin(path) => match FileItem::from_path(path) {
-                Some(item) => single_groups(&item, true, false),
-                None => vec![vec![(icons::PIN_OFF, tr("Unpin from sidebar"), MenuAction::Unpin(path.clone()))]],
+            MenuTarget::Pin(path) => match looked {
+                Some(Looked::Found(Some(item))) => single_groups(item, true, false),
+                Some(Looked::Found(None)) => vec![vec![(icons::PIN_OFF, tr("Unpin from sidebar"), MenuAction::Unpin(path.clone()))]],
+                // Not known yet: only what does not depend on what it is
+                _ => vec![vec![unknown], vec![(icons::PIN_OFF, tr("Unpin from sidebar"), MenuAction::Unpin(path.clone()))]],
             },
         }
     }
@@ -6340,6 +6392,15 @@ impl CompressionApp {
                 menu.label_rx = None;
                 unanswered = answer.err();
             }
+        if let Some(ContextMenu { looked: Some(looked), .. }) = self.menu.as_mut()
+            && let Looked::Waiting(rx) = looked
+        {
+            match rx.try_recv() {
+                Ok(found) => *looked = Looked::Found(found),
+                Err(mpsc::TryRecvError::Disconnected) => *looked = Looked::Found(None),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         // The entry just says "Open" without the label; only a missing answer is worth saying
         if unanswered == Some(apps::Why::TimedOut) {
             self.set_toast(trf("Could not find out what opens this file ({})", &[&apps::Why::TimedOut.text()]));
@@ -12308,6 +12369,148 @@ mod tests {
 
     fn count(n: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> usize {
         n.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How often `FileItem::from_path` ran on this thread, the window's in these tests.
+    fn asked_here() -> usize {
+        crate::fs::file_item::FROM_PATH_HERE.with(std::cell::Cell::get)
+    }
+
+    /// The entries of the menu that is open, as it is drawn now, those of submenus included.
+    fn open_menu_entries(app: &CompressionApp) -> Vec<(String, MenuAction)> {
+        let Some(menu) = &app.menu else { return Vec::new() };
+        let mut out = Vec::new();
+        for (_, label, action) in app.menu_entries(&menu.target).into_iter().flatten() {
+            if let MenuAction::Submenu(inner) = &action {
+                out.extend(inner.iter().map(|(_, l, a)| ((*l).to_owned(), a.clone())));
+            }
+            out.push((label.to_owned(), action));
+        }
+        out
+    }
+
+    fn open_menu_labels(app: &CompressionApp) -> Vec<String> {
+        open_menu_entries(app).into_iter().map(|(label, _)| label).collect()
+    }
+
+    #[test]
+    fn pin_and_place_menus_ask_nothing_on_the_window_thread_when_opened_cold_and_drawn_again_and_again() {
+        let work = window_dir("menu_lookup");
+        let (shown, pinned, place) = (work.join("shown"), work.join("pinned"), work.join("place"));
+        for dir in [&shown, &pinned, &place, &shown.join("child")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut w = Window::new(shown.clone());
+        w.app.pins = vec![pinned.clone()];
+        w.until("the listing", |w| w.app.items.iter().any(|i| i.name == "child"));
+        let ctx = w.ctx.clone();
+        // Neither is in the listing shown: looked up on a thread, held there for now
+        // While it is not known, only what does not depend on what it is: unpinning a pin, nothing for a folder place
+        for (target, path, waiting) in [
+            (MenuTarget::Pin(pinned.clone()), &pinned, vec!["Loading…", "Unpin from sidebar"]),
+            (MenuTarget::Place(place.clone(), None), &place, vec!["Loading…"]),
+        ] {
+            hold_creating_in(path);
+            let before = asked_here();
+            w.app.open_menu(&ctx, egui::pos2(100.0, 100.0), target);
+            w.run(Vec::new(), 10);
+            assert_eq!(open_menu_labels(&w.app), waiting);
+            assert!(w.shows("Loading…"), "{:?}", w.last);
+            assert_eq!(count(&w.app.menu_lookups), 1);
+            let_creating_go(path);
+            w.until("the answer", |w| open_menu_labels(&w.app).iter().any(|l| l == "Properties"));
+            w.run(Vec::new(), 10);
+            assert!(w.shows("Properties"), "{:?}", w.last);
+            assert_eq!(asked_here(), before, "the file system was not asked on the window's thread, opening or drawing");
+            assert_eq!(count(&w.app.menu_lookups), 0);
+            w.app.menu = None;
+        }
+        // One the listing shows is known at once, from the listing, with no thread
+        let before = asked_here();
+        w.app.open_menu(&ctx, egui::pos2(100.0, 100.0), MenuTarget::Place(shown.join("child"), None));
+        assert_eq!(count(&w.app.menu_lookups), 0);
+        assert!(open_menu_labels(&w.app).iter().any(|l| l == "Properties"));
+        w.run(Vec::new(), 10);
+        assert_eq!(asked_here(), before);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_menu_opened_for_another_target_meanwhile_takes_no_answer_meant_for_the_one_before() {
+        let work = window_dir("menu_other_target");
+        // Folders: the sidebar draws a file pin's icon from the file system each frame, which is not the menu's doing
+        let (shown, first, second) = (work.join("shown"), work.join("first"), work.join("second"));
+        for dir in [&shown, &first, &second] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut w = Window::new(shown);
+        w.app.pins = vec![first.clone(), second.clone()];
+        let ctx = w.ctx.clone();
+        let before = asked_here();
+        hold_creating_in(&first);
+        w.app.open_menu(&ctx, egui::pos2(100.0, 100.0), MenuTarget::Pin(first.clone()));
+        w.run(Vec::new(), 3);
+        // Closed, and opened on the other pin while the first lookup still runs
+        w.app.menu = None;
+        w.run(Vec::new(), 3);
+        w.app.open_menu(&ctx, egui::pos2(100.0, 100.0), MenuTarget::Pin(second.clone()));
+        w.until("the second answer", |w| open_menu_labels(&w.app).iter().any(|l| l == "Properties"));
+        let_creating_go(&first);
+        w.until("the first lookup to end", |w| count(&w.app.menu_lookups) == 0);
+        w.run(Vec::new(), 10);
+        let entries = open_menu_entries(&w.app);
+        assert!(entries.iter().any(|(_, a)| matches!(a, MenuAction::Open(item) if item.path == second && item.is_dir)));
+        assert!(entries.iter().any(|(_, a)| matches!(a, MenuAction::Properties(p) if *p == second)));
+        let about_first = entries.iter().any(|(_, a)| match a {
+            MenuAction::Open(item) => item.path == first,
+            MenuAction::Properties(p) | MenuAction::OpenInNewTab(p) | MenuAction::Unpin(p) | MenuAction::CopyPath(p) => *p == first,
+            _ => false,
+        });
+        assert!(!about_first, "nothing of the first pin");
+        assert_eq!(asked_here(), before);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn menu_lookups_that_hang_keep_their_places_and_a_further_menu_offers_only_what_does_not_depend_on_its_target() {
+        let work = window_dir("menu_lookups_capped");
+        let shown = work.join("shown");
+        std::fs::create_dir_all(&shown).unwrap();
+        let pins: Vec<PathBuf> = (1..=4).map(|n| work.join(format!("p{n}"))).collect();
+        for pin in &pins {
+            std::fs::create_dir(pin).unwrap();
+        }
+        let mut w = Window::new(shown);
+        w.app.pins = pins.clone();
+        let ctx = w.ctx.clone();
+        let not_asked = "Earlier lookups have not answered yet, so this one was not looked up";
+        for pin in &pins[..3] {
+            hold_creating_in(pin);
+            w.app.open_menu(&ctx, egui::pos2(100.0, 100.0), MenuTarget::Pin(pin.clone()));
+        }
+        assert_eq!(count(&w.app.menu_lookups), 3);
+        // No room: not looked up, said so, only unpinning offered; closing and opening again frees nothing
+        for _ in 0..2 {
+            w.app.menu = None;
+            w.app.open_menu(&ctx, egui::pos2(100.0, 100.0), MenuTarget::Pin(pins[3].clone()));
+            w.run(Vec::new(), 3);
+            assert_eq!(open_menu_labels(&w.app), [not_asked, "Unpin from sidebar"]);
+            assert_eq!(count(&w.app.menu_lookups), 3);
+        }
+        for pin in &pins[..3] {
+            let_creating_go(pin);
+        }
+        w.until("the places", |w| count(&w.app.menu_lookups) == 0);
+        w.app.open_menu(&ctx, egui::pos2(100.0, 100.0), MenuTarget::Pin(pins[3].clone()));
+        w.until("the answer", |w| open_menu_labels(&w.app).iter().any(|l| l == "Properties"));
+        // No thread: the same, and the place is free
+        w.app.menu = None;
+        FAIL_SPAWN.with(|f| f.set(true));
+        w.app.open_menu(&ctx, egui::pos2(100.0, 100.0), MenuTarget::Pin(pins[0].clone()));
+        FAIL_SPAWN.with(|f| f.set(false));
+        assert_eq!(open_menu_labels(&w.app), [not_asked, "Unpin from sidebar"]);
+        assert_eq!(count(&w.app.menu_lookups), 0);
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]

@@ -377,6 +377,12 @@ pub struct FileItem {
     pub is_locked: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How often `FileItem::from_path` ran on this thread.
+    pub(crate) static FROM_PATH_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl FileItem {
     /// A made-up file of a name and type, to show its icon; nothing on disk backs it.
     pub fn sample(name: &str, file_type: FileType) -> Self {
@@ -398,6 +404,8 @@ impl FileItem {
     }
 
     pub fn from_path(path: &Path) -> Option<Self> {
+        #[cfg(test)]
+        FROM_PATH_HERE.with(|n| n.set(n.get() + 1));
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
